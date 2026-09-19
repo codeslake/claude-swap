@@ -637,7 +637,7 @@ class PollEvent(AutoSwitchEvent):
             # WHAT actually blocks this candidate — a full 5h/7d block, or
             # only its pinned model's window (which the engine's fallback in
             # `_rank_candidates` can rank around; see `classify_candidate_block`).
-            # Same fallback as `human()` below (#805): `switch_bar`, the
+            # Same fallback as `human()` below (#321): `switch_bar`, the
             # strategy-aware landing bar, when the event carries one, never
             # the raw `threshold` alone under `dynamic`.
             kind, model = classify_candidate_block(
@@ -3108,7 +3108,7 @@ class AutoSwitchEngine:
         are (1) whether the peer, right now, would itself be a healthy place
         to land: `h > 100 - settings.threshold` -- the exact complement of
         `_every_account_above_threshold` (deliberately kept on the raw
-        threshold, #805), not `_rank_candidates`'s own landing gate, which
+        threshold, #321), not `_rank_candidates`'s own landing gate, which
         under `dynamic` reads the wider `proactive_switch_bar_pct` bar
         instead; the two agree for every OTHER strategy, where `bar`
         hands `threshold` straight back; and (2), when the landing floor
@@ -3231,7 +3231,7 @@ class AutoSwitchEngine:
             #
             #   landing   `h > 100 - settings.threshold` -- the exact
             #             complement of `_every_account_above_threshold`
-            #             (kept on the raw threshold, #805), NOT
+            #             (kept on the raw threshold, #321), NOT
             #             `_rank_candidates`'s own landing gate, which
             #             reads the wider dynamic bar under `dynamic`.
             #   recovery  the peer's binding reset is meaningfully sooner
@@ -3557,7 +3557,7 @@ class AutoSwitchEngine:
         # ONE NAME FOR BOTH THE GATE AND THE KEY. They were two copies of the
         # same trigger tuple, and this file has already had to close two
         # defects where a filter ran on one axis while the sort ran on
-        # another. Deliberately NOT `and not dynamic_landing` here (#805):
+        # another. Deliberately NOT `and not dynamic_landing` here (#321):
         # the `waiting` flag below reads `by_recovery_axis` alone, for every
         # strategy including dynamic's own genuine at-limit blackouts, and
         # narrowing this definition silently zeroed it for dynamic. The
@@ -3585,7 +3585,7 @@ class AutoSwitchEngine:
             )
         )
 
-        # THE BAR EVERY ADMISSION/RANKING/LABEL DECISION BELOW READS (#805):
+        # THE BAR EVERY ADMISSION/RANKING/LABEL DECISION BELOW READS (#321):
         # under `dynamic` this is `proactive_switch_bar_pct`'s 97 (100 -
         # SPENT_HEADROOM_PCT), not `settings.threshold` (90) — the owner's
         # live case, account 4 at 7d 95%/headroom 5 with its reset hours
@@ -3838,59 +3838,27 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
-            elif consume_first and trigger != "at-limit" and (
-                not all_above
-                or (dynamic_landing and trigger in CONSUME_FIRST_STRATEGIES)
-            ):
+            elif consume_first and trigger != "at-limit" and not all_above:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 #
                 # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so neither
                 # escape belongs: `at-limit` is a stopped session, and under
-                # `all_above` the spent guard has admitted `best`/
-                # `consume-first` candidates on a RECOVERY argument that this
-                # key would re-order by a weekly reset. `not all_above`
-                # covers that case; `failover` never satisfies it at all.
-                #
-                # `OR (dynamic_landing and trigger in CONSUME_FIRST_STRATEGIES)`
-                # (#805): the key above is gated `by_recovery_axis and not
-                # dynamic_landing`, not `by_recovery_axis` alone --
-                # `by_recovery_axis` itself stays keyed on `all_above` for
-                # every strategy (the `waiting` flag below reads it too),
-                # but a `dynamic` candidate admitted while `all_above` holds
-                # comes from CHAIN A's `elif trigger in
-                # CONSUME_FIRST_STRATEGIES` above instead, itself a
-                # reset-ordering gate (`reset_ts < active_reset_ts`, same
-                # axis this key sorts by), never a recovery argument. Falling
-                # to the escape key below instead ranks by raw headroom,
-                # which is not what "dynamic ranks by soonest reset" means.
-                # `trigger in CONSUME_FIRST_STRATEGIES` NARROWS it to exactly
-                # that admission path: `disabled-active`/`failover` under
-                # `dynamic` with `all_above` reach this same `elif` on
-                # `dynamic_landing` alone if it is dropped, but CHAIN A never
-                # admits THEM through the reset-ordering branch -- they skip
-                # chain A's gate entirely (its outer `if` needs `by_recovery_
-                # axis` or a matching trigger, neither true for them) -- so
-                # ranking them here instead of the escape key below is a
-                # regression, not a fix (measured: it silently changed which
-                # peer a disabled-active fleet lands on).
-                #
-                # `trigger in CONSUME_FIRST_STRATEGIES` (literally
-                # "consume-first" or "dynamic") never fires from a REAL
-                # dynamic tick: `_classify_dynamic_trigger` only ever
-                # produces "at-limit"/"proactive"/"dynamic-healthy", and the
-                # only place `trigger = settings.strategy` is assigned sits
-                # in the non-dynamic branch. It is exercised by
-                # `TestDynamicStrategy`'s direct `_rank_candidates` probes
-                # (`trigger="dynamic"`, the same white-box convention
-                # `test_the_voluntary_arm_never_lands_on_a_candidate_with_
-                # no_room` already used before #805) -- kept, not deleted,
-                # for the same reason the gate and `consume_first_rank_key`
-                # fixes above are kept even where today's trigger
-                # classification does not reach them: #805 asks that every
-                # comparison deciding "is this candidate blocked" read
-                # `bar`, not only the ones a current call graph happens to
-                # exercise.
+                # `all_above` the spent guard has admitted candidates on a
+                # RECOVERY argument that this key would re-order by a weekly
+                # reset. `not all_above` covers only the second — one
+                # below-threshold peer clears it, and `failover` never
+                # satisfies it at all. Unwidened for dynamic (#321): a
+                # dynamic candidate admitted through CHAIN A's own
+                # reset-ordering `elif` while `all_above` holds needs
+                # `trigger in CONSUME_FIRST_STRATEGIES` — a value no REAL
+                # dynamic tick's trigger classification produces
+                # (`_classify_dynamic_trigger` returns only
+                # "at-limit"/"proactive"/"dynamic-healthy") — so the escape
+                # key below, gated `by_recovery_axis and not dynamic_landing`
+                # just above, is what every reachable dynamic candidate in
+                # this state actually uses; measured unaffected by removing
+                # a `dynamic_landing`-only widening tried here.
                 #
                 # TIERED, because `disabled-active` and `failover` reach this
                 # arm with NO admission axis (both skip the landing gate), and
@@ -3899,7 +3867,7 @@ class AutoSwitchEngine:
                 #
                 # TWO TIERS AND NOT ONE. Servability and landing health are
                 # different bars — `h > SPENT_HEADROOM_PCT` against
-                # `h > 100 - bar` (#805: `bar` is `proactive_switch_bar_pct`
+                # `h > 100 - bar` (#321: `bar` is `proactive_switch_bar_pct`
                 # -- `settings.threshold` itself for consume-first, fixed at
                 # 97 for dynamic). Folded together, health hides servability
                 # inside its own top level. Their order is immaterial and
@@ -3963,7 +3931,7 @@ class AutoSwitchEngine:
                 # Fable-100 active passed over a Fable-89/5h-40/7d-65
                 # candidate for a Fable-10/5h-91 one).
                 #
-                # DELIBERATELY `settings.threshold`, NOT `bar` (#805).
+                # DELIBERATELY `settings.threshold`, NOT `bar` (#321).
                 # `bar == 100 - SPENT_HEADROOM_PCT` for dynamic exactly, so
                 # `h > SPENT_HEADROOM_PCT and (100.0 - h) >= bar` would read
                 # `h > 3 and h <= 3` -- always false, silently disabling
@@ -3977,14 +3945,14 @@ class AutoSwitchEngine:
                 # on its own binding window, say) is demoted by THIS check,
                 # not that one. It is a genuine, accepted asymmetry with
                 # `consume_first_rank_key`, which now tiers that same
-                # candidate "healthy" at the wider bar (97): pre-#805 both
+                # candidate "healthy" at the wider bar (97): pre-#321 both
                 # read `settings.threshold` and agreed; keeping this one on
                 # `settings.threshold` is what still catches the #321
                 # escape-axis bug in the ONE branch a true blackout always
                 # reaches, at the cost of not catching it in the branches
                 # that don't. Not a "which candidate is blocked" decision
                 # either way -- it only re-ranks within an already-admitted
-                # escape set -- so it stays outside #805's scope.
+                # escape set -- so it stays outside #321's scope.
                 dynamic_self_walled = (
                     dynamic_landing
                     and h > SPENT_HEADROOM_PCT

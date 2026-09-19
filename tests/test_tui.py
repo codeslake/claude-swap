@@ -1870,7 +1870,7 @@ class TestAutoScreen:
         the model-gated axis here would name #2 (99% Fable) the worse account
         when its real 5h is #3's better one: the two are on OPPOSITE sides of
         `-Fable, +5h` vs `+Fable, -5h`. Both Fable values sit over the dynamic
-        landing bar (97, not the raw 90 threshold, #805), or #2 reads "open"
+        landing bar (97, not the raw 90 threshold, #321), or #2 reads "open"
         on the model axis directly and the model gate never needs to drop."""
         import json as _json
 
@@ -2577,9 +2577,12 @@ class TestUnswitchableRowsAreListed:
         under it carries no block label.
 
         Parametrized so the wording rule holds under every strategy.
-        `consume-first` reads the raw `settings.threshold` (90) unchanged.
-        Under `dynamic` the bar is 97 (#805), so 92% (headroom 8) now sits
-        UNDER it -- the same reading as 50%, no block label at all.
+        `consume-first` reads the raw `settings.threshold` (90) unchanged,
+        so both #3 (92%) and #5 (98%) print the `>= 90%` wording. Under
+        `dynamic` the bar is 97 (#321): #3 (headroom 8) now sits UNDER it --
+        the same reading as 50%, no block label at all -- while #5
+        (headroom 2, still under 100) is the row that keeps the `>= 97%`
+        wording under test.
         """
         from claude_swap.settings import AutoSwitchSettings
 
@@ -2595,25 +2598,37 @@ class TestUnswitchableRowsAreListed:
             self._acct("4", "fifty@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 0.0}, "seven_day": {"pct": 50.0},
             }),
+            self._acct("5", "ninetyeight@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 98.0},
+            }),
         ), active="1", settings=settings)
 
         rows = {
             email: next(line for line in out.split("\n") if email in line)
-            for email in ("hundred@x.com", "ninetytwo@x.com", "fifty@x.com")
+            for email in (
+                "hundred@x.com", "ninetytwo@x.com", "fifty@x.com",
+                "ninetyeight@x.com",
+            )
         }
         assert "7d full" in rows["hundred@x.com"], rows["hundred@x.com"]
         if strategy == "dynamic":
             assert "full" not in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
             assert ">=" not in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
+            assert "7d 98% >= 97%" in rows["ninetyeight@x.com"], (
+                rows["ninetyeight@x.com"]
+            )
         else:
             assert "7d 92% >= 90%" in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
+            assert "7d 98% >= 90%" in rows["ninetyeight@x.com"], (
+                rows["ninetyeight@x.com"]
+            )
         assert "full" not in rows["fifty@x.com"], rows["fifty@x.com"]
         assert ">=" not in rows["fifty@x.com"], rows["fifty@x.com"]
 
     def test_the_panel_admits_a_headroom_candidate_with_hours_to_reset_under_dynamic(
         self,
     ):
-        """The owner's live case, 2026-09-19 (#805): account 4 at 7d 95%
+        """The owner's live case, 2026-09-19 (#321): account 4 at 7d 95%
         (headroom 5) with its reset hours away must read as open on the
         panel too, and rank ahead of a peer with more headroom but a
         reset days out -- the panel's label and its "Next best" order

@@ -680,15 +680,17 @@ class TestDecisionTable:
     def test_a_disabled_active_lands_on_the_peer_that_lifts_first_under_dynamic(
         self, temp_home
     ):
-        """CONTROL for #805: same fleet, `strategy="dynamic"`. `disabled-
+        """CONTROL for #321: same fleet, `strategy="dynamic"`. `disabled-
         active` never reaches `_rank_candidates_pass`'s landing gate (chain
         A's own outer `if` needs `by_recovery_axis` or a matching trigger,
-        neither true for it), so it never goes through the reset-ordering
-        `elif` this task widened for dynamic's OWN reset-ordering admission
-        -- that widening is narrowed to `trigger in CONSUME_FIRST_
-        STRATEGIES` precisely so `disabled-active` still falls to the escape
-        key below and keeps ranking by recovery time, not by raw headroom
-        (`-h`, 0 for every spent account here) or sequence order."""
+        neither true for it) and the reset-ordering `elif` requires
+        `not all_above`, so under `dynamic` it keeps falling to the escape
+        key below and ranking by recovery time, not by raw headroom (`-h`,
+        0 for every spent account here) or sequence order -- unchanged from
+        `best`/`consume-first` above. An intermediate version of this fix
+        widened the reset-ordering `elif` to also admit a `dynamic_landing`
+        candidate while `all_above` held; this pins that it must not also
+        catch `disabled-active`."""
         h, usage = self._spent_fleet(
             temp_home, lifts_in=(60, 50, 10), strategy="dynamic"
         )
@@ -5125,7 +5127,7 @@ class TestAModelWindowIsNotABlackout:
         self, temp_home
     ):
         """The reported fleet, reproduced exactly (numbers moved to the
-        dynamic landing bar, 97, not the raw threshold 90 -- #805): six
+        dynamic landing bar, 97, not the raw threshold 90 -- #321): six
         accounts, Fable pinned. 1/3/4/5's only over-bar window is Fable
         (98%) — 5h and 7d both have room — so the model-gated pass empties
         and the retry on 5h/7d alone must both rescue it and rank it
@@ -5140,7 +5142,7 @@ class TestAModelWindowIsNotABlackout:
         model set (never a candidate-only reading): an active with real
         Fable headroom must not have the wall dropped just because its
         candidates all happen to be model-blocked. `_model_window_binds_
-        everywhere` still reads the raw `settings.threshold` (90, #805
+        everywhere` still reads the raw `settings.threshold` (90, #321
         deliberately leaves it there), so the active's 95% still counts.
         """
         h = EngineHarness(temp_home, model="Fable", threshold=90.0)
@@ -5403,7 +5405,7 @@ class TestAModelWindowIsNotABlackout:
     def test_the_decision_log_reads_the_dynamic_bar_not_the_raw_threshold(
         self,
     ):
-        """#805: the owner's live case, account 4 at 7d 95% (headroom 5)
+        """#321: the owner's live case, account 4 at 7d 95% (headroom 5)
         with hours left on its reset. `_describe` must fall back to
         `switch_bar` (97 under dynamic), not `threshold` (90), the same
         fallback `human()`'s own "(switch at X%)" tail already uses --
@@ -5466,7 +5468,7 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
     1/5/6 are 7d-walled, #4 is Fable-walled with nothing else open.
 
     `dynamic_self_walled` (autoswitch.py) deliberately stays keyed on
-    `settings.threshold`, not the wider dynamic bar (#805): the wider bar
+    `settings.threshold`, not the wider dynamic bar (#321): the wider bar
     equals `100 - SPENT_HEADROOM_PCT` for dynamic by construction, so
     reading it here would make the servable/self-walled conjuncts
     (`h > SPENT_HEADROOM_PCT` and `(100 - h) >= bar`) mutually exclusive
@@ -5738,7 +5740,7 @@ class TestDynamicStrategy:
         configured threshold (`all_above`, which reads the raw threshold
         regardless of strategy), and a peer whose OWN window is already at
         the landing bar (`proactive_switch_bar_pct` — 97 under `dynamic`,
-        #805) but whose binding window happens to reset soonest. The
+        #321) but whose binding window happens to reset soonest. The
         pre-existing `all_above` recovery-axis escape admits that peer on
         recovery timing alone — measured live, the very next tick read
         `cooldown` while still blocked. `dynamic` closes it; `best`/
@@ -5777,7 +5779,7 @@ class TestDynamicStrategy:
     def test_a_headroom_candidate_with_hours_to_reset_is_admitted_under_dynamic(
         self, temp_home
     ):
-        """The owner's live case, 2026-09-19 (#805): account 4 at 7d 95%
+        """The owner's live case, 2026-09-19 (#321): account 4 at 7d 95%
         (headroom 5) with its reset ~6h29m away, active at 7d 18% whose own
         weekly reset is far out, and a second candidate with more headroom
         (60) but a reset days out (still sooner than the active's, so the
@@ -5826,35 +5828,36 @@ class TestDynamicStrategy:
             "dynamic bar, not ('full', '7d')"
         )
 
-    def test_CONTROL_the_same_snapshot_under_best_keeps_the_configured_threshold(
+    def test_CONTROL_the_same_snapshot_under_consume_first_keeps_the_configured_threshold(
         self, temp_home
     ):
         """CONTROL: `proactive_switch_bar_pct` hands non-dynamic strategies
-        their configured threshold back unchanged — the same headroom-5
-        (7d 95%, reset ~6h29m out) candidate that `dynamic` now admits
-        stays blocked, and `classify_candidate_block` still reads it
-        ("full", "7d"), under `best`."""
-        h = EngineHarness(temp_home, strategy="best")
+        their configured threshold back unchanged. The IDENTICAL snapshot
+        the test above admits #4 from (headroom 5, 7d 95%, reset ~6h29m
+        out) must still exclude it under `consume-first` — #4 stays out on
+        the raw 90 threshold, #2 (open on every axis, sooner-resetting
+        peer) is the only admission. Not a `best`/`proactive` control: there
+        the hysteresis margin (candidate must beat the active by 10 points)
+        would refuse #4 regardless of which bar the landing gate reads,
+        proving nothing about the bar itself."""
+        h = EngineHarness(temp_home, strategy="consume-first")
         now = h.clock.now
         usage = {
-            "7": _usage7(5.0, 18.0),
+            "7": _usage7(5.0, 18.0, _iso_at(now + 650000)),
             "4": _usage7(5.0, 95.0, _iso_at(now + 23340)),
+            "2": _usage7(5.0, 40.0, _iso_at(now + 500000)),
         }
-        headroom = {"7": 82.0, "4": 5.0}
+        headroom = {"7": 82.0, "4": 5.0, "2": 60.0}
         args = self._args(
-            h, usage=usage, current="7", oauth_candidates=["4"],
+            h, usage=usage, current="7", oauth_candidates=["4", "2"],
             headroom=headroom, active_headroom=82.0,
-            trigger="proactive", strategy="best",
+            trigger="consume-first", strategy="consume-first",
         )
         ordered, _, _, _ = h.engine._rank_candidates(**args)
-        assert ordered == [], (
+        assert ordered == ["2"], (
             f"got {ordered} — #4 (headroom 5) is still at/over the "
-            "configured threshold (90) under `best` and must stay blocked"
-        )
-        kind, label = classify_candidate_block([("7d", 95.0)], 90.0)
-        assert (kind, label) == ("full", "7d"), (
-            f"got ({kind!r}, {label!r}) — must still read ('full', '7d') "
-            "under the raw threshold"
+            "configured threshold (90) under `consume-first` and must stay "
+            "blocked; #2 is the only admission"
         )
 
     def test_consume_first_switches_on_a_plain_proactive_trigger_dynamic_holds(
@@ -5905,7 +5908,7 @@ class TestDynamicStrategy:
         where the active can hold real headroom even though the model gate
         that set the trigger spent it) — the other trigger the `all_above`
         recovery axis reaches. Candidate headroom moved to the new dynamic
-        bar (97, not the raw 90 threshold, #805): at headroom 10 (5h 90%)
+        bar (97, not the raw 90 threshold, #321): at headroom 10 (5h 90%)
         the gate no longer refuses it (90 < 97), and the hysteresis check
         (`h - active_headroom < settings.hysteresis_pct`) would refuse it
         anyway, no longer proving the landing bar is what does the work."""
@@ -15245,7 +15248,7 @@ class TestTheModelWindowBindsUnlessItBindsEverywhere:
         every candidate (#1, #3) are Fable-walled (100%) — a genuine
         fleet-wide model blackout. The retry must still drop the model set
         and rank on 5h/7d: #1's 7d (98%, moved from 92% to sit over the
-        dynamic landing bar -- 97, not the raw 90 threshold, #805) still
+        dynamic landing bar -- 97, not the raw 90 threshold, #321) still
         blocks it there, #3's (79%) does not, so #3 is the only admissible
         landing.
         """

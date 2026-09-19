@@ -381,7 +381,7 @@ class AutoScreen(Screen):
         consume_first = bool(
             self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
         )
-        # THE BAR EVERY ADMISSION/LABEL DECISION BELOW READS (#805): under
+        # THE BAR EVERY ADMISSION/LABEL DECISION BELOW READS (#321): under
         # `dynamic` this is `proactive_switch_bar_pct`'s 97, not the raw
         # `settings.threshold` — a candidate with hours left on its reset
         # is headroom `dynamic` exists to spend, not a blocked one. Every
@@ -526,7 +526,7 @@ class AutoScreen(Screen):
                 # The CLASSIFICATION (open/model/full) reads the same way
                 # here as in the decision log — same helper,
                 # `classify_candidate_block`, now the same strategy-aware
-                # `bar` the engine's own landing gate reads (#805: this used
+                # `bar` the engine's own landing gate reads (#321: this used
                 # to be `self._settings.threshold` unconditionally, which
                 # under `dynamic` called a candidate with real headroom left
                 # "7d full"). It still does not fold in the engine's other,
