@@ -6868,6 +6868,11 @@ class TestWarmthAndAlternation375:
         h.clock.advance(chunk - 1.0)
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.NO_ACTION, f"got {outcome} at chunk - 1s"
+        # Pins the HOLD to the dwell gate, not to cooldown (which would
+        # also read NO_ACTION here but is not what this row is about):
+        # "below-threshold" is the label `partner is not None` emits.
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"], reasons
         assert h.active_number() == 2
 
         h.clock.advance(1.0)  # now exactly at the chunk boundary
