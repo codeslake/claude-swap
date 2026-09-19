@@ -3106,14 +3106,15 @@ class AutoSwitchEngine:
         departure — there is no `leftHeadroom` to diff against and never was
         — so the two signals that do not depend on the active's LIVE state
         are (1) whether the peer, right now, would itself be a healthy place
-        to land: `h > 100 - settings.threshold`, the same "would the ranking
-        accept this as a landing spot" test `_rank_candidates` already runs
-        (`:1617`) on every candidate, reused rather than inventing a fresh
-        constant; and (2), when the landing floor cannot answer, whether the
-        peer's own binding reset is meaningfully sooner than the active's.
-        The landing floor is the exact complement of
-        `_every_account_above_threshold`, so it is UNSATISFIABLE whenever
-        the
+        to land: `h > 100 - settings.threshold` -- the exact complement of
+        `_every_account_above_threshold` (deliberately kept on the raw
+        threshold, #805), not `_rank_candidates`'s own landing gate, which
+        under `dynamic` reads the wider `proactive_switch_bar_pct` bar
+        instead; the two agree for every OTHER strategy, where `bar`
+        hands `threshold` straight back; and (2), when the landing floor
+        cannot answer, whether the peer's own binding reset is meaningfully
+        sooner than the active's. The landing floor is UNSATISFIABLE
+        whenever the
         fleet is all-spent — the recovery leg is what keeps the hold from
         becoming unconditional in exactly that regime. Neither leg can tell
         "genuinely recovered" from "was already this good" — there is
@@ -3228,19 +3229,20 @@ class AutoSwitchEngine:
             # that proved it. Two legs, both read-only against CURRENT state
             # (no departure baseline exists to diff against):
             #
-            #   landing   `h > 100 - settings.threshold` -- would the
-            #             ranking accept this peer as a landing spot right
-            #             now (`_rank_candidates`, :1636)?
+            #   landing   `h > 100 - settings.threshold` -- the exact
+            #             complement of `_every_account_above_threshold`
+            #             (kept on the raw threshold, #805), NOT
+            #             `_rank_candidates`'s own landing gate, which
+            #             reads the wider dynamic bar under `dynamic`.
             #   recovery  the peer's binding reset is meaningfully sooner
             #             than the ACTIVE's binding reset -- the same axis
             #             `_recovery_is_useful` switches to once headroom
             #             stops being informative. Needed because `landing`
-            #             is the exact complement of `_every_account_above_
-            #             threshold`: whenever the fleet is all-spent,
-            #             `landing` is unsatisfiable by construction, no
-            #             matter how soon the peer's own
-            #             window resets, and that regime is precisely where
-            #             the recovery axis is the one the engine trusts.
+            #             is unsatisfiable by construction whenever the
+            #             fleet is all-spent, no matter how soon the peer's
+            #             own window resets, and that regime is precisely
+            #             where the recovery axis is the one the engine
+            #             trusts.
             #
             # Burn cannot fake the recovery leg: a reset moves nearer only
             # when a nearer window starts binding, never as a side effect
@@ -3873,6 +3875,23 @@ class AutoSwitchEngine:
                 # regression, not a fix (measured: it silently changed which
                 # peer a disabled-active fleet lands on).
                 #
+                # `trigger in CONSUME_FIRST_STRATEGIES` (literally
+                # "consume-first" or "dynamic") never fires from a REAL
+                # dynamic tick: `_classify_dynamic_trigger` only ever
+                # produces "at-limit"/"proactive"/"dynamic-healthy", and the
+                # only place `trigger = settings.strategy` is assigned sits
+                # in the non-dynamic branch. It is exercised by
+                # `TestDynamicStrategy`'s direct `_rank_candidates` probes
+                # (`trigger="dynamic"`, the same white-box convention
+                # `test_the_voluntary_arm_never_lands_on_a_candidate_with_
+                # no_room` already used before #805) -- kept, not deleted,
+                # for the same reason the gate and `consume_first_rank_key`
+                # fixes above are kept even where today's trigger
+                # classification does not reach them: #805 asks that every
+                # comparison deciding "is this candidate blocked" read
+                # `bar`, not only the ones a current call graph happens to
+                # exercise.
+                #
                 # TIERED, because `disabled-active` and `failover` reach this
                 # arm with NO admission axis (both skip the landing gate), and
                 # an untiered weekly key takes whichever quota perishes
@@ -3945,18 +3964,27 @@ class AutoSwitchEngine:
                 # candidate for a Fable-10/5h-91 one).
                 #
                 # DELIBERATELY `settings.threshold`, NOT `bar` (#805).
-                # `bar` is `100 - SPENT_HEADROOM_PCT` for dynamic exactly,
-                # so `h > SPENT_HEADROOM_PCT and (100.0 - h) >= bar` would
-                # read `h > 3 and h <= 3` -- always false, silently
-                # disabling this demotion for every dynamic fleet (measured:
-                # it stopped catching the Fable-10/5h-91 case above). This
-                # comparison never EXCLUDES a candidate (unlike the landing
-                # gate, `consume_first_rank_key` and the label helper) --
-                # it only re-ranks within the already-admitted escape set --
-                # so it is outside #805's "which candidate is blocked"
-                # scope, and account-4-shaped candidates (headroom 5, real
-                # spend-worthy headroom) never reach this branch: they take
-                # the reset-ordered `consume_first_rank_key` arm above.
+                # `bar == 100 - SPENT_HEADROOM_PCT` for dynamic exactly, so
+                # `h > SPENT_HEADROOM_PCT and (100.0 - h) >= bar` would read
+                # `h > 3 and h <= 3` -- always false, silently disabling
+                # this demotion for every dynamic fleet (measured: it
+                # stopped catching the Fable-10/5h-91 case above).
+                #
+                # This does reach real dynamic fleets -- `at-limit` excludes
+                # itself from the reset-ordered `consume_first_rank_key` arm
+                # above (`trigger != "at-limit"`), so an at-limit tick
+                # always lands here, and a candidate with h in (3, 10] (91%
+                # on its own binding window, say) is demoted by THIS check,
+                # not that one. It is a genuine, accepted asymmetry with
+                # `consume_first_rank_key`, which now tiers that same
+                # candidate "healthy" at the wider bar (97): pre-#805 both
+                # read `settings.threshold` and agreed; keeping this one on
+                # `settings.threshold` is what still catches the #321
+                # escape-axis bug in the ONE branch a true blackout always
+                # reaches, at the cost of not catching it in the branches
+                # that don't. Not a "which candidate is blocked" decision
+                # either way -- it only re-ranks within an already-admitted
+                # escape set -- so it stays outside #805's scope.
                 dynamic_self_walled = (
                     dynamic_landing
                     and h > SPENT_HEADROOM_PCT

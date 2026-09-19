@@ -5400,6 +5400,28 @@ class TestAModelWindowIsNotABlackout:
         assert "#3: 5h 5% · 7d 5% · Fable 5%" in text, text
         assert "#3: 5h 5% · 7d 5% · Fable 5% (" not in text, text
 
+    def test_the_decision_log_reads_the_dynamic_bar_not_the_raw_threshold(
+        self,
+    ):
+        """#805: the owner's live case, account 4 at 7d 95% (headroom 5)
+        with hours left on its reset. `_describe` must fall back to
+        `switch_bar` (97 under dynamic), not `threshold` (90), the same
+        fallback `human()`'s own "(switch at X%)" tail already uses --
+        else the decision log calls this candidate "7d full" while the
+        panel next to it reads "open"."""
+        event = PollEvent(
+            active={"number": 7, "email": "a@example.com"},
+            headroom={"7": 82.0, "4": 5.0},
+            threshold=90.0,
+            switch_bar=97.0,
+            windows={
+                "4": {"5h": 5.0, "7d": 95.0},
+            },
+        )
+        text = event.human()
+        assert "#4: 5h 5% · 7d 95%" in text, text
+        assert "full" not in text, text
+
     def test_a_spend_only_account_prints_its_credit_figure_not_a_bare_mark(
         self,
     ):
@@ -5444,10 +5466,11 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
     1/5/6 are 7d-walled, #4 is Fable-walled with nothing else open.
 
     `dynamic_self_walled` (autoswitch.py) deliberately stays keyed on
-    `settings.threshold`, not the wider dynamic bar (#805): the two are
-    `100 - SPENT_HEADROOM_PCT` apart for dynamic by construction, so
-    reading the wider bar here would make the servable/self-walled
-    conjuncts mutually exclusive and this demotion would never fire.
+    `settings.threshold`, not the wider dynamic bar (#805): the wider bar
+    equals `100 - SPENT_HEADROOM_PCT` for dynamic by construction, so
+    reading it here would make the servable/self-walled conjuncts
+    (`h > SPENT_HEADROOM_PCT` and `(100 - h) >= bar`) mutually exclusive
+    and this demotion would never fire.
 
     Reproduces the escape-axis ranking bug: `_rank_candidates_pass`'s
     at-limit escape ranked candidates by `escape_h` (headroom on the SAME
@@ -5761,9 +5784,21 @@ class TestDynamicStrategy:
         consume-first reset-ordering leg admits it too). Under `dynamic`
         the whole point is to spend a window before it resets, so #4 must
         be admitted AND ranked ahead of #2's larger but far-off headroom
-        (`dynamic` ranks by soonest reset). Same shape as the no-room test
-        above (`trigger="dynamic"`, same 3668 gate); headroom 5.0 rather
-        than 0.1 is what turns this from blocked to admitted."""
+        (`dynamic` ranks by soonest reset).
+
+        `trigger="dynamic"` is a white-box probe, same convention as the
+        no-room test above (`_rank_candidates_pass`'s gate, autoswitch.py
+        :3688) -- a real dynamic tick's trigger classification never
+        literally produces "dynamic" (`_classify_dynamic_trigger` returns
+        "at-limit"/"proactive"/"dynamic-healthy" only, and the owner's own
+        healthy-active fleet classifies as "dynamic-healthy", which never
+        reaches this function at all -- see `_rank_dynamic_candidates`
+        instead). This pins the underlying comparison the gate makes;
+        `tests/test_tui.py`'s
+        `test_the_panel_admits_a_headroom_candidate_with_hours_to_reset_under_dynamic`
+        is the realistic, owner-visible check (the "Next best" panel).
+        Headroom 5.0 rather than 0.1 is what turns this from blocked to
+        admitted."""
         h = EngineHarness(temp_home, strategy="dynamic")
         now = h.clock.now
         usage = {
@@ -5869,7 +5904,11 @@ class TestDynamicStrategy:
         active NOT `about_to_wall` on this axis (the 5h/7d retry pass,
         where the active can hold real headroom even though the model gate
         that set the trigger spent it) — the other trigger the `all_above`
-        recovery axis reaches."""
+        recovery axis reaches. Candidate headroom moved to the new dynamic
+        bar (97, not the raw 90 threshold, #805): at headroom 10 (5h 90%)
+        the gate no longer refuses it (90 < 97), and the hysteresis check
+        (`h - active_headroom < settings.hysteresis_pct`) would refuse it
+        anyway, no longer proving the landing bar is what does the work."""
         h = EngineHarness(temp_home, strategy="dynamic")
         now = h.clock.now
         usage = {
@@ -5878,11 +5917,11 @@ class TestDynamicStrategy:
                 "seven_day": {"pct": 0.0},
             },
             "2": {
-                "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 120)},
+                "five_hour": {"pct": 97.0, "resets_at": _iso_at(now + 120)},
                 "seven_day": {"pct": 0.0},
             },
         }
-        headroom = {"6": 8.0, "2": 10.0}
+        headroom = {"6": 8.0, "2": 3.0}
         for strategy, expected in (
             ("dynamic", []),
             ("consume-first", ["2"]),
