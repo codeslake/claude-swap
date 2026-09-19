@@ -550,13 +550,10 @@ class AutoScreen(Screen):
                 # Position from `ordered_rank` (the engine's own pass, called
                 # once above), never a locally re-derived key -- but a row
                 # the pass never ranked at all still needs a DETERMINISTIC
-                # order among its peers, and `(1,)` flattened every such row
-                # to one identical key: the tie then broke on `acc.number`
-                # as a string, which could sort an unknown-reset account
-                # above a known, soon-reset one. Soonest 7-day reset first,
-                # unknown last (`+inf`) -- the pre-#371 reading
-                # (`consume_first_rank_key`), for ties only, never touching
-                # a row the pass DID admit.
+                # order among its peers, never the account number as a
+                # string. Soonest 7-day reset first, unknown last (`+inf`,
+                # `consume_first_rank_key`'s reading), for ties only, never
+                # touching a row the pass DID admit.
                 reset_ts = _seven_day_reset_ts(acc.usage.last_good, admission_now)
                 key = (
                     (0, ordered_rank[acc.number])

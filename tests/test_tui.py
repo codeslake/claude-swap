@@ -1447,8 +1447,9 @@ def _order_fixture_accounts():
     """Active "3", usable "5" (ranks first only by admission, never by
     sorting numbers), unusable "2"/"4"/"12" (disabled/expired/full). "2"
     and "12" carry DIFFERENT 7-day resets (3d vs. 6d) -- both land in the
-    same never-ranked tier, so an equal reset would let a flat, un-fixed
-    fallback key pass this test by coincidence."""
+    same never-ranked tier, and an equal reset on both would let any
+    ordering pass this test by coincidence, proving nothing about the
+    tie-break itself."""
     return [
         make_account(3, active=True, entry=make_entry(95.0, 95.0)),
         make_account(5, entry=make_entry(5.0, 5.0)),
@@ -1488,9 +1489,9 @@ class TestOrderedAccounts:
 
     def test_matches_the_auto_switch_view_and_sorts_unusable_last(self):
         """Also the tie-break control: never-ranked "2" (3d reset) sorts
-        before "12" (6d reset) on BOTH screens -- not a flat key falling
-        through to the account number, which this fixture's distinct
-        resets would catch diverging from either screen."""
+        before "12" (6d reset) on BOTH screens -- the account number plays
+        no part, which this fixture's distinct resets would catch either
+        screen falling back to."""
         snap = AccountsSnapshot(
             accounts=_order_fixture_accounts(), active_number="3", taken_at=0.0
         )
@@ -2168,8 +2169,8 @@ class TestAutoScreen:
         the rest on later ticks, once the active's own reset moves). Of six
         peers only "5" resets sooner than the active's 1.75 days out; the
         other four must be named "not a candidate", and -- unranked as they
-        are -- still keep the fallback's own soonest-reset order rather
-        than the account-number tie-break the un-fixed fallback used."""
+        are -- still keep the fallback's own soonest-reset order, never the
+        account number."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -3205,15 +3206,11 @@ class TestUnswitchableRowsAreListed:
         """When the active's own usage reading is stale (`age_s` past
         `STALE_OK_S`, `decision_value()` -> None) the ranking pass never
         runs (`trigger == "unreadable-active"`, `ordered` empty) and every
-        candidate falls to the panel's fallback key. Before #371 that
-        fallback was reset-based (`consume_first_rank_key` ->
-        `_seven_day_reset_ts`, `+inf` for unknown); #371 flattened it to a
-        single literal, so ties broke on the account NUMBER STRING instead
-        -- an unknown-reset account ("2") sorted above a known, soon-reset
-        one ("3"). Adapted from the integration branch's probe-era
-        regression (46f000bd) to this base, which has no probe mechanism;
-        the shared root cause is the same: a stale/unreadable active
-        leaves `ordered` empty and collapses every row to one flat key.
+        candidate falls to the panel's fallback key -- which must still
+        order a known 7-day reset before an unknown one
+        (`_seven_day_reset_ts`, `+inf` for unknown), never the account
+        NUMBER STRING: an unknown-reset account ("2") must not sort above
+        a known, soon-reset one ("3").
         """
         stale_active = UsageEntry(
             last_good={
@@ -3232,7 +3229,7 @@ class TestUnswitchableRowsAreListed:
             self._acct("1", "a@x.com", switchable=True, usage=stale_active),
             self._acct("2", "b@x.com", switchable=True, last_good=unknown),
             self._acct("3", "c@x.com", switchable=True, last_good=known_soon),
-        ), active="1", settings=AutoSwitchSettings(strategy="consume-first"))
+        ), active="1")
         # CONTROL that the ranking pass really never ran -- else `ordered_
         # rank` could supply this same order for an unrelated reason and
         # the assertion below would cover nothing.
