@@ -381,6 +381,16 @@ class AutoScreen(Screen):
         consume_first = bool(
             self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
         )
+        # THE BAR EVERY ADMISSION/LABEL DECISION BELOW READS (#805): under
+        # `dynamic` this is `proactive_switch_bar_pct`'s 97, not the raw
+        # `settings.threshold` — a candidate with hours left on its reset
+        # is headroom `dynamic` exists to spend, not a blocked one. Every
+        # other strategy gets `settings.threshold` back unchanged, so this
+        # is a no-op for them.
+        bar = (
+            proactive_switch_bar_pct(self._settings.strategy, self._settings.threshold)
+            if self._settings else 0.0
+        )
         # THE AXIS THE ENGINE WILL ACTUALLY RANK ON THIS TICK, not always
         # `models`: `_rank_candidates` (autoswitch.py) drops the model set
         # and retries on 5h/7d alone when the model-gated pass finds no
@@ -399,7 +409,6 @@ class AutoScreen(Screen):
         # and a "full" block stays blocked either way.
         rank_models = models
         if models and self._settings and self._settings.strategy == "dynamic":
-            threshold = self._settings.threshold
             for acc in snap.accounts:
                 if (
                     acc.number == active_number
@@ -414,7 +423,7 @@ class AutoScreen(Screen):
                         acc.usage.last_good, models
                     )
                 )
-                kind, _ = classify_candidate_block(windows, threshold)
+                kind, _ = classify_candidate_block(windows, bar)
                 if kind == "open":
                     break
             else:
@@ -516,20 +525,22 @@ class AutoScreen(Screen):
                 # a model-only block (the engine's fallback ranks around it).
                 # The CLASSIFICATION (open/model/full) reads the same way
                 # here as in the decision log — same helper,
-                # `classify_candidate_block`, same `self._settings.threshold`
-                # (NOT the strategy-aware departure bar `_update_summary`
-                # derives: that answers whether the ACTIVE should leave, and
-                # a candidate clearing it can still fail the engine's own,
+                # `classify_candidate_block`, now the same strategy-aware
+                # `bar` the engine's own landing gate reads (#805: this used
+                # to be `self._settings.threshold` unconditionally, which
+                # under `dynamic` called a candidate with real headroom left
+                # "7d full"). It still does not fold in the engine's other,
                 # separate, stricter landing floor -- `cold_switch_cost_pct`
-                # in autoswitch.py). Always on `models`, the full pinned set:
-                # this label explains why the row is not simply "open" on
-                # the criteria the user actually configured, independent of
-                # whether `rank_models` below has dropped to the retry's
+                # in autoswitch.py -- a candidate clearing this label can
+                # still fail that one. Always on `models`, the full pinned
+                # set: this label explains why the row is not simply "open"
+                # on the criteria the user actually configured, independent
+                # of whether `rank_models` below has dropped to the retry's
                 # axis for ORDERING purposes.
                 if self._settings:
                     kind, blocked_model = classify_candidate_block(
                         ((label, p) for label, p, _ in windows),
-                        self._settings.threshold,
+                        bar,
                     )
                     if kind == "model":
                         entry.append(
@@ -542,9 +553,9 @@ class AutoScreen(Screen):
                         # "(<window> full)" (autoswitch.py `_describe`):
                         # "full" is reserved here for actual exhaustion (the
                         # window's own pct at or over 100); a window merely
-                        # blocked at the threshold names the threshold it
-                        # was judged against instead (the owner's report,
-                        # 92% read "full" against a threshold of 90).
+                        # blocked at the bar names the bar it was judged
+                        # against instead (the owner's report, 92% read
+                        # "full" against a threshold of 90).
                         window_pct = next(
                             p for label, p, _ in windows if label == blocked_model
                         )
@@ -555,13 +566,13 @@ class AutoScreen(Screen):
                         else:
                             entry.append(
                                 f"  {blocked_model} {pct_label(window_pct)}%"
-                                f" >= {pct_label(self._settings.threshold)}%",
+                                f" >= {pct_label(bar)}%",
                                 style=palette.muted,
                             )
                 rank_pct = binding_pct(acc.usage.last_good, rank_models)
                 key = (
                     consume_first_rank_key(
-                        acc.usage.last_good, self._settings.threshold, now, rank_models
+                        acc.usage.last_good, bar, now, rank_models
                     )
                     if consume_first
                     else (pct if rank_pct is None else rank_pct,)

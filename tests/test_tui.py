@@ -1867,9 +1867,11 @@ class TestAutoScreen:
         `consume-first` never rank on 5h/7d alone, so under those strategies
         the panel must NOT drop the model gate either, even here. `strategy`
         must be `dynamic` for the panel to take this path at all — ranking on
-        the model-gated axis here would name #2 (95% Fable) the worse account
+        the model-gated axis here would name #2 (99% Fable) the worse account
         when its real 5h is #3's better one: the two are on OPPOSITE sides of
-        `-Fable, +5h` vs `+Fable, -5h`."""
+        `-Fable, +5h` vs `+Fable, -5h`. Both Fable values sit over the dynamic
+        landing bar (97, not the raw 90 threshold, #805), or #2 reads "open"
+        on the model axis directly and the model gate never needs to drop."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -1880,10 +1882,10 @@ class TestAutoScreen:
             [
                 make_account(1, active=True, entry=make_entry(91.0, 20.0)),
                 make_account(
-                    2, entry=make_entry(20.0, 5.0, scoped=[("Fable", 95.0)])
+                    2, entry=make_entry(20.0, 5.0, scoped=[("Fable", 99.0)])
                 ),
                 make_account(
-                    3, entry=make_entry(60.0, 5.0, scoped=[("Fable", 90.0)])
+                    3, entry=make_entry(60.0, 5.0, scoped=[("Fable", 98.0)])
                 ),
             ],
             tmp_path,
@@ -1898,7 +1900,7 @@ class TestAutoScreen:
             # #2's real 5h (20%) beats #3's (60%): once the model gate drops
             # (neither #2 nor #3 has a 5h/7d window over the bar on its own),
             # #2 must rank first — ranking on the model-gated axis instead
-            # would put #3 first (90% Fable < 95% Fable).
+            # would put #3 first (98% Fable < 99% Fable).
             assert plain.index("user2@example.com") < plain.index(
                 "user3@example.com"
             )
@@ -2568,13 +2570,14 @@ class TestUnswitchableRowsAreListed:
         """The owner's report, 2026-09-17: a 7d window at 92% printed `7d
         full` against the configured threshold of 90 -- a claim of
         nothing-left that was false. `full` now means nothing left (pct
-        >= 100); a window merely at or over the threshold names the
-        threshold instead; a window under it carries no block label.
+        >= 100); a window merely at or over the LANDING BAR
+        (`proactive_switch_bar_pct`) names that bar instead; a window
+        under it carries no block label.
 
-        Parametrized to prove the judgement stays on `settings.threshold`
-        under every strategy, including `dynamic` (whose departure bar is
-        97, not 90) -- this label deliberately does not chase that bar
-        (see the comment at the call site for why).
+        Parametrized so the wording rule holds under every strategy.
+        `consume-first` reads the raw `settings.threshold` (90) unchanged.
+        Under `dynamic` the bar is 97 (#805), so 92% (headroom 8) now sits
+        UNDER it -- the same reading as 50%, no block label at all.
         """
         from claude_swap.settings import AutoSwitchSettings
 
@@ -2597,9 +2600,52 @@ class TestUnswitchableRowsAreListed:
             for email in ("hundred@x.com", "ninetytwo@x.com", "fifty@x.com")
         }
         assert "7d full" in rows["hundred@x.com"], rows["hundred@x.com"]
-        assert "7d 92% >= 90%" in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
+        if strategy == "dynamic":
+            assert "full" not in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
+            assert ">=" not in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
+        else:
+            assert "7d 92% >= 90%" in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
         assert "full" not in rows["fifty@x.com"], rows["fifty@x.com"]
         assert ">=" not in rows["fifty@x.com"], rows["fifty@x.com"]
+
+    def test_the_panel_admits_a_headroom_candidate_with_hours_to_reset_under_dynamic(
+        self,
+    ):
+        """The owner's live case, 2026-09-19 (#805): account 4 at 7d 95%
+        (headroom 5) with its reset hours away must read as open on the
+        panel too, and rank ahead of a peer with more headroom but a
+        reset days out -- the panel's label and its "Next best" order
+        must never disagree with the engine (`proactive_switch_bar_pct`,
+        97 under dynamic)."""
+        from claude_swap.settings import AutoSwitchSettings
+        from tests.test_autoswitch import _iso_at
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("7", "active@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 18.0},
+            }),
+            self._acct("4", "close@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {
+                    "pct": 95.0, "resets_at": _iso_at(time.time() + 23340),
+                },
+            }),
+            self._acct("2", "far@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {
+                    "pct": 40.0, "resets_at": _iso_at(time.time() + 500000),
+                },
+            }),
+        ), active="7", settings=settings)
+
+        rows = {
+            email: next(line for line in out.split("\n") if email in line)
+            for email in ("close@x.com", "far@x.com")
+        }
+        assert "full" not in rows["close@x.com"], rows["close@x.com"]
+        assert ">=" not in rows["close@x.com"], rows["close@x.com"]
+        assert out.index("close@x.com") < out.index("far@x.com"), (
+            f"the panel's 'Next best' order disagrees with the engine: {out!r}"
+        )
 
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a

@@ -39,6 +39,7 @@ from claude_swap.autoswitch import (
     _seven_day_reset_ts,
     classify_candidate_block,
     pct_label,
+    proactive_switch_bar_pct,
 )
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
@@ -5097,12 +5098,14 @@ class TestAModelWindowIsNotABlackout:
     def test_the_owners_fleet_moves_once_the_model_window_is_dropped(
         self, temp_home
     ):
-        """The reported fleet, reproduced exactly: six accounts, Fable
-        pinned, threshold 90. 1/3/4/5's only over-bar window is Fable — 5h
-        and 7d both have room — so the model-gated pass empties and the
-        retry on 5h/7d alone must both rescue it and rank it (soonest 7-day
-        reset first, the consume-first strategy's own key). #2 stays out
-        either way: its OWN 5h sits at the bar with no model involved.
+        """The reported fleet, reproduced exactly (numbers moved to the
+        dynamic landing bar, 97, not the raw threshold 90 -- #805): six
+        accounts, Fable pinned. 1/3/4/5's only over-bar window is Fable
+        (98%) — 5h and 7d both have room — so the model-gated pass empties
+        and the retry on 5h/7d alone must both rescue it and rank it
+        (soonest 7-day reset first, the consume-first strategy's own key).
+        #2 stays out either way: its OWN 5h sits at the dynamic bar (97)
+        with no model involved.
 
         The active (#6) also reports its own over-bar Fable window — every
         account genuinely pinned to a model reports that model's window,
@@ -5110,7 +5113,9 @@ class TestAModelWindowIsNotABlackout:
         the ACTIVE to be walled too before the retry is allowed to drop the
         model set (never a candidate-only reading): an active with real
         Fable headroom must not have the wall dropped just because its
-        candidates all happen to be model-blocked.
+        candidates all happen to be model-blocked. `_model_window_binds_
+        everywhere` still reads the raw `settings.threshold` (90, #805
+        deliberately leaves it there), so the active's 95% still counts.
         """
         h = EngineHarness(temp_home, model="Fable", threshold=90.0)
         now = h.clock.now
@@ -5133,11 +5138,11 @@ class TestAModelWindowIsNotABlackout:
                 },
                 "scoped": [{"name": "Fable", "pct": 95.0}],
             },
-            "1": usage(34, 69, 91, 4),
-            "2": usage(90, 79, 87, 0.5),
-            "3": usage(33, 69, 94, 3),
-            "4": usage(0, 64, 91, 2),
-            "5": usage(0, 62, 90, 1),
+            "1": usage(34, 69, 98, 4),
+            "2": usage(97, 79, 87, 0.5),
+            "3": usage(33, 69, 98, 3),
+            "4": usage(0, 64, 98, 2),
+            "5": usage(0, 62, 98, 1),
         }
         headroom = {
             num: oauth.account_headroom(val, ("Fable",))
@@ -5153,8 +5158,8 @@ class TestAModelWindowIsNotABlackout:
         assert list(ordered) == ["5", "4", "3", "1"], (
             f"got {list(ordered)} — every candidate's only over-bar window "
             "is Fable, 5h/7d has room on all of 1/3/4/5, and #2 must stay "
-            "excluded on its own 5h at 90%: the retry is not a blanket "
-            "unblock, only a re-rank on 5h/7d"
+            "excluded on its own 5h at the dynamic bar (97): the retry is "
+            "not a blanket unblock, only a re-rank on 5h/7d"
         )
 
     def test_the_retry_drops_the_model_gate_from_both_admission_and_ranking(
@@ -5407,10 +5412,11 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
     """The owner's own fleet (lmd42, 2026-09-08 ~01:2xZ, `dynamic`,
     threshold 90, Fable pinned): active #3 is Fable-100 (walled on the
     model axis), and #7 clears the Fable axis (10%) but is ITSELF over the
-    departure threshold on its own 5h (91%) -- genuinely unusable, would
-    re-trigger the very next tick. #2 is the only account below threshold
-    on every axis (5h 40, 7d 65, Fable 89) and is the only correct target.
-    1/5/6 are 7d-walled, #4 is Fable-walled with nothing else open.
+    dynamic landing bar on its own 5h (98%, #805: 97 under dynamic, not
+    the raw 90 threshold) -- genuinely unusable, would re-trigger the very
+    next tick. #2 is the only account below threshold on every axis (5h
+    40, 7d 65, Fable 89) and is the only correct target. 1/5/6 are
+    7d-walled, #4 is Fable-walled with nothing else open.
 
     Reproduces the escape-axis ranking bug: `_rank_candidates_pass`'s
     at-limit escape ranked candidates by `escape_h` (headroom on the SAME
@@ -5435,7 +5441,7 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
                 "scoped": [{"name": "Fable", "pct": 89.0, "resets_at": iso(days=6, hours=5)}],
             },
             "7": {  # clear on Fable, but genuinely walled on its OWN 5h
-                "five_hour": {"pct": 91.0, "resets_at": iso(hours=3, minutes=13)},
+                "five_hour": {"pct": 98.0, "resets_at": iso(hours=3, minutes=13)},
                 "seven_day": {"pct": 18.0, "resets_at": iso(days=3, hours=20)},
                 "scoped": [{"name": "Fable", "pct": 10.0}],
             },
@@ -5469,8 +5475,9 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
         assert h.active_number() == 2, (
             f"landed on {h.active_number()} — #2 is the only account below "
             "threshold on every axis; #7 clears only the axis that blocked "
-            "the active and is itself over threshold on its own 5h, #3 is "
-            "the active itself, #4 has nothing open but the model axis"
+            "the active and is itself over the dynamic landing bar on its "
+            "own 5h, #3 is the active itself, #4 has nothing open but the "
+            "model axis"
         )
 
 
@@ -5675,13 +5682,15 @@ class TestDynamicStrategy:
     ):
         """Reproduces the live trace: active over threshold with real
         headroom (`proactive`, not `at-limit`), every account above the
-        threshold (`all_above`), and a peer whose OWN window is already at
-        the switch threshold but whose binding window happens to reset
-        soonest. The pre-existing `all_above` recovery-axis escape admits
-        that peer on recovery timing alone — measured live, the very next
-        tick read `cooldown` while still blocked. `dynamic` closes it;
-        `best`/`consume-first` keep the escape (asserted on the SAME
-        inputs, both directions, as the "unchanged" evidence)."""
+        configured threshold (`all_above`, which reads the raw threshold
+        regardless of strategy), and a peer whose OWN window is already at
+        the landing bar (`proactive_switch_bar_pct` — 97 under `dynamic`,
+        #805) but whose binding window happens to reset soonest. The
+        pre-existing `all_above` recovery-axis escape admits that peer on
+        recovery timing alone — measured live, the very next tick read
+        `cooldown` while still blocked. `dynamic` closes it; `best`/
+        `consume-first` keep the escape (asserted on the SAME inputs, both
+        directions, as the "unchanged" evidence)."""
         h = EngineHarness(temp_home, strategy="dynamic")
         now = h.clock.now
         usage = {
@@ -5689,12 +5698,12 @@ class TestDynamicStrategy:
                 "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
                 "seven_day": {"pct": 0.0},
             },
-            "2": {  # candidate: headroom 10 (at the wall), recovers in 2min
-                "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 120)},
+            "2": {  # candidate: headroom 3 (at the dynamic bar), recovers in 2min
+                "five_hour": {"pct": 97.0, "resets_at": _iso_at(now + 120)},
                 "seven_day": {"pct": 0.0},
             },
         }
-        headroom = {"6": 8.0, "2": 10.0}
+        headroom = {"6": 8.0, "2": 3.0}
         for strategy, expected in (
             ("dynamic", []),
             ("consume-first", ["2"]),
@@ -5708,9 +5717,80 @@ class TestDynamicStrategy:
             ordered, _, _, _ = h.engine._rank_candidates(**args)
             assert ordered == expected, (
                 f"strategy={strategy}: got {ordered}, want {expected} — #2 "
-                "is still at the wall (headroom 10, threshold 90) and only "
+                "is still at the wall (headroom 3, dynamic bar 97) and only "
                 "`dynamic` may refuse to land there"
             )
+
+    def test_a_headroom_candidate_with_hours_to_reset_is_admitted_under_dynamic(
+        self, temp_home
+    ):
+        """The owner's live case, 2026-09-19 (#805): account 4 at 7d 95%
+        (headroom 5) with its reset ~6h29m away, active at 7d 18% whose own
+        weekly reset is far out, and a second candidate with more headroom
+        (60) but a reset days out (still sooner than the active's, so the
+        consume-first reset-ordering leg admits it too). Under `dynamic`
+        the whole point is to spend a window before it resets, so #4 must
+        be admitted AND ranked ahead of #2's larger but far-off headroom
+        (`dynamic` ranks by soonest reset). Same shape as the no-room test
+        above (`trigger="dynamic"`, same 3668 gate); headroom 5.0 rather
+        than 0.1 is what turns this from blocked to admitted."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        usage = {
+            "7": _usage7(5.0, 18.0, _iso_at(now + 650000)),  # active: headroom 82, resets far out
+            "4": _usage7(5.0, 95.0, _iso_at(now + 23340)),   # headroom 5, resets ~6h29m
+            "2": _usage7(5.0, 40.0, _iso_at(now + 500000)),  # headroom 60, resets far out
+        }
+        headroom = {"7": 82.0, "4": 5.0, "2": 60.0}
+        args = self._args(
+            h, usage=usage, current="7", oauth_candidates=["4", "2"],
+            headroom=headroom, active_headroom=82.0,
+            trigger="dynamic", strategy="dynamic",
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert ordered == ["4", "2"], (
+            f"got {ordered} — #4 (headroom 5, reset ~6h29m) is exactly the "
+            "headroom `dynamic` exists to spend and must be admitted, "
+            "ranked ahead of #2's larger but far-off headroom"
+        )
+        kind, label = classify_candidate_block(
+            [("5h", 5.0), ("7d", 95.0)], proactive_switch_bar_pct("dynamic", 90.0)
+        )
+        assert (kind, label) == ("open", None), (
+            f"got ({kind!r}, {label!r}) — #4 must read 'open' under the "
+            "dynamic bar, not ('full', '7d')"
+        )
+
+    def test_CONTROL_the_same_snapshot_under_best_keeps_the_configured_threshold(
+        self, temp_home
+    ):
+        """CONTROL: `proactive_switch_bar_pct` hands non-dynamic strategies
+        their configured threshold back unchanged — the same headroom-5
+        (7d 95%, reset ~6h29m out) candidate that `dynamic` now admits
+        stays blocked, and `classify_candidate_block` still reads it
+        ("full", "7d"), under `best`."""
+        h = EngineHarness(temp_home, strategy="best")
+        now = h.clock.now
+        usage = {
+            "7": _usage7(5.0, 18.0),
+            "4": _usage7(5.0, 95.0, _iso_at(now + 23340)),
+        }
+        headroom = {"7": 82.0, "4": 5.0}
+        args = self._args(
+            h, usage=usage, current="7", oauth_candidates=["4"],
+            headroom=headroom, active_headroom=82.0,
+            trigger="proactive", strategy="best",
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert ordered == [], (
+            f"got {ordered} — #4 (headroom 5) is still at/over the "
+            "configured threshold (90) under `best` and must stay blocked"
+        )
+        kind, label = classify_candidate_block([("7d", 95.0)], 90.0)
+        assert (kind, label) == ("full", "7d"), (
+            f"got ({kind!r}, {label!r}) — must still read ('full', '7d') "
+            "under the raw threshold"
+        )
 
     def test_consume_first_switches_on_a_plain_proactive_trigger_dynamic_holds(
         self, temp_home
@@ -15095,14 +15175,16 @@ class TestTheModelWindowBindsUnlessItBindsEverywhere:
         """The design intent #321 exists for, preserved: active #4 AND
         every candidate (#1, #3) are Fable-walled (100%) — a genuine
         fleet-wide model blackout. The retry must still drop the model set
-        and rank on 5h/7d: #1's 7d (92%) still blocks it there, #3's (79%)
-        does not, so #3 is the only admissible landing.
+        and rank on 5h/7d: #1's 7d (98%, moved from 92% to sit over the
+        dynamic landing bar -- 97, not the raw 90 threshold, #805) still
+        blocks it there, #3's (79%) does not, so #3 is the only admissible
+        landing.
         """
         cls = TestAModelWindowIsNotABlackout()
         h = EngineHarness(temp_home, model="Fable", threshold=90.0)
         usage = {
             "4": self._u(8, 86, 100, 100),
-            "1": self._u(0, 92, 100, 4),
+            "1": self._u(0, 98, 100, 4),
             "3": self._u(0, 79, 100, 3),
         }
         headroom = {n: oauth.account_headroom(v, ("Fable",)) for n, v in usage.items()}

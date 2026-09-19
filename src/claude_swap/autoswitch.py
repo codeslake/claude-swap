@@ -637,7 +637,13 @@ class PollEvent(AutoSwitchEvent):
             # WHAT actually blocks this candidate — a full 5h/7d block, or
             # only its pinned model's window (which the engine's fallback in
             # `_rank_candidates` can rank around; see `classify_candidate_block`).
-            kind, model = classify_candidate_block(wins.items(), self.threshold)
+            # Same fallback as `human()` below (#805): `switch_bar`, the
+            # strategy-aware landing bar, when the event carries one, never
+            # the raw `threshold` alone under `dynamic`.
+            kind, model = classify_candidate_block(
+                wins.items(),
+                self.switch_bar if self.switch_bar is not None else self.threshold,
+            )
             if kind == "full":
                 text += f" ({model} full)"
             elif kind == "model":
@@ -3545,10 +3551,17 @@ class AutoSwitchEngine:
         # NOT failover: there the active is dead or unreadable, so its
         # recovery time is not a quota fact anyone can wait for.
         #
+        dynamic_landing = settings.strategy == "dynamic"
         # ONE NAME FOR BOTH THE GATE AND THE KEY. They were two copies of the
         # same trigger tuple, and this file has already had to close two
         # defects where a filter ran on one axis while the sort ran on
-        # another.
+        # another. Deliberately NOT `and not dynamic_landing` here (#805):
+        # the `waiting` flag below reads `by_recovery_axis` alone, for every
+        # strategy including dynamic's own genuine at-limit blackouts, and
+        # narrowing this definition silently zeroed it for dynamic. The
+        # `not dynamic_landing` exclusion belongs where `by_recovery` is
+        # actually CONSUMED, at the `if by_recovery_axis and not
+        # dynamic_landing:` key selection below.
         by_recovery_axis = all_above and (
             trigger in ("proactive", *CONSUME_FIRST_STRATEGIES)
             or (
@@ -3570,7 +3583,14 @@ class AutoSwitchEngine:
             )
         )
 
-        dynamic_landing = settings.strategy == "dynamic"
+        # THE BAR EVERY ADMISSION/RANKING/LABEL DECISION BELOW READS (#805):
+        # under `dynamic` this is `proactive_switch_bar_pct`'s 97 (100 -
+        # SPENT_HEADROOM_PCT), not `settings.threshold` (90) — the owner's
+        # live case, account 4 at 7d 95%/headroom 5 with its reset hours
+        # away, is exactly the headroom `dynamic` exists to spend before it
+        # resets, not a blocked candidate. Every other strategy gets
+        # `settings.threshold` back unchanged, so this is a no-op for them.
+        bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
 
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
@@ -3665,7 +3685,7 @@ class AutoSwitchEngine:
                 # `cooldown` while still blocked, and the tick after that had
                 # burned worse). `best`/`consume-first` keep the escape
                 # unchanged — this is additive, gated on the strategy alone.
-                if (100.0 - h) >= settings.threshold and not (
+                if (100.0 - h) >= bar and not (
                     all_above and not dynamic_landing
                 ):
                     continue
@@ -3791,7 +3811,7 @@ class AutoSwitchEngine:
                     # an improvement on the axis that admitted it.
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if by_recovery_axis:
+            if by_recovery_axis and not dynamic_landing:
                 # Ranked on the axis its own gate decided, and TIERED so the two
                 # stay comparable: a candidate returning inside the horizon
                 # beats one that does not, whatever its headroom. Untiered, the
@@ -3816,17 +3836,30 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
-            elif consume_first and trigger != "at-limit" and not all_above:
+            elif consume_first and trigger != "at-limit" and (
+                not all_above or dynamic_landing
+            ):
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 #
                 # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so neither
                 # escape belongs: `at-limit` is a stopped session, and under
-                # `all_above` the spent guard has admitted candidates on a
-                # RECOVERY argument that this key would re-order by a weekly
-                # reset. `not all_above` covers only the second — one
-                # below-threshold peer clears it, and `failover` never
-                # satisfies it at all.
+                # `all_above` the spent guard has admitted `best`/
+                # `consume-first` candidates on a RECOVERY argument that this
+                # key would re-order by a weekly reset. `not all_above`
+                # covers that case; `failover` never satisfies it at all.
+                #
+                # `OR dynamic_landing` (#805): the key above is gated
+                # `by_recovery_axis and not dynamic_landing`, not
+                # `by_recovery_axis` alone -- `by_recovery_axis` itself stays
+                # keyed on `all_above` for every strategy (the `waiting` flag
+                # below reads it too), but dynamic's own admission for an
+                # `all_above` candidate comes from CHAIN A's `elif trigger in
+                # CONSUME_FIRST_STRATEGIES` above instead, itself a
+                # reset-ordering gate (`reset_ts < active_reset_ts`, same
+                # axis this key sorts by), never a recovery argument. Falling
+                # to the escape key below instead ranks by raw headroom,
+                # which is not what "dynamic ranks by soonest reset" means.
                 #
                 # TIERED, because `disabled-active` and `failover` reach this
                 # arm with NO admission axis (both skip the landing gate), and
@@ -3835,15 +3868,17 @@ class AutoSwitchEngine:
                 #
                 # TWO TIERS AND NOT ONE. Servability and landing health are
                 # different bars — `h > SPENT_HEADROOM_PCT` against
-                # `h > 100 - threshold`, which the user sets — and above 97
-                # the landing gate calls a spent account a legal landing.
-                # Folded together, health hides servability inside its own top
-                # level. Their order is immaterial and needs no test:
-                # servable-but-unhealthy requires a threshold under 97 and
-                # spent-but-healthy over it, so no ONE fleet can hold both --
-                # and it takes both to order a pair differently.
+                # `h > 100 - bar` (#805: `bar` is `proactive_switch_bar_pct`
+                # -- `settings.threshold` itself for consume-first, fixed at
+                # 97 for dynamic). Folded together, health hides servability
+                # inside its own top level. Their order is immaterial and
+                # needs no test: for consume-first, servable-but-unhealthy
+                # needs a threshold under 97 and spent-but-healthy needs one
+                # over it, so no ONE fleet can hold both; under dynamic the
+                # two floors coincide by construction (`bar == 100 -
+                # SPENT_HEADROOM_PCT`) and the tiers simply agree.
                 key = consume_first_rank_key(
-                    usage.get(num), settings.threshold, now, models
+                    usage.get(num), bar, now, models
                 )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
@@ -3889,17 +3924,18 @@ class AutoSwitchEngine:
                 # emergency where nothing clears the threshold still lands
                 # somewhere): `escape_h` ranks by the axis that blocked the
                 # ACTIVE, not this candidate's OWN worst window, so a peer
-                # that is itself over `settings.threshold` on a different
-                # axis (its own 5h, say) can outrank one with real headroom
-                # everywhere purely because it happens to be clear on the
-                # window the active is walled on -- landing there re-triggers
-                # the very next tick (measured live, #321 follow-up: a
-                # Fable-100 active passed over a Fable-89/5h-40/7d-65
-                # candidate for a Fable-10/5h-91 one).
+                # that is itself over `bar` on a different axis (its own 5h,
+                # say -- #805: `bar` is `proactive_switch_bar_pct`, 97 under
+                # dynamic, not `settings.threshold`) can outrank one with
+                # real headroom everywhere purely because it happens to be
+                # clear on the window the active is walled on -- landing
+                # there re-triggers the very next tick (measured live, #321
+                # follow-up: a Fable-100 active passed over a Fable-89/
+                # 5h-40/7d-65 candidate for a Fable-10/5h-91 one).
                 dynamic_self_walled = (
                     dynamic_landing
                     and h > SPENT_HEADROOM_PCT
-                    and (100.0 - h) >= settings.threshold
+                    and (100.0 - h) >= bar
                 )
                 key = (
                     1 if dynamic_self_walled else (0 if h > SPENT_HEADROOM_PCT else 1),
