@@ -5515,11 +5515,10 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
         that is genuinely almost dead (`h <= SPENT_HEADROOM_PCT`) -- with
         one tier for both, the escape-axis magnitude alone then decides,
         and a nearly-spent peer (#2, 7d 99%, headroom 1) can outrank a
-        self-walled one with a real, T0805-shaped margin (#1, 7d 95%,
-        headroom 5) purely by reading cleaner on the axis that blocked the
-        active. Landing on #2 re-triggers within the hour; #1 has real
-        room to spend first. Three tiers (open / self-walled / dying)
-        keep the two apart."""
+        self-walled one with a real margin (#1, 7d 95%, headroom 5) purely
+        by reading cleaner on the axis that blocked the active. Landing on
+        #2 re-triggers within the hour; #1 has real room to spend first.
+        Three tiers (open / self-walled / dying) keep the two apart."""
         h = EngineHarness(temp_home, strategy="dynamic", threshold=90.0)
         for num, email in ((9, "active@example.invalid"), (1, "a@example.invalid"),
                             (2, "b@example.invalid")):

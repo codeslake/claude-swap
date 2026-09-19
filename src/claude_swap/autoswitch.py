@@ -3952,21 +3952,22 @@ class AutoSwitchEngine:
                 # Not a "which candidate is blocked" decision either way --
                 # it only re-ranks within an already-admitted escape set --
                 # so it stays outside #321's scope.
+                # `h > SPENT_HEADROOM_PCT` not asked here: the tier below
+                # checks `h <= SPENT_HEADROOM_PCT` FIRST, so this is only
+                # ever consulted once that has already failed.
                 dynamic_self_walled = (
-                    dynamic_landing
-                    and h > SPENT_HEADROOM_PCT
-                    and (100.0 - h) >= settings.threshold
+                    dynamic_landing and (100.0 - h) >= settings.threshold
                 )
                 # THREE TIERS, NOT TWO. Folding "genuinely unservable" (h <=
                 # SPENT_HEADROOM_PCT) and "self-walled but has real spare
-                # headroom" (`dynamic_self_walled`, h > SPENT_HEADROOM_PCT)
-                # into one tier let a candidate with almost nothing left
-                # (h=1, say) beat one with a real, T0805-shaped margin (h=5,
-                # self-walled only because its OWN binding window happens to
-                # read high) purely on `escape_h` magnitude -- measured: a
-                # 1-point weekly account outranking a 5-point one because the
-                # 1-point account's escape axis read cleaner. Self-walled is
-                # worse than open but still better than actually dying.
+                # headroom" (`dynamic_self_walled`) into one tier let a
+                # candidate with almost nothing left (h=1, say) beat one
+                # with a real margin (h=5, self-walled only because its OWN
+                # binding window happens to read high) purely on `escape_h`
+                # magnitude -- measured: a 1-point weekly account outranking
+                # a 5-point one because the 1-point account's escape axis
+                # read cleaner. Self-walled is worse than open but still
+                # better than actually dying.
                 key = (
                     (
                         2 if h <= SPENT_HEADROOM_PCT
