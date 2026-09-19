@@ -1451,6 +1451,9 @@ class TestAutoCommand:
 
         out = capsys.readouterr().out
         assert "threshold 90%" in out, f"the explicit flag was not echoed: {out!r}"
+        assert "switch at 97%" in out, (
+            f"premise: strategy was not dynamic, so this covers nothing: {out!r}"
+        )
 
     def test_once_is_interruptible_too(self, temp_home):
         """`--once` exits before the handlers are installed, so it has none.

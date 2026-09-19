@@ -770,11 +770,11 @@ Defaults live in settings.json in the backup root; flags override them.
             # configured threshold is not the engine's real bar (dynamic;
             # see proactive_switch_bar_pct) -- printing it plain would
             # misstate what the engine fires at. Shown anyway when it is not
-            # the shipped default, or when this run passed `--threshold`
-            # explicitly: either way it still steers ranking, so a
-            # deliberately-chosen value should land, alongside the real bar.
-            # The two disjuncts are independent: `--threshold 90` over a
-            # settings.json holding 80 is still a flag that was just typed.
+            # the shipped default (it still steers ranking, so a
+            # deliberately-chosen value should land alongside the real bar),
+            # or when this run passed `--threshold` explicitly regardless of
+            # its value: `--threshold 90` over a settings.json holding 80 is
+            # still a flag that was just typed.
             show_threshold = (
                 switch_bar == settings.threshold
                 or settings.threshold != SETTING_SPECS["autoswitch.threshold"].default
