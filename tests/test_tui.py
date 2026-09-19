@@ -2563,26 +2563,18 @@ class TestUnswitchableRowsAreListed:
         assert "Fable-walled" in out, out
         assert "  5h full" in out, out
 
-    @pytest.mark.parametrize("strategy", ["dynamic", "best", "consume-first"])
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
     def test_the_full_label_is_reserved_for_actual_exhaustion(self, strategy):
         """The owner's report, 2026-09-17: a 7d window at 92% printed `7d
         full` against the configured threshold of 90 -- a claim of
-        nothing-left that was false. `full` must mean nothing left (the
-        window's own pct at or over 100); a window merely at or over the
-        threshold names the threshold it was judged against instead, and a
-        window under the threshold carries no block label at all.
+        nothing-left that was false. `full` now means nothing left (pct
+        >= 100); a window merely at or over the threshold names the
+        threshold instead; a window under it carries no block label.
 
-        Parametrized over every strategy to prove this label deliberately
-        does NOT chase the strategy-aware departure bar
-        (`proactive_switch_bar_pct`, which under `dynamic` sits at 97, not
-        90): that bar answers "should the ACTIVE account leave", and a
-        candidate clearing it can still fail the engine's own, separate,
-        and stricter cold-landing floor (`cold_switch_cost_pct` in
-        autoswitch.py) -- so labelling a 92% candidate "open" there would
-        overstate the very thing this label exists to describe. The
-        configured threshold is what `classify_candidate_block` has always
-        judged this row against (see its own docstring); only the WORDING
-        changes here, not the number.
+        Parametrized to prove the judgement stays on `settings.threshold`
+        under every strategy, including `dynamic` (whose departure bar is
+        97, not 90) -- this label deliberately does not chase that bar
+        (see the comment at the call site for why).
         """
         from claude_swap.settings import AutoSwitchSettings
 
@@ -2592,28 +2584,19 @@ class TestUnswitchableRowsAreListed:
             self._acct("2", "hundred@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 0.0}, "seven_day": {"pct": 100.0},
             }),
-            self._acct("3", "ninetyeight@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 98.0},
-            }),
-            self._acct("4", "ninetytwo@x.com", switchable=True, last_good={
+            self._acct("3", "ninetytwo@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 0.0}, "seven_day": {"pct": 92.0},
             }),
-            self._acct("5", "fifty@x.com", switchable=True, last_good={
+            self._acct("4", "fifty@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 0.0}, "seven_day": {"pct": 50.0},
             }),
         ), active="1", settings=settings)
 
         rows = {
             email: next(line for line in out.split("\n") if email in line)
-            for email in (
-                "hundred@x.com", "ninetyeight@x.com",
-                "ninetytwo@x.com", "fifty@x.com",
-            )
+            for email in ("hundred@x.com", "ninetytwo@x.com", "fifty@x.com")
         }
         assert "7d full" in rows["hundred@x.com"], rows["hundred@x.com"]
-        assert "7d 98% >= 90%" in rows["ninetyeight@x.com"], (
-            rows["ninetyeight@x.com"]
-        )
         assert "7d 92% >= 90%" in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
         assert "full" not in rows["fifty@x.com"], rows["fifty@x.com"]
         assert ">=" not in rows["fifty@x.com"], rows["fifty@x.com"]

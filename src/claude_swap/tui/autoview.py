@@ -513,13 +513,19 @@ class AutoScreen(Screen):
                     entry.append("  stale", style=palette.sev_warn)
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
-                # a model-only block (the engine's fallback ranks around it),
-                # and the two must read the same way here as in the decision
-                # log — same helper, `classify_candidate_block`. Always on
-                # `models`, the full pinned set: this label explains why the
-                # row is not simply "open" on the criteria the user actually
-                # configured, independent of whether `rank_models` below has
-                # dropped to the retry's axis for ORDERING purposes.
+                # a model-only block (the engine's fallback ranks around it).
+                # The CLASSIFICATION (open/model/full) reads the same way
+                # here as in the decision log — same helper,
+                # `classify_candidate_block`, same `self._settings.threshold`
+                # (NOT the strategy-aware departure bar `_update_summary`
+                # derives: that answers whether the ACTIVE should leave, and
+                # a candidate clearing it can still fail the engine's own,
+                # separate, stricter landing floor -- `cold_switch_cost_pct`
+                # in autoswitch.py). Always on `models`, the full pinned set:
+                # this label explains why the row is not simply "open" on
+                # the criteria the user actually configured, independent of
+                # whether `rank_models` below has dropped to the retry's
+                # axis for ORDERING purposes.
                 if self._settings:
                     kind, blocked_model = classify_candidate_block(
                         ((label, p) for label, p, _ in windows),
@@ -531,23 +537,14 @@ class AutoScreen(Screen):
                             style=palette.muted,
                         )
                     elif kind == "full":
-                        # `classify_candidate_block` only says the window is
-                        # at or over the configured threshold, not that it
-                        # is exhausted -- a 92% 7d window against a 90%
-                        # threshold used to read `7d full`, a claim of
-                        # nothing-left that was false (the owner's report).
-                        # "full" stays reserved for actual exhaustion (the
+                        # The WORDING, unlike the classification, does not
+                        # read the same here as in the decision log's own
+                        # "(<window> full)" (autoswitch.py `_describe`):
+                        # "full" is reserved here for actual exhaustion (the
                         # window's own pct at or over 100); a window merely
                         # blocked at the threshold names the threshold it
-                        # was judged against instead. NOT the strategy-
-                        # aware bar `_update_summary` derives for the
-                        # active's own "switch at N%" line: a candidate
-                        # cleared of the (SPENT_HEADROOM_PCT-widened)
-                        # departure bar can still fail the engine's own,
-                        # separate, and stricter cold-landing floor
-                        # (`cold_switch_cost_pct`, autoswitch.py), so
-                        # reporting it "open" there would overstate the
-                        # very candidate this label exists to describe.
+                        # was judged against instead (the owner's report,
+                        # 92% read "full" against a threshold of 90).
                         window_pct = next(
                             p for label, p, _ in windows if label == blocked_model
                         )
