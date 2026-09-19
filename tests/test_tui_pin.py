@@ -1016,6 +1016,27 @@ class TestAnOrphanedRecordDoesNotHideItsOwnRemoval:
                 f"with a removable record still on disk: {actions}"
             )
 
+    async def test_the_pin_menu_title_says_why_slot_order_stays(self, tmp_path, monkeypatch):
+        """`_pin_entries` lists accounts in slot order on purpose: you pick
+
+        the one to pin BY its slot number, so ranking the list would move
+        rows between opens. Like the other two slot-ordered menus, the
+        title must state that reason, not just the label.
+        """
+        from claude_swap.tui import dashboard as _dash
+        from textual.widgets import Static
+
+        monkeypatch.setattr(_dash.pin, "is_available", lambda: True)
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "pin-menu")
+            await settle(pilot)
+            title = app.screen.query_one("#menu-title", Static).render().plain
+            assert "slot order" in title
+            assert "numbers stay put" in title  # states the reason, not just the label
+
 class TestTheCloudBadgeNeedsTheOrganizationToo:
     """The badge answers "which account owns the claude.ai side", and an email
     does not identify an account here.
