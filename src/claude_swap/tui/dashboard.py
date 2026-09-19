@@ -466,7 +466,9 @@ class DashboardScreen(Screen):
             app.do_toggle_disabled(number)
             await self._pop_menu()
         elif action_id == "pin-menu":
-            await self._push_menu("cloud account", self._pin_entries())
+            await self._push_menu(
+                "cloud account (slot order: numbers stay put)", self._pin_entries()
+            )
         elif action_id.startswith("pin:"):
             target = action_id.split(":", 1)[1]
             # CLEAR does not need the package, and must not: uninstalling the
