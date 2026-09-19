@@ -3778,9 +3778,12 @@ class AutoSwitchEngine:
         # (current)` is that same widened value's PRE-widen input, so this is
         # a no-op for `best`/`consume-first` (never widened) and only changes
         # `dynamic`'s primary pass.
-        ordered, any_known, active_reset_ts, waiting, probe_num = self._rank_candidates_pass(
-            models=self._models, headroom=headroom, active_headroom=headroom.get(current), **kw
+        probe_out: dict = {}
+        ordered, any_known, active_reset_ts, waiting, _axis = self._rank_candidates_pass(
+            models=self._models, headroom=headroom, active_headroom=headroom.get(current),
+            probe_out=probe_out, **kw
         )
+        probe_num = probe_out.get("probe_num")
         if settings.strategy != "dynamic":
             self._last_probe_num = probe_num
             return ordered, any_known, active_reset_ts, waiting
@@ -3799,10 +3802,12 @@ class AutoSwitchEngine:
             self._last_probe_num = probe_num
             return ordered, any_known, active_reset_ts, waiting
         fallback_headroom = _headroom_by_account(usage, ())
+        fb_probe_out: dict = {}
         fb = self._rank_candidates_pass(
             models=(),
             headroom=fallback_headroom,
             active_headroom=fallback_headroom.get(current),
+            probe_out=fb_probe_out,
             **kw,
         )
         # A genuine blackout (every candidate over 5h or 7d too) is the
@@ -3810,13 +3815,13 @@ class AutoSwitchEngine:
         # computed with models=() and all_above over 5h/7d headroom alone,
         # while the caller still reads the model-gated headroom/self._models.
         if fb[0]:
-            self._last_probe_num = fb[4]
+            self._last_probe_num = fb_probe_out.get("probe_num")
             return fb[:4]
         self._last_probe_num = probe_num
         return ordered, any_known, active_reset_ts, waiting
 
+    @staticmethod
     def _rank_candidates_pass(
-        self,
         *,
         models: Sequence[str],
         trigger: str,
@@ -3831,22 +3836,32 @@ class AutoSwitchEngine:
         now: float,
         probe_cooldown: dict[str, float] | None = None,
         entries: dict | None = None,
+        probe_out: dict | None = None,
     ) -> tuple[list[str], bool, float | None, bool, str | None]:
         """Filter and rank OAuth candidates for this tick's trigger, on one
-        window set (``models``).
+        window set (``models``); pure, no state writes, called at most
+        twice per tick by ``_rank_candidates`` (see its docstring), and by
+        the "Next best" panel through the module-level ``rank_candidates_pass``
+        alias below (a static method needs no engine instance) -- the panel
+        gets the engine's own admission instead of a second, hand-matched
+        copy of it. 5th element: the axis ``ordered`` sorted on, or
+        ``None`` when nothing ranked -- read off, never re-derived.
 
-        Returns ``(ordered, any_known, active_reset_ts, waiting_for_recovery,
-        probe_num)`` — ``probe_num`` is the one account (or ``None``) this
-        pass admitted past the reset-unknown gate to learn its reset;
         ``probe_cooldown`` (account number -> cooldown-until epoch, from the
         engine's own state file) is the only state this otherwise-pure
         function reads, mirroring how ``no_return`` already carries a
         caller-computed decision in rather than reading state itself.
-        Pure — no emits, no state writes — so the consume-first two-phase
-        commit can run it twice per tick: on the stored snapshot to decide
-        provisionally, then on the escalated refetch to re-verify before
-        switching. ``_rank_candidates`` (above) is the entry point every
-        caller uses; it calls this twice at most (see its docstring).
+
+        ``probe_out``, if given a dict, is written with ``probe_num`` -- the
+        one account (or ``None``) this pass admitted past the reset-unknown
+        gate to learn its reset. A SIDE CHANNEL, not a 6th tuple field: the
+        module-level ``rank_candidates_pass`` alias is called by
+        ``data.rank_switch_candidates`` with a fixed 5-value unpack (no
+        ``probe_out`` given), so the return shape cannot grow without
+        breaking that caller. ``_rank_candidates`` is the only caller that
+        needs ``probe_num``; it passes its own dict and reads it back (see
+        its own docstring for why ``self._last_probe_num`` is a side
+        channel too, rather than part of ITS 4-tuple contract).
 
         ``waiting_for_recovery`` is the one thing the caller cannot re-derive
         without restating four conditions this method already evaluated: an
@@ -3985,6 +4000,7 @@ class AutoSwitchEngine:
         # unchanged stale-usage gate in `_tick_inner` aborts the whole tick
         # on the first candidate whose entry is not `fresh()`.
         probe_candidates: list[str] = []
+        key_axis: dict[str, str] = {}  # per candidate, set alongside its key
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
@@ -4142,6 +4158,7 @@ class AutoSwitchEngine:
                                 < active_recovery_ts - RECOVERY_HYSTERESIS_S
                             ):
                                 fallback.append(((0, recovery_ts, -h), num))
+                                key_axis[num] = "soonest to recover"
                             continue
                 elif (
                     trigger in CONSUME_FIRST_STRATEGIES
@@ -4243,6 +4260,7 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
+                key_axis[num] = "soonest to recover" if by_recovery else "most headroom"
             elif consume_first and trigger != "at-limit" and not all_above:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
@@ -4272,6 +4290,7 @@ class AutoSwitchEngine:
                 key = consume_first_rank_key(
                     usage.get(num), settings.threshold, now, models
                 )
+                key_axis[num] = "soonest reset"
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
                 # back to `-h` when the label is unknown (usage without window
@@ -4333,6 +4352,7 @@ class AutoSwitchEngine:
                     -max(escape_h if escape_h is not None else h, 0.0),
                     recovery_ts,
                 )
+                key_axis[num] = "at-limit escape" if escape_h is not None else "most headroom"
             qualifying.append((key, num))
         # AT MOST ONE PROBE PER DECISION. `select_probe_target` picks the
         # most headroom among `probe_candidates`, same tie-break the key
@@ -4352,6 +4372,7 @@ class AutoSwitchEngine:
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
         ordered = [num for _, num in qualifying]
+        axis = key_axis.get(ordered[0]) if ordered else None  # winner's own axis
         # EVERY CANDIDATE READABLE, not merely one of them holding room. A
         # row we could not read may be a healthy account, and announcing a
         # reset over it claims a fleet nobody measured.
@@ -4366,7 +4387,9 @@ class AutoSwitchEngine:
             trigger == "at-limit" and by_recovery_axis and not ordered
             and all(headroom.get(n) is not None for n in oauth_candidates)
         )
-        return ordered, any_known, active_reset_ts, waiting, probe_num
+        if probe_out is not None:
+            probe_out["probe_num"] = probe_num
+        return ordered, any_known, active_reset_ts, waiting, axis
 
     # -- adaptive usage scheduling ---------------------------------------------
 
@@ -5232,3 +5255,9 @@ def _access_token_of(credentials) -> str | None:
         return None
     token = section.get("accessToken")
     return str(token) if token else None
+
+
+# A direct module-level name, not `AutoSwitchEngine._rank_candidates_pass`:
+# a caller that only wants the (pure, static) ranking -- the "Next best"
+# panel -- needs no engine instance to reach it.
+rank_candidates_pass = AutoSwitchEngine._rank_candidates_pass
