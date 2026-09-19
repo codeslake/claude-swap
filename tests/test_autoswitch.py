@@ -6769,9 +6769,15 @@ class TestWarmthAndAlternation375:
         reads its own real, sooner reset; only the missing ACTIVE side
         withholds the exemption."""
         h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        # Dwell satisfied: without it `since is None` alone forces
+        # NO_ACTION regardless of the exemption, and only the reason
+        # label (not the outcome) would discriminate this test.
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})
         usage = {
-            "1": _usage(78.0),                                  # active: headroom 22, NO 7d reset known
-            "2": _usage7(0.0, 96.0, _iso_at(h.clock.now + 3600)),  # headroom 4, real reset in 1h
+            "1": _usage(78.0),                              # active: headroom 22, NO 7d reset known
+            "2": _usage7(0.0, 96.0, _iso_at(now + 3600)),    # headroom 4, real reset in 1h
         }
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.NO_ACTION, (
@@ -6859,7 +6865,12 @@ class TestWarmthAndAlternation375:
             f"{h.active_number()!r}"
         )
 
-        h.clock.advance(chunk)
+        h.clock.advance(chunk - 1.0)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.NO_ACTION, f"got {outcome} at chunk - 1s"
+        assert h.active_number() == 2
+
+        h.clock.advance(1.0)  # now exactly at the chunk boundary
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — must alternate back once the next chunk "

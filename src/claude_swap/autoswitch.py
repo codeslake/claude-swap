@@ -902,16 +902,15 @@ def _perishes_before_active(
     """Whether a candidate's 7-day window resets sooner than the active's own
     (T0758): the active's own headroom will still be there next tick, but a
     candidate's window that resets first expires whatever it is not spent
-    on. Both read through `_seven_day_reset_ts`, so a None (unknown or
-    already past) reset is never "sooner" on EITHER side -- it sorts to
-    +inf like the ranking key `_rank_dynamic_candidates` already uses, and
-    must keep losing, the same reading `_seven_day_reset_ts` already gives
-    the candidate side (past == unknown). A None *active* reset stays
-    conservative for the same reason, not the permissive one: it collapses
-    "just rolled over, nothing pending" with "never fetched" indistinguish-
-    ably, and only the first of those would justify waiving both bars for
-    every candidate with a real reset at once -- an ambiguous signal must
-    not carry that much weight.
+    on. Both read through `_seven_day_reset_ts`. A None (unknown or already
+    past) CANDIDATE reset is never "sooner" -- it sorts to +inf like the
+    ranking key `_rank_dynamic_candidates` already uses, and must keep
+    losing, the same reading `_seven_day_reset_ts` already gives it (past
+    == unknown). A None ACTIVE reset is conservative instead, never +inf:
+    it collapses "just rolled over, nothing pending" with "never fetched"
+    indistinguishably, and only the first of those would justify waiving
+    both bars for every candidate with a real reset at once -- an
+    ambiguous signal must not carry that much weight.
     """
     candidate_ts = _seven_day_reset_ts(candidate_usage, now)
     if candidate_ts is None:
