@@ -6527,6 +6527,54 @@ class TestWarmthAndAlternation375:
         assert not any(isinstance(e, SwitchEvent) for e in h.events)
         assert h.active_number() == 1
 
+    def test_cold_partner_at_the_bare_floor_is_not_worth_the_rewrite_cost(
+        self, temp_home
+    ):
+        """Correctness review of T0807: a cold landing pays the real
+        re-write cost -- `cold_switch_cost_pct` IS that measured cost
+        (settings.py's own docstring, ~19 5h-points) -- so a candidate
+        admitted at the bare floor (20) would arrive almost spent, a real
+        regression out of a voluntary move with no wall to escape. The
+        cold half's floor is `cold_switch_cost_pct + SPENT_HEADROOM_PCT`;
+        account 2 clears the bare 20 but not the real 23, so it must be
+        refused -- as `below-floor`, the same label a candidate that never
+        reached 20 at all gets, not `cold` (reserved for one the floor
+        DOES admit, refused only by giveback)."""
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {"1": h.clock.now - chunk})
+        outcome = h.tick_with_usage({
+            "1": _usage(50.0),  # active, headroom 50
+            "2": _usage(78.0),  # cold, headroom 22 -- clears 20, not 23
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a cold candidate that would arrive already "
+            "spent after paying the re-write cost must not be taken"
+        )
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], reasons
+        assert h.active_number() == 1
+
+    def test_cold_partner_clearing_the_real_floor_but_not_giveback_reads_cold(
+        self, temp_home
+    ):
+        """Correctness review of T0807: account 2 clears the cold half's
+        real (cost-adjusted) floor -- 30 well past 23 -- but the active
+        already holds far more headroom (90) than giving that much back
+        is worth (giveback 60 against the 10-point bar), so `partner`
+        stays `None` and the reason must read `cold`, not `below-floor`:
+        the floor really did admit it."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(10.0),  # active, headroom 90 -- very healthy
+            "2": _usage(70.0),  # cold, headroom 30 -- clears the real
+                                 # floor (>23) but fails giveback (90-30=60)
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["cold"], reasons
+        assert h.active_number() == 1
+
     # -- no-return bar on the proactive/about_to_wall arm -----------------
 
     def test_no_return_bar_blocks_a_spent_peer_even_when_its_reset_recovered(

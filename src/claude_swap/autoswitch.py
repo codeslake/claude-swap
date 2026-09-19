@@ -2289,13 +2289,30 @@ class AutoSwitchEngine:
             # `warm_ordered` empty) restarts on a cold one rather than
             # holding forever -- `_is_warm` still decides which tier a
             # candidate sorts into, but no longer whether it is reachable at
-            # all. Both bars gate the cold half exactly as they already gate
-            # the warm half; a live rotation is unchanged because `next(iter(
-            # ...))` still finds its warm partner first in the concatenation.
+            # all. The giveback bar gates the cold half exactly as it
+            # already gates the warm half; the floor is a per-tier reading
+            # of the same `cold_switch_cost_pct` (below). A live rotation is
+            # unchanged because `next(iter(...))` still finds its warm
+            # partner first in the concatenation.
+            #
+            # A cold landing is not free the way a warm one is: `cold_
+            # switch_cost_pct` IS the measured re-write cost (settings.py's
+            # own docstring, "~19 5h-points"), so a cold candidate admitted
+            # at the bare floor arrives with only a sliver left -- a real
+            # regression out of a voluntary, unforced move with no wall to
+            # escape. `+SPENT_HEADROOM_PCT` on the cold floor only (correctness
+            # review): the candidate must still read healthy AFTER paying the
+            # cost, not merely non-negative. Warm pays no such cost, so its
+            # floor stays bare.
+            floor_needed = {
+                n: settings.cold_switch_cost_pct for n in warm_ordered
+            }
+            for n in cold_ordered:
+                floor_needed[n] = settings.cold_switch_cost_pct + SPENT_HEADROOM_PCT
             alternation_admissible = [
                 n for n in warm_ordered + cold_ordered
                 if (
-                    floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                    floor_headroom.get(n, 0.0) >= floor_needed[n]
                     and floor_headroom.get(current, 0.0) - floor_headroom.get(n, 0.0)
                     <= ALTERNATION_MAX_GIVEBACK_PCT
                 )
@@ -2452,10 +2469,17 @@ class AutoSwitchEngine:
                 # bars no longer refuse) reads the same as a warm partner
                 # here -- held by dwell, not by either bar -- or `below-
                 # floor`/`cold` would blame a bar that already admitted it.
+                # `floor_needed`, not the bare `cold_switch_cost_pct`
+                # (correctness review): a cold candidate that clears the
+                # bare floor but not the cost-adjusted one is exactly the
+                # `below-floor` story (not worth the re-write), same as
+                # one that never reached 20 at all -- `cold` is reserved
+                # for a candidate the floor DOES admit, refused only by
+                # the giveback bar.
                 if warm_ordered or partner is not None:
                     reason = "below-threshold"
                 elif any(
-                    floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                    floor_headroom.get(n, 0.0) >= floor_needed[n]
                     for n in cold_ordered
                 ):
                     reason = "cold"
