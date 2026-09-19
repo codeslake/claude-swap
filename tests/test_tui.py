@@ -1445,13 +1445,22 @@ class TestWatchScreen:
 
 def _order_fixture_accounts():
     """Active "3", usable "5" (ranks first only by admission, never by
-    sorting numbers), unusable "2"/"4"/"12" (disabled/expired/full)."""
+    sorting numbers), unusable "2"/"4"/"12" (disabled/expired/full). "2"
+    and "12" carry DIFFERENT 7-day resets (3d vs. 6d) -- both land in the
+    same never-ranked tier, so an equal reset would let a flat, un-fixed
+    fallback key pass this test by coincidence."""
     return [
         make_account(3, active=True, entry=make_entry(95.0, 95.0)),
         make_account(5, entry=make_entry(5.0, 5.0)),
         make_account(2, entry=make_entry(20.0, 20.0), disabled=True),
         make_account(4, entry=make_entry(sentinel=USAGE_TOKEN_EXPIRED)),
-        make_account(12, entry=make_entry(50.0, 100.0)),
+        make_account(12, entry=UsageEntry(
+            last_good={
+                "five_hour": {"pct": 50.0, "resets_at": _iso_in(7200)},
+                "seven_day": {"pct": 100.0, "resets_at": _iso_in(86400 * 6)},
+            },
+            fetched_at=time.time() - 5.0, age_s=5.0,
+        )),
     ]
 
 
@@ -1478,7 +1487,10 @@ class TestOrderedAccounts:
     """One order every listing screen renders -- never a re-derived key."""
 
     def test_matches_the_auto_switch_view_and_sorts_unusable_last(self):
-        """Also the tie-break control: never-ranked "2"/"12" settle "12" < "2"."""
+        """Also the tie-break control: never-ranked "2" (3d reset) sorts
+        before "12" (6d reset) on BOTH screens -- not a flat key falling
+        through to the account number, which this fixture's distinct
+        resets would catch diverging from either screen."""
         snap = AccountsSnapshot(
             accounts=_order_fixture_accounts(), active_number="3", taken_at=0.0
         )
@@ -1487,6 +1499,7 @@ class TestOrderedAccounts:
         assert order[1:] == _autoview_order(snap, "3", _ORDER_SETTINGS)
         for unusable in ("2", "4", "12"):  # disabled / token-expired / 7d-full
             assert order.index("5") < order.index(unusable)
+        assert order.index("2") < order.index("12")
 
     def test_unmodeled_trigger_keys_stay_in_sync_with_the_auto_view_text(self):
         """Two files key the same trigger names; a name added to one alone
