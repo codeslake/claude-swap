@@ -521,17 +521,9 @@ class AutoScreen(Screen):
                 # configured, independent of whether `rank_models` below has
                 # dropped to the retry's axis for ORDERING purposes.
                 if self._settings:
-                    # The bar this row is actually judged against, not the
-                    # raw configured value: under `dynamic` the engine's
-                    # real proactive gate sits at `proactive_switch_bar_pct`
-                    # (97 by default), not `settings.threshold` -- the same
-                    # derivation `_update_summary` already uses for the `·
-                    # switch at N%` line, so the two never disagree.
-                    bar = proactive_switch_bar_pct(
-                        self._settings.strategy, self._settings.threshold
-                    )
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows), bar
+                        ((label, p) for label, p, _ in windows),
+                        self._settings.threshold,
                     )
                     if kind == "model":
                         entry.append(
@@ -540,13 +532,22 @@ class AutoScreen(Screen):
                         )
                     elif kind == "full":
                         # `classify_candidate_block` only says the window is
-                        # at or over `bar`, not that it is exhausted -- under
-                        # `dynamic` the bar sits below 100, so a candidate
-                        # can land here with real headroom left (the owner's
-                        # report: 92% read `7d full` against a bar of 97).
-                        # "full" stays reserved for actual exhaustion; a
-                        # blocked-but-not-empty window names the bar it was
-                        # judged against instead.
+                        # at or over the configured threshold, not that it
+                        # is exhausted -- a 92% 7d window against a 90%
+                        # threshold used to read `7d full`, a claim of
+                        # nothing-left that was false (the owner's report).
+                        # "full" stays reserved for actual exhaustion (the
+                        # window's own pct at or over 100); a window merely
+                        # blocked at the threshold names the threshold it
+                        # was judged against instead. NOT the strategy-
+                        # aware bar `_update_summary` derives for the
+                        # active's own "switch at N%" line: a candidate
+                        # cleared of the (SPENT_HEADROOM_PCT-widened)
+                        # departure bar can still fail the engine's own,
+                        # separate, and stricter cold-landing floor
+                        # (`cold_switch_cost_pct`, autoswitch.py), so
+                        # reporting it "open" there would overstate the
+                        # very candidate this label exists to describe.
                         window_pct = next(
                             p for label, p, _ in windows if label == blocked_model
                         )
@@ -557,7 +558,7 @@ class AutoScreen(Screen):
                         else:
                             entry.append(
                                 f"  {blocked_model} {pct_label(window_pct)}%"
-                                f" >= {pct_label(bar)}%",
+                                f" >= {pct_label(self._settings.threshold)}%",
                                 style=palette.muted,
                             )
                 rank_pct = binding_pct(acc.usage.last_good, rank_models)

@@ -2563,28 +2563,26 @@ class TestUnswitchableRowsAreListed:
         assert "Fable-walled" in out, out
         assert "  5h full" in out, out
 
-    @pytest.mark.parametrize(
-        ("strategy", "bar", "row_92"),
-        [
-            ("dynamic", "97", None),
-            ("best", "90", "7d 92% >= 90%"),
-        ],
-    )
-    def test_the_full_label_is_reserved_for_actual_exhaustion(
-        self, strategy, bar, row_92
-    ):
-        """The owner's report, 2026-09-17: under `dynamic` a 7d window at
-        92% printed `7d full` against the configured threshold of 90, while
-        the engine's real bar (`proactive_switch_bar_pct`) was 97 and the
-        account was perfectly landable. `full` must mean nothing left (the
+    @pytest.mark.parametrize("strategy", ["dynamic", "best", "consume-first"])
+    def test_the_full_label_is_reserved_for_actual_exhaustion(self, strategy):
+        """The owner's report, 2026-09-17: a 7d window at 92% printed `7d
+        full` against the configured threshold of 90 -- a claim of
+        nothing-left that was false. `full` must mean nothing left (the
         window's own pct at or over 100); a window merely at or over the
-        bar says so with the bar in view instead, and a window under the
-        bar carries no block label at all.
+        threshold names the threshold it was judged against instead, and a
+        window under the threshold carries no block label at all.
 
-        `best` is the CONTROL: its bar is the configured threshold itself
-        (`proactive_switch_bar_pct` only widens it under `dynamic`), so the
-        92% row IS blocked there and reads `>= 90%`, not `>= 97%` --
-        proving the bar is strategy-aware, not just the wording.
+        Parametrized over every strategy to prove this label deliberately
+        does NOT chase the strategy-aware departure bar
+        (`proactive_switch_bar_pct`, which under `dynamic` sits at 97, not
+        90): that bar answers "should the ACTIVE account leave", and a
+        candidate clearing it can still fail the engine's own, separate,
+        and stricter cold-landing floor (`cold_switch_cost_pct` in
+        autoswitch.py) -- so labelling a 92% candidate "open" there would
+        overstate the very thing this label exists to describe. The
+        configured threshold is what `classify_candidate_block` has always
+        judged this row against (see its own docstring); only the WORDING
+        changes here, not the number.
         """
         from claude_swap.settings import AutoSwitchSettings
 
@@ -2613,14 +2611,10 @@ class TestUnswitchableRowsAreListed:
             )
         }
         assert "7d full" in rows["hundred@x.com"], rows["hundred@x.com"]
-        assert f"7d 98% >= {bar}%" in rows["ninetyeight@x.com"], (
+        assert "7d 98% >= 90%" in rows["ninetyeight@x.com"], (
             rows["ninetyeight@x.com"]
         )
-        if row_92 is None:
-            assert "full" not in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
-            assert ">=" not in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
-        else:
-            assert row_92 in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
+        assert "7d 92% >= 90%" in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
         assert "full" not in rows["fifty@x.com"], rows["fifty@x.com"]
         assert ">=" not in rows["fifty@x.com"], rows["fifty@x.com"]
 
