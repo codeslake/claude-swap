@@ -1379,6 +1379,42 @@ class TestAutoCommand:
         assert "threshold 80%" in out, f"the explicit flag was not echoed: {out!r}"
         assert "switch at 97%" in out, f"the real bar was dropped: {out!r}"
 
+    def test_the_banner_confirms_a_persisted_non_default_threshold(
+        self, temp_home, capsys
+    ):
+        """A `--threshold` in settings.json, not on the command line, still
+        steers ranking under `dynamic` -- it must not read as untouched-
+        default just because no flag was passed this run."""
+        from claude_swap.paths import get_backup_root
+
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        (backup_dir / "settings.json").write_text(
+            json.dumps({
+                "schemaVersion": 1,
+                "autoswitch": {"threshold": 80, "strategy": "dynamic"},
+            })
+        )
+
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine",
+                   return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        out = capsys.readouterr().out
+        assert "threshold 80%" in out, f"the persisted value was not shown: {out!r}"
+        assert "switch at 97%" in out
+
     def test_once_is_interruptible_too(self, temp_home):
         """`--once` exits before the handlers are installed, so it has none.
 

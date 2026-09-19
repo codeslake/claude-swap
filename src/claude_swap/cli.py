@@ -706,7 +706,7 @@ Defaults live in settings.json in the backup root; flags override them.
         proactive_switch_bar_pct,
     )
     from claude_swap.printer import accent, yellowed
-    from claude_swap.settings import load_settings, merged_with_cli
+    from claude_swap.settings import SETTING_SPECS, load_settings, merged_with_cli
 
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
@@ -769,11 +769,14 @@ Defaults live in settings.json in the backup root; flags override them.
             # `switch_bar != settings.threshold` is exactly when the
             # configured threshold is not the engine's real bar (dynamic;
             # see proactive_switch_bar_pct) -- printing it plain would
-            # misstate what the engine fires at. Shown anyway when an
-            # explicit `--threshold` was passed: an operator who just set a
-            # value should see it land, alongside the real bar.
-            show_threshold = switch_bar == settings.threshold or (
-                args.threshold is not None
+            # misstate what the engine fires at. Shown anyway when it is not
+            # the shipped default: it still steers ranking, so a
+            # deliberately-chosen value (an explicit `--threshold`, or one
+            # already sitting in settings.json) should land, alongside the
+            # real bar.
+            show_threshold = (
+                switch_bar == settings.threshold
+                or settings.threshold != SETTING_SPECS["autoswitch.threshold"].default
             )
             parts = []
             if show_threshold:

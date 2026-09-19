@@ -1768,6 +1768,31 @@ class TestAutoScreen:
             await self._open(pilot)
             assert app.screen._settings.strategy == "consume-first"
 
+    async def test_a_persisted_non_default_threshold_stays_visible_under_dynamic(
+        self, tmp_path, fake_engine
+    ):
+        """A threshold already in settings.json (not a session override)
+        still steers ranking under `dynamic` -- it must not read as
+        untouched-default just because nothing was adjusted this session."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 80.0, "strategy": "dynamic"},
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            from textual.widgets import Static
+
+            summary = app.screen.query_one("#auto-summary", Static)
+            assert "threshold 80%" in summary.render().plain
+            assert "(session)" not in summary.render().plain  # not an override
+            assert "switch at 97%" in summary.render().plain
+
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine
     ):
