@@ -766,15 +766,17 @@ Defaults live in settings.json in the backup root; flags override them.
             switch_bar = proactive_switch_bar_pct(
                 settings.strategy, settings.threshold
             )
-            switch_at = (
-                f", switch at {pct_label(switch_bar)}%"
-                if pct_label(switch_bar) != pct_label(settings.threshold)
-                else ""
+            # Under `dynamic` the configured threshold is not the engine's
+            # real bar (see `proactive_switch_bar_pct`) — print the bar in
+            # force instead of a rule that is not.
+            lead = (
+                f"switch at {pct_label(switch_bar)}%"
+                if settings.strategy == "dynamic"
+                else f"threshold {pct_label(settings.threshold)}%"
             )
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {pct_label(settings.threshold)}%"
-                    f"{switch_at}, "
+                    f"Auto-switch running: {lead}, "
                     f"every {settings.interval_seconds:.0f}s"
                     # THE ENGINE, NOT THE REQUEST. A demoted engine has
                     # `dry_run` True while `args.dry_run` is False, and this

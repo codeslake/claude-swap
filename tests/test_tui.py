@@ -1721,6 +1721,10 @@ class TestAutoScreen:
 
             summary = screen.query_one("#auto-summary", Static)
             assert "consume-first" in summary.render().plain
+            # CONTROL: a non-dynamic strategy still shows the configured
+            # threshold — without this, the dynamic-strategy assertion below
+            # would pass even if "threshold " never printed at all.
+            assert "threshold 90%" in summary.render().plain
             await pilot.press("s")
             await pilot.pause()
             assert screen._settings.strategy == "dynamic"
@@ -1730,6 +1734,9 @@ class TestAutoScreen:
             assert "dynamic (session)" in summary.render().plain
             assert "switch at 97%" in summary.render().plain
             assert app.threshold_pct == 97.0
+            # dynamic's configured threshold is not the engine's real bar —
+            # at rest (not adjusting) the header must not claim it is.
+            assert "threshold" not in summary.render().plain
             await pilot.press("s")
             await pilot.pause()
             assert screen._settings.strategy == "best"

@@ -1298,6 +1298,56 @@ class TestAutoCommand:
             f"switching over a process that will switch nothing: {out!r}"
         )
 
+    def test_the_banner_hides_threshold_under_dynamic(self, temp_home, capsys):
+        """Under `dynamic` the configured threshold is not the engine's real
+        bar (`proactive_switch_bar_pct`), so the banner must not print
+        `threshold <n>%` at rest -- only the bar in force."""
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine",
+                   return_value=_Engine()), \
+                patch.object(
+                    sys, "argv", ["claude-swap", "auto", "--strategy", "dynamic"]
+                ):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        out = capsys.readouterr().out
+        assert "switch at 97%" in out, f"no bar in force printed: {out!r}"
+        assert "threshold " not in out, (
+            f"dynamic's configured threshold is not the switch bar: {out!r}"
+        )
+
+    def test_the_banner_keeps_threshold_for_a_non_dynamic_strategy(
+        self, temp_home, capsys
+    ):
+        """CONTROL: without this, the dynamic case above would pass on a
+        banner that dropped `threshold ` unconditionally."""
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine",
+                   return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        out = capsys.readouterr().out
+        assert "threshold 90%" in out, f"premise: no threshold printed: {out!r}"
+
     def test_once_is_interruptible_too(self, temp_home):
         """`--once` exits before the handlers are installed, so it has none.
 
