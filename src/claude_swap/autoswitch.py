@@ -2300,19 +2300,23 @@ class AutoSwitchEngine:
             # own docstring, "~19 5h-points"), so a cold candidate admitted
             # at the bare floor arrives with only a sliver left -- a real
             # regression out of a voluntary, unforced move with no wall to
-            # escape. `+SPENT_HEADROOM_PCT` on the cold floor only (correctness
-            # review): the candidate must still read healthy AFTER paying the
-            # cost, not merely non-negative. Warm pays no such cost, so its
-            # floor stays bare.
-            floor_needed = {
-                n: settings.cold_switch_cost_pct for n in warm_ordered
-            }
-            for n in cold_ordered:
-                floor_needed[n] = settings.cold_switch_cost_pct + SPENT_HEADROOM_PCT
+            # escape. The cold half must still read healthy AFTER paying
+            # the cost, STRICTLY past `SPENT_HEADROOM_PCT` -- `>=` at
+            # exactly `cold_switch_cost_pct + SPENT_HEADROOM_PCT` would
+            # admit a candidate landing at precisely the headroom
+            # `_about_to_wall` itself calls walled (correctness review).
+            # Warm pays no re-write cost, so its floor stays the bare,
+            # unchanged `>=`.
+            cold_set = set(cold_ordered)
+            def _clears_the_landing_floor(n):
+                h = floor_headroom.get(n, 0.0)
+                if n in cold_set:
+                    return h - settings.cold_switch_cost_pct > SPENT_HEADROOM_PCT
+                return h >= settings.cold_switch_cost_pct
             alternation_admissible = [
                 n for n in warm_ordered + cold_ordered
                 if (
-                    floor_headroom.get(n, 0.0) >= floor_needed[n]
+                    _clears_the_landing_floor(n)
                     and floor_headroom.get(current, 0.0) - floor_headroom.get(n, 0.0)
                     <= ALTERNATION_MAX_GIVEBACK_PCT
                 )
@@ -2391,15 +2395,22 @@ class AutoSwitchEngine:
                         n for n in warm_ordered
                         if floor_headroom.get(n, 0.0) > warm_bar
                     ] + [
-                        # `>=`, matching every other plain
-                        # `cold_switch_cost_pct` comparison in this file
-                        # (:2038, :2109, :2224/the reason label below) --
-                        # a strict `>` here disagreed with the reason
-                        # label about a candidate sitting at exactly the
-                        # floor (measured: active unmodeled 5, a cold peer
-                        # at exactly 20.0 -- the escape refused it while
-                        # the label below called it "cold" [clearing the
-                        # floor, merely dwelling]).
+                        # `>=` on the bare `cold_switch_cost_pct`: this is
+                        # a FORCED move (the active is genuinely walled,
+                        # `_about_to_wall(raw_active_headroom)`), so any
+                        # positive landing beats staying walled -- unlike
+                        # the voluntary alternation admission above
+                        # (`_clears_the_landing_floor`), which prices the
+                        # re-write cost because nothing forces that move.
+                        # A strict `>` here once disagreed with the
+                        # reason label about a candidate sitting at
+                        # exactly the floor (measured: active unmodeled 5,
+                        # a cold peer at exactly 20.0 -- the escape
+                        # refused it while the label called it "cold"
+                        # [clearing the floor, merely dwelling]); the two
+                        # need not match any more, since T0807 moved the
+                        # label onto its own, stricter floor for the
+                        # voluntary path only.
                         n for n in cold_ordered
                         if floor_headroom.get(n, 0.0) >= cold_bar
                     ]
@@ -2469,19 +2480,16 @@ class AutoSwitchEngine:
                 # bars no longer refuse) reads the same as a warm partner
                 # here -- held by dwell, not by either bar -- or `below-
                 # floor`/`cold` would blame a bar that already admitted it.
-                # `floor_needed`, not the bare `cold_switch_cost_pct`
-                # (correctness review): a cold candidate that clears the
-                # bare floor but not the cost-adjusted one is exactly the
-                # `below-floor` story (not worth the re-write), same as
-                # one that never reached 20 at all -- `cold` is reserved
-                # for a candidate the floor DOES admit, refused only by
-                # the giveback bar.
+                # `_clears_the_landing_floor`, not the bare `cold_switch_
+                # cost_pct` (correctness review): a cold candidate that
+                # clears the bare floor but not the cost-adjusted one is
+                # exactly the `below-floor` story (not worth the
+                # re-write), same as one that never reached 20 at all --
+                # `cold` is reserved for a candidate the floor DOES admit,
+                # refused only by the giveback bar.
                 if warm_ordered or partner is not None:
                     reason = "below-threshold"
-                elif any(
-                    floor_headroom.get(n, 0.0) >= floor_needed[n]
-                    for n in cold_ordered
-                ):
+                elif any(_clears_the_landing_floor(n) for n in cold_ordered):
                     reason = "cold"
                 elif cold_ordered:
                     reason = "below-floor"

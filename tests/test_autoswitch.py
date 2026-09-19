@@ -6534,18 +6534,21 @@ class TestWarmthAndAlternation375:
         re-write cost -- `cold_switch_cost_pct` IS that measured cost
         (settings.py's own docstring, ~19 5h-points) -- so a candidate
         admitted at the bare floor (20) would arrive almost spent, a real
-        regression out of a voluntary move with no wall to escape. The
-        cold half's floor is `cold_switch_cost_pct + SPENT_HEADROOM_PCT`;
-        account 2 clears the bare 20 but not the real 23, so it must be
-        refused -- as `below-floor`, the same label a candidate that never
-        reached 20 at all gets, not `cold` (reserved for one the floor
-        DOES admit, refused only by giveback)."""
+        regression out of a voluntary move with no wall to escape. Active
+        headroom 30 keeps the giveback bar out of the way (giveback 8 <=
+        10), so account 2's own floor is the ONLY thing that can refuse
+        it here -- it clears the bare 20 but not the real, cost-adjusted
+        one, so it must be refused as `below-floor`, the same label a
+        candidate that never reached 20 at all gets, not `cold` (reserved
+        for one the floor DOES admit, refused only by giveback). Pre-fix
+        this candidate was admitted (the bare floor alone) and SWITCHED."""
         h = self._harness(temp_home)
         chunk = h.engine.settings.alternation_chunk_seconds
         self._seed_last_active_at(h, {"1": h.clock.now - chunk})
         outcome = h.tick_with_usage({
-            "1": _usage(50.0),  # active, headroom 50
-            "2": _usage(78.0),  # cold, headroom 22 -- clears 20, not 23
+            "1": _usage(70.0),  # active, headroom 30
+            "2": _usage(78.0),  # cold, headroom 22 -- clears 20, not 23;
+                                 # giveback (30-22=8) clears the OTHER bar
         })
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — a cold candidate that would arrive already "
@@ -6977,8 +6980,9 @@ class TestWarmthAndAlternation375:
     ):
         """The exemption is not cold-only: a WARM candidate that fails
         both ordinary bars is admitted too once it perishes sooner --
-        `alternation_admissible`'s `warm_ordered` branch carries the same
-        `or _perishes_before_active(...)` the `cold_ordered` branch does."""
+        `alternation_admissible`'s single `or _perishes_before_active(...)`
+        clause covers `warm_ordered + cold_ordered` alike, not a warm-only
+        carve-out."""
         h = self._harness(temp_home, threshold=90.0)
         chunk = h.engine.settings.alternation_chunk_seconds
         now = h.clock.now
