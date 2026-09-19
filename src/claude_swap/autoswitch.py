@@ -903,17 +903,21 @@ def _perishes_before_active(
     (T0758): the active's own headroom will still be there next tick, but a
     candidate's window that resets first expires whatever it is not spent
     on. Both read through `_seven_day_reset_ts`, so a None (unknown or
-    already past) candidate reset is never "sooner" -- it sorts to +inf like
-    the ranking key `_rank_dynamic_candidates` already uses, and must keep
-    losing. A None active reset reads as +inf too: nothing pending on the
-    active's own side to expire unspent, so any real candidate reset counts
-    as sooner.
+    already past) reset is never "sooner" on EITHER side -- it sorts to
+    +inf like the ranking key `_rank_dynamic_candidates` already uses, and
+    must keep losing, the same reading `_seven_day_reset_ts` already gives
+    the candidate side (past == unknown). A None *active* reset stays
+    conservative for the same reason, not the permissive one: it collapses
+    "just rolled over, nothing pending" with "never fetched" indistinguish-
+    ably, and only the first of those would justify waiving both bars for
+    every candidate with a real reset at once -- an ambiguous signal must
+    not carry that much weight.
     """
     candidate_ts = _seven_day_reset_ts(candidate_usage, now)
     if candidate_ts is None:
         return False
     active_ts = _seven_day_reset_ts(active_usage, now)
-    return active_ts is None or candidate_ts < active_ts
+    return active_ts is not None and candidate_ts < active_ts
 
 
 def consume_first_rank_key(
@@ -2439,7 +2443,11 @@ class AutoSwitchEngine:
             ):
                 # One label per story (item 5): a warm partner not yet
                 # dwelt on, or a cold one clearing/not-clearing the floor.
-                if warm_ordered:
+                # T0758: `partner is not None` (a perishing candidate the
+                # bars no longer refuse) reads the same as a warm partner
+                # here -- held by dwell, not by either bar -- or `below-
+                # floor`/`cold` would blame a bar that already admitted it.
+                if warm_ordered or partner is not None:
                     reason = "below-threshold"
                 elif any(
                     floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct

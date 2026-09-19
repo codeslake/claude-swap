@@ -3322,7 +3322,13 @@ class TestOutcomeDigest375:
         assert head[0] == "NO_ACTION", (
             f"got {head!r} — #375's whole point: a healthy active "
             "(headroom 22) must not move for a soonest-resetting, "
-            "near-empty candidate any more"
+            "near-empty candidate on a SINGLE tick with no dwell stamp "
+            "(this fixture never seeds `lastActiveAt`, so the dwell gate "
+            "holds it regardless of the bars below -- T0758 narrows "
+            "those same bars once dwell IS satisfied, see "
+            "TestWarmthAndAlternation375.test_the_owners_row_..., "
+            "which is this fleet's shape with dwell seeded and does "
+            "switch)"
         )
         base_results = _base_engine_results(
             tmp_path, "dynamic", seed=0, n_fleets=1,
@@ -6748,6 +6754,116 @@ class TestWarmthAndAlternation375:
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — headroom 2 is at/under SPENT_HEADROOM_PCT "
             "and must still be refused even though it perishes sooner"
+        )
+        assert h.active_number() == 1
+
+    def test_a_perishing_candidate_still_needs_a_real_active_reset(
+        self, temp_home
+    ):
+        """`_perishes_before_active` stays conservative when the ACTIVE's
+        own 7-day reset is unknown (no `resets_at` at all here, via the
+        bare `_usage()` helper): an unread datum must not waive both bars
+        for every candidate with a real reset -- it is never distinguish-
+        able from "never fetched" versus "genuinely nothing pending", and
+        only the first of those would justify it. The candidate side still
+        reads its own real, sooner reset; only the missing ACTIVE side
+        withholds the exemption."""
+        h = self._harness(temp_home, threshold=90.0)
+        usage = {
+            "1": _usage(78.0),                                  # active: headroom 22, NO 7d reset known
+            "2": _usage7(0.0, 96.0, _iso_at(h.clock.now + 3600)),  # headroom 4, real reset in 1h
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — an unknown active reset must not unlock "
+            "the exemption; the ordinary floor still refuses headroom 4"
+        )
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], reasons
+        assert h.active_number() == 1
+
+    def test_a_perishing_warm_candidate_is_also_exempt_from_both_bars(
+        self, temp_home
+    ):
+        """The exemption is not cold-only: a WARM candidate that fails
+        both ordinary bars is admitted too once it perishes sooner --
+        `alternation_admissible`'s `warm_ordered` branch carries the same
+        `or _perishes_before_active(...)` the `cold_ordered` branch does."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {
+            "1": now - chunk - 1.0,  # dwell elapsed
+            "2": now - 10.0,         # warm
+        })
+        usage = {
+            "1": _usage7(0.0, 18.0, _iso_at(now + 5 * 86400)),   # active: headroom 82, resets in days
+            "2": _usage7(0.0, 95.0, _iso_at(now + 6.5 * 3600)),  # warm: headroom 5, resets in ~6.5h
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a warm perishing candidate must be taken "
+            "even though it fails the ordinary floor and giveback bars"
+        )
+        assert h.active_number() == 2
+
+    def test_t0758_narrows_375s_own_motivating_fleet_once_dwell_is_satisfied(
+        self, temp_home
+    ):
+        """`TestOutcomeDigest375`'s motivating fleet (active headroom 22,
+        candidate headroom 4 resetting a day out against the active's 5)
+        pins `NO_ACTION` on a SINGLE tick with no dwell stamp -- that
+        fixture never seeds `lastActiveAt`, so the dwell gate holds it
+        regardless of the bars this change narrows, and that pin is
+        untouched by this change. This is the same shape WITH dwell
+        satisfied: T0758's carve-out reaches it too, deliberately -- #375
+        forbade chasing whichever window resets soonest regardless of
+        cost in general, and T0758 narrows exactly that rule for a
+        candidate whose own window would otherwise expire unspent. Named
+        explicitly so the two pins are never read as contradicting one
+        another by accident."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})  # dwell elapsed; #2 stays cold
+        usage = {
+            "1": _usage7(78.0, 56.0, _iso_at(now + 5 * 86400)),  # active: headroom 22
+            "2": _usage7(0.0, 96.0, _iso_at(now + 1 * 86400)),   # cold: headroom 4, resets a day out
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — #375's own motivating fleet, once dwell is "
+            "satisfied, is exactly the case T0758 carves out"
+        )
+        assert h.active_number() == 2
+
+    def test_a_perishing_switch_still_returns_at_the_next_chunk_boundary(
+        self, temp_home
+    ):
+        """Mirrors F3's own round trip (`test_f3_alternation_fires_at_
+        the_chunk_boundary_and_returns`): landing on a perishing candidate
+        is an ordinary alternation move, bounded by the same dwell/
+        cooldown machinery as any other -- it does not grant the
+        perishing account an extended, unbounded stay."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})
+        usage = {
+            "1": _usage7(0.0, 18.0, _iso_at(now + 5 * 86400)),
+            "2": _usage7(0.0, 95.0, _iso_at(now + 6.5 * 3600)),
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED and h.active_number() == 2, (
+            f"setup: must have switched 1 -> 2, got {outcome!r} / "
+            f"{h.active_number()!r}"
+        )
+
+        h.clock.advance(chunk)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — must alternate back once the next chunk "
+            "elapses on the still-warm departed account"
         )
         assert h.active_number() == 1
 
