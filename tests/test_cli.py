@@ -1348,6 +1348,37 @@ class TestAutoCommand:
         out = capsys.readouterr().out
         assert "threshold 90%" in out, f"premise: no threshold printed: {out!r}"
 
+    def test_the_banner_confirms_an_explicit_threshold_under_dynamic(
+        self, temp_home, capsys
+    ):
+        """An operator who passes `--threshold` explicitly should see it
+        land, even under `dynamic` -- alongside the real bar, not instead
+        of it: dropping the confirmation entirely was worse than the
+        original defect for the one case where the number is exactly what
+        the operator just typed."""
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine",
+                   return_value=_Engine()), \
+                patch.object(
+                    sys, "argv",
+                    ["claude-swap", "auto", "--strategy", "dynamic",
+                     "--threshold", "80"],
+                ):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        out = capsys.readouterr().out
+        assert "threshold 80%" in out, f"the explicit flag was not echoed: {out!r}"
+        assert "switch at 97%" in out, f"the real bar was dropped: {out!r}"
+
     def test_once_is_interruptible_too(self, temp_home):
         """`--once` exits before the handlers are installed, so it has none.
 

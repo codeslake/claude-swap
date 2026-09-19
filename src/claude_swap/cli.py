@@ -766,14 +766,21 @@ Defaults live in settings.json in the backup root; flags override them.
             switch_bar = proactive_switch_bar_pct(
                 settings.strategy, settings.threshold
             )
-            # Under `dynamic` the configured threshold is not the engine's
-            # real bar (see `proactive_switch_bar_pct`) — print the bar in
-            # force instead of a rule that is not.
-            lead = (
-                f"switch at {pct_label(switch_bar)}%"
-                if settings.strategy == "dynamic"
-                else f"threshold {pct_label(settings.threshold)}%"
+            # `switch_bar != settings.threshold` is exactly when the
+            # configured threshold is not the engine's real bar (dynamic;
+            # see proactive_switch_bar_pct) -- printing it plain would
+            # misstate what the engine fires at. Shown anyway when an
+            # explicit `--threshold` was passed: an operator who just set a
+            # value should see it land, alongside the real bar.
+            show_threshold = switch_bar == settings.threshold or (
+                args.threshold is not None
             )
+            parts = []
+            if show_threshold:
+                parts.append(f"threshold {pct_label(settings.threshold)}%")
+            if switch_bar != settings.threshold:
+                parts.append(f"switch at {pct_label(switch_bar)}%")
+            lead = ", ".join(parts)
             print(
                 dimmed(
                     f"Auto-switch running: {lead}, "

@@ -1737,6 +1737,22 @@ class TestAutoScreen:
             # dynamic's configured threshold is not the engine's real bar —
             # at rest (not adjusting) the header must not claim it is.
             assert "threshold" not in summary.render().plain
+            # But a session OVERRIDE must stay visible: `_end_adjust` does
+            # not revert it, and the override still steers ranking even
+            # though it is not the switch bar.
+            await pilot.press("t")
+            await pilot.pause()
+            assert "threshold 90%" in summary.render().plain  # shown while adjusting
+            await pilot.press("right")
+            await pilot.pause()
+            assert screen._settings.threshold == 91.0
+            await pilot.press("enter")
+            await pilot.pause()
+            assert "threshold 91% (session)" in summary.render().plain, (
+                f"an overridden threshold vanished at rest under dynamic: "
+                f"{summary.render().plain!r}"
+            )
+            assert "switch at 97%" in summary.render().plain
             await pilot.press("s")
             await pilot.pause()
             assert screen._settings.strategy == "best"
