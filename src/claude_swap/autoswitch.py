@@ -166,7 +166,13 @@ DANGER_INTERVAL_S = poll_policy.URGENT_INTERVAL_S
 
 
 def proactive_switch_bar_pct(strategy: str, threshold: float) -> float:
-    """The used-% a panel should display as "where the proactive arm fires".
+    """The used-% a candidate is blocked at.
+
+    Originally a panel-only display helper ("where the proactive arm
+    fires"); since #321 also the value every landing-gate, ranking-key and
+    label comparison in ``_rank_candidates_pass`` (and its TUI/decision-log
+    mirrors) reads, except `dynamic_self_walled`, deliberately kept on the
+    raw threshold (see its own comment).
 
     Under ``dynamic`` this is NOT ``settings.threshold`` — the proactive arm
     is gated on ``_about_to_wall`` (headroom <= SPENT_HEADROOM_PCT), measured
@@ -1091,8 +1097,10 @@ def classify_candidate_block(
     :func:`oauth.relevant_windows` reports, "5h"/"7d" plus each configured
     model's scoped display name. A window blocks when its OWN pct is at or
     over ``threshold`` — the landing gate's own arithmetic
-    (``_rank_candidates_pass``: ``(100.0 - h) >= threshold`` where
-    ``h = 100 - max(pcts)``, i.e. the binding pct itself), read per window
+    (``_rank_candidates_pass``: ``(100.0 - h) >= bar`` where ``h = 100 -
+    max(pcts)``, i.e. the binding pct itself, and ``bar`` is
+    ``proactive_switch_bar_pct(strategy, settings.threshold)`` — the raw
+    threshold for every strategy but ``dynamic``, #321), read per window
     instead of folded across all of them. Three outcomes: ``"open"``
     (nothing blocks), ``"full"`` (a 5h/7d window blocks — no model choice
     escapes that one, named the same way a model block already is: the
@@ -3114,10 +3122,10 @@ class AutoSwitchEngine:
         hands `threshold` straight back; and (2), when the landing floor
         cannot answer, whether the peer's own binding reset is meaningfully
         sooner than the active's. The landing floor is UNSATISFIABLE
-        whenever the
-        fleet is all-spent — the recovery leg is what keeps the hold from
-        becoming unconditional in exactly that regime. Neither leg can tell
-        "genuinely recovered" from "was already this good" — there is
+        whenever the fleet is all-spent — the recovery leg is what keeps
+        the hold from becoming unconditional in exactly that regime. Neither
+        leg can tell "genuinely recovered" from "was already this good" —
+        there is
         nothing recorded to tell them apart. Measured which side the landing
         floor should land on: sweeping mutations of this same leg for the
         ordinary path showed an absolute floor is silently reintroducible
@@ -3585,13 +3593,16 @@ class AutoSwitchEngine:
             )
         )
 
-        # THE BAR EVERY ADMISSION/RANKING/LABEL DECISION BELOW READS (#321):
+        # THE BAR MOST ADMISSION/RANKING/LABEL DECISIONS BELOW READ (#321):
         # under `dynamic` this is `proactive_switch_bar_pct`'s 97 (100 -
         # SPENT_HEADROOM_PCT), not `settings.threshold` (90) — the owner's
         # live case, account 4 at 7d 95%/headroom 5 with its reset hours
         # away, is exactly the headroom `dynamic` exists to spend before it
         # resets, not a blocked candidate. Every other strategy gets
         # `settings.threshold` back unchanged, so this is a no-op for them.
+        # One exception below, `dynamic_self_walled`, deliberately keeps
+        # `settings.threshold` -- see its own comment for why `bar` would
+        # make that specific check always false.
         bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
 
         qualifying: list[tuple[tuple, str]] = []
@@ -3848,17 +3859,12 @@ class AutoSwitchEngine:
                 # RECOVERY argument that this key would re-order by a weekly
                 # reset. `not all_above` covers only the second — one
                 # below-threshold peer clears it, and `failover` never
-                # satisfies it at all. Unwidened for dynamic (#321): a
-                # dynamic candidate admitted through CHAIN A's own
-                # reset-ordering `elif` while `all_above` holds needs
-                # `trigger in CONSUME_FIRST_STRATEGIES` — a value no REAL
-                # dynamic tick's trigger classification produces
-                # (`_classify_dynamic_trigger` returns only
-                # "at-limit"/"proactive"/"dynamic-healthy") — so the escape
-                # key below, gated `by_recovery_axis and not dynamic_landing`
-                # just above, is what every reachable dynamic candidate in
-                # this state actually uses; measured unaffected by removing
-                # a `dynamic_landing`-only widening tried here.
+                # satisfies it at all. `dynamic` (#321) never satisfies it
+                # either: whenever `all_above` holds, `dynamic_landing`
+                # keeps the `by_recovery_axis and not dynamic_landing` key
+                # a few lines above out of reach too (its own comment), so
+                # every dynamic candidate reaching this key selection with
+                # `all_above` true falls to the escape key below instead.
                 #
                 # TIERED, because `disabled-active` and `failover` reach this
                 # arm with NO admission axis (both skip the landing gate), and
@@ -3942,24 +3948,31 @@ class AutoSwitchEngine:
                 # itself from the reset-ordered `consume_first_rank_key` arm
                 # above (`trigger != "at-limit"`), so an at-limit tick
                 # always lands here, and a candidate with h in (3, 10] (91%
-                # on its own binding window, say) is demoted by THIS check,
-                # not that one. It is a genuine, accepted asymmetry with
-                # `consume_first_rank_key`, which now tiers that same
-                # candidate "healthy" at the wider bar (97): pre-#321 both
-                # read `settings.threshold` and agreed; keeping this one on
-                # `settings.threshold` is what still catches the #321
-                # escape-axis bug in the ONE branch a true blackout always
-                # reaches, at the cost of not catching it in the branches
-                # that don't. Not a "which candidate is blocked" decision
-                # either way -- it only re-ranks within an already-admitted
-                # escape set -- so it stays outside #321's scope.
+                # on its own binding window, say) is demoted by THIS check.
+                # Not a "which candidate is blocked" decision either way --
+                # it only re-ranks within an already-admitted escape set --
+                # so it stays outside #321's scope.
                 dynamic_self_walled = (
                     dynamic_landing
                     and h > SPENT_HEADROOM_PCT
                     and (100.0 - h) >= settings.threshold
                 )
+                # THREE TIERS, NOT TWO. Folding "genuinely unservable" (h <=
+                # SPENT_HEADROOM_PCT) and "self-walled but has real spare
+                # headroom" (`dynamic_self_walled`, h > SPENT_HEADROOM_PCT)
+                # into one tier let a candidate with almost nothing left
+                # (h=1, say) beat one with a real, T0805-shaped margin (h=5,
+                # self-walled only because its OWN binding window happens to
+                # read high) purely on `escape_h` magnitude -- measured: a
+                # 1-point weekly account outranking a 5-point one because the
+                # 1-point account's escape axis read cleaner. Self-walled is
+                # worse than open but still better than actually dying.
                 key = (
-                    1 if dynamic_self_walled else (0 if h > SPENT_HEADROOM_PCT else 1),
+                    (
+                        2 if h <= SPENT_HEADROOM_PCT
+                        else 1 if dynamic_self_walled
+                        else 0
+                    ),
                     -max(escape_h if escape_h is not None else h, 0.0),
                     recovery_ts,
                 )

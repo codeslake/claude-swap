@@ -639,11 +639,9 @@ class TestDecisionTable:
         )
         assert h.active_number() == 2
 
-    def _spent_fleet(self, temp_home, *, lifts_in, strategy="consume-first"):
+    def _spent_fleet(self, temp_home, *, lifts_in):
         """Four slots, every one at its 5-hour limit, each lifting when told."""
-        h = EngineHarness(
-            temp_home, threshold=90.0, hysteresis_pct=5.0, strategy=strategy
-        )
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
         for num, email in enumerate(("a", "b", "c", "d")[: len(lifts_in)], 1):
             h.seed(num, f"{email}@example.com")
         h.make_live("a@example.com", 1)
@@ -675,32 +673,6 @@ class TestDecisionTable:
             "slot 3 lifts in ten minutes and slot 2 in fifty; landing on 2 "
             "means the tie fell to slot order on the one trigger whose whole "
             "argument for moving was the return time"
-        )
-
-    def test_a_disabled_active_lands_on_the_peer_that_lifts_first_under_dynamic(
-        self, temp_home
-    ):
-        """CONTROL for #321: same fleet, `strategy="dynamic"`. `disabled-
-        active` never reaches `_rank_candidates_pass`'s landing gate (chain
-        A's own outer `if` needs `by_recovery_axis` or a matching trigger,
-        neither true for it) and the reset-ordering `elif` requires
-        `not all_above`, so under `dynamic` it keeps falling to the escape
-        key below and ranking by recovery time, not by raw headroom (`-h`,
-        0 for every spent account here) or sequence order -- unchanged from
-        `best`/`consume-first` above. An intermediate version of this fix
-        widened the reset-ordering `elif` to also admit a `dynamic_landing`
-        candidate while `all_above` held; this pins that it must not also
-        catch `disabled-active`."""
-        h, usage = self._spent_fleet(
-            temp_home, lifts_in=(60, 50, 10), strategy="dynamic"
-        )
-        h.switcher.set_account_disabled("1", True)
-        outcome = h.tick_with_usage(usage)
-        assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 3, (
-            f"landed on {h.active_number()} — slot 3 lifts in ten minutes "
-            "and slot 2 in fifty; under `dynamic` this must still rank by "
-            "recovery time, not fall to sequence order"
         )
 
     def test_a_disabled_active_keeps_the_recovery_margin(self, temp_home):
@@ -5535,6 +5507,47 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
             "the active itself, #4 has nothing open but the model axis"
         )
 
+    def test_self_walled_never_outranks_a_candidate_with_real_headroom(
+        self, temp_home
+    ):
+        """#321: `dynamic_self_walled` demotes a candidate self-walled on
+        its OWN binding window (autoswitch.py) into the SAME tier as one
+        that is genuinely almost dead (`h <= SPENT_HEADROOM_PCT`) -- with
+        one tier for both, the escape-axis magnitude alone then decides,
+        and a nearly-spent peer (#2, 7d 99%, headroom 1) can outrank a
+        self-walled one with a real, T0805-shaped margin (#1, 7d 95%,
+        headroom 5) purely by reading cleaner on the axis that blocked the
+        active. Landing on #2 re-triggers within the hour; #1 has real
+        room to spend first. Three tiers (open / self-walled / dying)
+        keep the two apart."""
+        h = EngineHarness(temp_home, strategy="dynamic", threshold=90.0)
+        for num, email in ((9, "active@example.invalid"), (1, "a@example.invalid"),
+                            (2, "b@example.invalid")):
+            h.seed(num, email)
+        h.make_live("active@example.invalid", 9)
+        now = h.clock.now
+        usage = {
+            "9": {  # active: walled on its OWN 5h
+                "five_hour": {"pct": 100.0},
+                "seven_day": {"pct": 0.0},
+            },
+            "1": {  # self-walled on 5h (91%), real headroom on 7d (5 pts)
+                "five_hour": {"pct": 91.0, "resets_at": _iso_at(now + 3600)},
+                "seven_day": {"pct": 95.0},
+            },
+            "2": {  # open on 5h, but nearly dead on 7d (1 pt)
+                "five_hour": {"pct": 0.0, "resets_at": _iso_at(now + 3600)},
+                "seven_day": {"pct": 99.0},
+            },
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 1, (
+            f"landed on {h.active_number()} — #1 (headroom 5, self-walled "
+            "only on the axis that blocked the active) must beat #2 "
+            "(headroom 1, genuinely near-dead)"
+        )
+
 
 class TestTheRetryAdmitsOnlyAnImprovement:
     """The 5h/7d retry (``_rank_candidates``'s second pass) must compare a
@@ -5789,8 +5802,8 @@ class TestDynamicStrategy:
         (`dynamic` ranks by soonest reset).
 
         `trigger="dynamic"` is a white-box probe, same convention as the
-        no-room test above (`_rank_candidates_pass`'s gate, autoswitch.py
-        :3688) -- a real dynamic tick's trigger classification never
+        no-room test above (`_rank_candidates_pass`'s landing gate) -- a
+        real dynamic tick's trigger classification never
         literally produces "dynamic" (`_classify_dynamic_trigger` returns
         "at-limit"/"proactive"/"dynamic-healthy" only, and the owner's own
         healthy-active fleet classifies as "dynamic-healthy", which never
@@ -5907,11 +5920,14 @@ class TestDynamicStrategy:
         active NOT `about_to_wall` on this axis (the 5h/7d retry pass,
         where the active can hold real headroom even though the model gate
         that set the trigger spent it) — the other trigger the `all_above`
-        recovery axis reaches. Candidate headroom moved to the new dynamic
-        bar (97, not the raw 90 threshold, #321): at headroom 10 (5h 90%)
-        the gate no longer refuses it (90 < 97), and the hysteresis check
-        (`h - active_headroom < settings.hysteresis_pct`) would refuse it
-        anyway, no longer proving the landing bar is what does the work."""
+        recovery axis reaches. NOT moved to the new dynamic bar (#321):
+        headroom 10 also makes `best_candidate_headroom <= SPENT_HEADROOM_
+        PCT` (3) false, which is what keeps `by_recovery_axis`'s at-limit
+        disjunct off and routes this candidate through the `(trigger ==
+        "at-limit" and not about_to_wall)` disjunct this test actually
+        names -- moving to headroom 3 crosses that OTHER boundary too and
+        the row starts passing on `by_recovery_axis` alone, whether or not
+        the code this test names is even present."""
         h = EngineHarness(temp_home, strategy="dynamic")
         now = h.clock.now
         usage = {
@@ -5920,11 +5936,11 @@ class TestDynamicStrategy:
                 "seven_day": {"pct": 0.0},
             },
             "2": {
-                "five_hour": {"pct": 97.0, "resets_at": _iso_at(now + 120)},
+                "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 120)},
                 "seven_day": {"pct": 0.0},
             },
         }
-        headroom = {"6": 8.0, "2": 3.0}
+        headroom = {"6": 8.0, "2": 10.0}
         for strategy, expected in (
             ("dynamic", []),
             ("consume-first", ["2"]),

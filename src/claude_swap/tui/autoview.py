@@ -525,15 +525,13 @@ class AutoScreen(Screen):
                 # a model-only block (the engine's fallback ranks around it).
                 # The CLASSIFICATION (open/model/full) reads the same way
                 # here as in the decision log — same helper,
-                # `classify_candidate_block`, now the same strategy-aware
-                # `bar` the engine's own landing gate reads (#321: this used
-                # to be `self._settings.threshold` unconditionally, which
-                # under `dynamic` called a candidate with real headroom left
-                # "7d full"). It still does not fold in the engine's other,
-                # separate, stricter landing floor -- `cold_switch_cost_pct`
-                # in autoswitch.py -- a candidate clearing this label can
-                # still fail that one. Always on `models`, the full pinned
-                # set: this label explains why the row is not simply "open"
+                # `classify_candidate_block`, the same strategy-aware `bar`
+                # the engine's own landing gate reads (#321). It still does
+                # not fold in the engine's other, separate, stricter landing
+                # floor -- `cold_switch_cost_pct` in autoswitch.py -- a
+                # candidate clearing this label can still fail that one.
+                # Always on `models`, the full pinned set: this label
+                # explains why the row is not simply "open"
                 # on the criteria the user actually configured, independent
                 # of whether `rank_models` below has dropped to the retry's
                 # axis for ORDERING purposes.
