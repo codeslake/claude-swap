@@ -2154,8 +2154,9 @@ class TestAutoScreen:
         yet and is not something a consume-first tick would do (it revisits
         the rest on later ticks, once the active's own reset moves). Of six
         peers only "5" resets sooner than the active's 1.75 days out; the
-        other four must be named "not a candidate" rather than fleet-wide
-        sorted as if every one of them were reachable this tick."""
+        other four must be named "not a candidate", and -- unranked as they
+        are -- still keep the fallback's own soonest-reset order rather
+        than the account-number tie-break the un-fixed fallback used."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -2205,13 +2206,11 @@ class TestAutoScreen:
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
-            positions = {
-                n: plain.index(f"user{n}@example.com")
-                for n in ("5", "1", "2", "3", "6")
-            }
-            assert positions["5"] == min(positions.values()), plain
-            five_row = plain[positions["5"]:positions["1"]]
-            assert "not a candidate" not in five_row, plain
+            positions = [
+                plain.index(f"user{n}@example.com")
+                for n in ("5", "3", "2", "1", "6", "7")
+            ]
+            assert positions == sorted(positions), plain
             assert plain.count("not a candidate") == 4, plain
 
 
@@ -2558,7 +2557,7 @@ class TestUnswitchableRowsAreListed:
         )
 
     def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
-              sentinel=None, disabled=False):
+              sentinel=None, disabled=False, usage=None):
         from unittest.mock import MagicMock
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
@@ -2567,7 +2566,10 @@ class TestUnswitchableRowsAreListed:
         # ranking pass's own read) is real code, not an auto-mocked
         # callable, and needs actual `sentinel`/`last_good`/`age_s` to
         # answer correctly. `age_s=0.0` reads as freshly-fetched.
-        a.usage = UsageEntry(
+        # `usage`, when given, is a caller-built `UsageEntry` (e.g. a
+        # stale one, `age_s` past `STALE_OK_S`) that overrides the
+        # freshly-fetched default entirely.
+        a.usage = usage or UsageEntry(
             sentinel=sentinel, last_good=last_good,
             fetched_at=time.time(), age_s=0.0,
         )
@@ -3184,6 +3186,47 @@ class TestUnswitchableRowsAreListed:
         assert panel_top == engine_pick, (
             f"panel top={panel_top!r}, engine picked {engine_pick!r} — "
             f"panel out:\n{rendered}"
+        )
+
+    def test_an_unranked_row_still_orders_a_known_reset_before_an_unknown_one(self):
+        """When the active's own usage reading is stale (`age_s` past
+        `STALE_OK_S`, `decision_value()` -> None) the ranking pass never
+        runs (`trigger == "unreadable-active"`, `ordered` empty) and every
+        candidate falls to the panel's fallback key. Before #371 that
+        fallback was reset-based (`consume_first_rank_key` ->
+        `_seven_day_reset_ts`, `+inf` for unknown); #371 flattened it to a
+        single literal, so ties broke on the account NUMBER STRING instead
+        -- an unknown-reset account ("2") sorted above a known, soon-reset
+        one ("3"). Adapted from the integration branch's probe-era
+        regression (46f000bd) to this base, which has no probe mechanism;
+        the shared root cause is the same: a stale/unreadable active
+        leaves `ordered` empty and collapses every row to one flat key.
+        """
+        stale_active = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 20.0},
+                "seven_day": {"pct": 20.0, "resets_at": _iso_in(8 * 86400)},
+            },
+            fetched_at=time.time() - STALE_OK_S - 100.0,
+            age_s=STALE_OK_S + 100.0,
+        )
+        unknown = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        known_soon = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(5 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, usage=stale_active),
+            self._acct("2", "b@x.com", switchable=True, last_good=unknown),
+            self._acct("3", "c@x.com", switchable=True, last_good=known_soon),
+        ), active="1", settings=AutoSwitchSettings(strategy="consume-first"))
+        positions = {n: out.index(e) for n, e in
+                     {"2": "b@x.com", "3": "c@x.com"}.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == "3", (
+            f"panel put the unknown-reset account on top ({panel_top!r}) "
+            f"while the active account's own reset is stale and unknown to "
+            f"the engine -- panel out:\n{out}"
         )
 
 
