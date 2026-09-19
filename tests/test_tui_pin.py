@@ -1020,8 +1020,8 @@ class TestAnOrphanedRecordDoesNotHideItsOwnRemoval:
         """`_pin_entries` lists accounts in slot order on purpose: you pick
 
         the one to pin BY its slot number, so ranking the list would move
-        rows between opens. Like the other two slot-ordered menus, the
-        title must state that reason, not just the label.
+        rows between opens. A list that keeps its order only for a
+        reason states that reason in the title, not just the label.
         """
         from claude_swap.tui import dashboard as _dash
         from textual.widgets import Static
