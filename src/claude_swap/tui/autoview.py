@@ -521,8 +521,17 @@ class AutoScreen(Screen):
                 # configured, independent of whether `rank_models` below has
                 # dropped to the retry's axis for ORDERING purposes.
                 if self._settings:
+                    # The bar this row is actually judged against, not the
+                    # raw configured value: under `dynamic` the engine's
+                    # real proactive gate sits at `proactive_switch_bar_pct`
+                    # (97 by default), not `settings.threshold` -- the same
+                    # derivation `_update_summary` already uses for the `·
+                    # switch at N%` line, so the two never disagree.
+                    bar = proactive_switch_bar_pct(
+                        self._settings.strategy, self._settings.threshold
+                    )
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows), self._settings.threshold
+                        ((label, p) for label, p, _ in windows), bar
                     )
                     if kind == "model":
                         entry.append(
@@ -530,7 +539,27 @@ class AutoScreen(Screen):
                             style=palette.muted,
                         )
                     elif kind == "full":
-                        entry.append(f"  {blocked_model} full", style=palette.muted)
+                        # `classify_candidate_block` only says the window is
+                        # at or over `bar`, not that it is exhausted -- under
+                        # `dynamic` the bar sits below 100, so a candidate
+                        # can land here with real headroom left (the owner's
+                        # report: 92% read `7d full` against a bar of 97).
+                        # "full" stays reserved for actual exhaustion; a
+                        # blocked-but-not-empty window names the bar it was
+                        # judged against instead.
+                        window_pct = next(
+                            p for label, p, _ in windows if label == blocked_model
+                        )
+                        if window_pct >= 100.0:
+                            entry.append(
+                                f"  {blocked_model} full", style=palette.muted
+                            )
+                        else:
+                            entry.append(
+                                f"  {blocked_model} {pct_label(window_pct)}%"
+                                f" >= {pct_label(bar)}%",
+                                style=palette.muted,
+                            )
                 rank_pct = binding_pct(acc.usage.last_good, rank_models)
                 key = (
                     consume_first_rank_key(

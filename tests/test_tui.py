@@ -2551,14 +2551,78 @@ class TestUnswitchableRowsAreListed:
                 "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
                 "scoped": [{"name": "Fable", "pct": 95.0}],
             }),
-            # Full block: 5h itself is over the bar, no model choice escapes it.
+            # Full block: 5h is genuinely exhausted (100%), no model choice
+            # escapes it. `full` means nothing-left, not merely over the
+            # bar -- see the parametrized test below for the blocked-but-
+            # not-exhausted wording.
             self._acct("3", "c@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 5.0},
+                "five_hour": {"pct": 100.0}, "seven_day": {"pct": 5.0},
                 "scoped": [{"name": "Fable", "pct": 10.0}],
             }),
         ), active="1", settings=settings)
         assert "Fable-walled" in out, out
         assert "  5h full" in out, out
+
+    @pytest.mark.parametrize(
+        ("strategy", "bar", "row_92"),
+        [
+            ("dynamic", "97", None),
+            ("best", "90", "7d 92% >= 90%"),
+        ],
+    )
+    def test_the_full_label_is_reserved_for_actual_exhaustion(
+        self, strategy, bar, row_92
+    ):
+        """The owner's report, 2026-09-17: under `dynamic` a 7d window at
+        92% printed `7d full` against the configured threshold of 90, while
+        the engine's real bar (`proactive_switch_bar_pct`) was 97 and the
+        account was perfectly landable. `full` must mean nothing left (the
+        window's own pct at or over 100); a window merely at or over the
+        bar says so with the bar in view instead, and a window under the
+        bar carries no block label at all.
+
+        `best` is the CONTROL: its bar is the configured threshold itself
+        (`proactive_switch_bar_pct` only widens it under `dynamic`), so the
+        92% row IS blocked there and reads `>= 90%`, not `>= 97%` --
+        proving the bar is strategy-aware, not just the wording.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy=strategy, threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "hundred@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 100.0},
+            }),
+            self._acct("3", "ninetyeight@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 98.0},
+            }),
+            self._acct("4", "ninetytwo@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 92.0},
+            }),
+            self._acct("5", "fifty@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 50.0},
+            }),
+        ), active="1", settings=settings)
+
+        rows = {
+            email: next(line for line in out.split("\n") if email in line)
+            for email in (
+                "hundred@x.com", "ninetyeight@x.com",
+                "ninetytwo@x.com", "fifty@x.com",
+            )
+        }
+        assert "7d full" in rows["hundred@x.com"], rows["hundred@x.com"]
+        assert f"7d 98% >= {bar}%" in rows["ninetyeight@x.com"], (
+            rows["ninetyeight@x.com"]
+        )
+        if row_92 is None:
+            assert "full" not in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
+            assert ">=" not in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
+        else:
+            assert row_92 in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
+        assert "full" not in rows["fifty@x.com"], rows["fifty@x.com"]
+        assert ">=" not in rows["fifty@x.com"], rows["fifty@x.com"]
 
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a
