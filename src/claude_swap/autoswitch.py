@@ -894,6 +894,28 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     return None
 
 
+def _perishes_before_active(
+    candidate_usage: dict | str | None,
+    active_usage: dict | str | None,
+    now: float,
+) -> bool:
+    """Whether a candidate's 7-day window resets sooner than the active's own
+    (T0758): the active's own headroom will still be there next tick, but a
+    candidate's window that resets first expires whatever it is not spent
+    on. Both read through `_seven_day_reset_ts`, so a None (unknown or
+    already past) candidate reset is never "sooner" -- it sorts to +inf like
+    the ranking key `_rank_dynamic_candidates` already uses, and must keep
+    losing. A None active reset reads as +inf too: nothing pending on the
+    active's own side to expire unspent, so any real candidate reset counts
+    as sooner.
+    """
+    candidate_ts = _seven_day_reset_ts(candidate_usage, now)
+    if candidate_ts is None:
+        return False
+    active_ts = _seven_day_reset_ts(active_usage, now)
+    return active_ts is None or candidate_ts < active_ts
+
+
 def consume_first_rank_key(
     usage: dict | str | None,
     threshold: float,
@@ -2250,11 +2272,25 @@ class AutoSwitchEngine:
             # two-sided form would repeal alternation entirely. One list,
             # shared with `dynamic_ordered` below, so the fallback past an
             # untrustworthy top pick lands under the same two bars.
+            #
+            # T0758: both bars price a switch against headroom that will
+            # still be there later -- false for a candidate whose 7-day
+            # window resets BEFORE the active's, since its remaining room
+            # expires unspent regardless. Such a candidate is exempt from
+            # both bars and from the warm-only sourcing (it may come from
+            # `cold_ordered`); it still had to clear `SPENT_HEADROOM_PCT`
+            # to reach either list at all.
             alternation_admissible = [
                 n for n in warm_ordered
-                if floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
-                and floor_headroom.get(current, 0.0) - floor_headroom.get(n, 0.0)
-                <= ALTERNATION_MAX_GIVEBACK_PCT
+                if (
+                    floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                    and floor_headroom.get(current, 0.0) - floor_headroom.get(n, 0.0)
+                    <= ALTERNATION_MAX_GIVEBACK_PCT
+                )
+                or _perishes_before_active(usage.get(n), usage.get(current), now)
+            ] + [
+                n for n in cold_ordered
+                if _perishes_before_active(usage.get(n), usage.get(current), now)
             ]
             partner = next(iter(alternation_admissible), None)
             since = last_active_at.get(current)

@@ -6674,6 +6674,83 @@ class TestWarmthAndAlternation375:
         )
         assert h.active_number() == 2
 
+    # -- item 5 (T0758): a perishing window is exempt from the floor and
+    # giveback bars, and from warm-only sourcing -------------------------
+
+    def test_the_owners_row_a_perishing_candidate_is_taken_over_a_distant_reset(
+        self, temp_home
+    ):
+        """The owner's live trace (2026-09-19, dynamic, threshold 90): a
+        healthy active sat on a weekly reset days out while a COLD
+        candidate at 7d 95% (headroom 5) -- resetting in about 6h29m --
+        was never switched to. Both the absolute floor (`cold_switch_
+        cost_pct`) and the giveback bar (`ALTERNATION_MAX_GIVEBACK_PCT`)
+        price a switch against headroom that will still be there later;
+        that premise is false when the candidate's own window expires
+        first. `dynamic`'s job is to fill a window before it resets, not
+        let it lapse unspent.
+        """
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})  # dwell elapsed; #2 stays cold
+        usage = {
+            "1": _usage7(0.0, 18.0, _iso_at(now + 5 * 86400)),   # active: headroom 82, resets in days
+            "2": _usage7(0.0, 95.0, _iso_at(now + 6.5 * 3600)),  # cold: headroom 5, resets in ~6.5h
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a perishing candidate must be taken even "
+            "cold and below the ordinary floor/giveback bars"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 2
+
+    def test_control_the_bars_still_bind_when_the_candidates_reset_is_later(
+        self, temp_home
+    ):
+        """Same two accounts, but #2's reset is LATER than #1's -- not
+        perishing, so today's floor still refuses it (`below-floor`, the
+        same hold this scenario reports without the fix)."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})
+        usage = {
+            "1": _usage7(0.0, 18.0, _iso_at(now + 1 * 3600)),    # active: headroom 82, resets sooner
+            "2": _usage7(0.0, 95.0, _iso_at(now + 10 * 86400)),  # cold: headroom 5, resets LATER
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — #2's reset is later than #1's, so it is "
+            "not perishing and the ordinary floor still applies"
+        )
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], reasons
+        assert h.active_number() == 1
+
+    def test_control_the_spent_floor_still_binds_for_a_perishing_candidate(
+        self, temp_home
+    ):
+        """A perishing candidate is still refused once its own headroom
+        sits at or below `SPENT_HEADROOM_PCT`: nothing worth taking, no
+        matter how soon it resets."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})
+        usage = {
+            "1": _usage7(0.0, 18.0, _iso_at(now + 5 * 86400)),  # active: headroom 82
+            "2": _usage7(0.0, 98.0, _iso_at(now + 1 * 3600)),   # headroom 2 -- at/under the spent floor
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — headroom 2 is at/under SPENT_HEADROOM_PCT "
+            "and must still be refused even though it perishes sooner"
+        )
+        assert h.active_number() == 1
+
 
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
