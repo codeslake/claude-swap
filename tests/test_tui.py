@@ -1908,8 +1908,10 @@ class TestAutoScreen:
     async def test_candidates_keep_the_model_gate_under_best_even_when_every_row_is_model_only(
         self, tmp_path, fake_engine
     ):
-        """The regression this gate exists to stop: same fleet as the test
-        above (both candidates blocked ONLY by the pinned model), but
+        """The regression this gate exists to stop: same shape as the test
+        above (both candidates blocked ONLY by the pinned model, here at
+        95%/90% rather than the dynamic test's 99%/98% -- `best` reads the
+        raw `settings.threshold` unchanged, so 90% already blocks), but
         `strategy: "best"` — the engine's own retry never drops the model
         set for `best`/`consume-first` (autoswitch.py:2400), so the panel
         must not either. Ranking stays on the model-gated axis: #3 (90%

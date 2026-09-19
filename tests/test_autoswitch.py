@@ -639,9 +639,11 @@ class TestDecisionTable:
         )
         assert h.active_number() == 2
 
-    def _spent_fleet(self, temp_home, *, lifts_in):
+    def _spent_fleet(self, temp_home, *, lifts_in, strategy="consume-first"):
         """Four slots, every one at its 5-hour limit, each lifting when told."""
-        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        h = EngineHarness(
+            temp_home, threshold=90.0, hysteresis_pct=5.0, strategy=strategy
+        )
         for num, email in enumerate(("a", "b", "c", "d")[: len(lifts_in)], 1):
             h.seed(num, f"{email}@example.com")
         h.make_live("a@example.com", 1)
@@ -673,6 +675,30 @@ class TestDecisionTable:
             "slot 3 lifts in ten minutes and slot 2 in fifty; landing on 2 "
             "means the tie fell to slot order on the one trigger whose whole "
             "argument for moving was the return time"
+        )
+
+    def test_a_disabled_active_lands_on_the_peer_that_lifts_first_under_dynamic(
+        self, temp_home
+    ):
+        """CONTROL for #805: same fleet, `strategy="dynamic"`. `disabled-
+        active` never reaches `_rank_candidates_pass`'s landing gate (chain
+        A's own outer `if` needs `by_recovery_axis` or a matching trigger,
+        neither true for it), so it never goes through the reset-ordering
+        `elif` this task widened for dynamic's OWN reset-ordering admission
+        -- that widening is narrowed to `trigger in CONSUME_FIRST_
+        STRATEGIES` precisely so `disabled-active` still falls to the escape
+        key below and keeps ranking by recovery time, not by raw headroom
+        (`-h`, 0 for every spent account here) or sequence order."""
+        h, usage = self._spent_fleet(
+            temp_home, lifts_in=(60, 50, 10), strategy="dynamic"
+        )
+        h.switcher.set_account_disabled("1", True)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} — slot 3 lifts in ten minutes "
+            "and slot 2 in fifty; under `dynamic` this must still rank by "
+            "recovery time, not fall to sequence order"
         )
 
     def test_a_disabled_active_keeps_the_recovery_margin(self, temp_home):
@@ -5412,11 +5438,16 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
     """The owner's own fleet (lmd42, 2026-09-08 ~01:2xZ, `dynamic`,
     threshold 90, Fable pinned): active #3 is Fable-100 (walled on the
     model axis), and #7 clears the Fable axis (10%) but is ITSELF over the
-    dynamic landing bar on its own 5h (98%, #805: 97 under dynamic, not
-    the raw 90 threshold) -- genuinely unusable, would re-trigger the very
-    next tick. #2 is the only account below threshold on every axis (5h
-    40, 7d 65, Fable 89) and is the only correct target. 1/5/6 are
-    7d-walled, #4 is Fable-walled with nothing else open.
+    departure threshold on its own 5h (91%) -- genuinely unusable, would
+    re-trigger the very next tick. #2 is the only account below threshold
+    on every axis (5h 40, 7d 65, Fable 89) and is the only correct target.
+    1/5/6 are 7d-walled, #4 is Fable-walled with nothing else open.
+
+    `dynamic_self_walled` (autoswitch.py) deliberately stays keyed on
+    `settings.threshold`, not the wider dynamic bar (#805): the two are
+    `100 - SPENT_HEADROOM_PCT` apart for dynamic by construction, so
+    reading the wider bar here would make the servable/self-walled
+    conjuncts mutually exclusive and this demotion would never fire.
 
     Reproduces the escape-axis ranking bug: `_rank_candidates_pass`'s
     at-limit escape ranked candidates by `escape_h` (headroom on the SAME
@@ -5441,7 +5472,7 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
                 "scoped": [{"name": "Fable", "pct": 89.0, "resets_at": iso(days=6, hours=5)}],
             },
             "7": {  # clear on Fable, but genuinely walled on its OWN 5h
-                "five_hour": {"pct": 98.0, "resets_at": iso(hours=3, minutes=13)},
+                "five_hour": {"pct": 91.0, "resets_at": iso(hours=3, minutes=13)},
                 "seven_day": {"pct": 18.0, "resets_at": iso(days=3, hours=20)},
                 "scoped": [{"name": "Fable", "pct": 10.0}],
             },
@@ -5475,9 +5506,8 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
         assert h.active_number() == 2, (
             f"landed on {h.active_number()} — #2 is the only account below "
             "threshold on every axis; #7 clears only the axis that blocked "
-            "the active and is itself over the dynamic landing bar on its "
-            "own 5h, #3 is the active itself, #4 has nothing open but the "
-            "model axis"
+            "the active and is itself over threshold on its own 5h, #3 is "
+            "the active itself, #4 has nothing open but the model axis"
         )
 
 

@@ -3837,7 +3837,8 @@ class AutoSwitchEngine:
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
             elif consume_first and trigger != "at-limit" and (
-                not all_above or dynamic_landing
+                not all_above
+                or (dynamic_landing and trigger in CONSUME_FIRST_STRATEGIES)
             ):
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
@@ -3849,17 +3850,28 @@ class AutoSwitchEngine:
                 # key would re-order by a weekly reset. `not all_above`
                 # covers that case; `failover` never satisfies it at all.
                 #
-                # `OR dynamic_landing` (#805): the key above is gated
-                # `by_recovery_axis and not dynamic_landing`, not
-                # `by_recovery_axis` alone -- `by_recovery_axis` itself stays
-                # keyed on `all_above` for every strategy (the `waiting` flag
-                # below reads it too), but dynamic's own admission for an
-                # `all_above` candidate comes from CHAIN A's `elif trigger in
+                # `OR (dynamic_landing and trigger in CONSUME_FIRST_STRATEGIES)`
+                # (#805): the key above is gated `by_recovery_axis and not
+                # dynamic_landing`, not `by_recovery_axis` alone --
+                # `by_recovery_axis` itself stays keyed on `all_above` for
+                # every strategy (the `waiting` flag below reads it too),
+                # but a `dynamic` candidate admitted while `all_above` holds
+                # comes from CHAIN A's `elif trigger in
                 # CONSUME_FIRST_STRATEGIES` above instead, itself a
                 # reset-ordering gate (`reset_ts < active_reset_ts`, same
                 # axis this key sorts by), never a recovery argument. Falling
                 # to the escape key below instead ranks by raw headroom,
                 # which is not what "dynamic ranks by soonest reset" means.
+                # `trigger in CONSUME_FIRST_STRATEGIES` NARROWS it to exactly
+                # that admission path: `disabled-active`/`failover` under
+                # `dynamic` with `all_above` reach this same `elif` on
+                # `dynamic_landing` alone if it is dropped, but CHAIN A never
+                # admits THEM through the reset-ordering branch -- they skip
+                # chain A's gate entirely (its outer `if` needs `by_recovery_
+                # axis` or a matching trigger, neither true for them) -- so
+                # ranking them here instead of the escape key below is a
+                # regression, not a fix (measured: it silently changed which
+                # peer a disabled-active fleet lands on).
                 #
                 # TIERED, because `disabled-active` and `failover` reach this
                 # arm with NO admission axis (both skip the landing gate), and
@@ -3924,18 +3936,31 @@ class AutoSwitchEngine:
                 # emergency where nothing clears the threshold still lands
                 # somewhere): `escape_h` ranks by the axis that blocked the
                 # ACTIVE, not this candidate's OWN worst window, so a peer
-                # that is itself over `bar` on a different axis (its own 5h,
-                # say -- #805: `bar` is `proactive_switch_bar_pct`, 97 under
-                # dynamic, not `settings.threshold`) can outrank one with
-                # real headroom everywhere purely because it happens to be
-                # clear on the window the active is walled on -- landing
-                # there re-triggers the very next tick (measured live, #321
-                # follow-up: a Fable-100 active passed over a Fable-89/
-                # 5h-40/7d-65 candidate for a Fable-10/5h-91 one).
+                # that is itself over `settings.threshold` on a different
+                # axis (its own 5h, say) can outrank one with real headroom
+                # everywhere purely because it happens to be clear on the
+                # window the active is walled on -- landing there re-triggers
+                # the very next tick (measured live, #321 follow-up: a
+                # Fable-100 active passed over a Fable-89/5h-40/7d-65
+                # candidate for a Fable-10/5h-91 one).
+                #
+                # DELIBERATELY `settings.threshold`, NOT `bar` (#805).
+                # `bar` is `100 - SPENT_HEADROOM_PCT` for dynamic exactly,
+                # so `h > SPENT_HEADROOM_PCT and (100.0 - h) >= bar` would
+                # read `h > 3 and h <= 3` -- always false, silently
+                # disabling this demotion for every dynamic fleet (measured:
+                # it stopped catching the Fable-10/5h-91 case above). This
+                # comparison never EXCLUDES a candidate (unlike the landing
+                # gate, `consume_first_rank_key` and the label helper) --
+                # it only re-ranks within the already-admitted escape set --
+                # so it is outside #805's "which candidate is blocked"
+                # scope, and account-4-shaped candidates (headroom 5, real
+                # spend-worthy headroom) never reach this branch: they take
+                # the reset-ordered `consume_first_rank_key` arm above.
                 dynamic_self_walled = (
                     dynamic_landing
                     and h > SPENT_HEADROOM_PCT
-                    and (100.0 - h) >= bar
+                    and (100.0 - h) >= settings.threshold
                 )
                 key = (
                     1 if dynamic_self_walled else (0 if h > SPENT_HEADROOM_PCT else 1),
