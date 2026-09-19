@@ -1793,6 +1793,21 @@ class TestAutoScreen:
             assert "(session)" not in summary.render().plain  # not an override
             assert "switch at 97%" in summary.render().plain
 
+            # A session override that lands EXACTLY on the shipped default
+            # (80 -> 90) is still a live override -- the default-comparison
+            # disjunct alone would miss this, since 90 == default.
+            screen = app.screen
+            await pilot.press("t")
+            screen.action_threshold_step(10.0)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert screen._settings.threshold == 90.0
+            assert "threshold 90% (session)" in summary.render().plain, (
+                f"a session override landing on the default vanished: "
+                f"{summary.render().plain!r}"
+            )
+
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine
     ):

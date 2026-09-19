@@ -259,16 +259,20 @@ class AutoScreen(Screen):
         # the proactive arm's real bar (dynamic; see
         # proactive_switch_bar_pct) -- printing it plain would misstate what
         # the panel fires at. Shown anyway while adjusting it (`t` + arrows,
-        # the number being changed) or when it is not the shipped default:
-        # it still steers ranking (`_model_window_binds_everywhere` and
+        # the number being changed), or when it differs from the shipped
+        # default, or when it differs from the mount-time file value: either
+        # way it still steers ranking (`_model_window_binds_everywhere` and
         # friends), so a deliberately-chosen value -- persisted in
         # settings.json or overridden this session, `_end_adjust` reverts
         # neither -- must stay visible, not read as "nothing to see here"
-        # alongside a value that IS the untouched default.
+        # alongside a value that IS the untouched default. The two disjuncts
+        # are independent: a session override FROM a non-default file value
+        # BACK TO the default (80 -> 90) is still a live override.
         show_threshold = (
             self._adjusting
             or bar == self._settings.threshold
             or self._settings.threshold != SETTING_SPECS["autoswitch.threshold"].default
+            or self._settings.threshold != self._configured_threshold
         )
         if show_threshold:
             text.append(
