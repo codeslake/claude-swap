@@ -5442,8 +5442,9 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
     `dynamic_self_walled` (autoswitch.py) deliberately stays keyed on
     `settings.threshold`, not the wider dynamic bar (#321): the wider bar
     equals `100 - SPENT_HEADROOM_PCT` for dynamic by construction, so
-    reading it here would make the servable/self-walled conjuncts
-    (`h > SPENT_HEADROOM_PCT` and `(100 - h) >= bar`) mutually exclusive
+    reading it here would make `dynamic_self_walled` (`(100 - h) >= bar`)
+    agree with the tier guard that gates it (`h <= SPENT_HEADROOM_PCT`,
+    i.e. `h > SPENT_HEADROOM_PCT` to even reach this check) for every h,
     and this demotion would never fire.
 
     Reproduces the escape-axis ranking bug: `_rank_candidates_pass`'s
