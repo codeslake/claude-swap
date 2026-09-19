@@ -3220,6 +3220,13 @@ class TestUnswitchableRowsAreListed:
             self._acct("2", "b@x.com", switchable=True, last_good=unknown),
             self._acct("3", "c@x.com", switchable=True, last_good=known_soon),
         ), active="1", settings=AutoSwitchSettings(strategy="consume-first"))
+        # CONTROL that the ranking pass really never ran -- else `ordered_
+        # rank` could supply this same order for an unrelated reason and
+        # the assertion below would cover nothing.
+        assert "not previewed (active status unknown)" in out, (
+            f"the ranking pass ran after all, so this test proves nothing "
+            f"about the fallback key: {out!r}"
+        )
         positions = {n: out.index(e) for n, e in
                      {"2": "b@x.com", "3": "c@x.com"}.items()}
         panel_top = min(positions, key=positions.get)

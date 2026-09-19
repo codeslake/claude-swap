@@ -403,6 +403,10 @@ class AutoScreen(Screen):
             snap, settings, now, active_number
         )
         ordered_rank = {num: i for i, num in enumerate(ordered)}
+        # Captured before the loop rebinds `now` below (per-row, for the
+        # window chips) -- the fallback key must agree with the SAME `now`
+        # the admission pass above just ran on, not a fresh read.
+        admission_now = now
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -553,7 +557,7 @@ class AutoScreen(Screen):
                 # unknown last (`+inf`) -- the pre-#371 reading
                 # (`consume_first_rank_key`), for ties only, never touching
                 # a row the pass DID admit.
-                reset_ts = _seven_day_reset_ts(acc.usage.last_good, now)
+                reset_ts = _seven_day_reset_ts(acc.usage.last_good, admission_now)
                 key = (
                     (0, ordered_rank[acc.number])
                     if acc.number in ordered_rank

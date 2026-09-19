@@ -27,6 +27,7 @@ from claude_swap.autoswitch import (
     _dynamic_active_headroom,
     _headroom_by_account,
     _model_window_binds_everywhere,
+    _seven_day_reset_ts,
     rank_candidates_pass,
 )
 from claude_swap.exceptions import ClaudeSwitchError
@@ -339,7 +340,12 @@ def ordered_accounts(
             return (2,)
         if binding_pct(acc.usage.last_good, models) is None:
             return (3,)
-        return (1,)
+        # Soonest 7-day reset first, unknown last -- matches the auto
+        # view's own fallback key for a row its admission pass refused
+        # (autoview.py's `_candidates_text`), or the two screens can list
+        # this same unranked row in two different orders.
+        reset_ts = _seven_day_reset_ts(acc.usage.last_good, now)
+        return (1, reset_ts if reset_ts is not None else float("inf"))
 
     others.sort(key=lambda a: (bucket(a), a.number))  # matches the auto view's tie-break
     numbers = [acc.number for acc in others]
