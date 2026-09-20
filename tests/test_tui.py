@@ -1737,9 +1737,10 @@ class TestAutoScreen:
             # dynamic's configured threshold is not the engine's real bar —
             # at rest (not adjusting) the header must not claim it is.
             assert "threshold" not in summary.render().plain
-            # But a session OVERRIDE must stay visible: `_end_adjust` does
-            # not revert it, and the override still steers ranking even
-            # though it is not the switch bar.
+            # A session OVERRIDE does not outlive the adjust mode: ending it
+            # (`enter`) returns to "at rest", where dynamic's header names
+            # only the bar in force, never the configured threshold, even
+            # though the override still steers ranking underneath.
             await pilot.press("t")
             await pilot.pause()
             assert "threshold 90%" in summary.render().plain  # shown while adjusting
@@ -1748,8 +1749,8 @@ class TestAutoScreen:
             assert screen._settings.threshold == 91.0
             await pilot.press("enter")
             await pilot.pause()
-            assert "threshold 91% (session)" in summary.render().plain, (
-                f"an overridden threshold vanished at rest under dynamic: "
+            assert "threshold" not in summary.render().plain, (
+                f"a non-bar threshold leaked at rest under dynamic: "
                 f"{summary.render().plain!r}"
             )
             assert "switch at 97%" in summary.render().plain
@@ -1767,46 +1768,6 @@ class TestAutoScreen:
             # reverts to the file value, same precedent as the threshold.
             await self._open(pilot)
             assert app.screen._settings.strategy == "consume-first"
-
-    async def test_a_persisted_non_default_threshold_stays_visible_under_dynamic(
-        self, tmp_path, fake_engine
-    ):
-        """A threshold already in settings.json (not a session override)
-        still steers ranking under `dynamic` -- it must not read as
-        untouched-default just because nothing was adjusted this session."""
-        import json as _json
-
-        (tmp_path / "settings.json").write_text(_json.dumps({
-            "schemaVersion": 1,
-            "autoswitch": {"threshold": 80.0, "strategy": "dynamic"},
-        }))
-        fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
-            from textual.widgets import Static
-
-            summary = app.screen.query_one("#auto-summary", Static)
-            assert "threshold 80%" in summary.render().plain
-            assert "(session)" not in summary.render().plain  # not an override
-            assert "switch at 97%" in summary.render().plain
-
-            # A session override that lands EXACTLY on the shipped default
-            # (80 -> 90) is still a live override -- the default-comparison
-            # disjunct alone would miss this, since 90 == default.
-            screen = app.screen
-            await pilot.press("t")
-            screen.action_threshold_step(10.0)
-            await pilot.pause()
-            await pilot.press("enter")
-            await pilot.pause()
-            assert screen._settings.threshold == 90.0
-            assert "threshold 90% (session)" in summary.render().plain, (
-                f"a session override landing on the default vanished: "
-                f"{summary.render().plain!r}"
-            )
 
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine

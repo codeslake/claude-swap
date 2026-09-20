@@ -255,23 +255,10 @@ class AutoScreen(Screen):
         bar = proactive_switch_bar_pct(
             self._settings.strategy, self._settings.threshold
         )
-        # `bar != threshold` is exactly when the configured threshold is not
-        # the proactive arm's real bar (dynamic; see
-        # proactive_switch_bar_pct) -- printing it plain would misstate what
-        # the panel fires at. Shown anyway while adjusting it (`t` + arrows,
-        # the number being changed): that is the number being changed. Also
-        # shown at rest whenever the threshold is not the untouched shipped
-        # default -- not now, and not when this session started -- since it
-        # still steers ranking (`_model_window_binds_everywhere` and
-        # friends) regardless of whether the number in force right now
-        # happens to coincide with the default.
-        default_threshold = SETTING_SPECS["autoswitch.threshold"].default
-        show_threshold = (
-            self._adjusting
-            or bar == self._settings.threshold
-            or self._settings.threshold != default_threshold
-            or self._configured_threshold != default_threshold
-        )
+        # The field is the bar in force: it prints only when the threshold
+        # IS the bar (`bar == threshold`), plus while it is being adjusted
+        # (`t` + arrows) -- that is the number being changed.
+        show_threshold = self._adjusting or bar == self._settings.threshold
         if show_threshold:
             text.append(
                 f"threshold {pct_label(self._settings.threshold)}%",

@@ -1348,43 +1348,12 @@ class TestAutoCommand:
         out = capsys.readouterr().out
         assert "threshold 90%" in out, f"premise: no threshold printed: {out!r}"
 
-    def test_the_banner_confirms_an_explicit_threshold_under_dynamic(
+    def test_the_banner_hides_a_non_default_threshold_under_dynamic(
         self, temp_home, capsys
     ):
-        """An operator who passes `--threshold` explicitly should see it
-        land, even under `dynamic` -- alongside the real bar, not instead
-        of it: dropping the confirmation entirely was worse than the
-        original defect for the one case where the number is exactly what
-        the operator just typed."""
-        class _Engine:
-            dry_run = False
-
-            def stop(self):
-                pass
-
-            def run_loop(self):
-                return 0
-
-        with patch("claude_swap.autoswitch.AutoSwitchEngine",
-                   return_value=_Engine()), \
-                patch.object(
-                    sys, "argv",
-                    ["claude-swap", "auto", "--strategy", "dynamic",
-                     "--threshold", "80"],
-                ):
-            with pytest.raises(SystemExit):
-                cli.main()
-
-        out = capsys.readouterr().out
-        assert "threshold 80%" in out, f"the explicit flag was not echoed: {out!r}"
-        assert "switch at 97%" in out, f"the real bar was dropped: {out!r}"
-
-    def test_the_banner_confirms_a_persisted_non_default_threshold(
-        self, temp_home, capsys
-    ):
-        """A `--threshold` in settings.json, not on the command line, still
-        steers ranking under `dynamic` -- it must not read as untouched-
-        default just because no flag was passed this run."""
+        """A configured threshold that differs from the shipped default is
+        still not the engine's real bar under `dynamic` -- the header stays
+        silent on it regardless of how the number got there."""
         from claude_swap.paths import get_backup_root
 
         backup_dir = get_backup_root()
@@ -1392,7 +1361,7 @@ class TestAutoCommand:
         (backup_dir / "settings.json").write_text(
             json.dumps({
                 "schemaVersion": 1,
-                "autoswitch": {"threshold": 80, "strategy": "dynamic"},
+                "autoswitch": {"threshold": 85, "strategy": "dynamic"},
             })
         )
 
@@ -1412,48 +1381,8 @@ class TestAutoCommand:
                 cli.main()
 
         out = capsys.readouterr().out
-        assert "threshold 80%" in out, f"the persisted value was not shown: {out!r}"
+        assert "threshold " not in out, f"a non-default threshold leaked: {out!r}"
         assert "switch at 97%" in out
-
-    def test_the_banner_confirms_an_explicit_threshold_landing_on_the_default(
-        self, temp_home, capsys
-    ):
-        """`--threshold 90` over a settings.json holding 80 is still a flag
-        that was just typed -- the default-comparison rule alone would miss
-        this, since 90 == the shipped default."""
-        from claude_swap.paths import get_backup_root
-
-        backup_dir = get_backup_root()
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        (backup_dir / "settings.json").write_text(
-            json.dumps({
-                "schemaVersion": 1,
-                "autoswitch": {"threshold": 80, "strategy": "dynamic"},
-            })
-        )
-
-        class _Engine:
-            dry_run = False
-
-            def stop(self):
-                pass
-
-            def run_loop(self):
-                return 0
-
-        with patch("claude_swap.autoswitch.AutoSwitchEngine",
-                   return_value=_Engine()), \
-                patch.object(
-                    sys, "argv", ["claude-swap", "auto", "--threshold", "90"],
-                ):
-            with pytest.raises(SystemExit):
-                cli.main()
-
-        out = capsys.readouterr().out
-        assert "threshold 90%" in out, f"the explicit flag was not echoed: {out!r}"
-        assert "switch at 97%" in out, (
-            f"premise: strategy was not dynamic, so this covers nothing: {out!r}"
-        )
 
     def test_once_is_interruptible_too(self, temp_home):
         """`--once` exits before the handlers are installed, so it has none.

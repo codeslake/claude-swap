@@ -709,7 +709,7 @@ Defaults live in settings.json in the backup root; flags override them.
         proactive_switch_bar_pct,
     )
     from claude_swap.printer import accent, yellowed
-    from claude_swap.settings import SETTING_SPECS, load_settings, merged_with_cli
+    from claude_swap.settings import load_settings, merged_with_cli
 
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
@@ -769,20 +769,10 @@ Defaults live in settings.json in the backup root; flags override them.
             switch_bar = proactive_switch_bar_pct(
                 settings.strategy, settings.threshold
             )
-            # `switch_bar != settings.threshold` is exactly when the
-            # configured threshold is not the engine's real bar (dynamic;
-            # see proactive_switch_bar_pct) -- printing it plain would
-            # misstate what the engine fires at. Shown anyway when it is not
-            # the shipped default (it still steers ranking, so a
-            # deliberately-chosen value should land alongside the real bar),
-            # or when this run passed `--threshold` explicitly regardless of
-            # its value: `--threshold 90` over a settings.json holding 80 is
-            # still a flag that was just typed.
-            show_threshold = (
-                switch_bar == settings.threshold
-                or settings.threshold != SETTING_SPECS["autoswitch.threshold"].default
-                or args.threshold is not None
-            )
+            # The lead prints only the bar in force: `threshold <n>%` when
+            # the configured threshold IS that bar (`switch_bar ==
+            # settings.threshold`), else just `switch at <bar>%`.
+            show_threshold = switch_bar == settings.threshold
             parts = []
             if show_threshold:
                 parts.append(f"threshold {pct_label(settings.threshold)}%")
