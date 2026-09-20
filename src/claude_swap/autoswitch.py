@@ -942,8 +942,9 @@ def consume_first_rank_key(
     Same two tiers ``_rank_candidates`` gates on below the threshold —
     servable (``h > SPENT_HEADROOM_PCT``) before landing-healthy — then
     soonest 7-day reset, most headroom breaking ties. Pulled out so a display
-    built from this key can never disagree with the account the engine would
-    switch to.
+    built from this key agrees with the account the engine picks WHEN the
+    engine itself ranks through this key -- not every ``dynamic`` tick does
+    (see the TUI panel's own comment on this).
     """
     h = oauth.account_headroom(usage, models)
     if h is None:

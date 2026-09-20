@@ -396,14 +396,14 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
         # `dynamic` ranks on `consume_first_rank_key` below, same as
-        # `consume-first` (CONSUME_FIRST_STRATEGIES) -- but a `dynamic`
-        # tick's proactive/dynamic-healthy arms rank through
-        # `_rank_dynamic_candidates` (autoswitch.py) instead, a warm/cold
-        # tier keyed on `lastActiveAt` state this panel cannot see. So for
-        # those two arms this label's order can diverge from the account
-        # the tick actually picks; `best` and a `dynamic` at-limit/failover
-        # tick (which can still reach `consume_first_rank_key`) do not have
-        # this gap.
+        # `consume-first` (CONSUME_FIRST_STRATEGIES) -- but that is not
+        # always the engine's OWN axis for a `dynamic` tick: depending on
+        # what triggered it, the engine can instead rank through
+        # `_rank_dynamic_candidates` or an at-limit escape key
+        # (autoswitch.py), both reading state (`lastActiveAt`, the active's
+        # own binding window) this panel does not have. So this label's
+        # order under `dynamic` is not a promise of what the next tick
+        # actually picks.
         consume_first = bool(
             self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
         )
