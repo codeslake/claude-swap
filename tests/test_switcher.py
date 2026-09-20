@@ -16390,7 +16390,7 @@ class TestALoginLandsInItsOwnSlot:
     gets the answer, compares it to ONE slot, and when it does not match it
     logs "foreign credential under a stale config" and DISCARDS the answer.
 
-    Measured on the personal mac: the owner ran `/login` and signed in as
+    Measured on a live machine: the owner ran `/login` and signed in as
     slot 5 while slot 1 was active. A switch to slot 5 then stashed that
     credential as foreign and installed slot 5's stored one — which was dead
     — one log line later. The stash was proven to be slot 5's own credential
@@ -17280,7 +17280,7 @@ class TestALoginLandsInItsOwnSlot:
         """A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE, the rule the
         switch-time heal (`_adopt_into_dead_slot`) already applies.
 
-        Measured 2026-09-02 06:15Z on the work Mac: the /login's first pass
+        Measured 2026-09-02 06:15Z on a live machine: the /login's first pass
         cleared slot 2's strike because the live credential was fresh, which
         made the slot look healthy, which made this refuse, which let the old
         stored token strike again two minutes later."""
