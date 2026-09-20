@@ -399,11 +399,10 @@ class AutoScreen(Screen):
         # `consume-first` (CONSUME_FIRST_STRATEGIES) -- but that is not
         # always the engine's OWN axis for a `dynamic` tick: depending on
         # what triggered it, the engine can instead rank through
-        # `_rank_dynamic_candidates` or an at-limit escape key
-        # (autoswitch.py), both reading state (`lastActiveAt`, the active's
-        # own binding window) this panel does not have. So this label's
-        # order under `dynamic` is not a promise of what the next tick
-        # actually picks.
+        # `_rank_dynamic_candidates`, keyed on `lastActiveAt` state this
+        # panel does not have, or an at-limit escape key (autoswitch.py).
+        # So this label's order under `dynamic` is not a promise of what
+        # the next tick actually picks.
         consume_first = bool(
             self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
         )
