@@ -649,8 +649,8 @@ Defaults live in settings.json in the backup root; flags override them.
             "Switch when the active account's binding 5h/7d window reaches "
             "this utilization (50-99.9; default 90). Under --strategy "
             "dynamic the real switch point is fixed near 97%%; this value "
-            "still steers poll cadence and the exhausted-fleet recovery "
-            "hold"
+            "still decides the --model fleet-wide blackout, poll cadence, "
+            "and the exhausted-fleet recovery hold"
         ),
     )
     parser.add_argument(

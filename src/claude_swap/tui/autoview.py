@@ -394,8 +394,12 @@ class AutoScreen(Screen):
         # displayed ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
-        # Same strategy the engine ticks on, so the panel's order can never
-        # disagree with the account a tick would actually switch to.
+        # Same strategy the engine ticks on -- true for `best`/`consume-first`,
+        # whose one ranking axis is `consume_first_rank_key` below. NOT true
+        # for `dynamic`: its own tick ranks through `_rank_dynamic_candidates`
+        # (autoswitch.py), a warm/cold-tier axis keyed on `lastActiveAt`
+        # state this panel has no access to, so this label's order can
+        # diverge from the account a `dynamic` tick would actually pick.
         consume_first = bool(
             self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
         )
