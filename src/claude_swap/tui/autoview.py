@@ -390,16 +390,20 @@ class AutoScreen(Screen):
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
         """Switch targets ranked the way the engine's strategy would rank them."""
-        # Same window set as the engine (autoswitch.model included), so the
-        # displayed ranking can never disagree with the account it picks.
+        # Same window set as the engine (autoswitch.model included) -- for
+        # the ranking KEY. Not a guarantee the order agrees end to end: see
+        # below, the engine's own tick can rank on a different axis.
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
-        # Same strategy the engine ticks on -- true for `best`/`consume-first`,
-        # whose one ranking axis is `consume_first_rank_key` below. NOT true
-        # for `dynamic`: its own tick ranks through `_rank_dynamic_candidates`
-        # (autoswitch.py), a warm/cold-tier axis keyed on `lastActiveAt`
-        # state this panel has no access to, so this label's order can
-        # diverge from the account a `dynamic` tick would actually pick.
+        # `dynamic` ranks on `consume_first_rank_key` below, same as
+        # `consume-first` (CONSUME_FIRST_STRATEGIES) -- but a `dynamic`
+        # tick's proactive/dynamic-healthy arms rank through
+        # `_rank_dynamic_candidates` (autoswitch.py) instead, a warm/cold
+        # tier keyed on `lastActiveAt` state this panel cannot see. So for
+        # those two arms this label's order can diverge from the account
+        # the tick actually picks; `best` and a `dynamic` at-limit/failover
+        # tick (which can still reach `consume_first_rank_key`) do not have
+        # this gap.
         consume_first = bool(
             self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
         )
