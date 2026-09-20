@@ -40,7 +40,10 @@ class AutoSwitchSettings:
     candidate must itself sit below the threshold (never land somewhere that
     re-triggers next tick) and beat the active account's utilization by at
     least ``hysteresis_pct``, so two accounts hovering at the line never
-    ping-pong while a strictly better account is always taken.
+    ping-pong while a strictly better account is always taken. This is
+    ``best``'s rule; ``consume-first`` and ``dynamic`` read the threshold
+    differently (see ``SETTING_SPECS["autoswitch.threshold"].help`` and the
+    README).
     """
 
     threshold: float = 90.0
