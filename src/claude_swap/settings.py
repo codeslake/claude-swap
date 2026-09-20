@@ -117,7 +117,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
             help="Switch when the binding 5h/7d window reaches this pct "
-            "(dynamic: fixed near 97% instead)",
+            "(dynamic: fixed near 97% instead; still gates blackout/cadence)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
