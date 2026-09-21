@@ -913,7 +913,7 @@ def _perishes_before_active(
     == unknown). A None ACTIVE reset is conservative instead, never +inf:
     it collapses "just rolled over, nothing pending" with "never fetched"
     indistinguishably, and only the first of those would justify waiving
-    both bars for every candidate with a real reset at once -- an
+    the floor for every candidate with a real reset at once -- an
     ambiguous signal must not carry that much weight.
     """
     candidate_ts = _seven_day_reset_ts(candidate_usage, now)
@@ -2284,13 +2284,17 @@ class AutoSwitchEngine:
             # heavily-spent one -- the ceiling refused exactly the partner
             # the warmth mechanism just produced. Safe with no ceiling:
             # headroom is not consumed by switching, so a wide gap gives
-            # back nothing real, and the floor plus the dwell chunk still
-            # bound it -- a partner that burns below the floor during its
-            # own chunk stops being admissible, so the pair converges
-            # rather than ping-ponging, and warm ranks ahead of cold so
-            # the rotation stays a two-account pair. One list, shared with
-            # `dynamic_ordered` below, so the fallback past an
-            # untrustworthy top pick lands under the same bar.
+            # back nothing real, and the dwell chunk alone bounds the
+            # cadence (one switch per `alternation_chunk_seconds`) -- an
+            # idle pair (the owner's own shape, nothing spending) just
+            # keeps trading the active back and forth, which IS the
+            # cache-warm rotation asked for; a partner that DOES burn
+            # below the floor during its own chunk simply stops being
+            # admissible next tick, so a genuinely spending pair still
+            # settles rather than ping-ponging. Warm ranks ahead of cold
+            # so the rotation stays a two-account pair either way. One
+            # list, shared with `dynamic_ordered` below, so the fallback
+            # past an untrustworthy top pick lands under the same bar.
             #
             # T0758: the floor prices a switch against headroom that will
             # still be there later -- false for a candidate whose 7-day
