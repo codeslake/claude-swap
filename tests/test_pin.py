@@ -3160,6 +3160,86 @@ class TestAClearWithoutThePackageUnsplicesTheConfig:
         )
 
 
+class TestTheRecordSurvivesUntilTheWiringIsConfirmedGone:
+    """A process killed between the two writes must not leave record-gone +
+    wiring-live: measured on lmd42 2026-09-19, that state stood for 21 hours.
+    The record is the recoverable half (`heal` rebuilds it from the wiring
+    receipt), so it must be the one dropped last, after `clear_wiring`
+    returns and the env keys are confirmed gone.
+    """
+
+    def _pinned_switcher(self, temp_home):
+        from claude_swap import settings as _s
+        from claude_swap.models import Platform
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        live = "live@example.com"
+        pinned = "cloud@example.com"
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {"1": {"email": live, "uuid": "uuid-1", "organizationUuid": "",
+                               "organizationName": "", "added": "2024-01-01T00:00:00Z"}}})
+        s._write_account_credentials("1", live, json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"}}))
+        s._write_account_config("1", live, json.dumps(
+            {"oauthAccount": {"emailAddress": live, "accountUuid": "uuid-1"}}))
+        _s.atomic_write_json(_s.settings_path(s.backup_dir),
+                             {"remoteControl": {"pinnedEmail": pinned}})
+        cfg = temp_home / ".claude.json"
+        cfg.write_text(json.dumps({
+            "env": {"HTTPS_PROXY": "x"}, "_cswapPinWiredKeys": ["HTTPS_PROXY"],
+            "oauthAccount": {"emailAddress": pinned, "accountUuid": "uuid-cloud"}}))
+        return s
+
+    def test_a_raising_clear_wiring_leaves_the_record_in_place(self, temp_home):
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+
+        s = self._pinned_switcher(temp_home)
+
+        class _NoOp:
+            def apply_pin(self, *a, **k):
+                pass
+
+        with patch.object(pin_mod, "_impl", lambda: _NoOp()), \
+                patch.object(pin_mod, "clear_wiring", side_effect=RuntimeError("locked")):
+            with pytest.raises(RuntimeError):
+                pin_mod.clear_pin(s)
+
+        assert pin_mod._pinned_email_now(s) is not None, (
+            "DEFECT: clear_wiring never returned, so the wiring is still "
+            "live, but the record was already dropped -- record-gone + "
+            "wiring-live, the state measured on lmd42 2026-09-19"
+        )
+
+    def test_a_surviving_wiring_keeps_the_record_and_names_both(self, temp_home):
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+
+        s = self._pinned_switcher(temp_home)
+
+        class _NoOp:
+            def apply_pin(self, *a, **k):
+                pass
+
+        with patch.object(pin_mod, "_impl", lambda: _NoOp()), \
+                patch.object(pin_mod, "clear_wiring", return_value=False):
+            ok, msg = pin_mod.clear_pin(s)
+
+        assert pin_mod._pinned_email_now(s) is not None, (
+            "DEFECT: clear_wiring returned False having removed nothing, but "
+            "the record was dropped anyway"
+        )
+        assert not ok
+        assert "the pin" in msg and "the wiring" in msg, msg
+
+
 class TestAClearThatCouldNotUnspliceSaysSo:
     """`--clear` must not report a bare success over a config it left spliced.
 

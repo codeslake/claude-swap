@@ -1848,13 +1848,10 @@ def clear_pin(switcher) -> tuple[bool, str]:
         impl.apply_pin(switcher, None, None, identity=_back_to)
         _unsplice = False
     except Exception:  # noqa: BLE001 — this command must work when the pin does not
-        # The record is cswap's own file, so clear it here rather than
-        # reporting that the package could not. With the extra uninstalled,
-        # leaving it made `--clear` fail, told the user to REINSTALL what they
-        # had just removed, and re-pinned the old account the moment anything
-        # did. `settings.json` -> `remoteControl` is as much cswap's file as
-        # the wiring `clear_wiring` was moved here to remove.
-        _clear_pin_record(switcher)
+        # WHOSE WRITE CAN BE LOST RUNS LAST. The record is the recoverable
+        # half -- `heal` rebuilds it from the wiring receipt and
+        # `pin-identity.json` -- so it is dropped below, after `clear_wiring`
+        # returns and the env keys are confirmed gone, not here.
         _unsplice = True
     # AND THE SAME FALLBACK WHEN IT DID NOT RAISE. A peer whose `apply_pin`
     # RETURNS and clears nothing reaches the dead end the branch above exists
@@ -1864,7 +1861,6 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # comment above rejects. An older peer, or one whose pin backend is off,
     # does precisely this.
     if _pinned_email_now(switcher) is not None:
-        _clear_pin_record(switcher)
         _unsplice = True
     # THE SPLICE IS THE OTHER HALF OF THE SAME STATE, and only the fallback
     # leaves it: a working `apply_pin` already un-spliced with this identity.
@@ -1874,7 +1870,6 @@ def clear_pin(switcher) -> tuple[bool, str]:
         if (_unsplice and _pinned and _pinned[0] and _back_to)
         else None,
     )
-    still_pinned = _pinned_email_now(switcher) is not None
     # THE ENV BLOCK, NOT THE MARKER. `_clear_wiring_locked` returns
     # `_clear_ledger(path)` AFTER the config write, so an unwritable
     # `pin-wiring/` (root-owned parent, read-only mount, full disk) reported
@@ -1883,6 +1878,17 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # prevents a phantom success; it substituted a permanent phantom failure,
     # which is the same defect with the sign flipped.
     survivors = env_keys_survive(before)
+    # THE RECORD DROPS HERE, LAST, AND ONLY WHEN THE WIRING IS ACTUALLY GONE.
+    # `clear_wiring` returning is not the wiring being gone: a contended lock
+    # returns False having removed nothing, and dropping the record there
+    # recreates the exact defect this order exists to prevent -- a process
+    # killed right after would leave record-gone + wiring-live, the state
+    # measured on lmd42 2026-09-19 that stood for 21 hours. `env_keys_survive`
+    # re-reads each config fresh, so `not survivors` is a sound "the wiring is
+    # actually gone" measurement, not an inference from a return value.
+    if _unsplice and not survivors:
+        _clear_pin_record(switcher)
+    still_pinned = _pinned_email_now(switcher) is not None
     if still_pinned or survivors:
         what = " and ".join(
             w for w, on in (("the pin", still_pinned), ("the wiring", bool(survivors)))
