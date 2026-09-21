@@ -187,14 +187,6 @@ def proactive_switch_bar_pct(strategy: str, threshold: float) -> float:
     return threshold
 
 
-# How much headroom a healthy-active ALTERNATION move may hand back (#321
-# follow-up). NOT `settings.hysteresis_pct`, despite the same units and the
-# same default: that setting means "a proactive candidate must BEAT the active
-# by >= X", the OPPOSITE direction — so an operator raising it to damp
-# ping-pong would LOOSEN this bar and buy MORE downgrade-alternation. A module
-# constant, not a setting: no config key, no CLI flag, nothing to mis-tune.
-ALTERNATION_MAX_GIVEBACK_PCT = 10.0
-
 # Strategies that rank by soonest weekly reset rather than most headroom.
 # `dynamic` shares consume-first's ranking key (and every gate keyed on the
 # below-threshold "consume-first" trigger, which this literal also drives —
@@ -2277,25 +2269,34 @@ class AutoSwitchEngine:
                 floor_headroom = unmodeled
                 model_window_dropped = True
             # Alternation: a warm partner past the floor, once we've sat
-            # on the active for a full chunk -- and, #321 follow-up, one
-            # that does not MATERIALLY REGRESS headroom. The floor is an
-            # ABSOLUTE bar with no reference to `active_headroom` at all,
-            # so it admitted a 90-headroom active departing for a warm
-            # partner at 25; the landing rule refuses that move when asked
-            # directly, but this arm never reaches it (`dynamic_ordered is
-            # not None` short-circuits `_rank_candidates_pass`). ONE-SIDED
-            # (giveback only), never that function's two-sided margin
-            # (`h - active_headroom < hysteresis_pct: continue`): an
-            # alternating move is a downgrade by construction, so the
-            # two-sided form would repeal alternation entirely. One list,
-            # shared with `dynamic_ordered` below, so the fallback past an
-            # untrustworthy top pick lands under the same two bars.
+            # on the active for a full chunk. The floor
+            # (`_clears_the_landing_floor`, per-tier, below) is the ONLY
+            # ordinary admission bar -- no comparison against
+            # `active_headroom` at all (owner, 2026-09-19: periodic
+            # cache-warm rotation never fired on the live fleet; a
+            # `77 vs 28` headroom gap sat refused 38 consecutive ticks on
+            # a since-removed headroom-gap ceiling,
+            # `ALTERNATION_MAX_GIVEBACK_PCT`). That ceiling was
+            # unsatisfiable by construction: the only way a partner
+            # becomes warm is by having just been the active, and the
+            # engine leaves an active only at its own wall
+            # (`_about_to_wall`), so a freshly-warm partner is always a
+            # heavily-spent one -- the ceiling refused exactly the partner
+            # the warmth mechanism just produced. Safe with no ceiling:
+            # headroom is not consumed by switching, so a wide gap gives
+            # back nothing real, and the floor plus the dwell chunk still
+            # bound it -- a partner that burns below the floor during its
+            # own chunk stops being admissible, so the pair converges
+            # rather than ping-ponging, and warm ranks ahead of cold so
+            # the rotation stays a two-account pair. One list, shared with
+            # `dynamic_ordered` below, so the fallback past an
+            # untrustworthy top pick lands under the same bar.
             #
-            # T0758: both bars price a switch against headroom that will
+            # T0758: the floor prices a switch against headroom that will
             # still be there later -- false for a candidate whose 7-day
             # window resets BEFORE the active's, since its remaining room
             # expires unspent regardless. Such a candidate is exempt from
-            # both bars and from the warm-only sourcing (it may come from
+            # the floor and from the warm-only sourcing (it may come from
             # `cold_ordered`); it still had to clear `SPENT_HEADROOM_PCT`
             # to reach either list at all.
             #
@@ -2304,11 +2305,10 @@ class AutoSwitchEngine:
             # `warm_ordered` empty) restarts on a cold one rather than
             # holding forever -- `_is_warm` still decides which tier a
             # candidate sorts into, but no longer whether it is reachable at
-            # all. The giveback bar gates the cold half exactly as it
-            # already gates the warm half; the floor is a per-tier reading
-            # of the same `cold_switch_cost_pct` (below). A live rotation is
-            # unchanged because `next(iter(...))` still finds its warm
-            # partner first in the concatenation.
+            # all. The floor is a per-tier reading of the same `cold_
+            # switch_cost_pct` (below). A live rotation is unchanged
+            # because `next(iter(...))` still finds its warm partner first
+            # in the concatenation.
             #
             # A cold landing is not free the way a warm one is: `cold_
             # switch_cost_pct` IS the measured re-write cost (settings.py's
@@ -2330,11 +2330,7 @@ class AutoSwitchEngine:
                 return h >= settings.cold_switch_cost_pct
             alternation_admissible = [
                 n for n in warm_ordered + cold_ordered
-                if (
-                    _clears_the_landing_floor(n)
-                    and floor_headroom.get(current, 0.0) - floor_headroom.get(n, 0.0)
-                    <= ALTERNATION_MAX_GIVEBACK_PCT
-                )
+                if _clears_the_landing_floor(n)
                 or _perishes_before_active(usage.get(n), usage.get(current), now)
             ]
             partner = next(iter(alternation_admissible), None)
@@ -2490,22 +2486,19 @@ class AutoSwitchEngine:
                 or now - since < settings.alternation_chunk_seconds
             ):
                 # One label per story (item 5): a warm partner not yet
-                # dwelt on, or a cold one clearing/not-clearing the floor.
-                # T0758: `partner is not None` (a perishing candidate the
-                # bars no longer refuse) reads the same as a warm partner
-                # here -- held by dwell, not by either bar -- or `below-
-                # floor`/`cold` would blame a bar that already admitted it.
-                # `_clears_the_landing_floor`, not the bare `cold_switch_
-                # cost_pct` (correctness review): a cold candidate that
-                # clears the bare floor but not the cost-adjusted one is
-                # exactly the `below-floor` story (not worth the
-                # re-write), same as one that never reached 20 at all --
-                # `cold` is reserved for a candidate the floor DOES admit,
-                # refused only by the giveback bar.
+                # dwelt on, or a cold one below the floor. T0758:
+                # `partner is not None` (a perishing candidate, or now
+                # T0807, a cold one the floor alone already admits) reads
+                # the same as a warm partner here -- held by dwell, not by
+                # the floor -- or `below-floor` would blame a bar that
+                # already admitted it. Nothing can clear
+                # `_clears_the_landing_floor` while `partner is None`
+                # (T0807 dropped the giveback ceiling that used to let a
+                # floor-clearing candidate fall through here as `cold`),
+                # so `below-floor` alone covers every cold candidate left
+                # in this branch.
                 if warm_ordered or partner is not None:
                     reason = "below-threshold"
-                elif any(_clears_the_landing_floor(n) for n in cold_ordered):
-                    reason = "cold"
                 elif cold_ordered:
                     reason = "below-floor"
                 else:

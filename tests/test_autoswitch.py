@@ -3325,8 +3325,8 @@ class TestOutcomeDigest375:
             "(headroom 22) must not move for a soonest-resetting, "
             "near-empty candidate on a SINGLE tick with no dwell stamp "
             "(this fixture never seeds `lastActiveAt`, so the dwell gate "
-            "holds it regardless of the bars below -- T0758 narrows "
-            "those same bars once dwell IS satisfied, see "
+            "holds it regardless of the floor below -- T0758 narrows "
+            "that same floor once dwell IS satisfied, see "
             "TestWarmthAndAlternation375.test_the_owners_row_..., "
             "which is this fleet's shape with dwell seeded and does "
             "switch)"
@@ -6163,10 +6163,10 @@ class TestDynamicStrategy:
         exact bug this round fixed (an active pinned on a real wall while
         a real Fable-healthy candidate sat idle). Account 5 still does not
         depart -- account 7 IS cold (never active) but its model-gated
-        headroom (25) DOES clear `cold_switch_cost_pct` (20) and the
-        giveback bar (10 - 25, negative), so it is a real admissible
-        partner; the hold is dwell (`since` is never seeded, so it reads
-        `None` for the whole test -- no switch ever fires here to set it).
+        headroom (25) DOES clear `cold_switch_cost_pct` (20), so it is a
+        real admissible partner; the hold is dwell (`since` is never
+        seeded, so it reads `None` for the whole test -- no switch ever
+        fires here to set it).
 
         T0807 re-pin: before the cold fallback, a bar-clearing cold entry
         could only enter `alternation_admissible` through the perishing
@@ -6248,7 +6248,7 @@ class TestDynamicStrategy:
         is cold), but every one of them is walled on the SAME Fable axis
         the active reads on, and none clears `cold_switch_cost_pct`'s
         20-point floor -- the fallback widens WHO is reachable, not WHAT
-        clears the bars, so the hold survives unchanged."""
+        clears the floor, so the hold survives unchanged."""
         h = self._owner_harness(temp_home, active_num=2)
         fleet_usage = self._owner_fleet(h.clock.now)
         outcome = h.tick_with_usage(fleet_usage)
@@ -6404,20 +6404,20 @@ class TestWarmthAndAlternation375:
         """Active not `about_to_wall` -- clearing the floor is not enough
         on its own to switch.
 
-        T0807 re-pin: account 2 clears BOTH alternation bars now (floor
-        20, giveback 10 -- headroom 50 against the active's 22), so it is
-        a genuine admissible partner (`partner is not None`), not merely
-        a cold entry the old reason-classifier noticed in passing. `since`
-        is unseeded (`None`), so the hold is dwell-pending, same story
+        T0807 re-pin: account 2 clears the landing floor now (20 --
+        headroom 50 against the active's 22), so it is a genuine
+        admissible partner (`partner is not None`), not merely a cold
+        entry the old reason-classifier noticed in passing. `since` is
+        unseeded (`None`), so the hold is dwell-pending, same story
         `below-threshold` already tells elsewhere -- `cold` used to be
         the label because cold entries could only reach `alternation_
-        admissible` through the perishing exemption; now that the
-        ordinary bars admit them directly, this is no longer distinct
-        from a warm partner pending dwell."""
+        admissible` through the perishing exemption; now that the floor
+        admits them directly, this is no longer distinct from a warm
+        partner pending dwell."""
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage(78.0) | {"seven_day": {"pct": 56.0}},
-            "2": _usage(50.0),  # cold, headroom 50 -- clears both bars
+            "2": _usage(50.0),  # cold, headroom 50 -- clears the floor
         })
         assert outcome is TickOutcome.NO_ACTION
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
@@ -6490,13 +6490,11 @@ class TestWarmthAndAlternation375:
             "1": start - (chunk - 1.0),
             "2": start - 10.0,  # warm, real headroom
         })
-        # Within one `ALTERNATION_MAX_GIVEBACK_PCT` of each other in BOTH
-        # directions --
-        # the round trip this test is about is only alternation while it
-        # gives nothing material back (#321 follow-up). The old pair (50
-        # vs 70) handed back 20 points on the return leg, which the
-        # giveback bar now refuses; the engine consumes the richer account
-        # until the two converge and alternation resumes.
+        # Same usage on both ticks: this test isolates the DWELL TIMER
+        # (fires only once `alternation_chunk_seconds` has elapsed, then
+        # swings back once it elapses again on the departed side) from
+        # any headroom question -- both accounts clear the landing floor
+        # with room to spare.
         usage = {"1": _usage(50.0), "2": _usage(45.0)}
 
         outcome = h.tick_with_usage(usage)
@@ -6560,7 +6558,7 @@ class TestWarmthAndAlternation375:
         cold. A mutant flipping the comparison must fail this.
 
         T0807: cold is no longer unreachable (the fallback admits it once
-        it clears the bars), so admission alone can no longer tell warm
+        it clears the floor), so admission alone can no longer tell warm
         from cold here -- `_is_warm`'s boundary now decides PREFERENCE:
         account 3, genuinely cold (never active) but holding MORE
         headroom, must win the pick over account 2 sitting exactly at the
@@ -6580,7 +6578,7 @@ class TestWarmthAndAlternation375:
             "3": _usage(10.0),   # cold too (never active), headroom 90 -- more
         })
         assert outcome is TickOutcome.SWITCHED, (
-            f"got {outcome} — a cold peer clearing the bars is reachable "
+            f"got {outcome} — a cold peer clearing the floor is reachable "
             "now regardless of warmth"
         )
         assert h.active_number() == 3, (
@@ -6629,8 +6627,7 @@ class TestWarmthAndAlternation375:
         restart. Seeding only the ACTIVE's own arrival stamp (`last_
         active_at` carries the current account alone) isolates the dwell
         gate from the fix under test: the peer stays genuinely cold and
-        must still be taken once it clears both bars (floor 20, giveback
-        10)."""
+        must still be taken once it clears the floor (20)."""
         h = self._harness(temp_home)
         chunk = h.engine.settings.alternation_chunk_seconds
         self._seed_last_active_at(h, {"1": h.clock.now - chunk})
@@ -6638,7 +6635,7 @@ class TestWarmthAndAlternation375:
 
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.SWITCHED, (
-            f"got {outcome} — a cold peer clearing both bars must restart "
+            f"got {outcome} — a cold peer clearing the floor must restart "
             "the rotation once no warm partner is admissible"
         )
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
@@ -6664,7 +6661,7 @@ class TestWarmthAndAlternation375:
         """CONTROL: a cold peer that never clears `cold_switch_cost_pct`
         must still hold, even though the fallback now reaches cold
         entries -- the fallback widens WHO is reachable, never WHAT
-        clears the bars."""
+        clears the floor."""
         h = self._harness(temp_home)
         chunk = h.engine.settings.alternation_chunk_seconds
         self._seed_last_active_at(h, {"1": h.clock.now - chunk})
@@ -6682,12 +6679,17 @@ class TestWarmthAndAlternation375:
         """POLICY: the bootstrap fixture above, unchanged, under a non-
         `dynamic` strategy -- `alternation` is `dynamic`-only, so no
         switch fires at the chunk boundary regardless of the cold
-        fallback."""
+        fallback.
+
+        T0807: driven at the owner's 2026-09-19 wide-headroom-gap shape
+        (77 vs 28) that dropping `ALTERNATION_MAX_GIVEBACK_PCT` newly
+        admits under `dynamic`, to prove `best` still never alternates
+        there."""
         h = self._harness(temp_home)
         h.engine.settings = replace(h.engine.settings, strategy="best")
         chunk = h.engine.settings.alternation_chunk_seconds
         self._seed_last_active_at(h, {"1": h.clock.now - chunk})
-        outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(55.0)})
+        outcome = h.tick_with_usage({"1": _usage(23.0), "2": _usage(72.0)})
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — `alternation` must not fire for a "
             "non-`dynamic` strategy"
@@ -6702,21 +6704,18 @@ class TestWarmthAndAlternation375:
         re-write cost -- `cold_switch_cost_pct` IS that measured cost
         (settings.py's own docstring, ~19 5h-points) -- so a candidate
         admitted at the bare floor (20) would arrive almost spent, a real
-        regression out of a voluntary move with no wall to escape. Active
-        headroom 30 keeps the giveback bar out of the way (giveback 8 <=
-        10), so account 2's own floor is the ONLY thing that can refuse
-        it here -- it clears the bare 20 but not the real, cost-adjusted
-        one, so it must be refused as `below-floor`, the same label a
-        candidate that never reached 20 at all gets, not `cold` (reserved
-        for one the floor DOES admit, refused only by giveback). Pre-fix
-        this candidate was admitted (the bare floor alone) and SWITCHED."""
+        regression out of a voluntary move with no wall to escape.
+        Account 2's own floor is the only thing that can refuse it here
+        -- it clears the bare 20 but not the real, cost-adjusted one, so
+        it must be refused as `below-floor`, the same label a candidate
+        that never reached 20 at all gets. Pre-fix this candidate was
+        admitted (the bare floor alone) and SWITCHED."""
         h = self._harness(temp_home)
         chunk = h.engine.settings.alternation_chunk_seconds
         self._seed_last_active_at(h, {"1": h.clock.now - chunk})
         outcome = h.tick_with_usage({
             "1": _usage(70.0),  # active, headroom 30
-            "2": _usage(78.0),  # cold, headroom 22 -- clears 20, not 23;
-                                 # giveback (30-22=8) clears the OTHER bar
+            "2": _usage(78.0),  # cold, headroom 22 -- clears 20, not 23
         })
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — a cold candidate that would arrive already "
@@ -6726,24 +6725,29 @@ class TestWarmthAndAlternation375:
         assert reasons == ["below-floor"], reasons
         assert h.active_number() == 1
 
-    def test_cold_partner_clearing_the_real_floor_but_not_giveback_reads_cold(
+    def test_cold_partner_clearing_the_real_floor_reads_below_threshold_not_cold(
         self, temp_home
     ):
-        """Correctness review of T0807: account 2 clears the cold half's
-        real (cost-adjusted) floor -- 30 well past 23 -- but the active
-        already holds far more headroom (90) than giving that much back
-        is worth (giveback 60 against the 10-point bar), so `partner`
-        stays `None` and the reason must read `cold`, not `below-floor`:
-        the floor really did admit it."""
+        """History: account 2 clears the cold half's real (cost-adjusted)
+        floor -- 30 well past 23 -- but under the removed
+        `ALTERNATION_MAX_GIVEBACK_PCT` bar the active's far larger
+        headroom (90) made that giveback (60) too much, so `partner`
+        stayed `None` and the reason read `cold`, not `below-floor`.
+
+        Reversed per the owner, 2026-09-19: with no giveback bar left,
+        the floor alone admits account 2 (`partner is not None`) --
+        `since` is never seeded here, so the hold is dwell-pending, the
+        same `below-threshold` story a warm partner pending dwell already
+        tells (see `test_f2_healthy_active_cold_candidate_above_floor_
+        still_refused`); `cold` no longer has a story to tell."""
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage(10.0),  # active, headroom 90 -- very healthy
-            "2": _usage(70.0),  # cold, headroom 30 -- clears the real
-                                 # floor (>23) but fails giveback (90-30=60)
+            "2": _usage(70.0),  # cold, headroom 30 -- clears the real floor (>23)
         })
         assert outcome is TickOutcome.NO_ACTION
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["cold"], reasons
+        assert reasons == ["below-threshold"], reasons
         assert h.active_number() == 1
 
     # -- no-return bar on the proactive/about_to_wall arm -----------------
@@ -6953,18 +6957,26 @@ class TestWarmthAndAlternation375:
             "twice over before the TTL, with real margin"
         )
 
-    # -- the alternation giveback bar ------------------------------------
+    # -- alternation admits any partner past the landing floor -----------
 
-    def test_alternation_refuses_a_partner_that_gives_back_the_headroom(
+    def test_alternation_admits_a_partner_that_gives_back_the_headroom(
         self, temp_home
     ):
-        """Warmth may cost headroom, never a MATERIAL regression of it:
-        the arm's only admission bar was the absolute `cold_switch_cost_
-        pct` floor, with no reference to `active_headroom` at all, so a
-        90-headroom active departed for a 25-headroom warm partner. The
-        landing rule refuses the same move when asked directly; this arm
-        never reaches it (`dynamic_ordered is not None` short-circuits
-        `_rank_candidates_pass`), so the bar belongs here.
+        """History: the arm once carried a second admission bar
+        (`ALTERNATION_MAX_GIVEBACK_PCT`, #321 follow-up) capping how much
+        headroom a healthy-active alternation move could hand back, so
+        this 90-vs-25 case (a 65-point giveback) was refused.
+
+        Reversed per the owner, 2026-09-19: periodic cache-warm rotation
+        was not happening on the live fleet -- the ceiling was
+        unsatisfiable by construction, since the only way a partner
+        becomes warm is by having just been the active, which the engine
+        leaves only at its own wall, so a freshly-warm partner is always
+        well below a healthy active; the ceiling refused exactly the
+        partner the warmth mechanism just produced. Admission is the
+        landing floor (`_clears_the_landing_floor`) alone now -- the
+        giveback itself costs nothing real, since headroom is not
+        consumed by switching.
         """
         h = self._harness(temp_home)
         chunk = h.engine.settings.alternation_chunk_seconds
@@ -6976,20 +6988,101 @@ class TestWarmthAndAlternation375:
             "1": _usage(10.0),  # active, headroom 90
             "2": _usage(75.0),  # warm, headroom 25 -- clears the floor (20)
         })
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a warm partner clearing the landing floor "
+            "must be admitted regardless of the headroom gap"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 2
+
+    def test_owner_20260919_alternates_at_a_wide_headroom_gap(
+        self, temp_home
+    ):
+        """The owner, 2026-09-19, from the live TUI: periodic cache-warm
+        rotation was not happening -- five accounts sat at 5h 0% while
+        one stayed active throughout. Measured on lmd42 against the
+        shipped ref: a warm partner at headroom 28 against an active at
+        headroom 77 (dwell elapsed) was refused 38 consecutive ticks,
+        all reading `no switch: below-threshold`, on the since-removed
+        `ALTERNATION_MAX_GIVEBACK_PCT` bar (77 - 28 = 49 against a bar
+        of 10). This reproduces that exact shape and its round trip.
+        """
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,  # dwell elapsed
+            "2": h.clock.now - 10.0,   # warm
+        })
+        usage = {
+            "1": _usage(23.0),  # active, headroom 77
+            "2": _usage(72.0),  # warm, headroom 28 -- clears the floor (20)
+        }
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a warm partner clearing the landing floor "
+            "must be admitted regardless of the headroom gap"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 2
+        first_switch_at = h.clock.now
+
+        h.clock.advance(chunk)
+        h.events.clear()
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — must swing back once the next chunk "
+            "elapses on the still-warm departed account"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 1
+
+        ttl = h.engine.settings.cache_ttl_seconds
+        assert h.clock.now - first_switch_at <= ttl, (
+            "both switches must fall inside cache_ttl_seconds of each "
+            "other, or the departed account went cold before the swing "
+            "back"
+        )
+
+    def test_alternation_control_below_floor_partner_never_swapped_to(
+        self, temp_home
+    ):
+        """The control: a healthy active whose only peer cannot serve --
+        below `cold_switch_cost_pct`, with no reset info to perish
+        sooner on either side -- is never swapped to, even once the
+        dwell chunk has fully elapsed. Must go red if a later author
+        also drops the landing floor alongside the giveback ceiling this
+        task removes.
+        """
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,  # dwell elapsed
+            "2": h.clock.now - 10.0,   # warm
+        })
+        outcome = h.tick_with_usage({
+            "1": _usage(50.0),  # active, headroom 50 -- healthy
+            "2": _usage(85.0),  # warm, headroom 15 -- below the floor (20)
+        })
         assert outcome is TickOutcome.NO_ACTION, (
-            f"got {outcome} — a 65-point giveback is not alternation; "
-            "the warm partner clears the absolute floor but hands back "
-            "far more headroom than `ALTERNATION_MAX_GIVEBACK_PCT`"
+            f"got {outcome} — a warm partner below the landing floor "
+            "must never be admitted, however long the dwell has elapsed"
         )
         assert h.active_number() == 1
 
     def test_alternation_still_fires_for_a_near_equal_warm_partner(
         self, temp_home
     ):
-        """The anti-repeal control: an alternating move is a downgrade by
-        construction, so the bar is ONE-SIDED (giveback only), never
-        `_rank_candidates_pass`'s two-sided margin. Green before and
-        after the fix -- if it goes red, the two-sided form was written.
+        """The anti-repeal control: alternation admits a candidate that
+        merely clears the landing floor, never `_rank_candidates_pass`'s
+        two-sided hysteresis margin (`h - active_headroom < hysteresis_
+        pct: continue`) -- an alternating move is a downgrade by
+        construction, so requiring the candidate to BEAT the active
+        would repeal alternation entirely. Green before and after the
+        fix -- if it goes red, the two-sided form was written.
         """
         h = self._harness(temp_home)
         chunk = h.engine.settings.alternation_chunk_seconds
@@ -6999,7 +7092,7 @@ class TestWarmthAndAlternation375:
         })
         outcome = h.tick_with_usage({
             "1": _usage(65.0),  # active, headroom 35
-            "2": _usage(72.0),  # warm, headroom 28 -- giveback 7 <= 10
+            "2": _usage(72.0),  # warm, headroom 28 -- clears the floor
         })
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — a near-equal warm partner is exactly the "
@@ -7009,34 +7102,8 @@ class TestWarmthAndAlternation375:
         assert sw.trigger == "alternation", sw.trigger
         assert h.active_number() == 2
 
-    def test_alternation_admits_a_giveback_of_exactly_the_bar(
-        self, temp_home
-    ):
-        """The boundary is `<=`: exactly the bar is admitted."""
-        # Imported HERE, never at module scope: `_base_engine_results`
-        # (:2944) runs this whole module against the base commit's
-        # package, and a top-level import of a symbol base does not carry
-        # SKIPS all seven base-digest comparisons in silence.
-        from claude_swap.autoswitch import ALTERNATION_MAX_GIVEBACK_PCT
-
-        h = self._harness(temp_home)
-        chunk = h.engine.settings.alternation_chunk_seconds
-        give = ALTERNATION_MAX_GIVEBACK_PCT
-        self._seed_last_active_at(h, {
-            "1": h.clock.now - chunk,
-            "2": h.clock.now - 10.0,
-        })
-        outcome = h.tick_with_usage({
-            "1": _usage(60.0),          # active, headroom 40
-            "2": _usage(60.0 + give),   # warm, giveback exactly `give`
-        })
-        assert outcome is TickOutcome.SWITCHED, (
-            f"got {outcome} — a giveback of exactly {give} is admitted"
-        )
-        assert h.active_number() == 2
-
-    # -- item 5 (T0758): a perishing window is exempt from the floor and
-    # giveback bars, and from warm-only sourcing -------------------------
+    # -- item 5 (T0758): a perishing window is exempt from the floor,
+    # and from warm-only sourcing -----------------------------------------
 
     def test_the_owners_row_a_perishing_candidate_is_taken_over_a_distant_reset(
         self, temp_home
@@ -7044,12 +7111,11 @@ class TestWarmthAndAlternation375:
         """The owner's live trace (2026-09-19, dynamic, threshold 90): a
         healthy active sat on a weekly reset days out while a COLD
         candidate at 7d 95% (headroom 5) -- resetting in about 6h29m --
-        was never switched to. Both the absolute floor (`cold_switch_
-        cost_pct`) and the giveback bar (`ALTERNATION_MAX_GIVEBACK_PCT`)
-        price a switch against headroom that will still be there later;
-        that premise is false when the candidate's own window expires
-        first. `dynamic`'s job is to fill a window before it resets, not
-        let it lapse unspent.
+        was never switched to. The absolute floor (`cold_switch_cost_
+        pct`) prices a switch against headroom that will still be there
+        later; that premise is false when the candidate's own window
+        expires first. `dynamic`'s job is to fill a window before it
+        resets, not let it lapse unspent.
         """
         h = self._harness(temp_home, threshold=90.0)
         chunk = h.engine.settings.alternation_chunk_seconds
@@ -7062,13 +7128,13 @@ class TestWarmthAndAlternation375:
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — a perishing candidate must be taken even "
-            "cold and below the ordinary floor/giveback bars"
+            "cold and below the ordinary floor"
         )
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "alternation", sw.trigger
         assert h.active_number() == 2
 
-    def test_control_the_bars_still_bind_when_the_candidates_reset_is_later(
+    def test_control_the_floor_still_binds_when_the_candidates_reset_is_later(
         self, temp_home
     ):
         """Same two accounts, but #2's reset is LATER than #1's -- not
@@ -7117,7 +7183,7 @@ class TestWarmthAndAlternation375:
     ):
         """`_perishes_before_active` stays conservative when the ACTIVE's
         own 7-day reset is unknown (no `resets_at` at all here, via the
-        bare `_usage()` helper): an unread datum must not waive both bars
+        bare `_usage()` helper): an unread datum must not waive the floor
         for every candidate with a real reset -- it is never distinguish-
         able from "never fetched" versus "genuinely nothing pending", and
         only the first of those would justify it. The candidate side still
@@ -7143,11 +7209,11 @@ class TestWarmthAndAlternation375:
         assert reasons == ["below-floor"], reasons
         assert h.active_number() == 1
 
-    def test_a_perishing_warm_candidate_is_also_exempt_from_both_bars(
+    def test_a_perishing_warm_candidate_is_also_exempt_from_the_floor(
         self, temp_home
     ):
         """The exemption is not cold-only: a WARM candidate that fails
-        both ordinary bars is admitted too once it perishes sooner --
+        the ordinary floor is admitted too once it perishes sooner --
         `alternation_admissible`'s single `or _perishes_before_active(...)`
         clause covers `warm_ordered + cold_ordered` alike, not a warm-only
         carve-out."""
@@ -7165,7 +7231,7 @@ class TestWarmthAndAlternation375:
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — a warm perishing candidate must be taken "
-            "even though it fails the ordinary floor and giveback bars"
+            "even though it fails the ordinary floor"
         )
         assert h.active_number() == 2
 
@@ -7176,7 +7242,7 @@ class TestWarmthAndAlternation375:
         candidate headroom 4 resetting a day out against the active's 5)
         pins `NO_ACTION` on a SINGLE tick with no dwell stamp -- that
         fixture never seeds `lastActiveAt`, so the dwell gate holds it
-        regardless of the bars this change narrows, and that pin is
+        regardless of the floor this change narrows, and that pin is
         untouched by this change. This is the same shape WITH dwell
         satisfied: T0758's carve-out reaches it too, deliberately -- #375
         forbade chasing whichever window resets soonest regardless of
