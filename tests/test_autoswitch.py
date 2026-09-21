@@ -6959,43 +6959,6 @@ class TestWarmthAndAlternation375:
 
     # -- alternation admits any partner past the landing floor -----------
 
-    def test_alternation_admits_a_partner_that_gives_back_the_headroom(
-        self, temp_home
-    ):
-        """History: the arm once carried a second admission bar
-        (`ALTERNATION_MAX_GIVEBACK_PCT`, #321 follow-up) capping how much
-        headroom a healthy-active alternation move could hand back, so
-        this 90-vs-25 case (a 65-point giveback) was refused.
-
-        Reversed per the owner, 2026-09-19: periodic cache-warm rotation
-        was not happening on the live fleet -- the ceiling was
-        unsatisfiable by construction, since the only way a partner
-        becomes warm is by having just been the active, which the engine
-        leaves only at its own wall, so a freshly-warm partner is always
-        well below a healthy active; the ceiling refused exactly the
-        partner the warmth mechanism just produced. Admission is the
-        landing floor (`_clears_the_landing_floor`) alone now -- the
-        giveback itself costs nothing real, since headroom is not
-        consumed by switching.
-        """
-        h = self._harness(temp_home)
-        chunk = h.engine.settings.alternation_chunk_seconds
-        self._seed_last_active_at(h, {
-            "1": h.clock.now - chunk,   # dwell elapsed
-            "2": h.clock.now - 10.0,    # warm
-        })
-        outcome = h.tick_with_usage({
-            "1": _usage(10.0),  # active, headroom 90
-            "2": _usage(75.0),  # warm, headroom 25 -- clears the floor (20)
-        })
-        assert outcome is TickOutcome.SWITCHED, (
-            f"got {outcome} — a warm partner clearing the landing floor "
-            "must be admitted regardless of the headroom gap"
-        )
-        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert sw.trigger == "alternation", sw.trigger
-        assert h.active_number() == 2
-
     def test_owner_20260919_alternates_at_a_wide_headroom_gap(
         self, temp_home
     ):
@@ -7007,6 +6970,12 @@ class TestWarmthAndAlternation375:
         all reading `no switch: below-threshold`, on the since-removed
         `ALTERNATION_MAX_GIVEBACK_PCT` bar (77 - 28 = 49 against a bar
         of 10). This reproduces that exact shape and its round trip.
+
+        That bar was unsatisfiable by construction: the only way a
+        partner becomes warm is by having just been the active, which
+        the engine leaves only at its own wall, so a freshly-warm
+        partner is always well below a healthy active -- the ceiling
+        refused exactly the partner the warmth mechanism just produced.
         """
         h = self._harness(temp_home)
         chunk = h.engine.settings.alternation_chunk_seconds
