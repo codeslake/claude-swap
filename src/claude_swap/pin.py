@@ -1848,10 +1848,14 @@ def clear_pin(switcher) -> tuple[bool, str]:
         impl.apply_pin(switcher, None, None, identity=_back_to)
         _unsplice = False
     except Exception:  # noqa: BLE001 — this command must work when the pin does not
-        # WHOSE WRITE CAN BE LOST RUNS LAST. The record is the recoverable
-        # half -- `heal` rebuilds it from the wiring receipt and
-        # `pin-identity.json` -- so it is dropped below, after `clear_wiring`
-        # returns and the env keys are confirmed gone, not here.
+        # WHOSE WRITE CAN BE LOST RUNS LAST. Killed here, the worst case is
+        # record-live + wiring-gone: the next `--clear` re-triggers this same
+        # fallback and the record drops once `survivors` reads empty (below).
+        # Dropping the record here instead risks record-gone + wiring-live,
+        # which nothing here re-converges automatically -- the state measured
+        # on lmd42 2026-09-19 that stood for 21 hours. So the record moves
+        # below, after `clear_wiring` returns and the env keys are confirmed
+        # gone, not here.
         _unsplice = True
     # AND THE SAME FALLBACK WHEN IT DID NOT RAISE. A peer whose `apply_pin`
     # RETURNS and clears nothing reaches the dead end the branch above exists

@@ -3163,9 +3163,10 @@ class TestAClearWithoutThePackageUnsplicesTheConfig:
 class TestTheRecordSurvivesUntilTheWiringIsConfirmedGone:
     """A process killed between the two writes must not leave record-gone +
     wiring-live: measured on lmd42 2026-09-19, that state stood for 21 hours.
-    The record is the recoverable half (`heal` rebuilds it from the wiring
-    receipt), so it must be the one dropped last, after `clear_wiring`
-    returns and the env keys are confirmed gone.
+    Killed the other way (record-live + wiring-gone), the next `--clear`
+    re-converges on its own: the record drops as soon as the wiring reads
+    gone. So the record is dropped last, after `clear_wiring` returns and
+    the env keys are confirmed gone.
     """
 
     def _pinned_switcher(self, temp_home):
