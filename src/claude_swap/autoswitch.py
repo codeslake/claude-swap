@@ -2277,12 +2277,15 @@ class AutoSwitchEngine:
             # `77 vs 28` headroom gap sat refused 38 consecutive ticks on
             # a since-removed headroom-gap ceiling,
             # `ALTERNATION_MAX_GIVEBACK_PCT`). That ceiling was
-            # unsatisfiable by construction: the only way a partner
-            # becomes warm is by having just been the active, and the
-            # engine leaves an active only at its own wall
-            # (`_about_to_wall`), so a freshly-warm partner is always a
-            # heavily-spent one -- the ceiling refused exactly the partner
-            # the warmth mechanism just produced. Safe with no ceiling:
+            # unsatisfiable for exactly the shape it was meant to price: a
+            # partner warmed by departing the active at ITS OWN wall
+            # (`proactive`, `_about_to_wall`) is necessarily a
+            # heavily-spent one, and the ceiling refused that same
+            # partner the moment it cooled toward a healthy active -- a
+            # near-equal pair born from an ordinary alternation swap
+            # (never a wall departure) was never the problem
+            # (`test_alternation_still_fires_for_a_near_equal_warm_
+            # partner` cleared the old ceiling fine). Safe with no ceiling:
             # headroom is not consumed by switching, so a wide gap gives
             # back nothing real, and the dwell chunk alone bounds the
             # cadence (one switch per `alternation_chunk_seconds`) -- an
