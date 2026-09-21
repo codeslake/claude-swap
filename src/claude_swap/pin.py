@@ -1853,7 +1853,7 @@ def clear_pin(switcher) -> tuple[bool, str]:
         # fallback and the record drops once `survivors` reads empty (below).
         # Dropping the record here instead risks record-gone + wiring-live,
         # which nothing here re-converges automatically -- the state measured
-        # on lmd42 2026-09-19 that stood for 21 hours. So the record moves
+        # 2026-09-19, that stood for 21 hours. So the record moves
         # below, after `clear_wiring` returns and the env keys are confirmed
         # gone, not here.
         _unsplice = True
@@ -1887,7 +1887,7 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # returns False having removed nothing, and dropping the record there
     # recreates the exact defect this order exists to prevent -- a process
     # killed right after would leave record-gone + wiring-live, the state
-    # measured on lmd42 2026-09-19 that stood for 21 hours. `env_keys_survive`
+    # measured 2026-09-19, that stood for 21 hours. `env_keys_survive`
     # re-reads each config fresh, so `not survivors` is a sound "the wiring is
     # actually gone" measurement, not an inference from a return value.
     if _unsplice and not survivors:

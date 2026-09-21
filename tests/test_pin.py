@@ -3162,7 +3162,7 @@ class TestAClearWithoutThePackageUnsplicesTheConfig:
 
 class TestTheRecordSurvivesUntilTheWiringIsConfirmedGone:
     """A process killed between the two writes must not leave record-gone +
-    wiring-live: measured on lmd42 2026-09-19, that state stood for 21 hours.
+    wiring-live: measured 2026-09-19, that state stood for 21 hours.
     Killed the other way (record-live + wiring-gone), the next `--clear`
     re-converges on its own: the record drops as soon as the wiring reads
     gone. So the record is dropped last, after `clear_wiring` returns and
@@ -3215,7 +3215,7 @@ class TestTheRecordSurvivesUntilTheWiringIsConfirmedGone:
         assert pin_mod._pinned_email_now(s) is not None, (
             "DEFECT: clear_wiring never returned, so the wiring is still "
             "live, but the record was already dropped -- record-gone + "
-            "wiring-live, the state measured on lmd42 2026-09-19"
+            "wiring-live, the state measured 2026-09-19"
         )
 
     def test_a_surviving_wiring_keeps_the_record_and_names_both(self, temp_home):
