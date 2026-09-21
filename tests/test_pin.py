@@ -3203,11 +3203,11 @@ class TestTheRecordSurvivesUntilTheWiringIsConfirmedGone:
 
         s = self._pinned_switcher(temp_home)
 
-        class _NoOp:
+        class _Dead:
             def apply_pin(self, *a, **k):
-                pass
+                raise ImportError("cryptography")
 
-        with patch.object(pin_mod, "_impl", lambda: _NoOp()), \
+        with patch.object(pin_mod, "_impl", lambda: _Dead()), \
                 patch.object(pin_mod, "clear_wiring", side_effect=RuntimeError("locked")):
             with pytest.raises(RuntimeError):
                 pin_mod.clear_pin(s)
@@ -3225,11 +3225,11 @@ class TestTheRecordSurvivesUntilTheWiringIsConfirmedGone:
 
         s = self._pinned_switcher(temp_home)
 
-        class _NoOp:
+        class _Dead:
             def apply_pin(self, *a, **k):
-                pass
+                raise ImportError("cryptography")
 
-        with patch.object(pin_mod, "_impl", lambda: _NoOp()), \
+        with patch.object(pin_mod, "_impl", lambda: _Dead()), \
                 patch.object(pin_mod, "clear_wiring", return_value=False):
             ok, msg = pin_mod.clear_pin(s)
 
@@ -4697,11 +4697,11 @@ class TestTheVerdictIsSharedNotDuplicated:
     ):
         """`--clear` MUST NOT TELL THE USER TO RE-RUN A COMMAND THAT CANNOT WORK.
 
-        The record is cleared here only in the `except` branch, on the
-        reasoning — spelled out in that branch's own comment — that advice
-        which "never converges (run 2 is identical)" is worse than useless.
-        A peer whose `apply_pin` RETURNS WITHOUT RAISING and clears nothing
-        reaches the same dead end without going through the except at all.
+        Only the `except` branch sees `apply_pin` raise. A peer whose
+        `apply_pin` RETURNS WITHOUT RAISING and clears nothing reaches the
+        same dead end without going through it at all — the re-read below
+        is what catches that peer too, on the reasoning that advice which
+        "never converges (run 2 is identical)" is worse than useless.
 
         Measured against this code before the fix:
             run 1: False 'Could not remove the pin — re-run once it frees up'
