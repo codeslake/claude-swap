@@ -195,6 +195,11 @@ class EngineHarness:
             "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
         }))
 
+    def set_active(self, num: int) -> None:
+        data = self.switcher._get_sequence_data()
+        data["activeAccountNumber"] = num
+        self.switcher._write_json(self.switcher.sequence_file, data)
+
     def tick_with_usage(self, usage: dict) -> TickOutcome:
         entries = {
             num: _entry_for(value, self.clock.now) for num, value in usage.items()
@@ -2625,11 +2630,6 @@ class TestApiKeyAccounts:
         data["accounts"][str(num)]["kind"] = "api_key"
         harness.switcher._write_json(harness.switcher.sequence_file, data)
 
-    def _set_active(self, harness, num: int) -> None:
-        data = harness.switcher._get_sequence_data()
-        data["activeAccountNumber"] = num
-        harness.switcher._write_json(harness.switcher.sequence_file, data)
-
     def test_api_key_candidate_excluded_by_default(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -2696,7 +2696,7 @@ class TestApiKeyAccounts:
         self._mark_api_key(h, 2)
         self._mark_api_key(h, 4)
         h.make_live("key2@token.local", 2)
-        self._set_active(h, 2)
+        h.set_active(2)
         h.engine.settings = replace(h.engine.settings, strategy="best")
 
         trace = tmp_path / "trace.log"
@@ -2754,7 +2754,7 @@ class TestApiKeyAccounts:
         h.seed(2, "key2@token.local")
         self._mark_api_key(h, 2)
         h.make_live("key2@token.local", 2)
-        self._set_active(h, 2)
+        h.set_active(2)
         h.engine.settings = replace(h.engine.settings, strategy="best")
 
         trace = tmp_path / "trace.log"
@@ -7013,6 +7013,7 @@ class TestHorizonAxisDoesNotFlap:
         # resets are relative to the ORIGINAL now, so both peers are still
         # ahead of the active by the same margins.
         h.make_live("b@example.com", 2)
+        h.set_active(2)
         h.clock.advance(301.0)
         h.engine._mutate_state(lambda st: st.pop("lastSwitchFrom", None))
         assert h.tick_with_usage(second) is TickOutcome.SWITCHED
@@ -13130,8 +13131,10 @@ class TestOverloadedTrigger:
         assert outcome is TickOutcome.NO_ACTION
 
         # A hand switch -- NOT through the engine's `_perform` -- moves the
-        # live login to account 2.
+        # live login to account 2. A real `cswap switch` moves the roster's
+        # activeAccountNumber too, so the harness must follow it here.
         harness.make_live("b@example.com", 2)
+        harness.set_active(2)
 
         # One more error call on its own is also under the floor, but
         # summed with account 1's carried (2, 3) it clears both
