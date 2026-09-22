@@ -828,7 +828,10 @@ Defaults live in settings.json in the backup root; flags override them.
         metavar="PCT",
         help=(
             "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "this utilization (50-99.9; default 90). Under --strategy "
+            "dynamic the real switch point is fixed near 97%%; this value "
+            "still decides the --model fleet-wide blackout, poll cadence, "
+            "and the exhausted-fleet recovery hold"
         ),
     )
     parser.add_argument(
@@ -858,12 +861,14 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "dynamic"),
         default=None,
         help=(
-            "Target selection: 'best' (most quota left) or "
+            "Target selection: 'best' (most quota left), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest; default)"
+            "resets soonest; default), or 'dynamic' (consume-first's ranking "
+            "plus a re-picked model basis and a landing rule that never lands "
+            "on an account with no room on the window in force)"
         ),
     )
     parser.add_argument(
@@ -878,7 +883,12 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     args = parser.parse_args(argv)
 
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.autoswitch import (
+        AutoSwitchEngine,
+        AutoSwitchEvent,
+        pct_label,
+        proactive_switch_bar_pct,
+    )
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
@@ -937,9 +947,22 @@ Defaults live in settings.json in the backup root; flags override them.
             sys.exit(engine.tick().value)
 
         if not args.json:
+            switch_bar = proactive_switch_bar_pct(
+                settings.strategy, settings.threshold
+            )
+            # The lead prints only the bar in force: `threshold <n>%` when
+            # the configured threshold IS that bar (`switch_bar ==
+            # settings.threshold`), else just `switch at <bar>%`.
+            show_threshold = switch_bar == settings.threshold
+            parts = []
+            if show_threshold:
+                parts.append(f"threshold {pct_label(settings.threshold)}%")
+            if switch_bar != settings.threshold:
+                parts.append(f"switch at {pct_label(switch_bar)}%")
+            lead = ", ".join(parts)
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
+                    f"Auto-switch running: {lead}, "
                     f"every {settings.interval_seconds:.0f}s"
                     # THE ENGINE, NOT THE REQUEST. A demoted engine has
                     # `dry_run` True while `args.dry_run` is False, and this

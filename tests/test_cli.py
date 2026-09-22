@@ -1153,6 +1153,20 @@ class TestAutoCommand:
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
 
+    def test_strategy_dynamic_is_accepted(self, temp_home):
+        self._run(["--once", "--strategy", "dynamic"], temp_home)
+        assert self.FakeEngine.instances[-1].settings.strategy == "dynamic"
+
+    def test_strategy_bogus_is_still_rejected(self, temp_home):
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(
+                 sys, "argv",
+                 ["claude-swap", "auto", "--strategy", "bogus"],
+             ):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2  # argparse usage error
+
     def test_json_stdout_is_pure_jsonl(self, temp_home, capsys):
         from claude_swap.autoswitch import NoSwitchEvent, TickOutcome
 
@@ -1306,6 +1320,92 @@ class TestAutoCommand:
             "the banner read the REQUEST, so a demoted engine announces "
             f"switching over a process that will switch nothing: {out!r}"
         )
+
+    def test_the_banner_hides_threshold_under_dynamic(self, temp_home, capsys):
+        """Under `dynamic` the configured threshold is not the engine's real
+        bar (`proactive_switch_bar_pct`), so the banner must not print
+        `threshold <n>%` at rest -- only the bar in force."""
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine",
+                   return_value=_Engine()), \
+                patch.object(
+                    sys, "argv", ["claude-swap", "auto", "--strategy", "dynamic"]
+                ):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        out = capsys.readouterr().out
+        assert "switch at 97%" in out, f"no bar in force printed: {out!r}"
+        assert "threshold " not in out, (
+            f"dynamic's configured threshold is not the switch bar: {out!r}"
+        )
+
+    def test_the_banner_keeps_threshold_for_a_non_dynamic_strategy(
+        self, temp_home, capsys
+    ):
+        """CONTROL: without this, the dynamic case above would pass on a
+        banner that dropped `threshold ` unconditionally."""
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine",
+                   return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        out = capsys.readouterr().out
+        assert "threshold 90%" in out, f"premise: no threshold printed: {out!r}"
+
+    def test_the_banner_hides_a_non_default_threshold_under_dynamic(
+        self, temp_home, capsys
+    ):
+        """A configured threshold that differs from the shipped default is
+        still not the engine's real bar under `dynamic` -- the header stays
+        silent on it regardless of how the number got there."""
+        from claude_swap.paths import get_backup_root
+
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        (backup_dir / "settings.json").write_text(
+            json.dumps({
+                "schemaVersion": 1,
+                "autoswitch": {"threshold": 85, "strategy": "dynamic"},
+            })
+        )
+
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine",
+                   return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        out = capsys.readouterr().out
+        assert "threshold " not in out, f"a non-default threshold leaked: {out!r}"
+        assert "switch at 97%" in out
 
     def test_once_is_interruptible_too(self, temp_home):
         """`--once` exits before the handlers are installed, so it has none.

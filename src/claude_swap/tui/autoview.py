@@ -25,12 +25,17 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
+    CONSUME_FIRST_STRATEGIES,
     AutoSwitchEngine,
     AutoSwitchEvent,
     binding_pct,
+    classify_candidate_block,
     consume_first_rank_key,
+    model_block_label,
     pct_label,
+    proactive_switch_bar_pct,
 )
 from claude_swap import pin
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
@@ -71,10 +76,14 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
     return text
 
 
+_STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
+
+
 class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
         Binding("t", "adjust_threshold", "Threshold"),
+        Binding("s", "cycle_strategy", "Strategy"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
@@ -98,6 +107,11 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # Session-only strategy override (s cycles best -> consume-first ->
+        # dynamic). Same precedent as the threshold above: never written to
+        # settings.json. ``_configured_strategy`` is the mount-time file
+        # value the screen reverts to on exit.
+        self._configured_strategy: str | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -119,7 +133,10 @@ class AutoScreen(Screen):
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
-        self.app.threshold_pct = self._settings.threshold
+        self.app.threshold_pct = proactive_switch_bar_pct(
+            self._settings.strategy, self._settings.threshold
+        )
+        self._configured_strategy = self._settings.strategy
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
@@ -138,7 +155,9 @@ class AutoScreen(Screen):
         # the poll planner and put the bar tick back on the file value.
         self.app.switcher.clear_poll_policy_inputs()
         if self._configured_threshold is not None:
-            self.app.threshold_pct = self._configured_threshold
+            self.app.threshold_pct = proactive_switch_bar_pct(
+                self._configured_strategy, self._configured_threshold
+            )
         self.app.set_store_only(False)
 
     def _on_theme_change(self, _theme: str) -> None:
@@ -203,19 +222,55 @@ class AutoScreen(Screen):
         self._settings = replace(self._settings, threshold=value)
         if self._engine is not None:
             self._engine.apply_threshold(value)
-        self.app.threshold_pct = value
+        self.app.threshold_pct = proactive_switch_bar_pct(
+            self._settings.strategy, value
+        )
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
+
+    def action_cycle_strategy(self) -> None:
+        # Session-only, exactly like `t`/threshold above: never written to
+        # settings.json, reverted to the file value on unmount.
+        current = _STRATEGY_CYCLE.index(self._settings.strategy)
+        value = _STRATEGY_CYCLE[(current + 1) % len(_STRATEGY_CYCLE)]
+        self._settings = replace(self._settings, strategy=value)
+        self.app.threshold_pct = proactive_switch_bar_pct(
+            value, self._settings.threshold
+        )
+        if self._engine is not None:
+            self._engine.apply_strategy(value)
+            self._engine.wake()  # show a decision under the new strategy now
+        self.query_one("#auto-active-panel", AccountsPanel).refresh()
+        self._update_summary()
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— strategy set to {value} for this session —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
 
     def _update_summary(self) -> None:
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
         text.append("auto-switch · ")
-        text.append(
-            f"threshold {pct_label(self._settings.threshold)}%",
-            style=palette.accent if self._adjusting else "",
+        bar = proactive_switch_bar_pct(
+            self._settings.strategy, self._settings.threshold
         )
-        if self._settings.threshold != self._configured_threshold:
+        # The field is the bar in force: it prints only when the threshold
+        # IS the bar (`bar == threshold`), plus while it is being adjusted
+        # (`t` + arrows) -- that is the number being changed.
+        show_threshold = self._adjusting or bar == self._settings.threshold
+        if show_threshold:
+            text.append(
+                f"threshold {pct_label(self._settings.threshold)}%",
+                style=palette.accent if self._adjusting else "",
+            )
+            if self._settings.threshold != self._configured_threshold:
+                text.append(" (session)", style=palette.muted)
+        if bar != self._settings.threshold:
+            text.append(f"{' · ' if show_threshold else ''}switch at {pct_label(bar)}%")
+        text.append(f" · {self._settings.strategy}")
+        if self._settings.strategy != self._configured_strategy:
             text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
@@ -282,7 +337,7 @@ class AutoScreen(Screen):
             self.app.push_screen(
                 ConfirmModal(
                     "Go live? claude-swap will switch your active account "
-                    "automatically when the threshold is reached.\n\n"
+                    "automatically when the switch point is reached.\n\n"
                     "(Same behavior as running `cswap auto` in a terminal.)",
                     title="Go live",
                     yes_label="Go live",
@@ -323,15 +378,69 @@ class AutoScreen(Screen):
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
         """Switch targets ranked the way the engine's strategy would rank them."""
-        # Same window set as the engine (autoswitch.model included), so the
-        # displayed ranking can never disagree with the account it picks.
+        # Same window set as the engine (autoswitch.model included) -- for
+        # the ranking KEY. Not a guarantee the order agrees end to end: see
+        # below, the engine's own tick can rank on a different axis.
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
-        # Same strategy the engine ticks on, so the panel's order can never
-        # disagree with the account a tick would actually switch to.
+        # `dynamic` ranks on `consume_first_rank_key` below, same as
+        # `consume-first` (CONSUME_FIRST_STRATEGIES) -- but that is not
+        # always the engine's OWN axis for a `dynamic` tick: depending on
+        # what triggered it, the engine can instead rank through
+        # `_rank_dynamic_candidates`, keyed on `lastActiveAt` state this
+        # panel does not have, or an at-limit escape key (autoswitch.py).
+        # So this label's order under `dynamic` is not a promise of what
+        # the next tick actually picks.
         consume_first = bool(
-            self._settings and self._settings.strategy == "consume-first"
+            self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
         )
+        # THE BAR EVERY ADMISSION/LABEL DECISION BELOW READS (#321): under
+        # `dynamic` this is `proactive_switch_bar_pct`'s 97, not the raw
+        # `settings.threshold` — a candidate with hours left on its reset
+        # is headroom `dynamic` exists to spend, not a blocked one. Every
+        # other strategy gets `settings.threshold` back unchanged, so this
+        # is a no-op for them.
+        bar = (
+            proactive_switch_bar_pct(self._settings.strategy, self._settings.threshold)
+            if self._settings else 0.0
+        )
+        # THE AXIS THE ENGINE WILL ACTUALLY RANK ON THIS TICK, not always
+        # `models`: `_rank_candidates` (autoswitch.py) drops the model set
+        # and retries on 5h/7d alone when the model-gated pass finds no
+        # healthy candidate — so a panel that always ranks on `models` can
+        # name a top row the engine would never pick (still model-gated
+        # ranking a fleet the engine has already dropped it for). But the
+        # engine only runs that retry under `strategy == "dynamic"`
+        # (autoswitch.py's `_rank_candidates`) — gated the same way here, or
+        # `best`/`consume-first` rank on an axis the engine is forbidden to
+        # use. Same predicate as the model-gated pass's own health filter
+        # (`classify_candidate_block` — "open" is exactly what that filter
+        # lets through): any candidate reading "open" means the model-gated
+        # pass has something to work with, so keep `models`; none reading
+        # "open" means it would come back empty, so rank on the retry's
+        # axis instead — a "model"-only block clears once `models` drops,
+        # and a "full" block stays blocked either way.
+        rank_models = models
+        if models and self._settings and self._settings.strategy == "dynamic":
+            for acc in snap.accounts:
+                if (
+                    acc.number == active_number
+                    or not acc.switchable
+                    or acc.usage.sentinel is not None
+                    or binding_pct(acc.usage.last_good, models) is None
+                ):
+                    continue
+                windows = (
+                    (label, p)
+                    for label, p, _ in oauth.relevant_windows(
+                        acc.usage.last_good, models
+                    )
+                )
+                kind, _ = classify_candidate_block(windows, bar)
+                if kind == "open":
+                    break
+            else:
+                rank_models = ()
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
         # The badge rides on that account's own row rather than the summary
@@ -399,34 +508,94 @@ class AutoScreen(Screen):
                     entry.append(f" · {spend_suffix}", style=palette.muted)
                 else:
                     entry.append("  usage unknown", style=palette.muted)
+                # A spend-axis account is never a ranking target regardless
+                # of `acc.disabled` (`relevant_windows` excludes spend, so
+                # `_rank` can't see it) -- but every OTHER row here says why
+                # it is never chosen, and this was the one silent exception.
+                if acc.disabled:
+                    entry.append("  auto-swap disabled", style=palette.muted)
                 # RANKED LAST EITHER WAY. Spend is not headroom: folding it
                 # into the sort key would change which account the engine
                 # picks, and the ranking axis is not this row's to move.
                 ranked.append(((999.0,), acc.number))
             else:
                 # Per-window chips, from the same helper the dashboard uses
-                # (data.window_chip_label) so one account cannot read two ways.
+                # (data.chip_label) so one account cannot read two ways. The
+                # SAME relevant_windows call feeds the label below, so the
+                # chips and the label can never disagree on which windows
+                # exist for this account.
                 now = time.time()
-                chips = [
-                    (key, label, data.window_pct(acc.usage.last_good, key))
-                    for label, key in (("5h", "five_hour"), ("7d", "seven_day"))
-                ]
-                chips = [c for c in chips if c[2] is not None]
-                for i, (key, label, wpct) in enumerate(chips):
+                windows = oauth.relevant_windows(acc.usage.last_good, models)
+                for i, (label, wpct, resets_at) in enumerate(windows):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
                     entry.append(
-                        data.window_chip_label(acc.usage.last_good, key, label, now),
+                        data.chip_label(label, data.reset_text({"resets_at": resets_at}, now)),
                         style=palette.muted,
                     )
                     entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
-                if not chips:  # no window data at all — keep the old reading
+                if not windows:  # no window data at all — keep the old reading
                     entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
+                # A candidate whose LAST poll failed (an active backoff, a
+                # run of failures; a success clears both) must not present
+                # its cached figures as live. Not `fresh()`'s 180 s TTL: a
+                # healthy row's `fetched_at` is older than that for most of
+                # every poll cycle, and the engine lands on it happily.
+                if acc.usage.in_backoff(now) or acc.usage.consecutive_failures:
+                    entry.append("  stale", style=palette.sev_warn)
+                # WHAT blocks this candidate, not just the raw chips: a 5h/7d
+                # window (no model choice escapes it) reads differently from
+                # a model-only block (the engine's fallback ranks around it).
+                # The CLASSIFICATION (open/model/full) reads the same way
+                # here as in the decision log — same helper,
+                # `classify_candidate_block`, the same strategy-aware `bar`
+                # the engine's own landing gate reads (#321). It still does
+                # not fold in the engine's other, separate, stricter landing
+                # floor -- `cold_switch_cost_pct` in autoswitch.py -- a
+                # candidate clearing this label can still fail that one.
+                # Always on `models`, the full pinned set: this label
+                # explains why the row is not simply "open"
+                # on the criteria the user actually configured, independent
+                # of whether `rank_models` below has dropped to the retry's
+                # axis for ORDERING purposes.
+                if self._settings:
+                    kind, blocked_model = classify_candidate_block(
+                        ((label, p) for label, p, _ in windows),
+                        bar,
+                    )
+                    if kind == "model":
+                        entry.append(
+                            f"  {model_block_label(blocked_model)}",
+                            style=palette.muted,
+                        )
+                    elif kind == "full":
+                        # The WORDING, unlike the classification, does not
+                        # read the same here as in the decision log's own
+                        # "(<window> full)" (autoswitch.py `_describe`):
+                        # "full" is reserved here for actual exhaustion (the
+                        # window's own pct at or over 100); a window merely
+                        # blocked at the bar names the bar it was judged
+                        # against instead (the owner's report, 92% read
+                        # "full" against a threshold of 90).
+                        window_pct = next(
+                            p for label, p, _ in windows if label == blocked_model
+                        )
+                        if window_pct >= 100.0:
+                            entry.append(
+                                f"  {blocked_model} full", style=palette.muted
+                            )
+                        else:
+                            entry.append(
+                                f"  {blocked_model} {pct_label(window_pct)}%"
+                                f" >= {pct_label(bar)}%",
+                                style=palette.muted,
+                            )
+                rank_pct = binding_pct(acc.usage.last_good, rank_models)
                 key = (
                     consume_first_rank_key(
-                        acc.usage.last_good, self._settings.threshold, now, models
+                        acc.usage.last_good, bar, now, rank_models
                     )
                     if consume_first
-                    else (pct,)
+                    else (pct if rank_pct is None else rank_pct,)
                 )
                 ranked.append((key, acc.number))
             # Outside the usage branches on purpose: an account whose usage is
