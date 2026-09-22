@@ -7611,6 +7611,10 @@ class ClaudeAccountSwitcher:
                 )
             ) is False:
                 return ("known-foreign", None)
+            if self._live_is_own_newer_generation(
+                current_account, live_oauth, backup, data
+            ):
+                return ("own-rotated", None)
             return ("unresolved", None)
         r_email = resolved.get("email") or ""
         r_org = resolved.get("organizationUuid") or ""
@@ -7657,6 +7661,10 @@ class ClaudeAccountSwitcher:
             # any other oracle degradation, not preserve-and-skip.
             if r_email and resolved.get("organizationUuid") is not None:
                 return ("alien", None)
+            if self._live_is_own_newer_generation(
+                current_account, live_oauth, backup, data
+            ):
+                return ("own-rotated", None)
             return ("unresolved", None)
         # A cross-slot attribution must be uuid-positive: an email+org match
         # against a slot with no recorded uuid (add-token placeholder) is not
@@ -7675,6 +7683,55 @@ class ClaudeAccountSwitcher:
         ):
             return ("foreign-synced", slot)
         return ("foreign", slot)
+
+    def _live_is_own_newer_generation(
+        self,
+        current_account: str,
+        live_oauth: dict | None,
+        backup: str,
+        data: dict,
+    ) -> bool:
+        """Stamp-only rescue for an oracle-unresolved live credential.
+
+        True when the live bytes and this slot's own stored backup carry
+        ``refreshTokenExpiresAt`` within ``_LINEAGE_STAMP_JITTER_MS`` of each
+        other, the live one is the later (newer) generation, and no OTHER
+        slot's backup stamp sits within that same jitter of the live value.
+        Guards the 2026-09-22 defect: a 401 on the ownership probe (body
+        never read) left the profile oracle silent on a genuine same-lineage
+        rotation, so the fail-narrow "unresolved" path stashed the slot's own
+        next generation as unadoptable while the backup kept the generation
+        the rotation had already consumed — invalid_grant on the next
+        refresh. Works from the bytes alone; no probe body is read here.
+        """
+        if not backup or not live_oauth:
+            return False
+        own_oauth = oauth.extract_oauth_data(backup) or {}
+        try:
+            live_at = float(live_oauth.get("refreshTokenExpiresAt") or 0)
+            own_at = float(own_oauth.get("refreshTokenExpiresAt") or 0)
+        except (TypeError, ValueError):
+            return False
+        if not live_at or not own_at:
+            return False
+        if abs(live_at - own_at) > _LINEAGE_STAMP_JITTER_MS or live_at <= own_at:
+            return False
+        for num, acct in data.get("accounts", {}).items():
+            if num == current_account:
+                continue
+            other_backup = self._read_account_credentials(
+                num, acct.get("email", "")
+            )
+            if not other_backup:
+                continue
+            other_oauth = oauth.extract_oauth_data(other_backup) or {}
+            try:
+                other_at = float(other_oauth.get("refreshTokenExpiresAt") or 0)
+            except (TypeError, ValueError):
+                continue
+            if other_at and abs(live_at - other_at) <= _LINEAGE_STAMP_JITTER_MS:
+                return False
+        return True
 
     def _stash_live_credential(
         self,

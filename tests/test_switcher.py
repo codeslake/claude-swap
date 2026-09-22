@@ -7995,6 +7995,79 @@ class TestProvenanceGuard:
         # The switch itself proceeded, onto the target's stored backup.
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
 
+    def test_unresolved_probe_with_own_newer_generation_backs_up(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A 401 on the ownership probe (body never read) must not stash
+        the slot's own rotated grant as unadoptable while its stored
+        backup keeps the generation the rotation consumed (2026-09-22
+        defect: invalid_grant 2.5h after a fresh login). Same lineage
+        stamp, newer generation, no cross-slot collision -> backs up
+        like a resolved `own-rotated`."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        g1 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stored-1", "refreshToken": "rt-1",
+            "refreshTokenExpiresAt": 1_700_000_000_000,
+        }})
+        creds_store[("1", "test@example.com")] = g1
+        g2 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-fresh-1", "refreshToken": "rt-1-rotated",
+            "refreshTokenExpiresAt": 1_700_000_000_700,
+        }})
+        live_state = {"creds": g2}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == g2
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
+
+    def test_unresolved_probe_with_cross_slot_stamp_stays_unresolved(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The stamp rescue must not fire when another slot's own backup
+        stamp also sits inside the jitter of the live value -- a foreign
+        login must never be adopted this way (the cross-wire protection
+        26def0a7 and #210's 40ea7f3f defend)."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        g1 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stored-1", "refreshToken": "rt-1",
+            "refreshTokenExpiresAt": 1_700_000_000_000,
+        }})
+        creds_store[("1", "test@example.com")] = g1
+        g2 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-fresh-1", "refreshToken": "rt-1-rotated",
+            "refreshTokenExpiresAt": 1_700_000_000_700,
+        }})
+        live_state = {"creds": g2}
+        creds_store[("2", "account2@example.com")] = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stale-2", "refreshToken": "rt-orig-2",
+            "refreshTokenExpiresAt": 1_700_000_000_900,
+        }})
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == g1
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id,) = entries
+        assert entries[entry_id]["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
+
     def test_unresolved_stash_is_not_adoptable_back_into_its_slot(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
