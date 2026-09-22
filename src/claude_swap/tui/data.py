@@ -19,12 +19,33 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from claude_swap import oauth, printer, usage_store
+from claude_swap.autoswitch import (
+    CONSUME_FIRST_STRATEGIES,
+    _classify_dynamic_trigger,
+    _dynamic_active_headroom,
+    _headroom_by_account,
+    _model_window_binds_everywhere,
+    _seven_day_reset_ts,
+    rank_candidates_pass,
+)
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.models import AccountsSnapshot
+from claude_swap.poll_policy import binding_pct
+from claude_swap.settings import parse_model_names
 from claude_swap.snapshot_source import SnapshotSource
 from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
+
+if TYPE_CHECKING:
+    from claude_swap.settings import AutoSwitchSettings
+
+# Triggers where the ranking pass never runs -- keys the auto view's own
+# `_UNMODELED_TEXT` shares (kept in sync by a test, not by import).
+_UNMODELED_TRIGGERS = frozenset(
+    {"dynamic-unmodeled", "below-threshold", "unreadable-active"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +337,140 @@ def clock_stamp() -> str:
     return time.strftime("%H:%M:%S")
 
 
+def rank_switch_candidates(
+    snap: AccountsSnapshot,
+    settings: "AutoSwitchSettings",
+    now: float,
+    active_number: str | None,
+) -> tuple[list[str], str | None, str, bool]:
+    """(ordered, rank_axis, trigger, unmodeled): mirrors the engine's own
+    admission and order. THE shared computation -- ``ordered_accounts`` and
+    the auto view's "Next best" panel both read off this, never a pass of
+    their own.
+    """
+    models = parse_model_names(settings.model)
+    consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
+    usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
+    oauth_candidates = [
+        acc.number
+        for acc in snap.accounts
+        if acc.number != active_number
+        and acc.switchable
+        and not acc.disabled
+        and acc.kind != "api_key"
+    ]
+    api_key_candidates = (
+        [
+            acc.number
+            for acc in snap.accounts
+            if acc.number != active_number
+            and acc.switchable
+            and not acc.disabled
+            and acc.kind == "api_key"
+        ]
+        if settings.include_api_key_accounts
+        else []
+    )
+
+    def _trigger_for(active_headroom: float | None, active_disabled: bool) -> str:
+        if active_disabled:
+            return "disabled-active"
+        if active_headroom is None:
+            return "unreadable-active"
+        if settings.strategy == "dynamic":
+            kind = _classify_dynamic_trigger(active_headroom)
+            return "at-limit" if kind == "at-limit" else "dynamic-unmodeled"
+        if (100.0 - active_headroom) < settings.threshold:
+            return (
+                settings.strategy
+                if settings.strategy in CONSUME_FIRST_STRATEGIES
+                else "below-threshold"
+            )
+        return "at-limit" if active_headroom <= 0 else "proactive"
+
+    def _rank_on(axis: tuple[str, ...], trigger: str) -> tuple[list[str], str | None]:
+        if trigger in _UNMODELED_TRIGGERS:
+            return [], None
+        headroom = _headroom_by_account(usage, axis)
+        ordered, _any_known, _reset_ts, _waiting, rank_axis = rank_candidates_pass(
+            models=axis,
+            trigger=trigger,
+            consume_first=consume_first,
+            oauth_candidates=oauth_candidates,
+            no_return=None,
+            usage=usage,
+            headroom=headroom,
+            current=active_number,
+            active_headroom=headroom.get(active_number),
+            settings=settings,
+            now=now,
+        )
+        return ordered, rank_axis
+
+    model_headroom = _headroom_by_account(usage, models)
+    active_disabled = next(
+        (acc.disabled for acc in snap.accounts if acc.number == active_number), False
+    )
+    trigger = _trigger_for(
+        _dynamic_active_headroom(
+            settings, models, usage, active_number, model_headroom.get(active_number)
+        ),
+        active_disabled,
+    )
+    unmodeled = trigger in _UNMODELED_TRIGGERS
+    ordered, rank_axis = _rank_on(models, trigger)
+    if (
+        not ordered
+        and models
+        and settings.strategy == "dynamic"
+        and _model_window_binds_everywhere(usage, models, settings.threshold)
+    ):
+        ordered, rank_axis = _rank_on((), trigger)
+    if (
+        not ordered
+        and api_key_candidates
+        and not unmodeled
+        and trigger not in CONSUME_FIRST_STRATEGIES
+    ):
+        ordered, rank_axis = api_key_candidates, None
+    return ordered, rank_axis, trigger, unmodeled
+
+
+def ordered_accounts(
+    snap: AccountsSnapshot, settings: "AutoSwitchSettings", now: float
+) -> list[str]:
+    """Every account number, active first, then the rest as the engine's own
+    pass would rank them: ranked-and-open, usable-but-refused, sentinel-
+    blocked, spend-only, unswitchable last. THE one order every screen
+    renders in -- a screen keeping slot order says so at its own call site.
+    """
+    active_number = snap.active_number
+    others = [acc for acc in snap.accounts if acc.number != active_number]
+    ordered, *_ = rank_switch_candidates(snap, settings, now, active_number)
+    ordered_rank = {num: i for i, num in enumerate(ordered)}
+    models = parse_model_names(settings.model)
+
+    def bucket(acc) -> tuple:
+        if not acc.switchable:
+            return (4,)
+        if acc.number in ordered_rank:
+            return (0, ordered_rank[acc.number])
+        if acc.usage.sentinel is not None:
+            return (2,)
+        if binding_pct(acc.usage.last_good, models) is None:
+            return (3,)
+        # Soonest 7-day reset first, unknown last -- matches the auto
+        # view's own fallback key for a row its admission pass refused
+        # (autoview.py's `_candidates_text`), or the two screens can list
+        # this same unranked row in two different orders.
+        reset_ts = _seven_day_reset_ts(acc.usage.last_good, now)
+        return (1, reset_ts if reset_ts is not None else float("inf"))
+
+    others.sort(key=lambda a: (bucket(a), a.number))  # matches the auto view's tie-break
+    numbers = [acc.number for acc in others]
+    return ([active_number] if active_number is not None else []) + numbers
+
+
 __all__ = [
     "ActionResult",
     "REFETCHING",
@@ -323,6 +478,8 @@ __all__ = [
     "format_age",
     "format_duration",
     "last_seen_note",
+    "ordered_accounts",
+    "rank_switch_candidates",
     "reset_clock",
     "reset_text",
     "run_action",

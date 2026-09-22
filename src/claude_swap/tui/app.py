@@ -21,7 +21,12 @@ from claude_swap import printer
 from claude_swap.autoswitch import proactive_switch_bar_pct
 from claude_swap.models import AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
-from claude_swap.settings import load_settings, load_ui_settings, set_setting
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    load_settings,
+    load_ui_settings,
+    set_setting,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
@@ -71,14 +76,15 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
-        # The auto-switch threshold, drawn as a tick on the status strip's
-        # bars everywhere. Missing/invalid settings fall back to the default.
+        # The auto-switch threshold (status strip tick) AND the settings
+        # object every account-listing screen ranks by (`ordered_accounts`).
         try:
-            _settings = load_settings(switcher.backup_dir)
+            self.auto_settings = load_settings(switcher.backup_dir)
             self.threshold_pct: float | None = proactive_switch_bar_pct(
-                _settings.strategy, _settings.threshold
+                self.auto_settings.strategy, self.auto_settings.threshold
             )
         except Exception:
+            self.auto_settings = AutoSwitchSettings()
             self.threshold_pct = None
         try:
             self._theme_name = load_ui_settings(switcher.backup_dir).theme
