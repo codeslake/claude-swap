@@ -13,10 +13,12 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import oauth, poll_policy
+from claude_swap import autoswitch, oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
+    MESSAGE_ERROR_SAMPLE,
     NO_RESET_FALLBACK_S,
+    OVERLOAD_BACKOFF_S,
     RECOVERY_HORIZON_S,
     SPENT_HEADROOM_PCT,
     AllExhaustedEvent,
@@ -12413,3 +12415,128 @@ class TestTheBindingRecoveryAgreesWithWhenTheAccountIsUsable:
             "ranking read the 5-hour reset the account is not waiting for"
         )
         assert harness.active_number() == 2
+
+
+class TestOverloadedTrigger:
+    """A 5xx burst on ``/v1/messages``, read from the pin's own request
+    trace, escapes the active account even while usage headroom reads
+    healthy -- autoswitch's headroom-only judgement never sees the
+    provider's own outage. See ``_message_error_burst`` / ``_trace_path``
+    (autoswitch.py).
+    """
+
+    @staticmethod
+    def _line(status: int) -> bytes:
+        return (
+            f"[c1]     <- HTTP/1.1 {status} unknown  POST /v1/messages?beta=true  "
+            "ua=claude-cli/2.1.278 (external, cli)\n"
+        ).encode()
+
+    def _write_trace(self, path: Path, statuses: list[int]) -> None:
+        path.write_bytes(b"".join(self._line(s) for s in statuses))
+
+    def _arm(self, harness, tmp_path, monkeypatch) -> Path:
+        trace = tmp_path / "trace.log"
+        trace.write_bytes(b"")  # armed, empty -- the first tick's baseline
+        monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace)
+        harness.engine.settings = replace(harness.engine.settings, strategy="best")
+        return trace
+
+    @pytest.mark.parametrize(
+        "statuses, fires",
+        [
+            ([529, 529, 529, 200, 200], True),   # 3/5 = 60%, at the share
+            ([200, 200, 200, 529, 529], False),  # 2/5 = 40%, same sample size
+        ],
+    )
+    def test_the_error_share_gates_the_switch(
+        self, harness, tmp_path, monkeypatch, statuses, fires
+    ):
+        trace = self._arm(harness, tmp_path, monkeypatch)
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION  # baseline tick, everyone healthy
+        self._write_trace(trace, statuses)
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        if fires:
+            assert outcome is TickOutcome.SWITCHED
+            switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+            assert switch.trigger == "overloaded"
+            assert switch.to_ref["number"] != 1
+            assert harness.state()["leftTrigger"] == "overloaded"
+        else:
+            assert outcome is TickOutcome.NO_ACTION
+            assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+
+    def test_the_first_read_of_an_armed_trace_decides_nothing(
+        self, harness, tmp_path, monkeypatch
+    ):
+        trace = self._arm(harness, tmp_path, monkeypatch)
+        # Content already sitting in the trace before the engine's first
+        # read must not be attributed to that tick.
+        self._write_trace(trace, [529, 529, 529, 529, 529])
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.engine._message_trace_offset == trace.stat().st_size
+
+    def test_a_rotated_trace_file_re_baselines_and_decides_nothing(
+        self, harness, tmp_path, monkeypatch
+    ):
+        trace = self._arm(harness, tmp_path, monkeypatch)
+        self._write_trace(trace, [529] * 20)
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert harness.engine._message_trace_offset == trace.stat().st_size
+        # Rotated: a fresh, shorter file landed at the same path.
+        self._write_trace(trace, [529, 529, 529, 200, 200])
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.engine._message_trace_offset == trace.stat().st_size
+
+    def test_the_account_just_left_is_barred_until_its_backoff_elapses(
+        self, harness, tmp_path, monkeypatch
+    ):
+        trace = self._arm(harness, tmp_path, monkeypatch)
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(5.0), "3": _usage(50.0),
+        })
+        self._write_trace(trace, [529, 529, 529, 200, 200])
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(5.0), "3": _usage(50.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        # Account 2 has more headroom than 3, so it wins the escape from 1.
+        assert harness.active_number() == 2
+
+        # Force another escape, off the NEW active (2): without the backoff,
+        # account 1 (headroom 99) would beat account 3 (headroom 50) -- but 1
+        # is still inside the backoff `_perform` just recorded for it.
+        outcome = harness.tick_with_usage({
+            "1": _usage(1.0), "2": _usage(100.0), "3": _usage(50.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(
+            e for e in reversed(harness.events) if isinstance(e, SwitchEvent)
+        )
+        assert switch.trigger == "at-limit"
+        assert harness.active_number() == 3, (
+            "account 1 was barred by its own just-recorded overload backoff, "
+            "so the at-limit escape from 2 should have landed on 3, not 1"
+        )
+
+        # Past the backoff, the same escape (off the new active, 3) admits 1
+        # again and its higher headroom wins it.
+        harness.clock.advance(OVERLOAD_BACKOFF_S + 1)
+        outcome = harness.tick_with_usage({
+            "1": _usage(1.0), "2": _usage(50.0), "3": _usage(100.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 1

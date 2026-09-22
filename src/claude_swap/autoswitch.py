@@ -166,6 +166,97 @@ HORIZON_HEADROOM_RATIO = 2.0
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
+# The 529/500 burst that means "the API itself is down", read from the pin's
+# request trace rather than from usage headroom (usage stays perfectly
+# readable through an outage -- see `_message_error_burst`). Five answers is
+# enough to not fire on one flaky request; half of them failing is enough to
+# not fire on ordinary noise.
+#
+# ponytail: this whole trigger only exists while the pin's trace is armed --
+# `_trace_path` returns None with no pin extra installed or no `trace-to`
+# written, `_message_error_burst` then returns None, and the engine falls
+# straight through to today's headroom-only behaviour. No failover on a 5xx
+# burst without it; upgrade path is arming the trace, not code here.
+MESSAGE_ERROR_SAMPLE = 5
+MESSAGE_ERROR_SHARE = 0.5
+
+# How long the account just escaped for `overloaded` is barred from being a
+# landing spot again, so alternation does not rotate straight back into it
+# before the provider's outage clears. 15 minutes: long enough to outlast a
+# short blip, short enough that a fleet with nowhere else to go is not parked
+# for an hour on one account's turn.
+#
+# ponytail: a genuinely fleet-wide Anthropic outage still walks the fleet one
+# account per MESSAGE_ERROR_SAMPLE failed calls, backing each off in turn,
+# until every account is barred and the engine falls back to whatever
+# headroom-based trigger applies next. That is the honest ceiling of a
+# per-account backoff with no fleet-wide "everyone is down" signal; a shared
+# circuit breaker across accounts would need its own state and its own task.
+OVERLOAD_BACKOFF_S = 900.0
+
+
+def _trace_path(switcher: ClaudeAccountSwitcher) -> Path | None:
+    """The pin's request trace file, or None when there is nothing to read.
+
+    ponytail: talks to ``cswap_pin.proxy`` directly instead of through a
+    ``claude_swap.pin`` adapter -- this branch (PR #199) does not carry one,
+    the cloud pin belongs to its own PR (#210, its own package release), and
+    this is the only caller here. Mirrors that adapter's own optional-extra
+    shape (never raises, `None` means "cannot ask") so a later move into
+    `pin.py` is a cut-and-paste, not a rewrite.
+    """
+    import importlib
+
+    importlib.invalidate_caches()
+    try:
+        proxy = importlib.import_module("cswap_pin.proxy")
+        target = proxy.trace_target(Path(switcher.backup_dir) / "pin-proxy")
+    except Exception:  # noqa: BLE001 -- an optional extra must not break a tick
+        return None
+    return Path(target) if target else None
+
+
+def _message_error_burst(
+    switcher: ClaudeAccountSwitcher, since: int | None
+) -> tuple[int, int, int] | None:
+    """Server-error share on ``/v1/messages`` since byte offset ``since``.
+
+    Returns ``(server_errors, calls, new_offset)`` counted over trace bytes
+    written after ``since``, or None when there is nothing to read: no pin
+    extra, no trace target armed, or the file could not be read. Never
+    raises -- every OSError path returns None, so this diagnostic can never
+    break a tick.
+
+    ``since=None`` (no baseline yet) and a rotated (shorter) file both
+    answer ``(0, 0, <current size>)``: zero calls counted is what makes the
+    caller decide nothing on either, using the exact same check it uses for
+    "not enough samples yet" -- no separate first-read flag needed.
+    """
+    path = _trace_path(switcher)
+    if path is None:
+        return None
+    try:
+        size = path.stat().st_size
+        if since is None or size < since:
+            return (0, 0, size)
+        with path.open("rb") as f:
+            f.seek(since)
+            chunk = f.read(min(size - since, 1024 * 1024))
+    except OSError:
+        return None
+    calls = server_errors = 0
+    for line in chunk.split(b"\n"):
+        if b"<- HTTP/1.1 " not in line or b"POST /v1/messages" not in line:
+            continue
+        try:
+            status = int(line.split(b"<- HTTP/1.1 ", 1)[1].split(b" ", 1)[0])
+        except (ValueError, IndexError):
+            continue
+        calls += 1
+        if status >= 500:
+            server_errors += 1
+    return (server_errors, calls, size)
+
 
 def _recovery_is_useful(
     candidate_recovery_ts: float,
@@ -416,7 +507,8 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    # proactive | at-limit | failover | consume-first | disabled-active
+    # proactive | at-limit | failover | consume-first | disabled-active |
+    # overloaded
     trigger: str
     from_ref: dict | None
     to_ref: dict | None
@@ -860,6 +952,10 @@ class AutoSwitchEngine:
         # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
         self._idle_hold_since: float | None = None
         self._idle_hold_slow = False
+        # Byte offset into the pin's trace the last tick read up to. None
+        # until the first successful read takes its baseline; see
+        # `_message_error_burst`.
+        self._message_trace_offset: int | None = None
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -1485,6 +1581,28 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+
+        # Read the pin's trace for a 5xx burst BEFORE the headroom-based
+        # classification below: usage stays perfectly readable through a
+        # provider-side outage, so headroom alone never sees one. Computed
+        # every tick (not only when the elif below is reached) so the
+        # baseline advances even on a disabled-active tick, and `had_baseline`
+        # keeps the first-ever read (and a rotated/shorter file, which reads
+        # back as zero calls the same way) from deciding anything.
+        overload_burst = _message_error_burst(
+            self.switcher, self._message_trace_offset
+        )
+        is_overloaded = False
+        if overload_burst is not None:
+            had_baseline = self._message_trace_offset is not None
+            server_errors, calls, new_offset = overload_burst
+            self._message_trace_offset = new_offset
+            is_overloaded = (
+                had_baseline
+                and calls >= MESSAGE_ERROR_SAMPLE
+                and server_errors >= calls * MESSAGE_ERROR_SHARE
+            )
+
         # A DISABLED ACTIVE IS NOT A LANDING SPOT. `disable` withdraws a slot
         # from automatic selection and `switchable_account_numbers()` honours
         # that for CANDIDATES, but nothing applied it to the slot the engine is
@@ -1506,6 +1624,17 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             trigger = "disabled-active"
+        elif is_overloaded:
+            # Its own trigger name for the same reason `disabled-active` gets
+            # one: every gate on the switching path keys on
+            # `trigger in ("proactive", "consume-first")`, so a new value
+            # falls to the at-limit/failover side -- no cooldown, no
+            # no-return bar, no hysteresis -- which is what "leave now"
+            # needs, and outranks the headroom read below (which the API
+            # itself is not honouring right now regardless of what it says).
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            trigger = "overloaded"
         elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
@@ -1584,10 +1713,22 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
+        # Read once, here, and reused below as `_rank`'s `now` too: a second
+        # independent `self.clock()` call shifts every value in a test's
+        # fixed clock sequence and is not a fact this filter needs freshly.
+        decided_now = self.clock()
+        overload_backoff = state.get("overloadBackoff")
+        if not isinstance(overload_backoff, dict):
+            overload_backoff = {}
         candidates = [
             num
             for num in self.switcher.switchable_account_numbers()
-            if num != current and num not in quarantined
+            if num != current
+            and num not in quarantined
+            # An account just escaped for `overloaded` is not a landing spot
+            # again until its backoff elapses -- see `_perform`, where the
+            # entry is written, and OVERLOAD_BACKOFF_S above.
+            and decided_now >= (overload_backoff.get(num) or 0)
         ]
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
@@ -1706,7 +1847,6 @@ class AutoSwitchEngine:
                     return unbarred
             return ranked
 
-        decided_now = self.clock()
         ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
             trigger=trigger,
             consume_first=consume_first,
@@ -3035,6 +3175,12 @@ class AutoSwitchEngine:
             # nulls then runs the wrong legs. Record it directly so the
             # reader never has to guess.
             state["leftTrigger"] = trigger
+            if trigger == "overloaded" and state["lastSwitchFrom"] is not None:
+                backoff = state.get("overloadBackoff")
+                if not isinstance(backoff, dict):
+                    backoff = {}
+                backoff[str(state["lastSwitchFrom"])] = self.clock() + OVERLOAD_BACKOFF_S
+                state["overloadBackoff"] = backoff
             atomic_write_json(self.state_path, state)
 
         warnings = list(result.get("warnings", []))
