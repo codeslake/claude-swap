@@ -16,7 +16,6 @@ import pytest
 from claude_swap import autoswitch, oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
-    MESSAGE_ERROR_SAMPLE,
     NO_RESET_FALLBACK_S,
     OVERLOAD_BACKOFF_S,
     RECOVERY_HORIZON_S,
@@ -68,6 +67,16 @@ def _usage(pct: float, resets_at: str | None = None) -> dict:
     if resets_at:
         window["resets_at"] = resets_at
     return {"five_hour": window, "seven_day": {"pct": 0.0}}
+
+
+def _trace_line(status: int) -> bytes:
+    """One line of the pin's request trace, as `_message_error_burst`
+    (autoswitch.py) parses it. Module-level so every test that fabricates
+    trace content shares one spelling of the format."""
+    return (
+        f"[c1]     <- HTTP/1.1 {status} unknown  POST /v1/messages?beta=true  "
+        "ua=claude-cli/2.1.278 (external, cli)\n"
+    ).encode()
 
 
 def _entry_for(value: dict | str | None, now: float) -> UsageEntry:
@@ -5103,6 +5112,49 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
             "does not clear at 11 points, and there is no leftHeadroom "
             "baseline to self-improve against -- must hold, not borrow the "
             "failover branch's more permissive landing floor"
+        )
+
+    def test_an_overloaded_departure_releases_without_improving_on_a_healthy_baseline(
+        self,
+    ):
+        """`leftTrigger == "overloaded"` gets the SAME full exemption as
+        `disabled-active`, not the ordinary dominance legs -- unlike a
+        headroom-triggered departure, an overload departure's `leftHeadroom`
+        is the ACTIVE's own (often healthy) reading at the moment of the 5xx
+        burst, not a low bar the peer needs to beat. Requiring dominance
+        over a baseline that was never low locks the peer out for days, far
+        outliving `OVERLOAD_BACKOFF_S`'s own 900s wait -- see `_perform`,
+        which already gates re-entry on that timer separately.
+        """
+        from claude_swap.autoswitch import AutoSwitchEngine
+        from claude_swap.settings import AutoSwitchSettings
+
+        class Fake(AutoSwitchEngine):
+            def __init__(self):
+                self._models = ()
+
+        e = Fake()
+        settings = AutoSwitchSettings()
+        now = 1_000_000.0
+        # The barred peer (1) and the active (2) are UNCHANGED since the
+        # departure -- no burn, no improvement, exactly the condition that
+        # never clears the ordinary dominance leg.
+        usage = {"1": _usage(8.0)}
+        headroom = {"1": 92.0}
+        overloaded_state = {
+            "lastSwitchFrom": "1",
+            "leftHeadroom": 92.0,   # healthy at departure -- not a low bar
+            "leftRecoveryAt": None,
+            "leftTrigger": "overloaded",
+        }
+        recovered = e._left_account_recovered(
+            overloaded_state, usage, headroom, 92.0, settings, now, "2"
+        )
+        assert recovered is True, (
+            "an overload departure must release on its own backoff "
+            "schedule, not on the ordinary headroom-improvement legs -- an "
+            "unimproved but already-healthy peer stays locked out for days "
+            "otherwise"
         )
 
     def test_pre_upgrade_null_snapshot_without_leftTrigger_still_infers_failover(
@@ -12417,6 +12469,47 @@ class TestTheBindingRecoveryAgreesWithWhenTheAccountIsUsable:
         assert harness.active_number() == 2
 
 
+class TestTracePath:
+    """`_trace_path` talks to the optional `cswap_pin` extra directly
+    (`cswap_pin.proxy.trace_target(certdir) -> str | None`) and is
+    monkeypatched away everywhere else in this file -- exercised here
+    directly, against a stub planted in `sys.modules`."""
+
+    def test_a_path_comes_back_when_the_extra_answers(self, harness, monkeypatch):
+        import sys
+        import types
+
+        wanted = str(Path(harness.switcher.backup_dir) / "pin-proxy" / "trace.log")
+        stub = types.SimpleNamespace(trace_target=lambda certdir: wanted)
+        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", stub)
+
+        assert autoswitch._trace_path(harness.switcher) == Path(wanted)
+
+    def test_none_when_trace_target_answers_nothing(self, harness, monkeypatch):
+        import sys
+        import types
+
+        stub = types.SimpleNamespace(trace_target=lambda certdir: None)
+        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", stub)
+
+        assert autoswitch._trace_path(harness.switcher) is None
+
+    def test_none_when_the_extra_cannot_be_imported(self, harness, monkeypatch, caplog):
+        def _raise(name, *a, **kw):
+            raise ImportError(f"no module named {name!r}")
+
+        monkeypatch.setattr(autoswitch.importlib, "import_module", _raise)
+
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            path = autoswitch._trace_path(harness.switcher)
+
+        assert path is None
+        assert "trace_target" in caplog.text, (
+            "the except branch must name the exception, not swallow it "
+            f"silently -- caplog: {caplog.text!r}"
+        )
+
+
 class TestOverloadedTrigger:
     """A 5xx burst on ``/v1/messages``, read from the pin's own request
     trace, escapes the active account even while usage headroom reads
@@ -12425,15 +12518,8 @@ class TestOverloadedTrigger:
     (autoswitch.py).
     """
 
-    @staticmethod
-    def _line(status: int) -> bytes:
-        return (
-            f"[c1]     <- HTTP/1.1 {status} unknown  POST /v1/messages?beta=true  "
-            "ua=claude-cli/2.1.278 (external, cli)\n"
-        ).encode()
-
     def _write_trace(self, path: Path, statuses: list[int]) -> None:
-        path.write_bytes(b"".join(self._line(s) for s in statuses))
+        path.write_bytes(b"".join(_trace_line(s) for s in statuses))
 
     def _arm(self, harness, tmp_path, monkeypatch) -> Path:
         trace = tmp_path / "trace.log"
@@ -12445,7 +12531,7 @@ class TestOverloadedTrigger:
     @pytest.mark.parametrize(
         "statuses, fires",
         [
-            ([529, 529, 529, 200, 200], True),   # 3/5 = 60%, at the share
+            ([529, 529, 529, 200, 200], True),   # 3/5 = 60%, above the 50% share
             ([200, 200, 200, 529, 529], False),  # 2/5 = 40%, same sample size
         ],
     )
@@ -12466,32 +12552,26 @@ class TestOverloadedTrigger:
             switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
             assert switch.trigger == "overloaded"
             assert switch.to_ref["number"] != 1
+            assert switch.detail == "3/5 5xx on /v1/messages", (
+                f"the decision log line must name the burst that decided it, "
+                f"not a bare trigger token -- got {switch.detail!r}"
+            )
             assert harness.state()["leftTrigger"] == "overloaded"
         else:
             assert outcome is TickOutcome.NO_ACTION
             assert not any(isinstance(e, SwitchEvent) for e in harness.events)
-
-    def test_the_first_read_of_an_armed_trace_decides_nothing(
-        self, harness, tmp_path, monkeypatch
-    ):
-        trace = self._arm(harness, tmp_path, monkeypatch)
-        # Content already sitting in the trace before the engine's first
-        # read must not be attributed to that tick.
-        self._write_trace(trace, [529, 529, 529, 529, 529])
-        outcome = harness.tick_with_usage({
-            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
-        })
-        assert outcome is TickOutcome.NO_ACTION
-        assert harness.engine._message_trace_offset == trace.stat().st_size
 
     def test_a_rotated_trace_file_re_baselines_and_decides_nothing(
         self, harness, tmp_path, monkeypatch
     ):
         trace = self._arm(harness, tmp_path, monkeypatch)
         self._write_trace(trace, [529] * 20)
-        harness.tick_with_usage({
+        # Content already sitting in the trace before the engine's first
+        # read must not be attributed to that tick.
+        outcome = harness.tick_with_usage({
             "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
         })
+        assert outcome is TickOutcome.NO_ACTION
         assert harness.engine._message_trace_offset == trace.stat().st_size
         # Rotated: a fresh, shorter file landed at the same path.
         self._write_trace(trace, [529, 529, 529, 200, 200])
@@ -12541,6 +12621,93 @@ class TestOverloadedTrigger:
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 1
 
+    def test_the_offset_re_baselines_after_a_switch_lands(
+        self, harness, tmp_path, monkeypatch
+    ):
+        """`_perform` must move `_message_trace_offset` to the trace's size
+        at the moment the switch actually LANDS, not leave it wherever the
+        tick's own read stopped. A real pin keeps logging while the switch
+        is in flight (freshening, the Keychain rewrite); bytes it writes in
+        that window are the OLD account's, and an offset left behind hands
+        them to whichever account the engine just moved TO -- two
+        consecutive bursts must fire once each, not twice off the same
+        underlying traffic.
+        """
+        trace = self._arm(harness, tmp_path, monkeypatch)
+        harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(5.0), "3": _usage(50.0),
+        })
+        self._write_trace(trace, [529, 529, 529, 200, 200])
+
+        real_switch_to = harness.switcher.switch_to
+
+        def switch_and_log_more_traffic(identifier, json_output=False, force=False):
+            # Traffic the OLD account generated after this tick's OWN read
+            # already advanced past the burst above -- simulating a real
+            # pin still logging while the switch is in flight.
+            with trace.open("ab") as f:
+                f.write(b"".join(_trace_line(s) for s in [529, 529, 529, 200, 200]))
+            return real_switch_to(identifier, json_output=json_output, force=force)
+
+        monkeypatch.setattr(
+            harness.switcher, "switch_to", switch_and_log_more_traffic
+        )
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(5.0), "3": _usage(50.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+        # Nothing new has happened since the switch landed. Without the
+        # re-baseline, the offset is still where the TICK's own read
+        # stopped -- before `switch_and_log_more_traffic`'s extra burst --
+        # so this tick would read those bytes as fresh and fire
+        # `overloaded` again on the account it just moved TO, though it
+        # made no calls of its own.
+        monkeypatch.setattr(harness.switcher, "switch_to", real_switch_to)
+        harness.events.clear()
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(5.0), "3": _usage(50.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events), (
+            "fired a second time on the account it just moved to, off bytes "
+            "the OLD account wrote during the switch -- the offset was "
+            "never re-baselined to the trace's size after landing"
+        )
+        assert harness.active_number() == 2
+
+    def test_the_overload_bar_releases_when_it_would_leave_nothing(
+        self, harness, tmp_path, monkeypatch
+    ):
+        """A 2-account fleet (account 3 disabled, out of rotation): barring
+        the account just left for `overloaded` empties the candidate list
+        entirely. The bar used to sit in the census filter, so at n=2 the
+        very next escape found `candidates` already empty and returned
+        BLOCKED `no-candidates` for the WHOLE 900s backoff -- parking the
+        engine on an exhausted active with a live alternative sitting right
+        there, barred. Moved into `_rank`, the bar now releases itself
+        instead when it would leave nothing.
+        """
+        harness.switcher.set_account_disabled("3", True)
+        trace = self._arm(harness, tmp_path, monkeypatch)
+        harness.tick_with_usage({"1": _usage(10.0), "2": _usage(10.0)})
+        self._write_trace(trace, [529, 529, 529, 200, 200])
+        outcome = harness.tick_with_usage({"1": _usage(10.0), "2": _usage(10.0)})
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        assert harness.state()["leftTrigger"] == "overloaded"
+
+        # Account 2 (the only OTHER account -- 3 is disabled) is now at its
+        # limit, and account 1 -- the sole remaining candidate -- is still
+        # inside the backoff `_perform` just recorded for it.
+        outcome = harness.tick_with_usage({"1": _usage(5.0), "2": _usage(100.0)})
+        assert outcome is TickOutcome.SWITCHED, (
+            f"barred from the only other account in a 2-account fleet, and "
+            f"parked BLOCKED instead of releasing; events={harness.kinds()}"
+        )
+        assert harness.active_number() == 1
+
 
 class TestMessageErrorBurstOffsetAfterACappedRead:
     """A tick's read of the trace is capped at 1 MiB; the offset it hands
@@ -12553,21 +12720,17 @@ class TestMessageErrorBurstOffsetAfterACappedRead:
     ):
         trace = tmp_path / "trace.log"
         monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace)
-        cap = 1024 * 1024
-        ok_line = (
-            "[c1]     <- HTTP/1.1 200 unknown  POST /v1/messages?beta=true  "
-            "ua=claude-cli/2.1.278 (external, cli)\n"
-        ).encode()
-        error_line = (
-            "[c1]     <- HTTP/1.1 529 unknown  POST /v1/messages?beta=true  "
-            "ua=claude-cli/2.1.278 (external, cli)\n"
-        ).encode()
-        # Enough healthy traffic to push well past the 1 MiB cap, then one
-        # error line sitting entirely beyond it.
-        padding = ok_line * ((cap // len(ok_line)) + 4)
+        ok_line = _trace_line(200)
+        error_line = _trace_line(529)
+        # A couple of healthy lines push past a (monkeypatched, tiny) cap,
+        # then one error line sitting entirely beyond it -- exercises the
+        # same code path a >1 MiB fixture would, without writing one, and
+        # without duplicating the module's own cap literal.
+        padding = ok_line * 2
+        monkeypatch.setattr(autoswitch, "TRACE_READ_CAP_BYTES", len(padding) - 10)
         trace.write_bytes(padding + error_line)
 
-        server_errors, calls, offset_after_first = autoswitch._message_error_burst(
+        server_errors, _, offset_after_first = autoswitch._message_error_burst(
             None, 0
         )
         assert server_errors == 0  # the error line sits well past the cap
@@ -12575,11 +12738,11 @@ class TestMessageErrorBurstOffsetAfterACappedRead:
             "a capped read must not report the file's full size as read"
         )
 
-        server_errors2, calls2, offset_after_second = autoswitch._message_error_burst(
+        server_errors2, _, offset_after_second = autoswitch._message_error_burst(
             None, offset_after_first
         )
         assert server_errors2 >= 1, (
-            "the error line beyond the first tick's 1 MiB cap must surface "
+            "the error line beyond the first tick's cap must surface "
             "on a later tick, not be lost because the previous tick's "
             "offset jumped straight to the file's end"
         )
