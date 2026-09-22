@@ -4160,6 +4160,7 @@ class AutoSwitchEngine:
             models=self._models, headroom=headroom, active_headroom=headroom.get(current), **kw
         )
         if settings.strategy != "dynamic":
+            self._last_probe_num = probe_num  # T0888 sweep: non-dynamic strategies record the probe pick too
             return ordered, any_known, active_reset_ts, waiting
         result = (ordered, any_known, active_reset_ts, waiting)
         # `dynamic` ONLY. Any strategy with `self._models` set whose
