@@ -8385,7 +8385,22 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             )
 
     def _usage_by_account(self) -> dict[str, dict | str | None]:
-        """Map account number → decision-grade usage value for managed accounts."""
+        """Map account number → decision-grade usage value for managed accounts.
+
+        ``models=()`` (account-wide 5h/7d only), deliberately, and every
+        other ``decision_value()`` call in this file (the CLI's
+        ``--list``/``--status`` JSON, the lockstep-usage duplicate-account
+        heuristic) matches it: a pinned model's scoped window is a property
+        of `cswap auto`'s ``AutoSwitchSettings.model``, which lives on the
+        ENGINE, not on ``ClaudeAccountSwitcher`` — this class holds no model
+        to scope by TODAY. A manual `cswap switch`/`--list`/`--status` shows
+        the account-wide picture; only the auto-switch engine (which holds
+        ``self._models``) folds a pinned model's window into what it reads
+        as "rolled" or "spent". Widening these to a model needs resolving one
+        from settings at a single default-resolution site (the way
+        ``cli.py``'s CLI-merged-model resolution already does), not a new
+        parameter threaded through every caller.
+        """
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info)
         return {num: entry.decision_value() for num, entry in entries.items()}
@@ -8598,6 +8613,8 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         for num, _email, _org_name, _org_uuid, _is_active, _creds, _alias in accounts_info:
             snum = str(num)
             entry = entries.get(snum)
+            # models=() — see `_usage_by_account`; this compares only the
+            # account-wide 5h/7d windows anyway (below), not a scoped one.
             usage = entry.decision_value() if entry else None
             if not isinstance(usage, dict):
                 continue
@@ -8641,6 +8658,15 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
             # keying on usageStatus == "ok" must not act on arbitrarily old data.
+            # A relevant window whose own reset has already elapsed is also
+            # dropped from a FRESH reading (#325, usage_store._drop_rolled_
+            # windows); if that leaves nothing (every relevant window
+            # rolled), the status is not "ok" either, even for a
+            # just-fetched row. On an older, deliberately-stale reading ANY
+            # rolled window nulls the whole thing outright, not just the
+            # window that rolled.
+            # models=() — see `_usage_by_account`; `--list` shows the
+            # account-wide picture, never a model-pinned one.
             accounts.append(
                 account_row(
                     num, email, org_name, org_uuid, is_active,
@@ -8836,6 +8862,8 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         )
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
+        # models=() — see `_usage_by_account`; `--status` shows the
+        # account-wide picture, never a model-pinned one.
         status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
         active: dict = {
             "number": int(account_num),

@@ -298,6 +298,41 @@ class TestFormatting:
         assert tui_data.format_duration(7980) == "2h 13m"
         assert tui_data.format_duration(3600 * 26) == "1d 2h"
 
+    def test_chip_label_countdown_is_zero_padded_to_a_fixed_width(self):
+        """The owner, 2026-09-15: a chip's countdown must render in one
+        fixed-width shape so the `:` before every window's `%` lands on
+        the same column regardless of how wide the raw countdown text is
+        (`2h 4m` vs `12m` vs `3d 4h`)."""
+        assert tui_data.chip_label("5h", "resets 2h 4m") == "5h(⟳2h04m):"
+        assert tui_data.chip_label("5h", "resets 2h") == "5h(⟳2h00m):"
+        assert tui_data.chip_label("5h", "resets 12m") == "5h(⟳0h12m):"
+        assert tui_data.chip_label("5h", "resets 45s") == "5h(⟳0h00m):"
+        assert tui_data.chip_label("7d", "resets 3d 4h") == "7d(⟳3d04h):"
+        assert tui_data.chip_label("7d", "resets 3d") == "7d(⟳3d00h):"
+        assert tui_data.chip_label("7d", "resets 1d 11h") == "7d(⟳1d11h):"
+        # a two-digit hour with no day component would be 6 wide
+        # ("14h04m") if it stayed in the hour shape -- one column wider
+        # than every other reading; routed through the day-plus shape
+        # instead it stays 5 wide.
+        assert tui_data.chip_label("7d", "resets 14h 4m") == "7d(⟳0d14h):"
+        assert tui_data.chip_label("7d", "resets 10h") == "7d(⟳0d10h):"
+        # unchanged branches
+        assert tui_data.chip_label("5h", "resets now") == "5h(⟳now):"
+        assert tui_data.chip_label("5h", tui_data.REFETCHING) == "5h(⟳refetching):"
+        assert tui_data.chip_label("5h", None) == "5h(⟳?):"
+        assert tui_data.chip_label("5h", None, pct=0.0) == "5h(⟳5h00m):"
+        # #325 follow-up: the retry/backoff markers `reset_text` can now
+        # name for a rolled-but-unclaimed window (see
+        # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`
+        # below) are not a plain duration shape either, so they keep their
+        # own words too instead of being mangled into `0h05m`/`0h02m` —
+        # and stay inside REFETCHING's width, the widest token this column
+        # already budgets for, so no layout changes (PR #323's business).
+        assert tui_data.chip_label("5h", "retry 5m") == "5h(⟳retry 5m):"
+        assert tui_data.chip_label("5h", "429 2m") == "5h(⟳429 2m):"
+        assert len("retry 5m") <= len(tui_data.REFETCHING)
+        assert len("429 2m") <= len(tui_data.REFETCHING)
+
     def test_format_age_fresh_is_silent(self):
         # Ages inside the serve TTL are the polling cadence at work, not
         # staleness worth flagging.
@@ -389,6 +424,136 @@ class TestFormatting:
         elapsed = {"resets_at": _iso_in(-60)}
         assert tui_data.reset_clock(elapsed, now) is None
         assert tui_data.reset_text(elapsed, now) == "resets now"
+
+    def test_reset_text_names_a_pct_that_provably_predates_the_reset(self):
+        """A window whose reset elapsed while the served pct is older still
+        (`fetched_at < resets_at <= now`) must not claim "resets now" beside
+        a pct that is provably pre-reset -- PR #325.
+
+        #325 follow-up: `fetched_at < resets_at <= now` alone proves the pct
+        is stale, but it does NOT prove a fetch is under way -- that needs
+        `entry` (see the three tests below). Without one, `reset_text` has
+        no way to tell a live claim from a stalled one and keeps its old,
+        conservative "refetching" guess; every production caller now passes
+        an `entry`, so this bare-`fetched_at` call is a unit-level probe of
+        `reset_text` itself, not a claim about what the UI shows."""
+        now = time.time()
+        window = {"resets_at": _iso_in(-60)}
+        fetched_before_reset = now - 120
+        assert (
+            tui_data.reset_text(window, now, fetched_at=fetched_before_reset)
+            == "refetching"
+        )
+        # CONTROL: a fetch that landed AFTER the reset carries a fresh pct,
+        # so the ordinary elapsed reading applies.
+        fetched_after_reset = now - 10
+        assert (
+            tui_data.reset_text(window, now, fetched_at=fetched_after_reset)
+            == "resets now"
+        )
+        # No fetched_at at all: cannot prove staleness, keep prior behaviour.
+        assert tui_data.reset_text(window, now) == "resets now"
+
+    def test_reset_text_shows_refetching_only_while_a_fetch_is_claimed(self):
+        """#325 follow-up: the placeholder was measured RESTING -- three
+        frames 3s apart on an unchanged `(last_good, fetched_at)` all read
+        `refetching`, with nothing in the branch to decay, retry or count.
+        The corrected premise: "refetching" names a fetch genuinely CLAIMED
+        (`entry.claimed(now)`, bounded by `CLAIM_TTL_S`), not merely "the
+        reset elapsed and the served pct predates it"."""
+        now = time.time()
+        window = {"resets_at": _iso_in(-60)}
+        fetched_at = now - 120
+        # `next_poll_at` is ALSO set, so this is a real discriminator: if
+        # `claimed(now)` were ignored (or always read False) the retry
+        # branch below would fire instead and this would read "retry 5m",
+        # not "refetching" -- a bare `claim_until` with nothing else set
+        # cannot tell "claimed" apart from "no signal at all" (reviewer
+        # finding, #325 follow-up).
+        claimed = UsageEntry(
+            fetched_at=fetched_at, claim_until=now + 30, next_poll_at=now + 300,
+        )
+        assert (
+            tui_data.reset_text(window, now, fetched_at, entry=claimed)
+            == "refetching"
+        )
+
+    def test_reset_text_names_the_retry_instant_when_nothing_is_in_flight(self):
+        """State 4a: the same rolled row, nothing claimed, a scheduled
+        `next_poll_at` -- names the retry instant instead of resting on the
+        placeholder forever."""
+        now = time.time()
+        window = {"resets_at": _iso_in(-60)}
+        fetched_at = now - 120
+        waiting = UsageEntry(fetched_at=fetched_at, next_poll_at=now + 300)
+        text = tui_data.reset_text(window, now, fetched_at, entry=waiting)
+        assert text == "retry 5m", text
+        assert text != tui_data.REFETCHING
+
+    def test_reset_text_names_the_backoff_reason_and_retry(self):
+        """State 4b: the same rolled row, in backoff after a failed attempt
+        -- names the reason and the retry, not the placeholder."""
+        now = time.time()
+        window = {"resets_at": _iso_in(-60)}
+        fetched_at = now - 120
+        backing_off = UsageEntry(
+            fetched_at=fetched_at, backoff_until=now + 120, last_error="http-429",
+        )
+        text = tui_data.reset_text(window, now, fetched_at, entry=backing_off)
+        assert text == "429 2m", text
+        assert text != tui_data.REFETCHING
+
+    def test_reset_text_names_overdue_when_the_retry_instant_has_passed(self):
+        """A `next_poll_at` already in the past (no collector has claimed
+        the row since it fell due) must not clamp through `_short_wait`'s
+        `max(0, ...)` into a frozen "retry 0s" -- that is the same
+        unqualified resting placeholder this range set out to stop, just
+        spelled differently. It should decay to a distinct, non-decaying-
+        looking marker instead."""
+        now = time.time()
+        window = {"resets_at": _iso_in(-60)}
+        fetched_at = now - 120
+        overdue = UsageEntry(fetched_at=fetched_at, next_poll_at=now - 30)
+        text = tui_data.reset_text(window, now, fetched_at, entry=overdue)
+        assert text == "overdue", text
+        assert text != tui_data.REFETCHING
+        assert not text.startswith("retry 0")
+
+    def test_a_known_or_absent_reset_never_placeholders_or_fetches(self):
+        """CONTROL for the three states above: state 1 (a live countdown)
+        and state 2 (a reset never reported) must never render the
+        placeholder, and rendering must never reach a fetch path -- the
+        render pass is the Textual event loop (`autoview.py`, `app.py`'s
+        `POLL_INTERVAL_S`) and `data.py`'s own module docstring says
+        everything blocking there must never run on it. No scheduling gap
+        excuses a network call from a render function."""
+        from unittest.mock import patch
+
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account"
+        ) as fetch, patch.object(
+            ClaudeAccountSwitcher, "consume_backup_grant"
+        ) as consume:
+            # state 1: known future reset
+            live = UsageEntry(
+                last_good={"five_hour": {"pct": 40.0, "resets_at": _iso_in(3600)}},
+                fetched_at=now,
+            )
+            out_live = mini_account_text(make_account(1, entry=live), now).plain
+            assert tui_data.REFETCHING not in out_live, out_live
+
+            # state 2: reset never reported
+            unknown = UsageEntry(
+                last_good={"five_hour": {"pct": 40.0}}, fetched_at=now,
+            )
+            out_unknown = mini_account_text(make_account(1, entry=unknown), now).plain
+            assert tui_data.REFETCHING not in out_unknown, out_unknown
+
+        fetch.assert_not_called()
+        consume.assert_not_called()
 
 
 class TestSnapshotSource:
@@ -602,6 +767,79 @@ class TestUsageRows:
         row = usage_rows(last_good, now)[0]
         assert "pace" not in row[2]
 
+    def test_seven_day_with_no_reported_reset_shows_reset_unknown(self):
+        """The card must name the gap, not go blank, when a probe candidate's
+        weekly reset has never been reported -- the visible half of the
+        unknown-reset feature (the decision log carries the other half)."""
+        from claude_swap.tui.widgets import usage_rows
+
+        now = time.time()
+        last_good = {"seven_day": {"pct": 10.0}}  # no resets_at at all
+        row = usage_rows(last_good, now)[0]
+        assert row[2] == "reset unknown", row
+        assert row[3] == "reset unknown", row
+
+    def test_five_hour_with_no_reported_reset_and_no_usage_shows_resets_5h(self):
+        """A lapsed 5h window (no reset reported, no usage) has nothing
+        withheld -- the ACTIVE account's own card row must not claim
+        "reset unknown" about it either (PR #325, same defect as the
+        inactive-row chip and the auto view's Next-best row)."""
+        from claude_swap.tui.widgets import account_card_text, usage_rows
+
+        now = time.time()
+        last_good = {"five_hour": {"pct": 0.0}}  # no resets_at at all
+        row = usage_rows(last_good, now)[0]
+        assert row[2] == "resets 5h", row
+        assert row[3] == "resets 5h", row
+
+        entry = UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
+        assert "resets 5h" in card, card
+        assert "reset unknown" not in card, card
+
+    def test_active_cards_5h_row_reads_refetching_not_a_stale_100pct_reset(self):
+        """A window whose reset has passed while the served pct still
+        predates it must not claim "resets now" beside a 100% that is
+        already wrong -- PR #325, the active card's own copy of the defect
+        the inactive-row chip and the Next-best row also carried.
+
+        #325 follow-up: the active card is threaded with `entry` too (not
+        only `fetched_at`), so it must ALSO tell a genuinely claimed fetch
+        (still "refetching") from nothing in flight (names its own retry
+        instead of resting on the placeholder)."""
+        from claude_swap.tui.widgets import account_card_text, usage_rows
+
+        now = time.time()
+        last_good = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)}}
+        fetched_at = now - 120  # measured well before the reset fired
+        # `next_poll_at` is ALSO set: a real discriminator (see the test
+        # above) rather than a bare `claim_until` a stubbed-out `claimed()`
+        # would pass just as well.
+        claimed = UsageEntry(
+            last_good=last_good, fetched_at=fetched_at, age_s=120.0,
+            claim_until=now + 30, next_poll_at=now + 300,
+        )
+        row = usage_rows(last_good, now, fetched_at, entry=claimed)[0]
+        assert row[2] == "refetching", row
+        assert row[3] == "refetching", row
+
+        card = account_card_text(make_account(1, active=True, entry=claimed), 80).plain
+        assert "refetching" in card, card
+        assert "resets now" not in card, card
+
+        # Nothing claimed, a scheduled next poll: names the retry, not the
+        # placeholder -- the row must not rest on "refetching" forever.
+        waiting = dataclasses.replace(claimed, claim_until=None, next_poll_at=now + 300)
+        row = usage_rows(last_good, now, fetched_at, entry=waiting)[0]
+        assert row[2] == "retry 5m", row
+        assert "refetching" not in row[2], row
+
+        # CONTROL: a fetch that landed after the reset carries a fresh pct,
+        # so the ordinary "resets now" reading must still apply.
+        fresh_fetched_at = now - 10
+        row = usage_rows(last_good, now, fresh_fetched_at)[0]
+        assert row[2] == "resets now", row
+
     def test_card_shows_clock_only_where_it_fits(self):
         # Per-row degradation: the wide card shows every clock, a mid width
         # keeps 5h/7d clocks while the longer spend row falls back to its
@@ -693,6 +931,68 @@ class TestMiniAccountText:
         chip = data.chip_label("5h", data.reset_text(last_good["five_hour"], now))
         assert chip == "5h(⟳2h28m):"
         assert f"{chip}100%" in mini_account_text(acc, now).plain
+
+    def test_a_dead_5h_window_reads_its_own_full_countdown_on_the_dashboard(self):
+        """The same fix as the auto view's Next-best row (PR #325): a 5h
+        window with no reported reset AND no usage reads its own full-window
+        countdown here too, not `⟳?` -- the dashboard and the auto view share
+        one `data.chip_label`, so a fix to one that does not reach the other
+        reproduces the exact "comment asserts an invariant the code does
+        not hold" shape #323 was opened for."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 0.0}}, fetched_at=now, age_s=0.0,
+        )
+        acc = make_account(1, entry=entry)
+        assert "5h(⟳5h00m):0%" in mini_account_text(acc, now).plain
+
+    def test_a_live_5h_window_with_no_reported_reset_keeps_unknown_marker_on_the_dashboard(
+        self,
+    ):
+        """CONTROL for the test above: a 5h window with usage but no
+        reported reset is a live window whose reset the server withheld, and
+        must keep `⟳?` on the dashboard exactly as it does on the auto
+        view."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 42.0}}, fetched_at=now, age_s=0.0,
+        )
+        acc = make_account(1, entry=entry)
+        assert "5h(⟳?):42%" in mini_account_text(acc, now).plain
+
+    def test_dashboard_chip_reads_refetching_not_stale_reset_now(self):
+        """Same PR #325 defect, third surface: the dashboard's inactive-row
+        chip must not say `⟳now` beside a pct that provably predates the
+        reset it names.
+
+        #325 follow-up: "refetching" here names a fetch genuinely claimed;
+        the same row with nothing in flight must name its own retry
+        instead of resting on the placeholder."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        fetched_at = now - 120
+        # `next_poll_at` is ALSO set: a real discriminator (see
+        # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`).
+        claimed = UsageEntry(
+            last_good={"five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)}},
+            fetched_at=fetched_at,
+            age_s=120.0,
+            claim_until=now + 30, next_poll_at=now + 300,
+        )
+        acc = make_account(1, entry=claimed)
+        out = mini_account_text(acc, now).plain
+        assert "5h(⟳refetching):100%" in out, out
+        assert "⟳now" not in out, out
+
+        waiting = dataclasses.replace(claimed, claim_until=None, next_poll_at=now + 300)
+        out2 = mini_account_text(make_account(1, entry=waiting), now).plain
+        assert "5h(⟳retry 5m):100%" in out2, out2
+        assert "refetching" not in out2, out2
 
     @pytest.mark.parametrize(
         "age_s, expect_dim",
@@ -822,7 +1122,7 @@ class TestMiniAccountText:
         acc = make_account(
             1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         )
-        assert "5h(⟳1h):42%" in mini_account_text(acc, now).plain
+        assert "5h(⟳1h00m):42%" in mini_account_text(acc, now).plain
 
     def test_scoped_window_below_100_shows_its_pct_alongside_5h_7d(self):
         """PROBE: the scoped loop only fires at/over 100 (`maxed`), so once a
@@ -1514,6 +1814,11 @@ class _FakeEngine:
         self.applied_strategies: list[str] = []
         self.wakes = 0
         self._stop = threading.Event()
+        # Mirrors AutoSwitchEngine's own cached probe-cooldown attribute
+        # (see its docstring) -- `_candidates_text` reads it straight off
+        # `self._engine`, and a real screen mount reaches that read before
+        # any real tick would populate it.
+        self._last_probe_cooldown: dict[str, float] = {}
         _FakeEngine.instances.append(self)
 
     def run_loop(self) -> int:
@@ -1566,6 +1871,12 @@ class _ContendedFakeEngine:
         self.stopped = False
         self._stop = threading.Event()
         self._promote_requested = threading.Event()
+        # Mirrors _FakeEngine's `_last_probe_cooldown` -- the panel reads it
+        # off `self._engine` on every store-only snapshot, and a mount that
+        # reaches that read once this engine is live raised AttributeError
+        # (swallowed as a "Store refresh failed" worker notification,
+        # freezing the candidates panel on a stale render) until this line.
+        self._last_probe_cooldown: dict[str, float] = {}
         _ContendedFakeEngine.instances.append(self)
 
     def run_loop(self) -> int:
@@ -2429,22 +2740,37 @@ class TestUnswitchableRowsAreListed:
         )
 
     def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
-              sentinel=None, disabled=False):
+              sentinel=None, usage=None, disabled=False):
+        from unittest.mock import MagicMock
+        a = MagicMock()
+        a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         from unittest.mock import MagicMock
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
-        a.usage.last_good = last_good
-        a.usage.sentinel = sentinel
+        if usage is not None:
+            a.usage = usage
+        else:
+            # A real UsageEntry, not a MagicMock -- `.decision_value()` is
+            # real code, not an auto-mocked callable, and needs actual
+            # `sentinel`/`last_good`/`age_s` to answer correctly. `age_s=0.0`
+            # reads as freshly-fetched, matching every test here that sets
+            # only `last_good`/`sentinel` and has no opinion on staleness; a
+            # test that DOES care passes `usage=` with its own `age_s`.
+            a.usage = UsageEntry(
+                sentinel=sentinel, last_good=last_good,
+                fetched_at=time.time(), age_s=0.0,
+            )
         return a
 
-    def _render(self, snap, active, *, settings=None):
+    def _render(self, snap, active, *, settings=None, engine=None):
         from unittest.mock import MagicMock, patch
         from claude_swap.tui.autoview import AutoScreen
         from claude_swap.settings import AutoSwitchSettings
 
         v = AutoScreen.__new__(AutoScreen)
         v._settings = settings or AutoSwitchSettings()
+        v._engine = engine
         from claude_swap.tui.theme import CSWAP_DARK
         app = MagicMock()
         app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
@@ -2540,6 +2866,50 @@ class TestUnswitchableRowsAreListed:
         )
         assert "$10.29" in out and "$20.00" in out, out
         assert "51%" in out, out
+
+    def test_a_spend_only_candidates_reset_agrees_with_the_dashboard(self):
+        """PR #325, the pay-as-you-go row: this branch used to call
+        `usage_rows` with no `fetched_at`, so an elapsed spend reset with a
+        pre-reset pct read `resets now` here while the dashboard's
+        `mini_account_text` (which IS threaded) already read `refetching`
+        for the same account -- one account reading two ways again, the
+        exact defect the comment three lines above names.
+
+        #325 follow-up: "refetching" only while genuinely claimed; the same
+        row with nothing in flight names its own retry instead."""
+        now = time.time()
+        stale_usage = UsageEntry(
+            last_good={
+                "spend": {
+                    "pct": 96.0, "used": 48.0, "limit": 50.0,
+                    "resets_at": _iso_in(-60),
+                },
+            },
+            fetched_at=now - 120,  # measured well before the reset fired
+            age_s=120.0,
+            # `next_poll_at` is ALSO set: a real discriminator (see
+            # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`).
+            claim_until=now + 30, next_poll_at=now + 330,
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("6", "paid@x.com", switchable=True, usage=stale_usage),
+        ), active="1")
+        assert "refetching" in out, out
+        assert "resets now" not in out, out
+
+        # _render computes its own `time.time()` internally, drifting a
+        # little from this test's `now` -- a wide margin past the 5m
+        # boundary keeps the floor-divided minute stable either side of it.
+        waiting_usage = dataclasses.replace(
+            stale_usage, claim_until=None, next_poll_at=now + 330
+        )
+        out2 = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("6", "paid@x.com", switchable=True, usage=waiting_usage),
+        ), active="1")
+        assert "retry 5m" in out2, out2
+        assert "refetching" not in out2, out2
 
     def test_spend_does_not_enter_the_ranking(self):
         """Showing spend must not make it a sort key. Spend is a budget, not
@@ -2642,13 +3012,14 @@ class TestUnswitchableRowsAreListed:
         )
 
     def test_later_chips_align_by_window_name_not_position(self):
-        """The email pad only lines up the FIRST chip. `5h(⟳4h9m):45%` is
-        nine characters wider than `5h:0%`, so a row whose 5h window carries
-        a live countdown pushes its 7d and Fable chips right of a row whose
-        5h window does not — a positional pad over `chip_label` cannot fix
-        this because the two rows' window LISTS can differ in length and
-        membership; the column has to be keyed by window NAME. Same emails-
-        length rows to isolate this from the already-covered email pad.
+        """The email pad only lines up the FIRST chip. `5h(⟳4h19m):45%` is
+        one column wider than `5h(⟳5h00m):0%`, so a row whose 5h window
+        carries a live countdown pushes its 7d and Fable chips right of a
+        row whose 5h window does not — a positional pad over `chip_label`
+        cannot fix this because the two rows' window LISTS can differ in
+        length and membership; the column has to be keyed by window NAME.
+        Same emails-length rows to isolate this from the already-covered
+        email pad.
         """
         from claude_swap.settings import AutoSwitchSettings
 
@@ -2657,7 +3028,7 @@ class TestUnswitchableRowsAreListed:
         out = self._render(self._snap(
             self._acct("2", "aaaa@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 45.0,
-                              "resets_at": (now + timedelta(hours=4, minutes=9)).isoformat()},
+                              "resets_at": (now + timedelta(hours=4, minutes=19)).isoformat()},
                 "seven_day": {"pct": 9.0,
                               "resets_at": (now + timedelta(days=3, hours=8)).isoformat()},
                 "scoped": [{"name": "Fable", "pct": 8.0,
@@ -2675,6 +3046,56 @@ class TestUnswitchableRowsAreListed:
         fable = [line.index("Fable") for line in lines]
         assert seven_d[0] == seven_d[1], f"7d chip not aligned: {seven_d} in {lines!r}"
         assert fable[0] == fable[1], f"Fable chip not aligned: {fable} in {lines!r}"
+
+    def test_next_best_percent_columns_align_across_countdown_widths(self):
+        """The owner, 2026-09-15 (live auto-switch panel): `5h(⟳3h14m):25%`
+        vs `7d(⟳2h4m):100%` -- the countdown's own width varies (`12m`,
+        `2h4m`, `3d4h`) so the `:` before a window's percentage does not
+        land on the same column across rows even when the window chips
+        themselves already align by name. Rows below carry minutes-only,
+        hour+minute, and day+hour countdowns spread across the three
+        windows so every magnitude appears; the `:` right before each
+        window's `%` must fall on the same column in every row."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=99.0)
+        now = datetime.now(timezone.utc)
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 25.0,
+                              "resets_at": (now + timedelta(minutes=12)).isoformat()},
+                "seven_day": {"pct": 9.0,
+                              "resets_at": (now + timedelta(hours=2, minutes=4)).isoformat()},
+                "scoped": [{"name": "Fable", "pct": 8.0,
+                            "resets_at": (now + timedelta(days=3, hours=4)).isoformat()}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 80.0,
+                              "resets_at": (now + timedelta(hours=2, minutes=4)).isoformat()},
+                "seven_day": {"pct": 70.0,
+                              "resets_at": (now + timedelta(days=3, hours=4)).isoformat()},
+                "scoped": [{"name": "Fable", "pct": 60.0,
+                            "resets_at": (now + timedelta(minutes=12)).isoformat()}],
+            }),
+            # A 7d window with 10-23h left and no day component -- the
+            # hour shape alone would be 6 wide ("14h04m") here, one column
+            # wider than the other rows' 5-wide readings.
+            self._acct("4", "cccc@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 50.0,
+                              "resets_at": (now + timedelta(hours=2, minutes=4)).isoformat()},
+                "seven_day": {"pct": 40.0,
+                              "resets_at": (now + timedelta(hours=14, minutes=4)).isoformat()},
+                "scoped": [{"name": "Fable", "pct": 30.0,
+                            "resets_at": (now + timedelta(minutes=12)).isoformat()}],
+            }),
+        ), active="9", settings=settings)
+        lines = [line for line in out.split("\n") if line.strip().startswith(("2 ", "3 ", "4 "))]
+        assert len(lines) == 3, lines
+        for window in ("5h(", "7d(", "Fable("):
+            cols = [line.index(":", line.index(window)) for line in lines]
+            assert len(set(cols)) == 1, (
+                f"{window!r} % column not aligned: {cols} in {lines!r}"
+            )
 
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach
@@ -2804,13 +3225,76 @@ class TestUnswitchableRowsAreListed:
             f"the panel's 'Next best' order disagrees with the engine: {out!r}"
         )
 
+    def test_the_panel_never_calls_a_refetching_window_full(self):
+        """PR #325: a 5h window whose reset just fired reads `refetching`
+        on the chip -- the same row's block label must not still say
+        `5h full` off the same provably-stale pct, which would contradict
+        the chip it sits beside.
+
+        #325 follow-up: the block label stays suppressed on the SAME stale
+        pct whether the chip beside it is genuinely claimed ("refetching")
+        or names its own retry -- the block filter is keyed on the pct's
+        staleness, not on which of those two words the chip happens to
+        show."""
+        now = time.time()
+        stale_usage = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)},
+                "seven_day": {"pct": 5.0},
+            },
+            fetched_at=now - 120,  # measured well before the reset fired
+            age_s=120.0,
+            # `next_poll_at` is ALSO set: a real discriminator (see
+            # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`).
+            claim_until=now + 30, next_poll_at=now + 330,
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, usage=stale_usage),
+        ), active="1")
+        assert "5h(⟳refetching):" in out, out
+        assert "5h full" not in out, out
+
+        # Same drift note as the spend-only variant above: a wide margin
+        # past the 5m boundary.
+        waiting_usage = dataclasses.replace(
+            stale_usage, claim_until=None, next_poll_at=now + 330
+        )
+        out2 = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, usage=waiting_usage),
+        ), active="1")
+        assert "5h(⟳retry 5m):" in out2, out2
+        assert "5h full" not in out2, out2
+
+    def test_the_panel_still_calls_a_genuinely_full_window_full(self):
+        """CONTROL for the test above: a fetch that landed AFTER the reset
+        carries a fresh pct, so a window that is really at/over threshold
+        must still read `5h full` -- the filter must not go unconditional."""
+        now = time.time()
+        fresh_usage = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)},
+                "seven_day": {"pct": 5.0},
+            },
+            fetched_at=now - 10,  # measured after the reset fired
+            age_s=10.0,
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, usage=fresh_usage),
+        ), active="1")
+        assert "5h full" in out, out
+
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a
         `model`-blocked row used to name the scoped window in its label
         while the chips, built from a literal 5h/7d pair, never printed it
         at all. Account #4's real values: 5h 28%, 7d 70%, Fable 91%,
         threshold 90, model Fable — the label already read `Fable-walled`;
-        the chips must now show `Fable:91%` alongside `5h:28%`/`7d:70%`."""
+        the chips must now show `Fable:91%` alongside `5h:28%`/`7d:70%` (none
+        of the three windows carry a reset here, so each chip reads its
+        explicit unknown-reset marker rather than the bare label)."""
         from claude_swap.settings import AutoSwitchSettings
 
         settings = AutoSwitchSettings(model="Fable", threshold=90.0)
@@ -2822,7 +3306,69 @@ class TestUnswitchableRowsAreListed:
             }),
         ), active="1", settings=settings)
         assert "Fable-walled" in out, out
-        assert "Fable:91%" in out, out
+        assert "Fable(⟳?):91%" in out, out
+
+    def test_a_dead_5h_window_reads_its_own_full_countdown_not_unknown(self):
+        """A 5h window with no reported reset AND no usage is not a gap to
+        flag -- the whole window is what's left, so it reads that literally
+        instead of the uniform `⟳?` marker (owner-directed, PR #325 round).
+        The 7d window on the same account still has no reported reset
+        either, and must keep reading `⟳?`: this PR does not touch 7d."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+        ), active="1")
+        assert "5h(⟳5h00m):0%" in out, out
+        assert "7d(⟳?):0%" in out, out
+
+    def test_a_live_5h_window_with_no_reported_reset_keeps_unknown_marker(self):
+        """CONTROL for the pct conjunct above: a 5h window that HAS usage but
+        no reported reset is a live window whose reset the server withheld,
+        not an untouched one -- it must keep `⟳?`, never the full-window
+        countdown."""
+        from tests.test_autoswitch import _iso_at
+
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 42.0}, "seven_day": {"pct": 9.0,
+                    "resets_at": _iso_at(time.time() + 2 * 86400)},
+            }),
+        ), active="1")
+        assert "5h(⟳?):42%" in out, out
+
+    def test_a_lapsed_5h_chip_is_the_same_width_as_a_live_one(self):
+        """The owner's five Next-best rows: a lapsed 5h chip (no reset,
+        pct 0) renders 3 columns narrower than a live one (4 with the pct
+        digit), so the caller's column pad fills the gap with spaces the
+        owner rejected (`5h(⟳5h):0%     ·`, owner-directed). `5h00m` closes
+        that gap. The unknown-reset case must not widen to `5h00m` -- a 5h
+        window WITH usage but no reported reset is a live window whose reset
+        the server withheld, not an untouched one, so it keeps the plain
+        `⟳?` marker; that case is a different state and must not gain the
+        same width."""
+        from claude_swap.tui import data
+
+        lapsed = data.chip_label("5h", None, pct=0.0)
+        live = data.chip_label("5h", "resets 2h 14m")
+        assert len(lapsed) == len(live), (lapsed, live)
+
+    def test_a_budget_only_account_names_no_reset_marker_at_all(self):
+        """A monthly-budget (API-key/spend) account has no usage-window
+        reset to report -- `usage unknown`/`⟳?` are both false there.
+        Owner-directed, same round: the $$ chip must read its own truth,
+        not borrow the unknown-reset wording."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "spend": {"used": 12.5, "limit": 50.0, "pct": 25.0, "currency": "USD"},
+            }),
+        ), active="1")
+        assert "$$" in out, out
+        assert "$12.50 / $50.00" in out, out
+        assert "reset unknown" not in out, out
 
     def test_panel_top_matches_the_engines_pick_under_consume_first(
         self, temp_home
@@ -2892,6 +3438,268 @@ class TestUnswitchableRowsAreListed:
         assert panel_top == engine_pick, (
             f"panel top={panel_top!r}, engine picked {engine_pick!r} — "
             f"panel out:\n{rendered}"
+        )
+
+    def test_the_panel_top_agrees_with_the_engine_on_an_unknown_reset_candidate(
+        self, temp_home
+    ):
+        """`consume_first_rank_key` used to be called with no `probe` flag and
+        no knowledge of the probe target, so an unknown-reset candidate read
+        its own absent reset as `+inf` (sorted last) here while the engine
+        ranks the SAME candidate `-inf` (first) once it admits it as a probe
+        — `consume_first_rank_key`'s own docstring: "a display built from
+        this key can never disagree with the account the engine would switch
+        to." Same fleet as `TestConsumeFirstProbesAnUnknownReset
+        .test_admits_the_unknown_reset_candidate_ahead_of_a_known_soon_reset`.
+        """
+        from tests.test_autoswitch import EngineHarness, _iso_at
+        from claude_swap.autoswitch import TickOutcome
+        from claude_swap.settings import AutoSwitchSettings
+
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@x.invalid")
+        h.seed(2, "b@x.invalid")
+        h.seed(3, "c@x.invalid")
+        h.make_live("a@x.invalid", 1)
+
+        # Anchored to REAL wall-clock time, not the engine harness's
+        # `FakeClock` (which starts near epoch 1_000_000): the panel reads
+        # `time.time()` directly, and a fixed past ISO date would read as
+        # "reset already elapsed" (== unknown) there while the harness's own
+        # far-future-relative `now` still sees it as a real future reset —
+        # masking exactly the disagreement this test exists to catch.
+        real_now = time.time()
+        later = _iso_at(real_now + 8 * 86400)
+        soon = _iso_at(real_now + 5 * 86400)
+
+        def w7(five_h, seven_d, reset=None):
+            seven: dict = {"pct": seven_d}
+            if reset:
+                seven["resets_at"] = reset
+            return {"five_hour": {"pct": five_h}, "seven_day": seven}
+
+        fleet = {
+            "1": w7(20, 20, later),  # active, known reset
+            "2": w7(10, 10),         # UNKNOWN reset -- never probed
+            "3": w7(10, 10, soon),   # known, soonest of the KNOWN
+        }
+        out = h.tick_with_usage(fleet)
+        assert out is TickOutcome.SWITCHED, f"expected a switch, got {out}"
+        engine_pick = str(h.active_number())
+        assert engine_pick == "2", (
+            f"harness precondition: expected the probe (2), got {engine_pick}"
+        )
+
+        settings = AutoSwitchSettings(strategy="consume-first")
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True, last_good=fleet["1"]),
+            self._acct("2", "b@x.invalid", switchable=True, last_good=fleet["2"]),
+            self._acct("3", "c@x.invalid", switchable=True, last_good=fleet["3"]),
+        ), active="1", settings=settings)
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == engine_pick, (
+            f"panel top={panel_top!r}, engine picked {engine_pick!r} — "
+            f"panel out:\n{rendered}"
+        )
+
+    def test_the_panel_ranks_a_probe_candidate_on_its_surviving_window_not_its_rolled_one(
+        self,
+    ):
+        """#325's per-window ruling: a candidate whose 7-day window has
+        rolled keeps its real 5-hour headroom (``_drop_rolled_windows``
+        only removes the rolled window, not the whole reading). The panel's
+        own probe ranking (`select_probe_target`'s pool, ``oauth
+        .account_headroom`` over ``decision_value(rank_models)``) must see
+        that surviving headroom too, or it ranks the rolled candidate as
+        spent (its stale 100% 7-day pct still counted) and probes a
+        genuinely lower-headroom peer instead — disagreeing with the engine,
+        which reads the same dropped value.
+        """
+        from tests.test_autoswitch import _iso_at
+        from claude_swap.settings import AutoSwitchSettings
+
+        real_now = time.time()
+        later = _iso_at(real_now + 8 * 86400)
+        rolled = _iso_at(real_now - 3600)
+
+        active = {
+            "five_hour": {"pct": 20.0}, "seven_day": {"pct": 20.0, "resets_at": later},
+        }
+        # Real 90-point headroom (5h alone survives, 7d's own reset has
+        # elapsed and is dropped). Read raw (undropped) it is only 85 --
+        # still below account "3"'s 87, which would win the probe race on
+        # headroom alone if the roll were not dropped.
+        rolled_window = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 15.0, "resets_at": rolled},
+        }
+        # Genuinely 87-point headroom, unmeasured reset -- must lose the
+        # probe race once account "2"'s real (dropped) 90-point headroom is
+        # seen, but WINS it if "2" is read raw (85 < 87).
+        genuinely_lower = {"five_hour": {"pct": 13.0}, "seven_day": {"pct": 13.0}}
+
+        settings = AutoSwitchSettings(strategy="consume-first")
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True, last_good=active),
+            self._acct("2", "b@x.invalid", switchable=True, last_good=rolled_window),
+            self._acct("3", "c@x.invalid", switchable=True, last_good=genuinely_lower),
+        ), active="1", settings=settings)
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == "2", (
+            f"panel probed {panel_top!r} instead of the rolled-window "
+            f"account with real 5h headroom -- panel out:\n{rendered}"
+        )
+
+    def test_the_panel_never_probes_an_account_the_engine_has_put_on_cooldown(
+        self,
+    ):
+        """`_candidates_text` used to hardcode `probe_cooldown=None` into its
+        own `select_probe_target` call (autoview.py), so a candidate the
+        ENGINE was still cooling down from a previous probe
+        (`_perform`'s `probeCooldown[num] = now + PROBE_COOLDOWN_S`,
+        autoswitch.py) read as fresh here and jumped back to the top of
+        "Next best" for up to an hour, pointing at an account the engine
+        will not go to. The panel must read the same cooldown record the
+        engine cached from its own tick (`AutoSwitchEngine._last_probe_cooldown`).
+        """
+        from tests.test_autoswitch import _iso_at
+        from claude_swap.settings import AutoSwitchSettings
+
+        class _FakeEngine:
+            def __init__(self, cooldown):
+                self._last_probe_cooldown = cooldown
+
+        real_now = time.time()
+        soon = _iso_at(real_now + 5 * 86400)
+
+        active = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_at(real_now + 8 * 86400)},
+        }
+        unknown = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        known_soon = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": soon},
+        }
+
+        settings = AutoSwitchSettings(strategy="consume-first")
+        engine = _FakeEngine({"2": real_now + 3600})
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True,
+                        usage=UsageEntry(last_good=active, age_s=0.0,
+                                          fetched_at=real_now)),
+            self._acct("2", "b@x.invalid", switchable=True, last_good=unknown),
+            self._acct("3", "c@x.invalid", switchable=True, last_good=known_soon),
+        ), active="1", settings=settings, engine=engine)
+
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == "3", (
+            f"panel probed a cooling-down account ({panel_top!r}) instead "
+            f"of the known-soon-reset one -- panel out:\n{rendered}"
+        )
+
+    def test_the_panel_survives_a_null_cooldown_left_behind_by_a_switch_to_another_account(
+        self, temp_home
+    ):
+        """`_perform` (autoswitch.py) publishes the RAW `state["probeCooldown"]`
+        into `_last_probe_cooldown` -- it pops only the account the switch just
+        landed ON, so a corrupted entry for any OTHER account (`{"5": null}`,
+        e.g. from a hand-edited state file) survives into the panel's cache
+        untouched, bypassing the type filter `_rank_candidates` applies for
+        exactly this reason. A switch to a DIFFERENT account then leaves the
+        panel's own `select_probe_target` call comparing `None > now` for
+        account 5 and raising `TypeError` as soon as 5 has readable headroom
+        and an unmeasured 7-day reset."""
+        from tests.test_autoswitch import EngineHarness, _iso_at
+        from claude_swap.settings import AutoSwitchSettings
+
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@x.invalid")
+        h.seed(2, "b@x.invalid")
+        h.make_live("a@x.invalid", 1)
+        h.switcher._write_json(
+            h.switcher.backup_dir / "autoswitch_state.json",
+            {"probeCooldown": {"5": None}},
+        )
+        # Lands on "2", not "5" -- the pop in `_perform` never reaches "5".
+        h.engine._perform("2", "b@x.invalid", "proactive", (90.0, float("inf")))
+        assert h.active_number() == 2
+
+        # The panel reads real wall-clock time (`time.time()`), not the
+        # engine harness's `FakeClock` (near epoch 1_000_000) -- a reset
+        # timestamped off the fake clock would read as already elapsed
+        # (== unknown) to the panel and never reach the comparison this
+        # test exists to exercise.
+        real_now = time.time()
+        known_active = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_at(real_now + 8 * 86400)},
+        }
+        unknown_headroom = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+
+        settings = AutoSwitchSettings(strategy="consume-first")
+        rendered = self._render(self._snap(
+            self._acct("2", "b@x.invalid", switchable=True, last_good=known_active),
+            self._acct("5", "e@x.invalid", switchable=True,
+                        last_good=unknown_headroom),
+        ), active="2", settings=settings, engine=h.engine)
+        assert "e@x.invalid" in rendered, rendered
+
+    def test_the_panel_never_probes_off_an_active_reset_the_engine_has_stopped_trusting(
+        self,
+    ):
+        """The panel used to read the active account's `sentinel or
+        last_good` for its own `select_probe_target` call, ignoring
+        staleness -- so once the active account's store row aged past
+        `STALE_OK_S` the panel still saw its old known 7-day reset while the
+        engine's own gate (`decision_value()`) had already stopped trusting
+        it and reads no active reset at all. `select_probe_target`'s
+        ``active_reset_ts is None`` guard (autoswitch.py) exists exactly for
+        that case: with a stale active it must refuse to name any probe
+        target, and the unknown-reset candidate must sort LAST like any
+        other candidate with no reset, never jump to the top on `-inf`.
+        """
+        from tests.test_autoswitch import _iso_at
+        from claude_swap.settings import AutoSwitchSettings
+
+        real_now = time.time()
+        soon = _iso_at(real_now + 5 * 86400)
+
+        stale_last_good = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_at(real_now + 8 * 86400)},
+        }
+        active_usage = UsageEntry(
+            last_good=stale_last_good,
+            fetched_at=real_now - STALE_OK_S - 100.0,
+            age_s=STALE_OK_S + 100.0,
+        )
+        unknown = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        known_soon = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": soon},
+        }
+
+        settings = AutoSwitchSettings(strategy="consume-first")
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True, usage=active_usage),
+            self._acct("2", "b@x.invalid", switchable=True, last_good=unknown),
+            self._acct("3", "c@x.invalid", switchable=True, last_good=known_soon),
+        ), active="1", settings=settings)
+
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == "3", (
+            f"panel put the unknown-reset account on top ({panel_top!r}) "
+            f"while the active account's own reset is stale and unknown to "
+            f"the engine -- panel out:\n{rendered}"
         )
 
 
