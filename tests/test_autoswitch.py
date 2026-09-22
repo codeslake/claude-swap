@@ -2674,6 +2674,62 @@ class TestApiKeyAccounts:
             "active-api-key"
         ]
 
+    def test_the_overload_bar_applies_to_an_api_key_landing_too(
+        self, temp_home, tmp_path, monkeypatch
+    ):
+        """The overload backoff recorded for an api-key departure must also
+        bar that account from being chosen through the api-key LAST-RESORT
+        fallback (reached only when no OAuth candidate ranks) -- otherwise
+        a proactive tick with no OAuth alternative lands straight back on
+        the api-key account still inside its bar, the case fix 1 forbids
+        for OAuth.
+        """
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key2@token.local")
+        h.seed(4, "key4@token.local")
+        self._mark_api_key(h, 2)
+        self._mark_api_key(h, 4)
+        h.make_live("key2@token.local", 2)
+        h.engine.settings = replace(h.engine.settings, strategy="best")
+
+        trace = tmp_path / "trace.log"
+        trace.write_bytes(b"")  # armed, empty -- the first tick's baseline
+        monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(10.0), "2": "api key", "4": "api key",
+        })
+        assert outcome is TickOutcome.NO_ACTION  # baseline tick
+
+        # A 529 burst on the active api-key account (2) escapes it to the
+        # OAuth account (1) -- the only candidate that outranks the
+        # api-key last-resort -- and bars account 2 for OVERLOAD_BACKOFF_S.
+        trace.write_bytes(
+            b"".join(_trace_line(s) for s in [529, 529, 529, 200, 200])
+        )
+        outcome = h.tick_with_usage({
+            "1": _usage(10.0), "2": "api key", "4": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert h.state()["leftTrigger"] == "overloaded"
+
+        # Past the cooldown, still inside the 900s overload backoff. Active
+        # account 1 crosses the threshold (a proactive trigger) with no
+        # OAuth peer at all -- both other accounts are api-key -- forcing
+        # the last-resort fallback. Account 2 is barred; account 4 is not.
+        h.clock.advance(301.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(92.0), "2": "api key", "4": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 4, (
+            "the api-key last-resort fallback landed on the account still "
+            "inside its overload backoff instead of skipping to the other "
+            "one available"
+        )
+
 
 class TestFreshening:
     def test_near_expiry_target_is_refreshed_and_persisted(self, temp_home):
@@ -12551,6 +12607,77 @@ class TestOverloadedTrigger:
             assert outcome is TickOutcome.NO_ACTION
             assert not any(isinstance(e, SwitchEvent) for e in harness.events)
 
+    def test_a_single_tick_under_the_sample_floor_never_fires_alone(
+        self, harness, tmp_path, monkeypatch
+    ):
+        """MESSAGE_ERROR_SAMPLE (5 calls) is a floor even at 100% failure --
+        no existing case pinned it (every other overload test's single-tick
+        burst already clears 5 calls). This is also the two-tick window's
+        own control: after fix 2, an isolated tick like this one is the
+        same shape as the first of a two-tick pair -- it must stay quiet on
+        its own, or the window's floor is not really 5.
+        """
+        trace = self._arm(harness, tmp_path, monkeypatch)
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION  # baseline tick
+
+        self._write_trace(trace, [529, 529, 529, 529])  # 4/4 = 100%, under sample
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+
+    @pytest.mark.parametrize(
+        "errors_per_tick, fires",
+        [
+            (2, True),   # 2/3 + 2/3 -> 4/6 = 66%, clears both sum thresholds
+            (1, False),  # 1/3 + 1/3 -> 2/6 = 33%, sample clears but share doesn't
+        ],
+    )
+    def test_a_burst_spread_across_two_ticks_is_still_seen(
+        self, harness, tmp_path, monkeypatch, errors_per_tick, fires
+    ):
+        """A single tick under MESSAGE_ERROR_SAMPLE (5 calls) never fires
+        alone, but the incident this gate is built for averaged ~3.6 calls
+        a tick -- a real storm spread across a tick boundary must still be
+        caught. The gate sums THIS tick's (server_errors, calls) with the
+        PREVIOUS tick's, so two 3-call ticks add up to the 5-call sample.
+        """
+        trace = self._arm(harness, tmp_path, monkeypatch)
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION  # baseline tick
+
+        statuses = [529] * errors_per_tick + [200] * (3 - errors_per_tick)
+        with trace.open("ab") as f:
+            f.write(b"".join(_trace_line(s) for s in statuses))
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            "a single 3-call tick must never fire alone -- it is under "
+            "MESSAGE_ERROR_SAMPLE by itself either way"
+        )
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+
+        with trace.open("ab") as f:
+            f.write(b"".join(_trace_line(s) for s in statuses))
+        harness.events.clear()
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        if fires:
+            assert outcome is TickOutcome.SWITCHED
+            switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+            assert switch.trigger == "overloaded"
+        else:
+            assert outcome is TickOutcome.NO_ACTION
+            assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+
     def test_a_rotated_trace_file_re_baselines_and_decides_nothing(
         self, harness, tmp_path, monkeypatch
     ):
@@ -12570,6 +12697,53 @@ class TestOverloadedTrigger:
         })
         assert outcome is TickOutcome.NO_ACTION
         assert harness.engine._message_trace_offset == trace.stat().st_size
+
+    def test_a_re_arm_to_a_different_path_re_baselines_even_onto_a_larger_file(
+        self, harness, tmp_path, monkeypatch
+    ):
+        """`_trace_path` re-reads the pin's `trace-to` file every tick, so
+        the operator can re-arm it at a DIFFERENT path mid-run. `size <
+        since` alone (the rotation guard above) never catches this when the
+        newly-armed file is BIGGER than the old offset -- exactly the case
+        that matters: a small trace re-armed onto a pre-existing larger one
+        leaves `since` pointing into that other file's unrelated history,
+        and the next read counts an old 529 storm sitting there as live
+        traffic.
+        """
+        trace1 = tmp_path / "trace1.log"
+        # Five healthy lines already sitting in the FIRST trace before the
+        # engine's first read -- gives the offset a non-zero value to carry
+        # across the re-arm below (byte 0 of any file is always a valid
+        # start, so a zero offset can't expose the bug).
+        trace1.write_bytes(b"".join(_trace_line(200) for _ in range(5)))
+        monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace1)
+        harness.engine.settings = replace(harness.engine.settings, strategy="best")
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION  # baseline tick
+        offset_before = harness.engine._message_trace_offset
+        assert offset_before == trace1.stat().st_size
+
+        # A pre-existing, LARGER file lands at a DIFFERENT path -- the
+        # operator re-arming `trace-to` mid-run, not a rotation of the same
+        # file. Its own history (20 failing lines) predates this re-arm.
+        trace2 = tmp_path / "trace2.log"
+        trace2.write_bytes(b"".join(_trace_line(529) for _ in range(20)))
+        assert trace2.stat().st_size > offset_before, (
+            "the reproduction needs the new file bigger than the old "
+            "offset -- `size < since` alone already catches the other case"
+        )
+        monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace2)
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            "a re-arm onto a different, larger trace file was read as live "
+            "traffic instead of re-baselining"
+        )
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert harness.engine._message_trace_offset == trace2.stat().st_size
 
     def test_the_account_just_left_is_barred_until_its_backoff_elapses(
         self, harness, tmp_path, monkeypatch
@@ -12697,53 +12871,114 @@ class TestOverloadedTrigger:
         )
         assert harness.active_number() == 1
 
-    def test_a_consume_first_tick_does_not_release_the_overload_bar(
+    def test_a_second_overloaded_fire_with_everything_barred_does_not_release(
         self, harness, tmp_path, monkeypatch
     ):
-        """The overload-backoff release in `_rank` is scoped like every
-        other bar there: `trigger not in ("proactive", "consume-first")`.
-        Those two triggers already read an empty ranking as a correct
-        NO_ACTION (`already-consuming-soonest`), not the stall the release
-        exists for -- an unscoped release lands straight back on the
-        account still inside its 900s backoff, on the shipped default
-        strategy, burning a refresh generation on a move that never had to
-        happen.
+        """The release exercised above is right for `at-limit` (the account
+        we are ON is genuinely exhausted, so parking BLOCKED helps nobody)
+        but wrong for a SECOND `overloaded` fire: a provider-wide 529 storm
+        bars whichever account it lands on next, so an unscoped release
+        walks the whole fleet -- one switch every two ticks for the entire
+        outage, each one burning a fresh-target refresh generation and
+        rewriting the default login. Staying put is correct here: an
+        account-specific 529 burst never reaches a second fire (only the
+        account it escaped is barred), so a second fire finding everyone
+        barred is provider-wide by construction and every peer is exactly
+        as bad as the one just left.
         """
         harness.switcher.set_account_disabled("3", True)
         trace = self._arm(harness, tmp_path, monkeypatch)
-        harness.engine.settings = replace(
-            harness.engine.settings, strategy="consume-first"
-        )
-        now = harness.clock.now
-        harness.tick_with_usage({
-            "1": _usage7(10.0, 0.0, _iso_at(now + 5 * 86400)),
-            "2": _usage7(10.0, 0.0, _iso_at(now + 5 * 86400)),
-        })
+        harness.tick_with_usage({"1": _usage(10.0), "2": _usage(10.0)})
         self._write_trace(trace, [529, 529, 529, 200, 200])
-        outcome = harness.tick_with_usage({
-            "1": _usage7(10.0, 0.0, _iso_at(now + 5 * 86400)),
-            "2": _usage7(30.0, 0.0, _iso_at(now + 3 * 86400)),
-        })
+        outcome = harness.tick_with_usage({"1": _usage(10.0), "2": _usage(10.0)})
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        assert harness.state()["leftTrigger"] == "overloaded"
+
+        # The tick right after a switch lands is always a re-baseline (the
+        # offset was reset to None) -- consume it before writing fresh
+        # bytes so the next burst is read as new traffic on account 2, not
+        # lumped in with the one that already fired on account 1.
+        outcome = harness.tick_with_usage({"1": _usage(10.0), "2": _usage(10.0)})
+        assert outcome is TickOutcome.NO_ACTION
+
+        # A second, distinct 529 burst -- this time on the account we just
+        # moved TO. Account 1 (the only other account) is still inside the
+        # backoff `_perform` recorded for it above.
+        with trace.open("ab") as f:
+            f.write(b"".join(_trace_line(s) for s in [529, 529, 529, 200, 200]))
+        outcome = harness.tick_with_usage({"1": _usage(10.0), "2": _usage(10.0)})
+        assert outcome is not TickOutcome.SWITCHED, (
+            "a second overloaded fire with every candidate barred released "
+            f"the bar and walked back to the account just left; "
+            f"events={harness.kinds()}"
+        )
+        assert harness.active_number() == 2, (
+            "the fleet-wide outage bounced the engine back to the account "
+            "it escaped instead of staying put"
+        )
+
+    @pytest.mark.parametrize("strategy", ["consume-first", "best"])
+    def test_the_overload_bar_release_is_scoped_to_its_excluded_triggers(
+        self, harness, tmp_path, monkeypatch, strategy
+    ):
+        """The overload-backoff release in `_rank` is scoped like every
+        other bar there: `trigger not in ("proactive", "consume-first",
+        "overloaded")`. `proactive` and `consume-first` already read an
+        empty ranking as a correct NO_ACTION (`no-qualifying-candidate` /
+        `already-consuming-soonest`), not the stall the release exists for
+        -- an unscoped release lands straight back on the account still
+        inside its 900s backoff, burning a refresh generation on a move
+        that never had to happen. Only `consume-first` was exercised
+        before this test was parametrized, so a mutation dropping
+        `proactive` from the tuple survived the suite.
+        """
+        harness.switcher.set_account_disabled("3", True)
+        trace = self._arm(harness, tmp_path, monkeypatch)
+        harness.engine.settings = replace(harness.engine.settings, strategy=strategy)
+        now = harness.clock.now
+        if strategy == "consume-first":
+            baseline = {
+                "1": _usage7(10.0, 0.0, _iso_at(now + 5 * 86400)),
+                "2": _usage7(10.0, 0.0, _iso_at(now + 5 * 86400)),
+            }
+            escape = {
+                "1": _usage7(10.0, 0.0, _iso_at(now + 5 * 86400)),
+                "2": _usage7(30.0, 0.0, _iso_at(now + 3 * 86400)),
+            }
+            # Account 1's fresh headroom (100) dominates active account 2's
+            # (30) by more than HORIZON_HEADROOM_RATIO, so the ordinary
+            # no-return bar releases on its own merits, AND account 1's
+            # weekly window resets sooner (2 days out against 2's 4) so
+            # consume-first's own ranking would otherwise pick it too --
+            # the ONLY thing left barring it is the overload backoff.
+            control = {
+                "1": _usage7(0.0, 0.0, _iso_at(now + 2 * 86400)),
+                "2": _usage7(70.0, 0.0, _iso_at(now + 4 * 86400)),
+            }
+        else:
+            baseline = {"1": _usage(10.0), "2": _usage(10.0)}
+            escape = {"1": _usage(10.0), "2": _usage(10.0)}
+            # Active account 2 is over threshold (proactive trigger).
+            # Account 1's headroom (80) clears both the below-threshold and
+            # hysteresis gates a normal proactive landing needs -- the ONLY
+            # thing left barring it is the overload backoff.
+            control = {"1": _usage(20.0), "2": _usage(95.0)}
+
+        harness.tick_with_usage(baseline)
+        self._write_trace(trace, [529, 529, 529, 200, 200])
+        outcome = harness.tick_with_usage(escape)
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 2
         assert harness.state()["leftTrigger"] == "overloaded"
 
         # Past the 300s cooldown, still inside the 900s overload backoff.
-        # Account 1's fresh headroom (100) dominates active account 2's (30)
-        # by more than HORIZON_HEADROOM_RATIO, so the ordinary no-return bar
-        # releases on its own merits, AND account 1's weekly window resets
-        # sooner (2 days out against 2's 4) so consume-first's own ranking
-        # would otherwise pick it too -- the ONLY thing left barring it is
-        # the overload backoff.
         harness.clock.advance(301.0)
         harness.events.clear()
-        outcome = harness.tick_with_usage({
-            "1": _usage7(0.0, 0.0, _iso_at(now + 2 * 86400)),
-            "2": _usage7(70.0, 0.0, _iso_at(now + 4 * 86400)),
-        })
+        outcome = harness.tick_with_usage(control)
         assert outcome is not TickOutcome.SWITCHED, (
-            "a consume-first tick released the overload bar and landed "
-            f"back on the still-barred account; events={harness.kinds()}"
+            f"a {strategy!r}-strategy tick released the overload bar and "
+            f"landed back on the still-barred account; events={harness.kinds()}"
         )
         assert not any(
             isinstance(e, SwitchEvent) and e.to_ref and e.to_ref["number"] == 1

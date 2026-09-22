@@ -966,6 +966,18 @@ class AutoSwitchEngine:
         # until the first successful read takes its baseline; see
         # `_message_error_burst`.
         self._message_trace_offset: int | None = None
+        # The trace PATH the offset above was baselined against. The pin's
+        # trace-to file can be re-armed at a different path mid-run, and a
+        # `size < since` check alone misses that when the newly-armed file
+        # is BIGGER than the old offset -- exactly the re-arm that matters.
+        self._message_trace_path: Path | None = None
+        # The previous tick's own (server_errors, calls), summed with this
+        # tick's to evaluate MESSAGE_ERROR_SAMPLE/MESSAGE_ERROR_SHARE over a
+        # bounded two-tick window instead of one tick alone -- a burst
+        # spread across a tick boundary must still be seen. Cleared
+        # whenever the offset re-baselines (see `tick()`), so a stale count
+        # never combines with a fresh account's or a fresh file's.
+        self._message_error_carry: tuple[int, int] | None = None
         # Account number -> the epoch when an `overloaded` departure's backoff
         # clears; see `OVERLOAD_BACKOFF_S` and `_perform`. Engine-lifetime,
         # not persisted -- like `_message_trace_offset` above, which the
@@ -1519,22 +1531,38 @@ class AutoSwitchEngine:
         # Genuinely unconditional now -- previously it sat after both,
         # skipping the advance and leaving the next tick to count a stale
         # backlog against whatever slot was active by then.
-        overload_burst = _message_error_burst(
-            self.switcher, self._message_trace_offset
+        current_trace_path = _trace_path(self.switcher)
+        # A re-arm at a different path re-baselines too, same as `since is
+        # None`: `_message_error_burst`'s own `size < since` check never
+        # catches a re-arm onto a pre-existing LARGER file.
+        trace_path_changed = current_trace_path != self._message_trace_path
+        self._message_trace_path = current_trace_path
+        effective_since = (
+            None if trace_path_changed else self._message_trace_offset
         )
+        overload_burst = _message_error_burst(self.switcher, effective_since)
         is_overloaded = False
         overload_detail = ""
         if overload_burst is not None:
-            had_baseline = self._message_trace_offset is not None
             server_errors, calls, new_offset = overload_burst
+            rebaselined = (
+                effective_since is None or new_offset < effective_since
+            )
             self._message_trace_offset = new_offset
+            carry_errors, carry_calls = (
+                (0, 0) if rebaselined else (self._message_error_carry or (0, 0))
+            )
+            self._message_error_carry = (server_errors, calls)
+            window_errors = server_errors + carry_errors
+            window_calls = calls + carry_calls
             is_overloaded = (
-                had_baseline
-                and calls >= MESSAGE_ERROR_SAMPLE
-                and server_errors >= calls * MESSAGE_ERROR_SHARE
+                window_calls >= MESSAGE_ERROR_SAMPLE
+                and window_errors >= window_calls * MESSAGE_ERROR_SHARE
             )
             if is_overloaded:
-                overload_detail = f"{server_errors}/{calls} 5xx on /v1/messages"
+                overload_detail = (
+                    f"{window_errors}/{window_calls} 5xx on /v1/messages"
+                )
 
         current = self.switcher.current_account_number()
         if current is None:
@@ -1825,9 +1853,16 @@ class AutoSwitchEngine:
             shape, but with no `recovered` gate -- it is a plain timer, not
             an anti-flap check, so a bar that would leave nothing simply
             releases rather than parking the engine BLOCKED for the whole
-            backoff. Scoped like every sibling gate, `trigger not in
-            ("proactive", "consume-first")`: those two already read an empty
-            ranking as the correct outcome, not a stall to retry out of.
+            backoff. Scoped `trigger not in ("proactive", "consume-first",
+            "overloaded")`: the first two already read an empty ranking as
+            the correct outcome, not a stall to retry out of; `overloaded`
+            is excluded for a different reason -- staying put is right when
+            EVERY peer is 529-ing, and releasing there walks the whole
+            fleet one switch every two ticks (each fire bars the account it
+            lands on next, so the next fire finds everyone barred and
+            releases right back). An account-specific 529 burst never
+            reaches a second fire: the account it escaped is the only one
+            barred, so a real peer is always still there to rank.
             """
             # Recomputed per snapshot, never once per tick: the consume-first
             # two-phase commit replaces `headroom` and `active_headroom` and
@@ -1863,7 +1898,9 @@ class AutoSwitchEngine:
                     )
                     if unbarred[0]:
                         return unbarred
-                if overload_backoff and trigger not in ("proactive", "consume-first"):
+                if overload_backoff and trigger not in (
+                    "proactive", "consume-first", "overloaded"
+                ):
                     unbarred = self._rank_candidates(
                         no_return=no_return, overload_backoff={}, **kw
                     )
@@ -1921,7 +1958,20 @@ class AutoSwitchEngine:
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
-            ordered = api_key_candidates
+            #
+            # Barred the same as an OAuth candidate: `_rank_candidates` never
+            # sees this list, so without a bar here the backoff recorded for
+            # an api-key departure was never read, and (e.g.) a proactive
+            # tick with no OAuth alternative could land straight back on an
+            # api-key account still inside its 900s bar. Same
+            # release-if-it-leaves-nothing shape as the OAuth bar in `_rank`
+            # above: filter first, fall back to the unfiltered list only
+            # when the bar would leave nothing to move to.
+            unbarred_api_key = [
+                n for n in api_key_candidates
+                if decided_now >= (overload_backoff.get(n) or 0)
+            ]
+            ordered = unbarred_api_key or api_key_candidates
 
         if not ordered:
             if not any_known:
