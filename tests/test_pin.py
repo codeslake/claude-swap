@@ -10031,6 +10031,14 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
             # refused outright rather than un-spliced, because `accountUuid` is
             # recoverable from nowhere else.
             "switcher.py:add_account",
+            # THE STRICT-MODE RAISE INSIDE `_live_identity_matches`
+            # (T0888): the resolver's own merge literal combines
+            # #199's `strict=` fail-closed check with #210's
+            # `_live_login_identity` in one method -- the raise-only
+            # call is a TOCTOU-style config read, the same reason
+            # `_reject_identity_drift_since_verify` above is exempt,
+            # and neither PR branch alone defines this call site.
+            "switcher.py:_live_identity_matches",
         }
         assert set(found) <= known, (
             "a NEW site re-derives the active slot from the identity file, "

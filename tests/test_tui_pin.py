@@ -924,7 +924,9 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
             app.screen.refresh_root_menu = _counted
             # A poll publishes a new snapshot; that is the app's own mechanism,
             # not a helper invented here.
-            app.snapshot = types.SimpleNamespace(accounts=[make_account(1, active=True)])
+            app.snapshot = types.SimpleNamespace(
+                accounts=[make_account(1, active=True)], active_number="1"
+            )
             await pilot.pause()
             await settle(pilot)
             assert calls, (
