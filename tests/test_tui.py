@@ -675,7 +675,7 @@ class TestMiniAccountText:
 
         The dashboard rendered `5h 100% (resets 2h 28m)` while the auto view
         rendered `5h(⟳2h28m):100%` for the same window in the same second.
-        Both now come from data.window_chip_label, so a change to one surface
+        Both now come from data.chip_label, so a change to one surface
         cannot silently diverge from the other.
         """
         from claude_swap.tui import data
@@ -690,7 +690,7 @@ class TestMiniAccountText:
         acc = make_account(
             1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         )
-        chip = data.window_chip_label(last_good, "five_hour", "5h", now)
+        chip = data.chip_label("5h", data.reset_text(last_good["five_hour"], now))
         assert chip == "5h(⟳2h28m):"
         assert f"{chip}100%" in mini_account_text(acc, now).plain
 
@@ -823,6 +823,44 @@ class TestMiniAccountText:
             1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         )
         assert "5h(⟳1h):42%" in mini_account_text(acc, now).plain
+
+    def test_scoped_window_below_100_shows_its_pct_alongside_5h_7d(self):
+        """PROBE: the scoped loop only fires at/over 100 (`maxed`), so once a
+        5h/7d window already rendered (`parts` nonzero) a scoped window below
+        its cap never reaches the dashboard row at all — it is not the
+        `usage unknown` fallback catching it either, since 5h/7d already
+        produced output. An account sitting at 91% on a per-model window
+        reads as if that window does not exist."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        last_good = {
+            "five_hour": {"pct": 28.0},
+            "seven_day": {"pct": 70.0},
+            "scoped": [{"name": "Fable", "pct": 91.0}],
+        }
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        out = mini_account_text(acc, now).plain
+        assert "Fable" in out and "91%" in out, (
+            f"a scoped window below 100 vanished from the dashboard row: {out!r}"
+        )
+
+    def test_scoped_window_at_100_keeps_its_marker_and_shows_pct(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        last_good = {
+            "five_hour": {"pct": 28.0},
+            "seven_day": {"pct": 70.0},
+            "scoped": [{"name": "Fable", "pct": 100.0}],
+        }
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        out = mini_account_text(acc, now).plain
+        assert "Fable" in out and "100%" in out and "(!)" in out, out
 
 
 class TestRunAction:
@@ -2574,6 +2612,69 @@ class TestUnswitchableRowsAreListed:
             self._acct("1", "a@x.com", switchable=True),
         ), active="9")
         assert out.index("a@x.com") < out.index("empty@x.com")
+
+    def test_the_first_chip_starts_at_the_same_column_across_rows(self):
+        """Each row's content must start where the widest email in this
+        block ends, not where its own email ends — otherwise a long email
+        pushes its row's content far right while short ones sit left, and
+        the columns never line up. This must hold at BOTH sites that pad
+        the email: the switchable rows (chips) and the unswitchable row
+        (a sentinel note instead), which are two separate append sites in
+        the panel and can drift out of alignment independently.
+        """
+        import re
+
+        out = self._render(self._snap(
+            self._acct("2", "brief@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+            self._acct("3", "a-much-longer-address@example.com",
+                       switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+            self._acct("4", "new@x.com", switchable=False),
+        ), active="9")
+        rows = [line for line in out.split("\n") if re.match(r"\s+\d+\s+\S+\s+", line)]
+        assert len(rows) == 3, rows
+        columns = [re.match(r"\s+\d+\s+\S+\s+", line).end() for line in rows]
+        assert columns[0] == columns[1] == columns[2], (
+            f"content does not share a column: {columns} in {rows!r}"
+        )
+
+    def test_later_chips_align_by_window_name_not_position(self):
+        """The email pad only lines up the FIRST chip. `5h(⟳4h9m):45%` is
+        nine characters wider than `5h:0%`, so a row whose 5h window carries
+        a live countdown pushes its 7d and Fable chips right of a row whose
+        5h window does not — a positional pad over `chip_label` cannot fix
+        this because the two rows' window LISTS can differ in length and
+        membership; the column has to be keyed by window NAME. Same emails-
+        length rows to isolate this from the already-covered email pad.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=99.0)
+        now = datetime.now(timezone.utc)
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 45.0,
+                              "resets_at": (now + timedelta(hours=4, minutes=9)).isoformat()},
+                "seven_day": {"pct": 9.0,
+                              "resets_at": (now + timedelta(days=3, hours=8)).isoformat()},
+                "scoped": [{"name": "Fable", "pct": 8.0,
+                            "resets_at": (now + timedelta(days=3, hours=8)).isoformat()}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": 0.0}],
+            }),
+        ), active="9", settings=settings)
+        lines = [line for line in out.split("\n") if line.strip().startswith(("2 ", "3 "))]
+        assert len(lines) == 2, lines
+        seven_d = [line.index("7d") for line in lines]
+        fable = [line.index("Fable") for line in lines]
+        assert seven_d[0] == seven_d[1], f"7d chip not aligned: {seven_d} in {lines!r}"
+        assert fable[0] == fable[1], f"Fable chip not aligned: {fable} in {lines!r}"
 
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach

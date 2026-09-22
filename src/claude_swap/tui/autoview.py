@@ -452,6 +452,37 @@ class AutoScreen(Screen):
         # mistake was fixed for the pin lookup itself — see the test that pins
         # its call count.
         pin_applying = pin.pin_is_applying(self.app.switcher) if pinned_identity else None
+        # Padded to the widest email among the rows THIS block renders, so
+        # every row's chips start in the same column — computed from exactly
+        # the accounts the loop below iterates (all but the active one).
+        email_width = max(
+            (len(acc.email) for acc in snap.accounts if acc.number != active_number),
+            default=0,
+        )
+        now = time.time()
+        # Chip columns are keyed by WINDOW NAME, never by position: two rows
+        # can have different-length window lists built from that account's
+        # own payload (`relevant_windows`), so "chip 1" is not the same
+        # window across rows. Computed once, before any row is drawn, over
+        # exactly the accounts that will reach the chip branch below
+        # (switchable, no sentinel, a known binding pct).
+        row_windows: dict[str, list[tuple[str, float, str | None]]] = {}
+        for acc in snap.accounts:
+            if (
+                acc.number == active_number
+                or not acc.switchable
+                or acc.usage.sentinel is not None
+                or binding_pct(acc.usage.last_good, models) is None
+            ):
+                continue
+            row_windows[acc.number] = oauth.relevant_windows(acc.usage.last_good, models)
+        chip_width: dict[str, int] = {}
+        for windows in row_windows.values():
+            for label, wpct, resets_at in windows:
+                width = len(
+                    data.chip_label(label, data.reset_text({"resets_at": resets_at}, now))
+                ) + len(f"{wpct:.0f}%")
+                chip_width[label] = max(chip_width.get(label, 0), width)
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -463,7 +494,7 @@ class AutoScreen(Screen):
             if not acc.switchable:
                 entry = Text()
                 entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
-                entry.append(acc.email, style=palette.muted)
+                entry.append(f"{acc.email:<{email_width}}", style=palette.muted)
                 # From SENTINEL_NOTES, not written here: an API-key slot has no
                 # login to restore, and the switch screen reads the same table,
                 # so both surfaces must describe a slot identically.
@@ -484,7 +515,7 @@ class AutoScreen(Screen):
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
+            entry.append(f"{acc.email:<{email_width}}", style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -524,15 +555,22 @@ class AutoScreen(Screen):
                 # SAME relevant_windows call feeds the label below, so the
                 # chips and the label can never disagree on which windows
                 # exist for this account.
-                now = time.time()
-                windows = oauth.relevant_windows(acc.usage.last_good, models)
+                windows = row_windows[acc.number]
                 for i, (label, wpct, resets_at) in enumerate(windows):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
-                    entry.append(
-                        data.chip_label(label, data.reset_text({"resets_at": resets_at}, now)),
-                        style=palette.muted,
+                    label_text = data.chip_label(
+                        label, data.reset_text({"resets_at": resets_at}, now)
                     )
-                    entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
+                    entry.append(label_text, style=palette.muted)
+                    pct_text = f"{wpct:.0f}%"
+                    entry.append(pct_text, style=palette.severity(wpct))
+                    # Never on the LAST chip: nothing after it needs
+                    # aligning, and padding it would leave trailing
+                    # whitespace before end of line, the `-only`/`full`
+                    # suffix or the pin badge.
+                    if i < len(windows) - 1:
+                        pad = chip_width[label] - len(label_text) - len(pct_text)
+                        entry.append(" " * pad, style=palette.muted)
                 if not windows:  # no window data at all — keep the old reading
                     entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 # A candidate whose LAST poll failed (an active backoff, a
