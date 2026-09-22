@@ -2625,6 +2625,11 @@ class TestApiKeyAccounts:
         data["accounts"][str(num)]["kind"] = "api_key"
         harness.switcher._write_json(harness.switcher.sequence_file, data)
 
+    def _set_active(self, harness, num: int) -> None:
+        data = harness.switcher._get_sequence_data()
+        data["activeAccountNumber"] = num
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+
     def test_api_key_candidate_excluded_by_default(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -2691,6 +2696,7 @@ class TestApiKeyAccounts:
         self._mark_api_key(h, 2)
         self._mark_api_key(h, 4)
         h.make_live("key2@token.local", 2)
+        self._set_active(h, 2)
         h.engine.settings = replace(h.engine.settings, strategy="best")
 
         trace = tmp_path / "trace.log"
@@ -2748,6 +2754,7 @@ class TestApiKeyAccounts:
         h.seed(2, "key2@token.local")
         self._mark_api_key(h, 2)
         h.make_live("key2@token.local", 2)
+        self._set_active(h, 2)
         h.engine.settings = replace(h.engine.settings, strategy="best")
 
         trace = tmp_path / "trace.log"
