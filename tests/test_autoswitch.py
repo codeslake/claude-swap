@@ -69,12 +69,12 @@ def _usage(pct: float, resets_at: str | None = None) -> dict:
     return {"five_hour": window, "seven_day": {"pct": 0.0}}
 
 
-def _trace_line(status: int) -> bytes:
+def _trace_line(status: int, path: str = "/v1/messages?beta=true") -> bytes:
     """One line of the pin's request trace, as `_message_error_burst`
     (autoswitch.py) parses it. Module-level so every test that fabricates
     trace content shares one spelling of the format."""
     return (
-        f"[c1]     <- HTTP/1.1 {status} unknown  POST /v1/messages?beta=true  "
+        f"[c1]     <- HTTP/1.1 {status} unknown  POST {path}  "
         "ua=claude-cli/2.1.278 (external, cli)\n"
     ).encode()
 
@@ -2728,6 +2728,56 @@ class TestApiKeyAccounts:
             "the api-key last-resort fallback landed on the account still "
             "inside its overload backoff instead of skipping to the other "
             "one available"
+        )
+
+    def test_the_overload_bar_release_for_api_key_is_scoped_too(
+        self, temp_home, tmp_path, monkeypatch
+    ):
+        """The api-key last-resort fallback's own bar-release arm
+        (`ordered = unbarred_api_key or api_key_candidates`) used to be
+        unscoped -- unlike the OAuth release in `_rank`, it dropped the
+        overload bar on EVERY trigger, including `proactive`. A fleet with
+        TWO api-key candidates (see
+        `test_the_overload_bar_applies_to_an_api_key_landing_too` above)
+        never reaches the `or` arm at all when a second, unbarred candidate
+        is around to satisfy `unbarred_api_key` on its own -- this is the
+        ONE-candidate fixture that actually exercises it.
+        """
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key2@token.local")
+        self._mark_api_key(h, 2)
+        h.make_live("key2@token.local", 2)
+        h.engine.settings = replace(h.engine.settings, strategy="best")
+
+        trace = tmp_path / "trace.log"
+        trace.write_bytes(b"")  # armed, empty -- the first tick's baseline
+        monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace)
+
+        outcome = h.tick_with_usage({"1": _usage(10.0), "2": "api key"})
+        assert outcome is TickOutcome.NO_ACTION  # baseline tick
+
+        # A 529 burst on the active api-key account (2) escapes it to the
+        # only OAuth candidate (1), and bars account 2 for OVERLOAD_BACKOFF_S.
+        trace.write_bytes(
+            b"".join(_trace_line(s) for s in [529, 529, 529, 200, 200])
+        )
+        outcome = h.tick_with_usage({"1": _usage(10.0), "2": "api key"})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert h.state()["leftTrigger"] == "overloaded"
+
+        # Past the cooldown, still inside the 900s overload backoff. Active
+        # account 1 crosses the threshold (a proactive trigger) with no
+        # OAuth peer at all -- account 2 is the ONLY other account, and it
+        # is barred. The unscoped release used to fall back to it anyway,
+        # landing straight back on the account it had just escaped.
+        h.clock.advance(301.0)
+        outcome = h.tick_with_usage({"1": _usage(92.0), "2": "api key"})
+        assert h.active_number() == 1, (
+            "a proactive tick released the barred api-key account through "
+            "the unscoped last-resort fallback and landed back on it "
+            "inside its own backoff"
         )
 
 
@@ -11702,6 +11752,55 @@ class TestDisabledActiveReviewFindings:
         )
         assert outcome is TickOutcome.SWITCHED
 
+    def test_overloaded_escalates_the_candidate_fetch_before_choosing(
+        self, harness, tmp_path, monkeypatch
+    ):
+        """Same hazard as `disabled-active` above, for `overloaded`.
+
+        `escalate` keyed only on the active row's headroom, so an
+        `overloaded` tick firing while the active reads comfortably below
+        the escalation band (no other leg satisfied) chose among candidate
+        rows up to CANDIDATE_MAX_INTERVAL_S old -- an account this tick
+        never fetched.
+        """
+        trace = tmp_path / "trace.log"
+        trace.write_bytes(b"")  # armed, empty -- the first tick's baseline
+        monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace)
+        harness.engine.settings = replace(harness.engine.settings, strategy="best")
+
+        entries = {
+            n: _entry_for(v, harness.clock.now)
+            for n, v in {
+                "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+            }.items()
+        }
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", return_value=entries
+        ):
+            outcome = harness.engine.tick()
+        assert outcome is TickOutcome.NO_ACTION  # baseline tick, arms the trace
+
+        trace.write_bytes(
+            b"".join(_trace_line(s) for s in [529, 529, 529, 200, 200])
+        )
+        fetch_sets: list[set] = []
+
+        def spying(*args, **kwargs):
+            fetch_sets.append(set(kwargs.get("fetch") or ()))
+            return entries
+
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", side_effect=spying
+        ):
+            outcome = harness.engine.tick()
+
+        every = set().union(*fetch_sets) if fetch_sets else set()
+        assert "3" in every, (
+            "an 'overloaded' escape chose a candidate it never refreshed "
+            f"this tick; fetch sets were {fetch_sets}"
+        )
+        assert outcome is TickOutcome.SWITCHED
+
     def test_the_trigger_string_itself_is_pinned(self, harness):
         """Renaming the trigger to "at-limit" passed all 2248 tests.
 
@@ -12986,6 +13085,53 @@ class TestOverloadedTrigger:
         ), "switched back onto the account still inside its overload backoff"
         assert harness.active_number() == 2
 
+    def test_a_hand_switch_off_engine_re_baselines_the_offset_and_carry(
+        self, harness, tmp_path, monkeypatch
+    ):
+        """Only an ENGINE-performed switch (through `_perform`) used to
+        re-baseline the trace offset and carry. A hand `cswap switch` or a
+        TUI switch moves the live login without ever calling `_perform`, so
+        the carry and the unread bytes stayed pointed at the OLD account's
+        traffic and got charged to whichever account the user just chose.
+        """
+        trace = self._arm(harness, tmp_path, monkeypatch)
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION  # baseline tick, account 1 active
+
+        # A sub-floor burst on account 1 -- 2 errors on 3 calls, under
+        # MESSAGE_ERROR_SAMPLE (5) -- fires nothing on its own but leaves
+        # (2, 3) sitting in the carry for the next tick to add to.
+        self._write_trace(trace, [529, 529, 200])
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+
+        # A hand switch -- NOT through the engine's `_perform` -- moves the
+        # live login to account 2.
+        harness.make_live("b@example.com", 2)
+
+        # One more error call on its own is also under the floor, but
+        # summed with account 1's carried (2, 3) it clears both
+        # MESSAGE_ERROR_SAMPLE and the share -- the unfixed code charges
+        # that combined burst to account 2, which made one call of its own.
+        # Appended, not overwritten: the file must stay at or above the
+        # offset the previous tick's read stopped at, or the size-based
+        # rotation guard alone would already re-baseline this, masking
+        # whether the account-change check is doing the work.
+        with trace.open("ab") as f:
+            f.write(b"".join(_trace_line(s) for s in [529, 200]))
+        outcome = harness.tick_with_usage({
+            "1": _usage(10.0), "2": _usage(10.0), "3": _usage(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            "fired 'overloaded' off account 1's carried errors, one tick "
+            "after a hand switch moved the live login to account 2"
+        )
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+
 
 class TestMessageErrorBurstOffsetAfterACappedRead:
     """A tick's read of the trace is capped at 1 MiB; the offset it hands
@@ -12997,7 +13143,6 @@ class TestMessageErrorBurstOffsetAfterACappedRead:
         self, monkeypatch, tmp_path
     ):
         trace = tmp_path / "trace.log"
-        monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace)
         ok_line = _trace_line(200)
         error_line = _trace_line(529)
         # A couple of healthy lines push past a (monkeypatched, tiny) cap,
@@ -13009,7 +13154,7 @@ class TestMessageErrorBurstOffsetAfterACappedRead:
         trace.write_bytes(padding + error_line)
 
         server_errors, _, offset_after_first = autoswitch._message_error_burst(
-            None, 0
+            trace, 0
         )
         assert server_errors == 0  # the error line sits well past the cap
         assert offset_after_first < trace.stat().st_size, (
@@ -13017,7 +13162,7 @@ class TestMessageErrorBurstOffsetAfterACappedRead:
         )
 
         server_errors2, calls2, _ = autoswitch._message_error_burst(
-            None, offset_after_first
+            trace, offset_after_first
         )
         assert calls2 == 1
         assert server_errors2 == 1, (
@@ -13026,3 +13171,38 @@ class TestMessageErrorBurstOffsetAfterACappedRead:
             "offset jumped straight to the file's end -- and not "
             "double-counted, which `>= 1` could not tell apart from `== 2`"
         )
+
+
+class TestMessageErrorBurstMatchesTheExactRoute:
+    """`POST /v1/messages` is also a substring of `POST
+    /v1/messages/count_tokens` -- a real, high-volume route the pin logs
+    the same way. A bare substring match let a token-counting burst alone
+    satisfy MESSAGE_ERROR_SAMPLE. See `_message_error_burst` (autoswitch.py).
+    """
+
+    def test_count_tokens_traffic_is_not_counted_as_messages_traffic(
+        self, tmp_path
+    ):
+        trace = tmp_path / "trace.log"
+        trace.write_bytes(
+            b"".join(
+                _trace_line(529, path="/v1/messages/count_tokens?beta=true")
+                for _ in range(5)
+            )
+        )
+        server_errors, calls, _ = autoswitch._message_error_burst(trace, 0)
+        assert calls == 0, (
+            "counted /v1/messages/count_tokens traffic as /v1/messages -- "
+            "a route PREFIX match, not an exact one"
+        )
+        assert server_errors == 0
+
+    def test_control_messages_traffic_is_still_counted(self, tmp_path):
+        """CONTROL. The exact-match fix must not stop matching the real
+        route -- without this, requiring an exact but wrong comparison
+        (e.g. against the query string too) would pass the test above."""
+        trace = tmp_path / "trace.log"
+        trace.write_bytes(b"".join(_trace_line(529) for _ in range(5)))
+        server_errors, calls, _ = autoswitch._message_error_burst(trace, 0)
+        assert calls == 5
+        assert server_errors == 5

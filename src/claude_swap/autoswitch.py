@@ -202,15 +202,18 @@ def _trace_path(switcher: ClaudeAccountSwitcher) -> Path | None:
 
 
 def _message_error_burst(
-    switcher: ClaudeAccountSwitcher, since: int | None
+    path: Path | None, since: int | None
 ) -> tuple[int, int, int] | None:
     """Server-error share on ``/v1/messages`` since byte offset ``since``.
 
     Returns ``(server_errors, calls, new_offset)`` counted over trace bytes
-    written after ``since``, or None when there is nothing to read: the
-    `cswap-pin` package not importable, no trace target armed, or the file
-    could not be read. Never raises -- every OSError path returns None, so
-    this diagnostic can never break a tick.
+    written after ``since``, or None when there is nothing to read: no trace
+    target armed (``path`` is None), or the file could not be read. Never
+    raises -- every OSError path returns None, so this diagnostic can never
+    break a tick. ``path`` is resolved once per tick by the caller (via
+    `_trace_path`), not here -- a second resolve per tick previously left
+    the path this read opens unprovably the same as the one the caller's
+    re-arm/re-baseline decision compared.
 
     ``since=None`` (no baseline yet) and a rotated (shorter) file both
     answer ``(0, 0, <current size>)``: zero calls counted is what makes the
@@ -223,10 +226,13 @@ def _message_error_burst(
     of skipping it -- the offset never jumps past bytes this call never
     looked at.
 
-    Never double-counted: a capped read can only suppress a fire, never
-    manufacture one.
+    Never double-counted: each byte the cap admits lands in exactly one
+    tick's ``chunk``. A line straddling the cap boundary is dropped
+    entirely, not counted on either side -- and that can also MANUFACTURE a
+    fire, not only suppress one: dropping a straddling 200 removes a call
+    from the denominator too, so 3 errors on 7 calls (no fire, 43%) reads as
+    3 on 6 (fire, 50%) with one fewer healthy line counted.
     """
-    path = _trace_path(switcher)
     if path is None:
         return None
     try:
@@ -240,7 +246,18 @@ def _message_error_burst(
         return None
     calls = server_errors = 0
     for line in chunk.split(b"\n"):
-        if b"<- HTTP/1.1 " not in line or b"POST /v1/messages" not in line:
+        if b"<- HTTP/1.1 " not in line:
+            continue
+        try:
+            # The route, not a prefix of it: `POST /v1/messages` is also a
+            # substring of `POST /v1/messages/count_tokens`, a real,
+            # high-volume route the pin logs the same way -- a bare
+            # substring match let a token-counting burst alone satisfy the
+            # 5-call sample.
+            route = line.split(b"POST ", 1)[1].split(b" ", 1)[0].split(b"?", 1)[0]
+        except IndexError:
+            continue
+        if route != b"/v1/messages":
             continue
         try:
             status = int(line.split(b"<- HTTP/1.1 ", 1)[1].split(b" ", 1)[0])
@@ -353,6 +370,25 @@ def _recovery_is_useful(
         candidate_recovery_ts - now <= RECOVERY_HORIZON_S
         or active_recovery_ts - now <= RECOVERY_HORIZON_S
     )
+
+
+def _overload_bar_releases(trigger: str) -> bool:
+    """May a barred-empty ranking fall back to the unfiltered candidate
+    list, dropping the overload bar to retry rather than staying BLOCKED?
+
+    Only on an escape. ``proactive`` and ``consume-first`` already read an
+    empty ranking as the correct outcome, not a stall to retry out of; and
+    releasing on a SECOND ``overloaded`` fire walks the whole fleet one
+    switch every two ticks (each fire bars the account it lands on next, so
+    the next fire finds everyone barred and would release right back).
+
+    ONE predicate for every such release arm -- `_rank`'s OAuth bar and the
+    api-key last-resort fallback in `_tick_inner` both call this rather than
+    each spelling the trigger tuple inline, which is how the api-key arm
+    shipped unscoped for two rounds running: the invariant lived at the call
+    site, so the second site never inherited the fix made to the first.
+    """
+    return trigger not in ("proactive", "consume-first", "overloaded")
 
 
 # Ceiling on `stop()`'s wait for an in-flight TICK before it frees the LIVE
@@ -971,6 +1007,12 @@ class AutoSwitchEngine:
         # `size < since` check alone misses that when the newly-armed file
         # is BIGGER than the old offset -- exactly the re-arm that matters.
         self._message_trace_path: Path | None = None
+        # The account active when the offset above was baselined. A switch
+        # away re-baselines the same way a path re-arm does -- ENGINE (once,
+        # via `_perform`), hand (`cswap switch`), or TUI, all read back here
+        # as the same `current` -- so bytes the OLD account's traffic wrote
+        # never carry onto whichever account a later tick finds active.
+        self._message_trace_account: str | None = None
         # The previous tick's own (server_errors, calls), summed with this
         # tick's to evaluate MESSAGE_ERROR_SAMPLE/MESSAGE_ERROR_SHARE over a
         # bounded two-tick window instead of one tick alone -- a burst
@@ -1525,6 +1567,11 @@ class AutoSwitchEngine:
             else {}
         )
 
+        # Read once, ahead of the trace block below, which needs THIS
+        # tick's value to tell a switched-away account from the one the
+        # last tick's offset/carry were baselined against.
+        current = self.switcher.current_account_number()
+
         # Read the pin's trace for a 5xx burst FIRST, before any early return
         # below: `no-active-account` and `active-api-key` can each hold for
         # hours, and this call needs no fact those returns would gate.
@@ -1534,13 +1581,19 @@ class AutoSwitchEngine:
         current_trace_path = _trace_path(self.switcher)
         # A re-arm at a different path re-baselines too, same as `since is
         # None`: `_message_error_burst`'s own `size < since` check never
-        # catches a re-arm onto a pre-existing LARGER file.
+        # catches a re-arm onto a pre-existing LARGER file. A switch away
+        # re-baselines the same way -- see `_message_trace_account`'s
+        # comment in `__init__`.
         trace_path_changed = current_trace_path != self._message_trace_path
+        account_changed = current != self._message_trace_account
         self._message_trace_path = current_trace_path
+        self._message_trace_account = current
         effective_since = (
-            None if trace_path_changed else self._message_trace_offset
+            None
+            if trace_path_changed or account_changed
+            else self._message_trace_offset
         )
-        overload_burst = _message_error_burst(self.switcher, effective_since)
+        overload_burst = _message_error_burst(current_trace_path, effective_since)
         is_overloaded = False
         overload_detail = ""
         if overload_burst is not None:
@@ -1564,7 +1617,6 @@ class AutoSwitchEngine:
                     f"{window_errors}/{window_calls} 5xx on /v1/messages"
                 )
 
-        current = self.switcher.current_account_number()
         if current is None:
             self._emit(
                 PollEvent(active=None, headroom={}, threshold=settings.threshold)
@@ -1603,7 +1655,7 @@ class AutoSwitchEngine:
             raise _EngineStopped()
 
         entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
+            current, quarantined, threshold=settings.threshold, overloaded=is_overloaded
         )
         self._emit(
             PollEvent(
@@ -1853,16 +1905,20 @@ class AutoSwitchEngine:
             shape, but with no `recovered` gate -- it is a plain timer, not
             an anti-flap check, so a bar that would leave nothing simply
             releases rather than parking the engine BLOCKED for the whole
-            backoff. Scoped `trigger not in ("proactive", "consume-first",
-            "overloaded")`: the first two already read an empty ranking as
-            the correct outcome, not a stall to retry out of; `overloaded`
-            is excluded for a different reason -- staying put is right when
-            EVERY peer is 529-ing, and releasing there walks the whole
-            fleet one switch every two ticks (each fire bars the account it
-            lands on next, so the next fire finds everyone barred and
-            releases right back). An account-specific 529 burst never
-            reaches a second fire: the account it escaped is the only one
-            barred, so a real peer is always still there to rank.
+            backoff. Scoped via `_overload_bar_releases`: `proactive` and
+            `consume-first` already read an empty ranking as the correct
+            outcome, not a stall to retry out of; `overloaded` is excluded
+            for a different reason -- staying put is right when EVERY peer
+            is 529-ing, and releasing there walks the whole fleet one
+            switch every two ticks (each fire bars the account it lands on
+            next, so the next fire finds everyone barred and would release
+            right back). At two usable accounts the "peer" a second
+            `overloaded` fire needs IS the one just barred: that tick emits
+            `no-qualifying-candidate` BLOCKED until the bar clears rather
+            than finding a real peer to rank -- bounded by
+            OVERLOAD_BACKOFF_S and self-clearing, so the wait is correct;
+            it is this paragraph's earlier claim of an always-available
+            peer that was wrong, not the wait.
             """
             # Recomputed per snapshot, never once per tick: the consume-first
             # two-phase commit replaces `headroom` and `active_headroom` and
@@ -1898,9 +1954,7 @@ class AutoSwitchEngine:
                     )
                     if unbarred[0]:
                         return unbarred
-                if overload_backoff and trigger not in (
-                    "proactive", "consume-first", "overloaded"
-                ):
+                if overload_backoff and _overload_bar_releases(trigger):
                     unbarred = self._rank_candidates(
                         no_return=no_return, overload_backoff={}, **kw
                     )
@@ -1965,13 +2019,17 @@ class AutoSwitchEngine:
             # tick with no OAuth alternative could land straight back on an
             # api-key account still inside its 900s bar. Same
             # release-if-it-leaves-nothing shape as the OAuth bar in `_rank`
-            # above: filter first, fall back to the unfiltered list only
-            # when the bar would leave nothing to move to.
+            # above, through the same `_overload_bar_releases` predicate:
+            # filter first, fall back to the unfiltered list only when the
+            # bar would leave nothing to move to AND the trigger is an
+            # escape.
             unbarred_api_key = [
                 n for n in api_key_candidates
                 if decided_now >= (overload_backoff.get(n) or 0)
             ]
-            ordered = unbarred_api_key or api_key_candidates
+            ordered = unbarred_api_key
+            if not ordered and _overload_bar_releases(trigger):
+                ordered = api_key_candidates
 
         if not ordered:
             if not any_known:
@@ -2438,6 +2496,17 @@ class AutoSwitchEngine:
             # See `test_an_overloaded_departure_releases_without_improving_
             # on_a_healthy_baseline` for why `overloaded` gets the same
             # exemption.
+            #
+            # DECLARED CEILING: this exemption reads `leftTrigger`, PERSISTED
+            # in state.json, but the bar actually protecting an `overloaded`
+            # departure is `_overload_backoff` -- engine-lifetime only, never
+            # persisted (see `_message_trace_account`'s comment in
+            # `__init__` for the same split). An engine restart inside the
+            # 900s window loses that in-memory bar and finds this exemption
+            # still in force, `leftTrigger` having survived the restart --
+            # so nothing bars an immediate flap back onto the account just
+            # left. Bounded by OVERLOAD_BACKOFF_S and overwritten by the
+            # next real departure; not fixed here.
             return True
         h = headroom.get(barred)
         left_headroom = state.get("leftHeadroom")
@@ -2985,6 +3054,7 @@ class AutoSwitchEngine:
         quarantined: set[str] = frozenset(),
         *,
         threshold: float | None = None,
+        overloaded: bool = False,
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
@@ -2998,9 +3068,11 @@ class AutoSwitchEngine:
         active usage unknown (failover must not run on stale candidate data).
         At-limit, proactive, and ordinary unknown-usage failover selection
         never runs on the pre-escalation snapshot — those triggers imply the
-        escalation condition. ``disabled-active`` does not imply it (a disabled
-        active can read comfortably below the band), so it is named explicitly
-        in ``escalate`` below rather than arriving through a headroom condition (the deliberate exception: an owned-and-expired
+        escalation condition. Neither ``disabled-active`` nor ``overloaded``
+        implies it (a disabled active, or one the trace's own 5xx burst is
+        escaping, can each read comfortably below the band), so both are
+        named explicitly in ``escalate`` below rather than arriving through a
+        headroom condition (the deliberate exception: an owned-and-expired
         active is excluded above, so a post-idle-hold failover can run
         without escalating). The consume-first trigger can fire outside the
         escalation band, so it instead decides *provisionally* on the stored
@@ -3098,11 +3170,13 @@ class AutoSwitchEngine:
         if threshold is None:
             threshold = self.settings.threshold
         escalate = bool(candidates) and (
-            # A disabled active switches on ANY headroom, including one well
-            # below the band, which satisfies neither leg below — without this
-            # the choice runs on candidate rows up to CANDIDATE_MAX_INTERVAL_S
-            # old, i.e. onto an account it never fetched that tick.
+            # A disabled or overloaded active switches on ANY headroom,
+            # including one well below the band, which satisfies neither leg
+            # below — without this the choice runs on candidate rows up to
+            # CANDIDATE_MAX_INTERVAL_S old, i.e. onto an account it never
+            # fetched that tick.
             self.switcher.is_account_disabled(current)
+            or overloaded
             or (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
                 active_headroom is not None
@@ -3268,7 +3342,12 @@ class AutoSwitchEngine:
                 )
             atomic_write_json(self.state_path, state)
 
-        self._message_trace_offset = None
+        # No explicit `_message_trace_offset` reset here: `_tick_inner`
+        # reads `current` fresh every tick and re-baselines whenever it
+        # differs from the account `_message_trace_account` was last set
+        # to, which this switch changing the live login satisfies on the
+        # very next tick -- the same path a hand `cswap switch` or a TUI
+        # switch takes, since none of those call `_perform` either.
 
         warnings = list(result.get("warnings", []))
         # A SWITCH CHANGES THE DEFAULT LOGIN AND NOTHING ELSE. A session-mode
