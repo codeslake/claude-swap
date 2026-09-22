@@ -12540,3 +12540,46 @@ class TestOverloadedTrigger:
         })
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 1
+
+
+class TestMessageErrorBurstOffsetAfterACappedRead:
+    """A tick's read of the trace is capped at 1 MiB; the offset it hands
+    back must be where THAT read stopped, not the file's current (larger)
+    size, or every byte beyond the cap is skipped forever instead of being
+    picked up on a later tick. See `_message_error_burst` (autoswitch.py)."""
+
+    def test_bytes_past_the_cap_are_read_on_a_later_tick_not_lost(
+        self, monkeypatch, tmp_path
+    ):
+        trace = tmp_path / "trace.log"
+        monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace)
+        cap = 1024 * 1024
+        ok_line = (
+            "[c1]     <- HTTP/1.1 200 unknown  POST /v1/messages?beta=true  "
+            "ua=claude-cli/2.1.278 (external, cli)\n"
+        ).encode()
+        error_line = (
+            "[c1]     <- HTTP/1.1 529 unknown  POST /v1/messages?beta=true  "
+            "ua=claude-cli/2.1.278 (external, cli)\n"
+        ).encode()
+        # Enough healthy traffic to push well past the 1 MiB cap, then one
+        # error line sitting entirely beyond it.
+        padding = ok_line * ((cap // len(ok_line)) + 4)
+        trace.write_bytes(padding + error_line)
+
+        server_errors, calls, offset_after_first = autoswitch._message_error_burst(
+            None, 0
+        )
+        assert server_errors == 0  # the error line sits well past the cap
+        assert offset_after_first < trace.stat().st_size, (
+            "a capped read must not report the file's full size as read"
+        )
+
+        server_errors2, calls2, offset_after_second = autoswitch._message_error_burst(
+            None, offset_after_first
+        )
+        assert server_errors2 >= 1, (
+            "the error line beyond the first tick's 1 MiB cap must surface "
+            "on a later tick, not be lost because the previous tick's "
+            "offset jumped straight to the file's end"
+        )

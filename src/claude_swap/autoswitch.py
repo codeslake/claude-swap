@@ -30,6 +30,7 @@ read-modify-write under a dedicated file lock.
 from __future__ import annotations
 
 import enum
+import importlib
 import json
 import logging
 import math
@@ -203,11 +204,11 @@ def _trace_path(switcher: ClaudeAccountSwitcher) -> Path | None:
     the cloud pin belongs to its own PR (#210, its own package release), and
     this is the only caller here. Mirrors that adapter's own optional-extra
     shape (never raises, `None` means "cannot ask") so a later move into
-    `pin.py` is a cut-and-paste, not a rewrite.
+    `pin.py` is a cut-and-paste, not a rewrite. No ``invalidate_caches()``
+    call: `importlib`'s own `FileFinder` re-stats its directory's mtime on
+    every `import_module`, so a pin installed into an already-scanned
+    site-packages after start-up is found on the very next tick without it.
     """
-    import importlib
-
-    importlib.invalidate_caches()
     try:
         proxy = importlib.import_module("cswap_pin.proxy")
         target = proxy.trace_target(Path(switcher.backup_dir) / "pin-proxy")
@@ -231,6 +232,11 @@ def _message_error_burst(
     answer ``(0, 0, <current size>)``: zero calls counted is what makes the
     caller decide nothing on either, using the exact same check it uses for
     "not enough samples yet" -- no separate first-read flag needed.
+
+    A single tick reads at most 1 MiB. ``new_offset`` is where THAT read
+    stopped, not the file's current size, so a tick whose window grew past
+    the cap defers the remainder to the next tick instead of skipping it --
+    the offset never jumps past bytes this call never looked at.
     """
     path = _trace_path(switcher)
     if path is None:
@@ -255,7 +261,7 @@ def _message_error_burst(
         calls += 1
         if status >= 500:
             server_errors += 1
-    return (server_errors, calls, size)
+    return (server_errors, calls, since + len(chunk))
 
 
 def _recovery_is_useful(
