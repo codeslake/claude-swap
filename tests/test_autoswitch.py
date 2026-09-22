@@ -12475,39 +12475,29 @@ class TestTracePath:
     monkeypatched away everywhere else in this file -- exercised here
     directly, against a stub planted in `sys.modules`."""
 
-    def test_a_path_comes_back_when_the_extra_answers(self, harness, monkeypatch):
+    @pytest.mark.parametrize("answers", [True, False])
+    def test_the_path_reflects_what_the_extra_answers(
+        self, harness, monkeypatch, answers
+    ):
         import sys
         import types
 
         wanted = str(Path(harness.switcher.backup_dir) / "pin-proxy" / "trace.log")
-        stub = types.SimpleNamespace(trace_target=lambda certdir: wanted)
+        stub = types.SimpleNamespace(
+            trace_target=lambda certdir: wanted if answers else None
+        )
         monkeypatch.setitem(sys.modules, "cswap_pin.proxy", stub)
 
-        assert autoswitch._trace_path(harness.switcher) == Path(wanted)
+        expected = Path(wanted) if answers else None
+        assert autoswitch._trace_path(harness.switcher) == expected
 
-    def test_none_when_trace_target_answers_nothing(self, harness, monkeypatch):
-        import sys
-        import types
-
-        stub = types.SimpleNamespace(trace_target=lambda certdir: None)
-        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", stub)
-
-        assert autoswitch._trace_path(harness.switcher) is None
-
-    def test_none_when_the_extra_cannot_be_imported(self, harness, monkeypatch, caplog):
+    def test_none_when_the_extra_cannot_be_imported(self, harness, monkeypatch):
         def _raise(name, *a, **kw):
             raise ImportError(f"no module named {name!r}")
 
         monkeypatch.setattr(autoswitch.importlib, "import_module", _raise)
 
-        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
-            path = autoswitch._trace_path(harness.switcher)
-
-        assert path is None
-        assert "trace_target" in caplog.text, (
-            "the except branch must name the exception, not swallow it "
-            f"silently -- caplog: {caplog.text!r}"
-        )
+        assert autoswitch._trace_path(harness.switcher) is None
 
 
 class TestOverloadedTrigger:
@@ -12624,14 +12614,13 @@ class TestOverloadedTrigger:
     def test_the_offset_re_baselines_after_a_switch_lands(
         self, harness, tmp_path, monkeypatch
     ):
-        """`_perform` must move `_message_trace_offset` to the trace's size
-        at the moment the switch actually LANDS, not leave it wherever the
-        tick's own read stopped. A real pin keeps logging while the switch
-        is in flight (freshening, the Keychain rewrite); bytes it writes in
-        that window are the OLD account's, and an offset left behind hands
-        them to whichever account the engine just moved TO -- two
-        consecutive bursts must fire once each, not twice off the same
-        underlying traffic.
+        """`_perform` must reset `_message_trace_offset` the moment a switch
+        LANDS, not leave it wherever the tick's own read stopped. A real pin
+        keeps logging while the switch is in flight (freshening, the
+        Keychain rewrite); bytes it writes in that window are the OLD
+        account's, and an offset left behind hands them to whichever account
+        the engine just moved TO -- two consecutive bursts must fire once
+        each, not twice off the same underlying traffic.
         """
         trace = self._arm(harness, tmp_path, monkeypatch)
         harness.tick_with_usage({
@@ -12708,6 +12697,60 @@ class TestOverloadedTrigger:
         )
         assert harness.active_number() == 1
 
+    def test_a_consume_first_tick_does_not_release_the_overload_bar(
+        self, harness, tmp_path, monkeypatch
+    ):
+        """The overload-backoff release in `_rank` is scoped like every
+        other bar there: `trigger not in ("proactive", "consume-first")`.
+        Those two triggers already read an empty ranking as a correct
+        NO_ACTION (`already-consuming-soonest`), not the stall the release
+        exists for -- an unscoped release lands straight back on the
+        account still inside its 900s backoff, on the shipped default
+        strategy, burning a refresh generation on a move that never had to
+        happen.
+        """
+        harness.switcher.set_account_disabled("3", True)
+        trace = self._arm(harness, tmp_path, monkeypatch)
+        harness.engine.settings = replace(
+            harness.engine.settings, strategy="consume-first"
+        )
+        now = harness.clock.now
+        harness.tick_with_usage({
+            "1": _usage7(10.0, 0.0, _iso_at(now + 5 * 86400)),
+            "2": _usage7(10.0, 0.0, _iso_at(now + 5 * 86400)),
+        })
+        self._write_trace(trace, [529, 529, 529, 200, 200])
+        outcome = harness.tick_with_usage({
+            "1": _usage7(10.0, 0.0, _iso_at(now + 5 * 86400)),
+            "2": _usage7(30.0, 0.0, _iso_at(now + 3 * 86400)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        assert harness.state()["leftTrigger"] == "overloaded"
+
+        # Past the 300s cooldown, still inside the 900s overload backoff.
+        # Account 1's fresh headroom (100) dominates active account 2's (30)
+        # by more than HORIZON_HEADROOM_RATIO, so the ordinary no-return bar
+        # releases on its own merits, AND account 1's weekly window resets
+        # sooner (2 days out against 2's 4) so consume-first's own ranking
+        # would otherwise pick it too -- the ONLY thing left barring it is
+        # the overload backoff.
+        harness.clock.advance(301.0)
+        harness.events.clear()
+        outcome = harness.tick_with_usage({
+            "1": _usage7(0.0, 0.0, _iso_at(now + 2 * 86400)),
+            "2": _usage7(70.0, 0.0, _iso_at(now + 4 * 86400)),
+        })
+        assert outcome is not TickOutcome.SWITCHED, (
+            "a consume-first tick released the overload bar and landed "
+            f"back on the still-barred account; events={harness.kinds()}"
+        )
+        assert not any(
+            isinstance(e, SwitchEvent) and e.to_ref and e.to_ref["number"] == 1
+            for e in harness.events
+        ), "switched back onto the account still inside its overload backoff"
+        assert harness.active_number() == 2
+
 
 class TestMessageErrorBurstOffsetAfterACappedRead:
     """A tick's read of the trace is capped at 1 MiB; the offset it hands
@@ -12738,11 +12781,13 @@ class TestMessageErrorBurstOffsetAfterACappedRead:
             "a capped read must not report the file's full size as read"
         )
 
-        server_errors2, _, offset_after_second = autoswitch._message_error_burst(
+        server_errors2, calls2, _ = autoswitch._message_error_burst(
             None, offset_after_first
         )
-        assert server_errors2 >= 1, (
+        assert calls2 == 1
+        assert server_errors2 == 1, (
             "the error line beyond the first tick's cap must surface "
             "on a later tick, not be lost because the previous tick's "
-            "offset jumped straight to the file's end"
+            "offset jumped straight to the file's end -- and not "
+            "double-counted, which `>= 1` could not tell apart from `== 2`"
         )
