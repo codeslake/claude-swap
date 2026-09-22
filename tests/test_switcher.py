@@ -8043,12 +8043,14 @@ class TestProvenanceGuard:
         )
         g1 = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-stored-1", "refreshToken": "rt-1",
-            "refreshTokenExpiresAt": 1_700_000_000_000, "expiresAt": 2000,
+            "refreshTokenExpiresAt": 4_000_000_000_000,
+            "expiresAt": 2_300_000_002_000,
         }})
         creds_store[("1", "test@example.com")] = g1
         g2 = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-stale-1", "refreshToken": "rt-1-stale",
-            "refreshTokenExpiresAt": 1_700_000_000_700, "expiresAt": 1000,
+            "refreshTokenExpiresAt": 4_000_000_000_700,
+            "expiresAt": 2_300_000_001_000,
         }})
         live_state = {"creds": g2}
         patches = self._install_store_patches(
@@ -8078,17 +8080,19 @@ class TestProvenanceGuard:
         )
         g1 = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-stored-1", "refreshToken": "rt-1",
-            "refreshTokenExpiresAt": 1_700_000_000_000, "expiresAt": 1000,
+            "refreshTokenExpiresAt": 4_000_000_000_000,
+            "expiresAt": 2_300_000_001_000,
         }})
         creds_store[("1", "test@example.com")] = g1
         g2 = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-fresh-1", "refreshToken": "rt-1-rotated",
-            "refreshTokenExpiresAt": 1_700_000_000_700, "expiresAt": 2000,
+            "refreshTokenExpiresAt": 4_000_000_000_700,
+            "expiresAt": 2_300_000_002_000,
         }})
         live_state = {"creds": g2}
         creds_store[("2", "account2@example.com")] = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-stale-2", "refreshToken": "rt-orig-2",
-            "refreshTokenExpiresAt": 1_700_000_000_900,
+            "refreshTokenExpiresAt": 4_000_000_000_900,
         }})
         patches = self._install_store_patches(
             switcher, creds_store, configs_store, live_state,
