@@ -2779,6 +2779,8 @@ class TestApiKeyAccounts:
             "the unscoped last-resort fallback and landed back on it "
             "inside its own backoff"
         )
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "no-comparison" in reasons, reasons
 
 
 class TestFreshening:
@@ -12887,8 +12889,10 @@ class TestOverloadedTrigger:
     def test_the_offset_re_baselines_after_a_switch_lands(
         self, harness, tmp_path, monkeypatch
     ):
-        """`_perform` must reset `_message_trace_offset` the moment a switch
-        LANDS, not leave it wherever the tick's own read stopped. A real pin
+        """`_message_trace_offset` must read as re-baselined once a switch
+        LANDS, not leave it wherever the tick's own read stopped -- not by an
+        explicit reset in `_perform`, but by `_tick_inner`'s own account
+        check on the very next tick. A real pin
         keeps logging while the switch is in flight (freshening, the
         Keychain rewrite); bytes it writes in that window are the OLD
         account's, and an offset left behind hands them to whichever account
@@ -13016,6 +13020,8 @@ class TestOverloadedTrigger:
             "the fleet-wide outage bounced the engine back to the account "
             "it escaped instead of staying put"
         )
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert "no-qualifying-candidate" in reasons, reasons
 
     @pytest.mark.parametrize("strategy", ["consume-first", "best"])
     def test_the_overload_bar_release_is_scoped_to_its_excluded_triggers(
@@ -13084,6 +13090,13 @@ class TestOverloadedTrigger:
             for e in harness.events
         ), "switched back onto the account still inside its overload backoff"
         assert harness.active_number() == 2
+        expected_reason = (
+            "already-consuming-soonest"
+            if strategy == "consume-first"
+            else "no-qualifying-candidate"
+        )
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert expected_reason in reasons, reasons
 
     def test_a_hand_switch_off_engine_re_baselines_the_offset_and_carry(
         self, harness, tmp_path, monkeypatch

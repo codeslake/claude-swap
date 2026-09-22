@@ -191,6 +191,12 @@ def _trace_path(switcher: ClaudeAccountSwitcher) -> Path | None:
     own `FileFinder` re-stats its directory's mtime on every `import_module`,
     so a pin installed into an already-scanned site-packages after start-up
     is found on the very next tick without it.
+
+    FIRST CEILING: a pin too old to expose ``trace_target`` at all returns
+    None here, before `_message_error_burst` ever runs. Measured: this
+    fork's own venv carries ``cswap_pin-0.1.143``, which has no
+    ``trace_target`` -- the ``except Exception`` above catches the
+    resulting ``AttributeError`` and every tick reads a no-op.
     """
     try:
         proxy = importlib.import_module("cswap_pin.proxy")
@@ -211,9 +217,7 @@ def _message_error_burst(
     target armed (``path`` is None), or the file could not be read. Never
     raises -- every OSError path returns None, so this diagnostic can never
     break a tick. ``path`` is resolved once per tick by the caller (via
-    `_trace_path`), not here -- a second resolve per tick previously left
-    the path this read opens unprovably the same as the one the caller's
-    re-arm/re-baseline decision compared.
+    `_trace_path`), not here.
 
     ``since=None`` (no baseline yet) and a rotated (shorter) file both
     answer ``(0, 0, <current size>)``: zero calls counted is what makes the
@@ -275,9 +279,7 @@ def _message_error_burst(
             # with the pin's trace format -- too old or too new writes a
             # line this parser never matches, and `calls=0` then reads like
             # an idle fleet. Measured minimum: cswap-pin 0.1.148 is the
-            # first release whose response line carries method and path
-            # (`72f9b77`); the copy vendored in this fork's .venv,
-            # cswap_pin-0.1.143, predates it and does not match.
+            # first release whose response line carries method and path.
             server_errors += 1
     return (server_errors, calls, since + len(chunk))
 
@@ -381,6 +383,13 @@ def _overload_bar_releases(trigger: str) -> bool:
     releasing on a SECOND ``overloaded`` fire walks the whole fleet one
     switch every two ticks (each fire bars the account it lands on next, so
     the next fire finds everyone barred and would release right back).
+
+    That "next fire finds everyone barred" claim assumes a peer to walk to.
+    At two usable accounts there is none: the "peer" a second ``overloaded``
+    fire needs IS the one just barred, so that tick emits
+    ``no-qualifying-candidate`` BLOCKED until the bar clears instead --
+    bounded by OVERLOAD_BACKOFF_S and self-clearing, so the wait is correct
+    even though the walk above never happens there.
 
     ONE predicate for every such release arm -- `_rank`'s OAuth bar and the
     api-key last-resort fallback in `_tick_inner` both call this rather than
@@ -1002,17 +1011,16 @@ class AutoSwitchEngine:
         # until the first successful read takes its baseline; see
         # `_message_error_burst`.
         self._message_trace_offset: int | None = None
-        # The trace PATH the offset above was baselined against. The pin's
-        # trace-to file can be re-armed at a different path mid-run, and a
-        # `size < since` check alone misses that when the newly-armed file
-        # is BIGGER than the old offset -- exactly the re-arm that matters.
-        self._message_trace_path: Path | None = None
-        # The account active when the offset above was baselined. A switch
-        # away re-baselines the same way a path re-arm does -- ENGINE (once,
-        # via `_perform`), hand (`cswap switch`), or TUI, all read back here
-        # as the same `current` -- so bytes the OLD account's traffic wrote
-        # never carry onto whichever account a later tick finds active.
-        self._message_trace_account: str | None = None
+        # The (trace PATH, active account) pair the offset above was
+        # baselined against. The pin's trace-to file can be re-armed at a
+        # different path mid-run, and a `size < since` check alone misses
+        # that when the newly-armed file is BIGGER than the old offset --
+        # exactly the re-arm that matters. A switch re-baselines the same
+        # way -- ENGINE (once, via `_perform`), hand (`cswap switch`), or
+        # TUI, all read back here as the same `current` -- so bytes the OLD
+        # account's traffic wrote never carry onto whichever account a
+        # later tick finds active.
+        self._message_trace_key: tuple[Path | None, str | None] | None = None
         # The previous tick's own (server_errors, calls), summed with this
         # tick's to evaluate MESSAGE_ERROR_SAMPLE/MESSAGE_ERROR_SHARE over a
         # bounded two-tick window instead of one tick alone -- a burst
@@ -1575,22 +1583,18 @@ class AutoSwitchEngine:
         # Read the pin's trace for a 5xx burst FIRST, before any early return
         # below: `no-active-account` and `active-api-key` can each hold for
         # hours, and this call needs no fact those returns would gate.
-        # Genuinely unconditional now -- previously it sat after both,
-        # skipping the advance and leaving the next tick to count a stale
-        # backlog against whatever slot was active by then.
         current_trace_path = _trace_path(self.switcher)
         # A re-arm at a different path re-baselines too, same as `since is
         # None`: `_message_error_burst`'s own `size < since` check never
         # catches a re-arm onto a pre-existing LARGER file. A switch away
-        # re-baselines the same way -- see `_message_trace_account`'s
-        # comment in `__init__`.
-        trace_path_changed = current_trace_path != self._message_trace_path
-        account_changed = current != self._message_trace_account
-        self._message_trace_path = current_trace_path
-        self._message_trace_account = current
+        # re-baselines the same way -- see `_message_trace_key`'s comment
+        # in `__init__`.
+        trace_key = (current_trace_path, current)
+        key_changed = trace_key != self._message_trace_key
+        self._message_trace_key = trace_key
         effective_since = (
             None
-            if trace_path_changed or account_changed
+            if key_changed
             else self._message_trace_offset
         )
         overload_burst = _message_error_burst(current_trace_path, effective_since)
@@ -1612,10 +1616,6 @@ class AutoSwitchEngine:
                 window_calls >= MESSAGE_ERROR_SAMPLE
                 and window_errors >= window_calls * MESSAGE_ERROR_SHARE
             )
-            if is_overloaded:
-                overload_detail = (
-                    f"{window_errors}/{window_calls} 5xx on /v1/messages"
-                )
 
         if current is None:
             self._emit(
@@ -1726,6 +1726,7 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             trigger = "overloaded"
+            overload_detail = f"{window_errors}/{window_calls} 5xx on /v1/messages"
         elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
@@ -1798,11 +1799,6 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.NO_ACTION
             trigger = "failover"
-
-        if trigger != "overloaded":
-            # `disabled-active` outranks `is_overloaded` above; don't leak
-            # a stale detail into a switch logged under a different trigger.
-            overload_detail = ""
 
         if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
@@ -1905,20 +1901,8 @@ class AutoSwitchEngine:
             shape, but with no `recovered` gate -- it is a plain timer, not
             an anti-flap check, so a bar that would leave nothing simply
             releases rather than parking the engine BLOCKED for the whole
-            backoff. Scoped via `_overload_bar_releases`: `proactive` and
-            `consume-first` already read an empty ranking as the correct
-            outcome, not a stall to retry out of; `overloaded` is excluded
-            for a different reason -- staying put is right when EVERY peer
-            is 529-ing, and releasing there walks the whole fleet one
-            switch every two ticks (each fire bars the account it lands on
-            next, so the next fire finds everyone barred and would release
-            right back). At two usable accounts the "peer" a second
-            `overloaded` fire needs IS the one just barred: that tick emits
-            `no-qualifying-candidate` BLOCKED until the bar clears rather
-            than finding a real peer to rank -- bounded by
-            OVERLOAD_BACKOFF_S and self-clearing, so the wait is correct;
-            it is this paragraph's earlier claim of an always-available
-            peer that was wrong, not the wait.
+            backoff, scoped the same way: see `_overload_bar_releases`'s
+            docstring for which triggers release and why.
             """
             # Recomputed per snapshot, never once per tick: the consume-first
             # two-phase commit replaces `headroom` and `active_headroom` and
@@ -2019,10 +2003,8 @@ class AutoSwitchEngine:
             # tick with no OAuth alternative could land straight back on an
             # api-key account still inside its 900s bar. Same
             # release-if-it-leaves-nothing shape as the OAuth bar in `_rank`
-            # above, through the same `_overload_bar_releases` predicate:
-            # filter first, fall back to the unfiltered list only when the
-            # bar would leave nothing to move to AND the trigger is an
-            # escape.
+            # above, through the same `_overload_bar_releases` predicate --
+            # see its docstring for the escape-only scoping.
             unbarred_api_key = [
                 n for n in api_key_candidates
                 if decided_now >= (overload_backoff.get(n) or 0)
@@ -2500,7 +2482,7 @@ class AutoSwitchEngine:
             # DECLARED CEILING: this exemption reads `leftTrigger`, PERSISTED
             # in state.json, but the bar actually protecting an `overloaded`
             # departure is `_overload_backoff` -- engine-lifetime only, never
-            # persisted (see `_message_trace_account`'s comment in
+            # persisted (see `_message_trace_key`'s comment in
             # `__init__` for the same split). An engine restart inside the
             # 900s window loses that in-memory bar and finds this exemption
             # still in force, `leftTrigger` having survived the restart --
@@ -3342,12 +3324,9 @@ class AutoSwitchEngine:
                 )
             atomic_write_json(self.state_path, state)
 
-        # No explicit `_message_trace_offset` reset here: `_tick_inner`
-        # reads `current` fresh every tick and re-baselines whenever it
-        # differs from the account `_message_trace_account` was last set
-        # to, which this switch changing the live login satisfies on the
-        # very next tick -- the same path a hand `cswap switch` or a TUI
-        # switch takes, since none of those call `_perform` either.
+        # No explicit `_message_trace_offset` reset here: the switch changes
+        # `current`, and `_tick_inner` re-baselines off that on the very
+        # next tick -- see `_message_trace_key`'s comment in `__init__`.
 
         warnings = list(result.get("warnings", []))
         # A SWITCH CHANGES THE DEFAULT LOGIN AND NOTHING ELSE. A session-mode
