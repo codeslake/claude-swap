@@ -8002,19 +8002,21 @@ class TestProvenanceGuard:
         the slot's own rotated grant as unadoptable while its stored
         backup keeps the generation the rotation consumed (2026-09-22
         defect: invalid_grant 2.5h after a fresh login). Same lineage
-        stamp, newer generation, no cross-slot collision -> backs up
+        stamp (a 700ms gap -- the measured shape, refresh never moves it),
+        newer generation by access-token `expiresAt` (the way the codebase
+        already orders generations), no cross-slot collision -> backs up
         like a resolved `own-rotated`."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
         g1 = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-stored-1", "refreshToken": "rt-1",
-            "refreshTokenExpiresAt": 1_700_000_000_000,
+            "refreshTokenExpiresAt": 1_700_000_000_000, "expiresAt": 1000,
         }})
         creds_store[("1", "test@example.com")] = g1
         g2 = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-fresh-1", "refreshToken": "rt-1-rotated",
-            "refreshTokenExpiresAt": 1_700_000_000_700,
+            "refreshTokenExpiresAt": 1_700_000_000_700, "expiresAt": 2000,
         }})
         live_state = {"creds": g2}
         patches = self._install_store_patches(
@@ -8029,6 +8031,41 @@ class TestProvenanceGuard:
         assert switcher.list_unclaimed_credentials() == {}
         assert op["warnings"] == []
 
+    def test_unresolved_probe_with_older_access_expiry_stays_unresolved(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Same lineage stamp (within jitter) is only half the proof: a
+        live `expiresAt` EARLIER than the backup's is a consumed
+        predecessor, not the successor, and must not be written over the
+        slot's real (newer) backup."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        g1 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stored-1", "refreshToken": "rt-1",
+            "refreshTokenExpiresAt": 1_700_000_000_000, "expiresAt": 2000,
+        }})
+        creds_store[("1", "test@example.com")] = g1
+        g2 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stale-1", "refreshToken": "rt-1-stale",
+            "refreshTokenExpiresAt": 1_700_000_000_700, "expiresAt": 1000,
+        }})
+        live_state = {"creds": g2}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == g1
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id,) = entries
+        assert entries[entry_id]["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
+
     def test_unresolved_probe_with_cross_slot_stamp_stays_unresolved(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
@@ -8041,12 +8078,12 @@ class TestProvenanceGuard:
         )
         g1 = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-stored-1", "refreshToken": "rt-1",
-            "refreshTokenExpiresAt": 1_700_000_000_000,
+            "refreshTokenExpiresAt": 1_700_000_000_000, "expiresAt": 1000,
         }})
         creds_store[("1", "test@example.com")] = g1
         g2 = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-fresh-1", "refreshToken": "rt-1-rotated",
-            "refreshTokenExpiresAt": 1_700_000_000_700,
+            "refreshTokenExpiresAt": 1_700_000_000_700, "expiresAt": 2000,
         }})
         live_state = {"creds": g2}
         creds_store[("2", "account2@example.com")] = json.dumps({"claudeAiOauth": {
@@ -8067,6 +8104,28 @@ class TestProvenanceGuard:
         (entry_id,) = entries
         assert entries[entry_id]["reason"] == "unresolved"
         assert any("could not be verified" in w for w in op["warnings"])
+
+    def test_stamp_rescue_refuses_on_an_unreadable_peer_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """An unreadable peer (a locked Mac Keychain) must not read as
+        'no collision' -- `_refuse_if_peer_shares_grant`/`_check_attribution`
+        both fail closed on unreadable, and this rescue must match rather
+        than bypass them with attributed=True."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        data = switcher._get_sequence_data()
+        live_oauth = {"refreshTokenExpiresAt": 1_700_000_000_700, "expiresAt": 2000}
+        backup = json.dumps({"claudeAiOauth": {
+            "refreshTokenExpiresAt": 1_700_000_000_000, "expiresAt": 1000,
+        }})
+        with patch.object(
+            switcher, "_read_account_credentials_ex", return_value=("", True),
+        ):
+            assert switcher._live_is_own_newer_generation(
+                "1", live_oauth, backup, data,
+            ) is False
 
     def test_unresolved_stash_is_not_adoptable_back_into_its_slot(
         self, temp_home, mock_claude_config, sample_sequence_data,

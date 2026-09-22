@@ -7661,10 +7661,6 @@ class ClaudeAccountSwitcher:
             # any other oracle degradation, not preserve-and-skip.
             if r_email and resolved.get("organizationUuid") is not None:
                 return ("alien", None)
-            if self._live_is_own_newer_generation(
-                current_account, live_oauth, backup, data
-            ):
-                return ("own-rotated", None)
             return ("unresolved", None)
         # A cross-slot attribution must be uuid-positive: an email+org match
         # against a slot with no recorded uuid (add-token placeholder) is not
@@ -7695,14 +7691,18 @@ class ClaudeAccountSwitcher:
 
         True when the live bytes and this slot's own stored backup carry
         ``refreshTokenExpiresAt`` within ``_LINEAGE_STAMP_JITTER_MS`` of each
-        other, the live one is the later (newer) generation, and no OTHER
-        slot's backup stamp sits within that same jitter of the live value.
-        Guards the 2026-09-22 defect: a 401 on the ownership probe (body
-        never read) left the profile oracle silent on a genuine same-lineage
-        rotation, so the fail-narrow "unresolved" path stashed the slot's own
-        next generation as unadoptable while the backup kept the generation
-        the rotation had already consumed — invalid_grant on the next
-        refresh. Works from the bytes alone; no probe body is read here.
+        other (same lineage — refresh never moves that stamp, so this is
+        proof of ancestry, not of order) AND the live credential's access
+        token ``expiresAt`` is later than the backup's (the newer
+        generation, the way the codebase already orders generations), and no
+        OTHER slot's backup stamp sits within that same jitter of the live
+        value. Guards the 2026-09-22 defect: a 401 on the ownership probe
+        (body never read) left the profile oracle silent on a genuine
+        same-lineage rotation, so the fail-narrow "unresolved" path stashed
+        the slot's own next generation as unadoptable while the backup kept
+        the generation the rotation had already consumed — invalid_grant on
+        the next refresh. Works from the bytes alone; no probe body is read
+        here.
         """
         if not backup or not live_oauth:
             return False
@@ -7714,14 +7714,25 @@ class ClaudeAccountSwitcher:
             return False
         if not live_at or not own_at:
             return False
-        if abs(live_at - own_at) > _LINEAGE_STAMP_JITTER_MS or live_at <= own_at:
+        if abs(live_at - own_at) > _LINEAGE_STAMP_JITTER_MS:
+            return False
+        live_exp = live_oauth.get("expiresAt") or 0
+        own_exp = own_oauth.get("expiresAt") or 0
+        if not (live_exp > own_exp):
             return False
         for num, acct in data.get("accounts", {}).items():
             if num == current_account:
                 continue
-            other_backup = self._read_account_credentials(
+            other_backup, unreadable = self._read_account_credentials_ex(
                 num, acct.get("email", "")
             )
+            if unreadable:
+                # Cannot verify a peer's backup does not also share this
+                # stamp — fail closed, the same rule
+                # `_refuse_if_peer_shares_grant`/`_check_attribution` apply
+                # to an unreadable peer: "cannot verify" refuses like a
+                # collision, never "empty" like an absent slot.
+                return False
             if not other_backup:
                 continue
             other_oauth = oauth.extract_oauth_data(other_backup) or {}
@@ -8474,10 +8485,12 @@ class ClaudeAccountSwitcher:
                     )
                 else:  # own-family / own-rotated
                     # attributed only for "own-rotated": that kind is
-                    # established by `_classify_outgoing_credential`'s
-                    # uuid-verified oracle match, so its fingerprint
-                    # legitimately differs from the stored backup and needs
-                    # the attestation. "own-family" is a stored-backup
+                    # established either by `_classify_outgoing_credential`'s
+                    # uuid-verified oracle match or by its stamp-only rescue
+                    # (`_live_is_own_newer_generation`, for an oracle-silent
+                    # rotation), so its fingerprint legitimately differs from
+                    # the stored backup and needs the attestation.
+                    # "own-family" is a stored-backup
                     # fingerprint match already, which the store's own
                     # attribution guard re-derives independently below — left
                     # unattributed on purpose, as a second, redundant check
@@ -8491,10 +8504,17 @@ class ClaudeAccountSwitcher:
                     self._write_account_config(
                         current_account, current_email, original_config
                     )
-                    if kind == "own-rotated":
-                        # The profile call proved the identity; backfill a
-                        # missing slot uuid (add-token placeholder) while the
-                        # sequence file is being rewritten anyway.
+                    if kind == "own-rotated" and provenance.get("live") == original_creds:
+                        # The profile call proved the identity for THESE
+                        # bytes; backfill a missing slot uuid (add-token
+                        # placeholder) while the sequence file is being
+                        # rewritten anyway. Gated on live-bytes equality:
+                        # `resolved` is "only trustworthy while the live
+                        # bytes haven't moved" (`_prefetch_live_identity`'s
+                        # docstring) — the stamp-only rescue can return
+                        # "own-rotated" from bytes alone even when `resolved`
+                        # holds a stale identity for different bytes, and
+                        # backfilling that uuid would poison the roster.
                         resolved = provenance.get("resolved") or {}
                         acct = data.get("accounts", {}).get(current_account, {})
                         if not acct.get("uuid") and resolved.get("uuid"):
