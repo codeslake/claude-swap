@@ -3127,6 +3127,49 @@ class TestUnswitchableRowsAreListed:
             f"the panel's 'Next best' order disagrees with the engine: {out!r}"
         )
 
+    def test_the_proactive_arms_cold_floor_partition_ranks_the_floor_clearer_first(
+        self,
+    ):
+        """The owner's fixture above, widened at the active only: account 7
+        at 7d 98% (headroom 2) is inside `SPENT_HEADROOM_PCT` (3.0), so
+        `_classify_dynamic_trigger` reads `proactive`, not `dynamic-
+        healthy` — the ONE trigger `_rank_dynamic_on` applies the
+        cold-floor partition on (`_tick_inner`'s own `dynamic_ordered =
+        warm_ordered + cold_clears_floor`, reached only when `trigger ==
+        "proactive"`). Both #4 and #2 stay cold (no `last_active_at`); #4
+        (`close@x.com`, headroom 5) is below `cold_switch_cost_pct` (the
+        20.0 default) and #2 (`far@x.com`, headroom 60) clears it, so the
+        floor-clearer must rank first even though its reset is the later
+        one. A mutant collapsing the partition to `ordered = warm + cold`
+        for `trigger == "proactive"` too falls back to `_rank_dynamic_
+        candidates`' own soonest-reset order (close's reset is hours out,
+        far's is days out) and reads close before far instead.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+        from tests.test_autoswitch import _iso_at
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("7", "active@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 98.0},
+            }),
+            self._acct("4", "close@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {
+                    "pct": 95.0, "resets_at": _iso_at(time.time() + 23340),
+                },
+            }),
+            self._acct("2", "far@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {
+                    "pct": 40.0, "resets_at": _iso_at(time.time() + 500000),
+                },
+            }),
+        ), active="7", settings=settings)
+
+        assert out.index("far@x.com") < out.index("close@x.com"), (
+            f"the proactive arm's cold-floor partition must rank the "
+            f"floor-clearer first: {out!r}"
+        )
+
     def test_a_warm_partner_outranks_a_sooner_cold_reset(self, tmp_path):
         """`_rank_dynamic_on` used to pass a hardcoded `{}` for
         `last_active_at`, so `_is_warm` was False for every candidate and

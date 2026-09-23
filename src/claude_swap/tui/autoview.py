@@ -516,11 +516,15 @@ class AutoScreen(Screen):
                     entry.append("  stale", style=palette.sev_warn)
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
-                # a model-only block (the engine's fallback ranks around it),
-                # and the two must read the same way here as in the decision
-                # log — same helper, `classify_candidate_block`. Always on
-                # `models`, the full pinned set: this label explains why the
-                # row is not simply "open" on the criteria the user actually
+                # a model-only block (the engine's fallback ranks around it)
+                # — classified here and in the decision log through the SAME
+                # helper, `classify_candidate_block`, though the two print
+                # `kind == "full"` in different words on purpose (the elif
+                # below): the log always says "full", this panel reserves
+                # "full" for a window actually at or over 100 and names the
+                # bar it was judged against otherwise. Always on `models`,
+                # the full pinned set: this label explains why the row is
+                # not simply "open" on the criteria the user actually
                 # configured, independent of whether the pass above retried
                 # on the 5h/7d-only axis for ORDERING purposes.
                 kind = "open"
