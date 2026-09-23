@@ -1467,8 +1467,38 @@ def _order_fixture_accounts():
 
 _ORDER_SETTINGS = AutoSwitchSettings(strategy="best", threshold=90.0)
 
+_WARM_ORDER_SETTINGS = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
 
-def _autoview_order(snap, active, settings):
+
+def _warm_fixture_accounts():
+    """Active "1" healthy (50/50, `dynamic-healthy`); "2" a warm partner
+    (last active 20m ago, cached org context inside the default 1h
+    `cache_ttl_seconds`) with a 5-day weekly reset; "3" cold (never
+    active) with the SOONER 1-day reset. `_rank_dynamic_candidates` ranks
+    a warm candidate ahead of every cold one regardless of reset time, so
+    every screen must list "2" before "3" -- same fixture the auto view's
+    own `test_a_warm_partner_outranks_a_sooner_cold_reset` uses, reused
+    here to prove the OTHER surfaces agree with it, not just re-derive it."""
+    return [
+        make_account(1, active=True, entry=make_entry(50.0, 50.0)),
+        make_account(2, entry=UsageEntry(
+            last_good={
+                "five_hour": {"pct": 40.0},
+                "seven_day": {"pct": 40.0, "resets_at": _iso_in(5 * 86400)},
+            },
+            fetched_at=time.time(), age_s=0.0,
+        )),
+        make_account(3, entry=UsageEntry(
+            last_good={
+                "five_hour": {"pct": 10.0},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_in(1 * 86400)},
+            },
+            fetched_at=time.time(), age_s=0.0,
+        )),
+    ]
+
+
+def _autoview_order(snap, active, settings, last_active_at=None):
     """The account numbers "Next best" renders, in its own displayed order."""
     from unittest.mock import MagicMock, patch
 
@@ -1477,11 +1507,26 @@ def _autoview_order(snap, active, settings):
 
     v = AutoScreen.__new__(AutoScreen)
     v._settings = settings
+    v._last_active_at = last_active_at or {}
     app = MagicMock(current_theme=CSWAP_DARK)
     with patch.object(AutoScreen, "app", property(lambda s: app)):
         rendered = str(v._candidates_text(snap, active_number=active))
     others = [acc.number for acc in snap.accounts if acc.number != active]
     return sorted(others, key=lambda n: rendered.index(f"user{n}@example.com"))
+
+
+class TestReadLastActiveAt:
+    """Mirrors `AutoSwitchEngine._read_state`'s own safety contract: a
+    missing or garbled state file reads as no cached warm context, never
+    raises -- the file being unreadable is no different from the engine's
+    own read of it."""
+
+    def test_no_file_returns_empty(self, tmp_path):
+        assert tui_data.read_last_active_at(tmp_path) == {}
+
+    def test_non_json_file_returns_empty(self, tmp_path):
+        (tmp_path / "autoswitch_state.json").write_text("not json{")
+        assert tui_data.read_last_active_at(tmp_path) == {}
 
 
 class TestOrderedAccounts:
@@ -1609,6 +1654,27 @@ class TestOrderedAccounts:
         assert order == ["1", "3", "2"], order
         assert order[1:] == _autoview_order(snap, "1", settings)
 
+    def test_matches_next_best_on_a_warm_partner_fixture(self, tmp_path):
+        """`ordered_accounts` called `rank_switch_candidates` with no
+        `last_active_at`, so the account list (Switch/Watch) and the
+        AccountsPanel minis never saw a warm partner -- only AutoScreen
+        read the state file. On this fixture "Next best" lists "2" (warm)
+        before "3" (cold, sooner reset); `ordered_accounts` must agree."""
+        snap = AccountsSnapshot(
+            accounts=_warm_fixture_accounts(), active_number="1", taken_at=0.0
+        )
+        (tmp_path / "autoswitch_state.json").write_text(json.dumps({
+            "lastActiveAt": {"2": time.time() - 20 * 60},
+        }))
+        last_active_at = tui_data.read_last_active_at(tmp_path)
+        order = tui_data.ordered_accounts(
+            snap, _WARM_ORDER_SETTINGS, time.time(), last_active_at
+        )
+        assert order[1:] == ["2", "3"], order
+        assert order[1:] == _autoview_order(
+            snap, "1", _WARM_ORDER_SETTINGS, last_active_at
+        )
+
 
 @pytest.mark.asyncio
 class TestSharedAccountOrder:
@@ -1627,18 +1693,31 @@ class TestSharedAccountOrder:
             assert app.auto_settings.strategy == "best"
 
     async def test_every_listing_screen_follows_the_shared_order(self, tmp_path):
+        """A state file on disk, so the reference order below actually
+        depends on `last_active_at` (`dynamic`, the warm-partner fixture)
+        -- a fixture with no state file passes even when a surface skips
+        the read entirely, since `last_active_at={}` and `{}` agree."""
         from textual.widgets import ListView
 
         from claude_swap.tui.widgets import AccountItem, AccountsPanel
 
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"schemaVersion": 1, "autoswitch": {"strategy": "dynamic"}})
+        )
+        (tmp_path / "autoswitch_state.json").write_text(json.dumps({
+            "lastActiveAt": {"2": time.time() - 20 * 60},
+        }))
         for menu_id in (None, "switch", "watch"):  # None: the dashboard itself
-            fake = FakeSwitcher(_order_fixture_accounts(), tmp_path)
+            fake = FakeSwitcher(_warm_fixture_accounts(), tmp_path)
             app = make_app(fake)
             async with app.run_test(size=(100, 40)) as pilot:
                 await settle(pilot)
+                last_active_at = tui_data.read_last_active_at(tmp_path)
                 order = tui_data.ordered_accounts(
-                    fake.accounts_snapshot(), app.auto_settings, time.time()
+                    fake.accounts_snapshot(), app.auto_settings, time.time(),
+                    last_active_at,
                 )
+                assert order[1:] == ["2", "3"], order  # warm outranks sooner cold
                 if menu_id is None:
                     panel = app.screen.query_one(AccountsPanel).render().plain
                     positions = [panel.index(f"user{n}@example.com") for n in order]

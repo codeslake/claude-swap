@@ -378,17 +378,25 @@ def rank_switch_candidates(
 
 
 def ordered_accounts(
-    snap: AccountsSnapshot, settings: "AutoSwitchSettings", now: float
+    snap: AccountsSnapshot,
+    settings: "AutoSwitchSettings",
+    now: float,
+    last_active_at: dict | None = None,
 ) -> list[str]:
     """Every account number, active first, then the rest as the engine's own
     pass would rank them: ranked-and-open, usable-but-refused (waiting,
     soonest binding recovery first), non-target (disabled, sentinel-
     blocked, spend-only), unswitchable last. THE one order every screen
     renders in -- a screen keeping slot order says so at its own call site.
+    ``last_active_at`` is the caller's own ``read_last_active_at`` read (one
+    file read feeds every screen), so ``dynamic``'s warm/cold pass ranks
+    the same way here as it does in the "Next best" panel.
     """
     active_number = snap.active_number
     others = [acc for acc in snap.accounts if acc.number != active_number]
-    ordered, *_ = rank_switch_candidates(snap, settings, now, active_number)
+    ordered, *_ = rank_switch_candidates(
+        snap, settings, now, active_number, last_active_at
+    )
     ordered_rank = {num: i for i, num in enumerate(ordered)}
     models = parse_model_names(settings.model)
 

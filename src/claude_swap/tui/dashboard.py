@@ -246,7 +246,10 @@ class AccountListScreen(Screen):
             return
         listview = self.query_one("#accounts", ListView)
         by_number = {acc.number: acc for acc in snap.accounts}
-        numbers = data.ordered_accounts(snap, self.app.auto_settings, time.time())
+        numbers = data.ordered_accounts(
+            snap, self.app.auto_settings, time.time(),
+            data.read_last_active_at(self.app.switcher.backup_dir),
+        )
         ordered_accounts_ = [by_number[n] for n in numbers]
         if numbers != self._numbers:
             first_build = not self._numbers
