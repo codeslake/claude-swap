@@ -229,11 +229,19 @@ def _cooldown_yields_to_the_wall(
     would refuse to land on is one it must be free to leave.
 
     IT CANNOT FLAP, BY CONSTRUCTION, and that is the check the tests make
-    rather than a scenario: landing requires `h > SPENT_HEADROOM_PCT` and
-    this departure requires `h <= SPENT_HEADROOM_PCT`. The two conditions
-    are disjoint, so the account just left can never be the one next
-    landed on; the bypass can only produce a chain of departures onto
-    accounts with room, bounded by the roster.
+    rather than a scenario: outside the at-limit escape
+    (`dynamic_at_limit_escape`, T0938), landing requires `h >
+    SPENT_HEADROOM_PCT` and this departure requires `h <=
+    SPENT_HEADROOM_PCT` — the two conditions are disjoint, so the ordinary
+    landing path can never pick the account just left. The escape itself
+    CAN land on an `h <= SPENT_HEADROOM_PCT` candidate (that is its whole
+    purpose — choosing WHERE a walled fleet is stuck), but it fires only
+    when the active is ALSO walled (`about_to_wall`, the same condition
+    this function gates cooldown on), and the account just left is
+    excluded by its own number (`no_return`), not by headroom, so the
+    escape's bypass cannot re-pick it either. Either path, the bypass can
+    only produce a chain of departures onto accounts with room or a
+    genuinely sooner recovery, bounded by the roster.
 
     NOT the exemption `_in_cooldown`'s docstring records as reverted: that
     one lived inside `_in_cooldown` on its own fresh, unwidened `h <= 0`
@@ -3583,8 +3591,10 @@ class AutoSwitchEngine:
         # strategy including dynamic's own genuine at-limit blackouts, and
         # narrowing this definition silently zeroed it for dynamic. The
         # `not dynamic_landing` exclusion belongs where `by_recovery` is
-        # actually CONSUMED, at the `if by_recovery_axis and not
-        # dynamic_landing:` key selection below.
+        # actually CONSUMED, at the `if by_recovery_axis and (not
+        # dynamic_landing or dynamic_at_limit_escape):` key selection below
+        # (T0938 widened that key to the at-limit escape too, gated on
+        # `about_to_wall` -- see `dynamic_at_limit_escape`'s own comment).
         by_recovery_axis = all_above and (
             trigger in ("proactive", *CONSUME_FIRST_STRATEGIES)
             or (
@@ -3615,8 +3625,26 @@ class AutoSwitchEngine:
         # `best`/`consume-first` do, below. Every other dynamic landing
         # decision (the bar itself, the proactive/all_above case) is
         # unchanged.
+        #
+        # `about_to_wall` EARNS THE BYPASS; `by_recovery_axis` ALONE DOES
+        # NOT. `by_recovery_axis`'s at-limit disjunct reads
+        # `best_candidate_headroom` (the fleet's best offer), never the
+        # ACTIVE's own headroom — so on the 5h/7d retry (the same "active
+        # not `about_to_wall`" call `test_the_at_limit_arm_never_lands_on_
+        # a_candidate_still_at_the_wall` covers) a fleet where every
+        # candidate happens to sit inside `SPENT_HEADROOM_PCT` made
+        # `by_recovery_axis` true while the active itself was never stuck,
+        # and an escape gated on that alone bypassed the landing-health
+        # gate onto a still-walled candidate the ordinary rule refuses
+        # (measured: `test_the_at_limit_escape_never_bypasses_the_landing_
+        # bar_for_a_healthy_active`, active headroom 8, candidate headroom
+        # 2). "Choosing WHERE to be stuck" presupposes the active IS
+        # stuck.
         dynamic_at_limit_escape = (
-            dynamic_landing and trigger == "at-limit" and by_recovery_axis
+            dynamic_landing
+            and trigger == "at-limit"
+            and about_to_wall
+            and by_recovery_axis
         )
 
         # THE BAR MOST ADMISSION/RANKING/LABEL DECISIONS BELOW READ (#321):
@@ -3713,17 +3741,24 @@ class AutoSwitchEngine:
                 # on every tick, `[2,1,2,1,...]`).
                 # THE LANDING RULE (dynamic only): never admit a candidate
                 # with no room on the axis this pass ranks by, even when
-                # every account is above the threshold. The `all_above`
-                # recovery-axis escape below exists so a proactive/at-limit
-                # trigger can wait on whichever account recovers soonest when
-                # nothing currently qualifies — but "recovers soonest" is a
-                # future fact, and landing on it NOW moved the engine onto an
+                # every account is above the threshold — UNLESS the active
+                # itself is genuinely walled (`dynamic_at_limit_escape`,
+                # T0938): there "recovers soonest" is not a future
+                # optimisation, it is the only question left, the same one
+                # `best`/`consume-first`'s own at-limit escape below already
+                # answers on a spent active. The `all_above` recovery-axis
+                # escape below exists so a proactive/at-limit trigger can
+                # wait on whichever account recovers soonest when nothing
+                # currently qualifies — but for a trigger OTHER than a
+                # genuinely walled at-limit, "recovers soonest" is a future
+                # fact, and landing on it NOW moved the engine onto an
                 # account that was ITSELF still blocked (measured live: a
                 # proactive move onto an account whose own 5h was already at
                 # the switch threshold, which the very next tick read as
                 # `cooldown` while still blocked, and the tick after that had
                 # burned worse). `best`/`consume-first` keep the escape
-                # unchanged — this is additive, gated on the strategy alone.
+                # unchanged — this is additive, gated on the strategy AND on
+                # `about_to_wall`, not the strategy alone.
                 if (100.0 - h) >= bar and not (
                     (all_above and not dynamic_landing) or dynamic_at_limit_escape
                 ):
@@ -3887,10 +3922,14 @@ class AutoSwitchEngine:
                 # below-threshold peer clears it, and `failover` never
                 # satisfies it at all. `dynamic` (#321) never satisfies it
                 # either: whenever `all_above` holds, `dynamic_landing`
-                # keeps the `by_recovery_axis and not dynamic_landing` key
-                # a few lines above out of reach too (its own comment), so
-                # every dynamic candidate reaching this key selection with
-                # `all_above` true falls to the escape key below instead.
+                # keeps the `by_recovery_axis and (not dynamic_landing or
+                # dynamic_at_limit_escape)` key a few lines above out of
+                # reach too (its own comment) — this `elif`'s own guard,
+                # `trigger != "at-limit"`, is what keeps `dynamic_at_limit_
+                # escape` False here too (T0938: it requires `trigger ==
+                # "at-limit"`), so every dynamic candidate reaching this key
+                # selection with `all_above` true still falls to the escape
+                # key below instead.
                 #
                 # TIERED, because `disabled-active` and `failover` reach this
                 # arm with NO admission axis (both skip the landing gate), and

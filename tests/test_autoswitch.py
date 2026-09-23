@@ -5411,15 +5411,24 @@ class TestAModelWindowIsNotABlackout:
         assert payload["switchBar"] == 97.0, payload
         assert payload["threshold"] == 90.0, payload
 
-    def test_the_poll_payload_omits_switch_bar_when_unset(self):
-        """The additive contract: a caller that never widens `switch_bar`
-        (every non-`dynamic` strategy) must not gain a new key."""
-        event = PollEvent(
-            active={"number": 7, "email": "a@example.com"},
-            headroom={"7": 82.0},
-            threshold=90.0,
+    def test_the_poll_payload_carries_switch_bar_for_a_non_dynamic_strategy_too(
+        self, harness
+    ):
+        """The additive contract is at the `PollEvent` class level, not the
+        engine's: a hand-built event that never sets `switch_bar` omits the
+        key, but the engine (autoswitch.py:1872) always passes
+        `switch_bar=proactive_switch_bar_pct(strategy, threshold)`, and
+        that function returns the raw `threshold` unchanged for every
+        non-`dynamic` strategy — so a real `best`/`consume-first` poll DOES
+        carry `switchBar`, equal to `threshold`. Additive and harmless (a
+        UI reading only `threshold` sees nothing new), but the payload
+        gains one more, equal, key rather than omitting it."""
+        harness.tick_with_usage(
+            {"1": _usage(42), "2": _usage(10), "3": _usage(50)}
         )
-        assert "switchBar" not in event.to_json()
+        poll = next(e for e in harness.events if isinstance(e, PollEvent))
+        payload = poll.to_json()
+        assert payload["switchBar"] == payload["threshold"] == 90.0, payload
 
     def test_a_spend_only_account_prints_its_credit_figure_not_a_bare_mark(
         self,
@@ -5725,10 +5734,15 @@ class TestDynamicStrategy:
     each tick, and a landing rule that never lands on a candidate with no
     room on the axis in force — even when every account is above the
     threshold, where the pre-existing ``all_above`` recovery-axis escape
-    otherwise admits one on a "recovers soonest" basis alone. Scoped to
-    ``strategy == "dynamic"`` throughout: `best`/`consume-first` keep
-    whatever they did before this class exists, and several tests below
-    assert that directly, on the SAME inputs.
+    otherwise admits one on a "recovers soonest" basis alone. One
+    exception (T0938): when the ACTIVE is itself genuinely walled
+    (``about_to_wall``) on an ``at-limit`` trigger, the escape
+    (``dynamic_at_limit_escape``) does bypass that landing rule, ranked by
+    soonest recovery — "choosing WHERE to be stuck" rather than "landing
+    somewhere healthy". Scoped to ``strategy == "dynamic"`` throughout:
+    `best`/`consume-first` keep whatever they did before this class
+    exists, and several tests below assert that directly, on the SAME
+    inputs.
     """
 
     @staticmethod
@@ -5981,6 +5995,44 @@ class TestDynamicStrategy:
                 "at-limit escape must not bypass the landing bar for "
                 "dynamic just because `about_to_wall` is false on this axis"
             )
+
+    def test_the_at_limit_escape_never_bypasses_the_landing_bar_for_a_healthy_active(
+        self, temp_home
+    ):
+        """Mirrors `test_the_at_limit_escape_still_lands_when_the_active_
+        is_genuinely_spent` below with one flip: the active is healthy
+        (headroom 8, same as the test above -- NOT `about_to_wall`) while
+        the ONLY candidate is itself still walled (headroom 2, inside
+        `SPENT_HEADROOM_PCT`). `best_candidate_headroom <=
+        SPENT_HEADROOM_PCT` alone made `by_recovery_axis`'s at-limit
+        disjunct true, and an escape gated on that alone bypassed the
+        landing-health gate onto a still-walled candidate for an active
+        that was never actually stuck. The escape earns its bypass from
+        the ACTIVE being walled, not from the candidate being spent."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        usage = {
+            "6": {  # active: healthy, headroom 8 — NOT about_to_wall
+                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {  # candidate: spent-band, headroom 2 — itself still walled
+                "five_hour": {"pct": 98.0, "resets_at": _iso_at(now + 300)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"6": 8.0, "2": 2.0}
+        args = self._args(
+            h, usage=usage, current="6", oauth_candidates=["2"],
+            headroom=headroom, active_headroom=8.0,
+            trigger="at-limit", strategy="dynamic",
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert ordered == [], (
+            f"got {ordered} — the at-limit escape must not bypass the "
+            "landing bar onto a still-walled candidate (headroom 2) when "
+            "the active itself is healthy (headroom 8, not about_to_wall)"
+        )
 
     def test_the_at_limit_escape_still_lands_when_the_active_is_genuinely_spent(
         self, temp_home
@@ -6423,6 +6475,42 @@ class TestDynamicStrategy:
             exhausted.waiting_on
         )
         assert "Account-2" in exhausted.human(), exhausted.human()
+
+    def test_the_soonest_reset_wins_among_several_walled_candidates_under_dynamic(
+        self, temp_home
+    ):
+        """T0938 item 1, three-account version of the test above: with a
+        SINGLE walled candidate, that test only ever exercises the at-limit
+        escape's landing-gate bypass, never the tiered KEY (~3853) that
+        chooses BETWEEN two such candidates. Active and Y are both fully
+        spent (headroom 0); X sits at headroom 2 -- MORE headroom than Y --
+        but Y's 5h window resets in ten minutes against X's two hours. The
+        recovery axis must decide on reset time, not headroom: `dynamic`
+        switches to Y, the soonest recovery.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, hysteresis_pct=5.0, strategy="dynamic",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "x@example.com")
+        h.seed(3, "y@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(100.0, 60.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        x = _usage7(98.0, 60.0)
+        x["five_hour"]["resets_at"] = _iso_at(now + 2 * 3600)
+        y = _usage7(100.0, 60.0)
+        y["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        usage = {"1": active, "2": x, "3": y}
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} instead of account 3 (Y) -- Y's "
+            "ten-minute reset must beat X's two extra headroom points and "
+            "X's own two-hour reset"
+        )
 
 
 class TestWarmthAndAlternation375:
