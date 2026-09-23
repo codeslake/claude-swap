@@ -469,8 +469,9 @@ def _backup_prev(path: Path, data: dict) -> None:
         return
     prev_path = path.with_name(path.name + ".prev")
     tmp_path = prev_path.with_name(prev_path.name + f".{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     try:
-        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(str(tmp_path), flags, 0o600)
         try:
             os.write(fd, current)
         finally:
