@@ -29,7 +29,6 @@ from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
-    _binding_recovery_ts,
     binding_pct,
     classify_candidate_block,
     model_block_label,
@@ -593,7 +592,7 @@ class AutoScreen(Screen):
                 key = (
                     (0, ordered_rank[acc.number]) if acc.number in ordered_rank
                     else (998.0,) if acc.disabled
-                    else (1, _binding_recovery_ts(acc.usage.last_good, models, admission_now))
+                    else (1,) + data.waiting_tail_key(acc.usage.last_good, models, admission_now)
                 )
                 ranked.append((key, acc.number))
             lines[acc.number] = entry
