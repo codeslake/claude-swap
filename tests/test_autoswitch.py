@@ -5396,6 +5396,31 @@ class TestAModelWindowIsNotABlackout:
         assert "#4: 5h 5% · 7d 95%" in text, text
         assert "full" not in text, text
 
+    def test_the_poll_payload_carries_switch_bar(self):
+        """T0815: `switch_bar` already drives `human()`/`_describe()` (the
+        test above) but `_fields()` never put it in the JSON payload a
+        consumer reads -- so a client rendering the poll never learned the
+        dynamic bar differs from `threshold`. Additive field."""
+        event = PollEvent(
+            active={"number": 7, "email": "a@example.com"},
+            headroom={"7": 82.0, "4": 5.0},
+            threshold=90.0,
+            switch_bar=97.0,
+        )
+        payload = event.to_json()
+        assert payload["switchBar"] == 97.0, payload
+        assert payload["threshold"] == 90.0, payload
+
+    def test_the_poll_payload_omits_switch_bar_when_unset(self):
+        """The additive contract: a caller that never widens `switch_bar`
+        (every non-`dynamic` strategy) must not gain a new key."""
+        event = PollEvent(
+            active={"number": 7, "email": "a@example.com"},
+            headroom={"7": 82.0},
+            threshold=90.0,
+        )
+        assert "switchBar" not in event.to_json()
+
     def test_a_spend_only_account_prints_its_credit_figure_not_a_bare_mark(
         self,
     ):
@@ -6338,6 +6363,66 @@ class TestDynamicStrategy:
             f"landed on {h.active_number()} instead of account 3 — the "
             "soonest-resetting candidate that clears the floor"
         )
+
+    def test_the_wall_is_taken_on_the_account_that_lifts_first_under_dynamic(
+        self, temp_home
+    ):
+        """T0938 item 1, `dynamic` twin of
+        `TestDecisionTable.test_the_wall_is_taken_on_the_account_that_lifts_first`.
+
+        The owner's live case: both accounts spent (97-100% used), and
+        `dynamic`'s own landing bar (97, #321) refused every peer with that
+        little headroom outright -- including inside the at-limit escape's
+        own `by_recovery_axis` case, which exists exactly to pick WHERE a
+        spent fleet is stuck. The engine parked on the active reading a
+        multi-hour wait while a peer reset in minutes. Both accounts spent
+        here too (headroom 0, the plainest case the bar swallowed): `dynamic`
+        must still switch onto the one that lifts first, and then hold there
+        once it has -- the peer is now the nearer reset, not the account just
+        vacated, so bouncing back would be strictly worse.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, hysteresis_pct=5.0, strategy="dynamic",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(100.0, 60.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        soonest = _usage7(100.0, 60.0)
+        soonest["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        usage = {"1": active, "2": soonest}
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            "dynamic must switch onto the peer that lifts first too -- the "
+            "landing bar exists to keep a proactive move off a still-walled "
+            "candidate, not to gate the at-limit escape"
+        )
+        assert h.active_number() == 2
+
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        payload = poll.to_json()
+        assert payload["switchBar"] == 97.0, payload
+        assert payload["threshold"] == 90.0, payload
+
+        # Then it waits: account 2 is now active, and it is ITSELF the
+        # nearer reset in the fleet (ten minutes vs. three hours), so the
+        # very next tick must not bounce back to account 1 -- it holds, and
+        # names account 2 as what it is waiting on.
+        h.events.clear()
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 2
+        exhausted = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
+        assert exhausted.waiting_on == {"number": 2, "email": "b@example.com"}, (
+            exhausted.waiting_on
+        )
+        assert "Account-2" in exhausted.human(), exhausted.human()
 
 
 class TestWarmthAndAlternation375:
