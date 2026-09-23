@@ -84,7 +84,6 @@ _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 # Trigger names keyed to WHY the ranking pass never ran -- never "no
 # candidate qualifies", the claim only a real, empty pass earns.
 _UNMODELED_TEXT = {
-    "dynamic-unmodeled": "not previewed (dynamic warm/cold state)",
     "below-threshold": "not previewed (active below threshold)",
     "unreadable-active": "not previewed (active status unknown)",
 }

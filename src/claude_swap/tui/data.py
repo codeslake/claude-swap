@@ -28,6 +28,7 @@ from claude_swap.autoswitch import (
     _dynamic_active_headroom,
     _headroom_by_account,
     _model_window_binds_everywhere,
+    _rank_dynamic_candidates,
     rank_candidates_pass,
 )
 from claude_swap.exceptions import ClaudeSwitchError
@@ -42,9 +43,7 @@ if TYPE_CHECKING:
 
 # Triggers where the ranking pass never runs -- keys the auto view's own
 # `_UNMODELED_TEXT` shares (kept in sync by a test, not by import).
-_UNMODELED_TRIGGERS = frozenset(
-    {"dynamic-unmodeled", "below-threshold", "unreadable-active"}
-)
+_UNMODELED_TRIGGERS = frozenset({"below-threshold", "unreadable-active"})
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +258,7 @@ def rank_switch_candidates(
         if active_headroom is None:
             return "unreadable-active"
         if settings.strategy == "dynamic":
-            kind = _classify_dynamic_trigger(active_headroom)
-            return "at-limit" if kind == "at-limit" else "dynamic-unmodeled"
+            return _classify_dynamic_trigger(active_headroom)
         if (100.0 - active_headroom) < settings.threshold:
             return (
                 settings.strategy
@@ -269,9 +267,36 @@ def rank_switch_candidates(
             )
         return "at-limit" if active_headroom <= 0 else "proactive"
 
+    def _rank_dynamic_on(axis: tuple[str, ...]) -> tuple[list[str], str | None]:
+        """`dynamic`'s own healthy/proactive ranking -- `_rank_dynamic_
+        candidates` (warm/cold tiered, soonest weekly reset), never
+        `rank_candidates_pass`: that pass's landing gate is a hysteresis
+        MARGIN over the active, which a warm candidate with less headroom
+        than a cold one can never clear against an about-to-wall active
+        (autoswitch.py's own comment at the `_dynamic_rank` call site).
+        `last_active_at` is always `{}` here -- this panel has no access to
+        the live engine's warm-context cache, and an unmeasured candidate
+        reads cold, never warm (`_is_warm`'s own contract). Display-only,
+        unlike the tick's `dynamic_ordered`: a cold candidate under
+        `settings.cold_switch_cost_pct` is ranked LAST here, never dropped
+        -- this panel shows who is next, not whether a tick would act on it
+        this instant.
+        """
+        headroom = _headroom_by_account(usage, axis)
+        warm, cold = _rank_dynamic_candidates(
+            oauth_candidates, headroom, usage, now, {}, settings.cache_ttl_seconds,
+        )
+        cold_floor = settings.cold_switch_cost_pct
+        cold_clears = [n for n in cold if headroom[n] >= cold_floor]
+        cold_rest = [n for n in cold if n not in cold_clears]
+        ordered = warm + cold_clears + cold_rest
+        return ordered, ("soonest to recover" if ordered else None)
+
     def _rank_on(axis: tuple[str, ...], trigger: str) -> tuple[list[str], str | None]:
         if trigger in _UNMODELED_TRIGGERS:
             return [], None
+        if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
+            return _rank_dynamic_on(axis)
         headroom = _headroom_by_account(usage, axis)
         ordered, _any_known, _reset_ts, _waiting, rank_axis = rank_candidates_pass(
             models=axis,
@@ -341,10 +366,18 @@ def ordered_accounts(
         # automatically, however soon its own window recovers -- so it
         # sorts with the other non-targets, never inside the waiting tier
         # below by reset-time coincidence.
-        if acc.disabled or acc.usage.sentinel is not None:
+        if acc.usage.sentinel is not None:
             return (2,)
         if binding_pct(acc.usage.last_good, models) is None:
+            # Spend-only: the same bucket whether disabled or not -- a
+            # spend axis carries no window pct to gate `disabled` against,
+            # and the auto view's own key (autoview.py:485-488) reads it
+            # this way too. `disabled` must not pull this row into the
+            # sentinel-like tier above, or the two screens disagree on the
+            # same snapshot.
             return (3,)
+        if acc.disabled:
+            return (2,)
         # Soonest BINDING-window recovery first, unknown last -- matches
         # the auto view's own fallback key for a row its admission pass
         # refused (autoview.py's `_candidates_text`), or the two screens

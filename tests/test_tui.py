@@ -1578,6 +1578,37 @@ class TestOrderedAccounts:
         assert order == ["1", "3", "2"], order
         assert order[1:] == _autoview_order(snap, "1", settings)
 
+    def test_a_disabled_spend_only_row_sorts_with_the_uniform_spend_tier(self):
+        """`acc.disabled or acc.usage.sentinel is not None` used to fold a
+        disabled SPEND-ONLY row into the same tier as a disabled WINDOW-
+        based one -- but the auto view's own key (autoview.py:485-488)
+        keys every spend-only row at its own, later tier, disabled or not:
+        a spend axis carries no window pct to gate `disabled` against. "3"
+        (disabled, window-based) and "2" (disabled, no window/spend-only)
+        used to tie-break on account NUMBER inside the one shared bucket,
+        printing "2" before "3" -- the reverse of the auto view's own
+        order, which puts the window-based row ("3") first."""
+        active = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0}}
+        window_based_disabled = {
+            "five_hour": {"pct": 20.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_in(86400)},
+        }
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=UsageEntry(
+                    last_good=active, fetched_at=time.time(), age_s=0.0)),
+                make_account(3, entry=UsageEntry(
+                    last_good=window_based_disabled, fetched_at=time.time(),
+                    age_s=0.0), disabled=True),
+                make_account(2, entry=make_entry(None, None), disabled=True),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "3", "2"], order
+        assert order[1:] == _autoview_order(snap, "1", settings)
+
 
 @pytest.mark.asyncio
 class TestSharedAccountOrder:
@@ -2889,24 +2920,17 @@ class TestUnswitchableRowsAreListed:
             f"the excluded 7d-exhausted row gave no reason: {out!r}"
         )
 
-    def test_dynamic_never_ranks_a_healthy_active_via_the_wrong_mechanism(self):
+    def test_dynamic_healthy_ranks_through_the_engines_own_warm_cold_mechanism(self):
         """`dynamic`'s own steady state (the active neither at-limit nor
-        about to wall) never reaches `_rank_candidates_pass` on a real
-        tick -- `_tick_inner` ranks it with the separate warm/cold-tiered
-        `_rank_dynamic_candidates` instead, gated on `last_active_at`/
-        `cold_switch_cost_pct` state this panel does not track. Passing
-        "proactive" or "dynamic-healthy" into the pass anyway would rank a
-        candidate the real engine might refuse below the cold-switch floor
-        -- so the panel must not name a specific, unverifiable top pick.
-
-        But it must also not claim the opposite: `_tick_inner`'s own warm/
-        cold mechanism CAN and does switch on this exact tick (as
-        "alternation"), so "no candidate qualifies" -- which says nothing
-        will be picked -- is just as false a claim as a wrong top pick
-        would be, and so is stamping the open candidate row "not a
-        candidate". The honest state is neither: say the ranking was not
-        previewed, and leave the row unlabelled.
-        """
+        about to wall) never reaches `rank_candidates_pass` on a real tick
+        -- `_tick_inner` ranks it with the separate warm/cold-tiered
+        `_rank_dynamic_candidates` instead (the `dynamic-healthy` arm's own
+        `_dynamic_rank`/`_rank_dynamic_candidates` call). The panel must
+        call that SAME pure function, not stay silent about it: a healthy
+        candidate clearing both `SPENT_HEADROOM_PCT` and `settings.
+        cold_switch_cost_pct` IS knowable here, and "not previewed" is now
+        the false claim (owner decision: all three surfaces follow the
+        dynamic engine's own ranking)."""
         from claude_swap.settings import AutoSwitchSettings
 
         settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
@@ -2924,18 +2948,51 @@ class TestUnswitchableRowsAreListed:
                        last_good=candidate),
         ), active="1", settings=settings)
         assert "no candidate qualifies" not in out, (
-            f"dynamic's steady state claimed nothing will be picked, but "
-            f"the real (warm/cold-tiered) mechanism can switch this tick: "
-            f"{out!r}"
+            f"a real, healthy candidate was ranked: {out!r}"
         )
-        assert "not previewed (dynamic warm/cold state)" in out, (
-            f"the panel did not say it could not preview this state: {out!r}"
+        assert "not previewed" not in out, (
+            f"the engine's own warm/cold ranking is knowable here -- "
+            f"staying silent is now the false claim: {out!r}"
         )
         row2 = out[out.index("candidate@x.com"):]
         assert "not a candidate" not in row2, (
-            f"the panel named a row the real mechanism might switch to as "
-            f"never a candidate: {out!r}"
+            f"the engine's own next pick was labelled never a candidate: {out!r}"
         )
+
+    def test_dynamic_ranks_two_cold_candidates_by_soonest_weekly_reset(self):
+        """The engine's own `_rank_dynamic_candidates` ranks a `dynamic`
+        proactive/healthy tick's candidates by SOONEST WEEKLY (7-day)
+        reset, never by `_binding_recovery_ts` (whichever window actually
+        blocks THIS account -- the waiting tier's own key, for a candidate
+        the pass never ranked at all). "2" is 5h 60% (its OWN binding
+        window, back in 1h) and 7d 20% (back in 6d); "3" is 5h 5% and 7d
+        30% (its OWN binding window, back in 1d). Both are cold (no cached
+        org context) and both clear `SPENT_HEADROOM_PCT` -- the engine
+        ranks [3, 2] (soonest 7-day reset first); `_binding_recovery_ts`
+        reads [2, 3] instead (1h < 1d on each account's own binding
+        window) -- the wrong key for this state.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        active = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        acc2 = {
+            "five_hour": {"pct": 60.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_in(6 * 86400)},
+        }
+        acc3 = {
+            "five_hour": {"pct": 5.0, "resets_at": _iso_in(4 * 3600)},
+            "seven_day": {"pct": 30.0, "resets_at": _iso_in(1 * 86400)},
+        }
+        snap = self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "b@x.com", switchable=True, last_good=acc2),
+            self._acct("3", "c@x.com", switchable=True, last_good=acc3),
+        )
+        ordered, *_ = tui_data.rank_switch_candidates(
+            snap, settings, time.time(), "1"
+        )
+        assert ordered == ["3", "2"], ordered
 
     def test_a_disabled_account_with_the_most_headroom_is_not_offered(self):
         """Every OTHER unswitchable/blocked row already says why; `disabled`
@@ -3179,7 +3236,13 @@ class TestUnswitchableRowsAreListed:
         `SPENT_HEADROOM_PCT`), not at `settings.threshold` (90%). A
         candidate sitting between the two — blocked on the raw threshold,
         still open on the engine's actual bar — must read "open" here too,
-        or this panel tags a row `full` the engine itself would still rank.
+        never `full`: the `full` tag names a window nothing can escape, not
+        a candidate the cold floor (`settings.cold_switch_cost_pct`) merely
+        orders LAST among the survivors that do clear it -- ranked behind
+        every warm/floor-clearing peer is not the same claim as "blocked".
+        CONTROL: a genuinely full row (at/over the dynamic bar) must still
+        read `full`, proving the absence below is not a panel that never
+        prints the tag at all.
         """
         from claude_swap.settings import AutoSwitchSettings
 
@@ -3193,8 +3256,16 @@ class TestUnswitchableRowsAreListed:
             self._acct("2", "between@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 10.0}, "seven_day": {"pct": 92.0},
             }),
+            # CONTROL: 98%, at/over the dynamic switch bar itself.
+            self._acct("3", "full@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 98.0},
+            }),
         ), active="1", settings=settings)
-        assert "7d full" not in out, out
+        assert "between@x.com" in out, out
+        row2 = out[out.index("between@x.com"):out.index("full@x.com")]
+        assert "7d full" not in row2, out
+        row3 = out[out.index("full@x.com"):]
+        assert "7d full" in row3, out
 
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a
