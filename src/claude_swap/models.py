@@ -143,6 +143,12 @@ class AccountSnapshot:
     # RUNNING engine leaves a disabled ACTIVE on its next tick, so the explicit
     # switch holds only while auto is stopped.
     disabled: bool = False
+    # A local, no-network expiry read (oauth.is_oauth_token_expired) taken
+    # fresh every snapshot. Lets a reconciler require it before carrying a
+    # stale "token expired" sentinel forward, so a credential Claude Code
+    # already refreshed drops the label on the next pass even while a 429
+    # backoff blocks every usage fetch.
+    token_expired: bool = False
 
     @property
     def display_tag(self) -> str:

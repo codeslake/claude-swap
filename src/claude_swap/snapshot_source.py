@@ -78,6 +78,7 @@ class SnapshotSource:
         if (
             prev.usage.sentinel == USAGE_TOKEN_EXPIRED
             and fetched == prev_fetched
+            and acc.token_expired
         ):
             return replace(acc, usage=replace(acc.usage, sentinel=USAGE_TOKEN_EXPIRED))
         return acc

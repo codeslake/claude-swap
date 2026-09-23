@@ -1835,6 +1835,11 @@ class ClaudeAccountSwitcher:
             n = str(num)
             if is_active:
                 active_number = n
+            oauth_data = oauth.extract_oauth_data(_creds)
+            token_expired = bool(
+                oauth_data
+                and oauth.is_oauth_token_expired(oauth_data.get("expiresAt"))
+            )
             accounts.append(
                 AccountSnapshot(
                     number=n,
@@ -1847,6 +1852,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    token_expired=token_expired,
                 )
             )
         return AccountsSnapshot(
@@ -5832,6 +5838,19 @@ class ClaudeAccountSwitcher:
                 active_oauth.get("expiresAt")
             ):
                 sentinels[num] = USAGE_TOKEN_EXPIRED
+            elif active_oauth and not self._active_read_degraded:
+                # Adoption otherwise rides the fetch path alone
+                # (`_resync_rotated_backup` is only ever called from
+                # `_fetch_active_usage`'s success branch), so the same gate
+                # that blocks the fetch here also blocked a fresh re-login
+                # from resyncing — for as long as the backoff holds. Healthy
+                # and plainly rotated: resync now, under every guard
+                # `_resync_rotated_backup` already has (identity, the lock).
+                backup = self._read_account_credentials(num, info[1])
+                if oauth.credential_fingerprint(
+                    info[5]
+                ) != oauth.credential_fingerprint(backup):
+                    self._resync_rotated_backup(num, info[1], info[3], info[5])
 
         if claims:
             pre = entries
