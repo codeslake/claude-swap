@@ -38,6 +38,7 @@ from claude_swap.autoswitch import (
 )
 from claude_swap import pin
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
+from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -491,6 +492,9 @@ class AutoScreen(Screen):
                 entry = Text()
                 entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
                 entry.append(f"{acc.email:<{email_width}}", style=palette.muted)
+                quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
+                login_value = oauth.format_login_expiry(acc.login_expires_at, quarantined)
+                entry.append(f"  login {login_value}", style=palette.muted)
                 # From SENTINEL_NOTES, not written here: an API-key slot has no
                 # login to restore, and the switch screen reads the same table,
                 # so both surfaces must describe a slot identically.
@@ -512,6 +516,11 @@ class AutoScreen(Screen):
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
             entry.append(f"{acc.email:<{email_width}}", style=palette.foreground)
+            quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
+            login_value = oauth.format_login_expiry(
+                acc.login_expires_at, quarantined
+            )
+            entry.append(f"  login {login_value}", style=palette.muted)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted

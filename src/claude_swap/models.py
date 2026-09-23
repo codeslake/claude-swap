@@ -155,6 +155,10 @@ class AccountSnapshot:
     # on the next pass regardless of whether that refresh happened to land
     # before or after the token's own local expiry.
     access_token_fp: str | None = None
+    # Stored refresh token's expiry (epoch seconds), or None when missing/
+    # unreadable — see oauth.login_expires_at_epoch. Feeds the "login Xd Yh"
+    # countdown every account view shows.
+    login_expires_at: float | None = None
 
     @property
     def display_tag(self) -> str:
