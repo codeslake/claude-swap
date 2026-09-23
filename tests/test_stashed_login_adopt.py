@@ -1150,9 +1150,25 @@ class TestAnUnresolvedStashRowHealsOnLineage:
         Stashed BEFORE the backup write: the real writer's own sweep drops
         an entry byte-identical to what a slot already stores, which this
         row deliberately is -- stashing it first, while the backup is still
-        empty, is what lets it survive to reach the adopt path at all."""
+        empty, is what lets it survive to reach the adopt path at all.
+
+        The row's access ``expiresAt`` is LATER than the stored backup's, so
+        the lineage successor check (~6162) does not also refuse this on its
+        own tie -- only a fingerprint guard can. And the slot is made
+        genuinely idle AFTER the stash (pointing ``~/.claude.json`` at
+        another slot): the stash above still captures this slot's own
+        ``liveOauthAccount``, but ``current_account_number()`` is re-read
+        live by the adopt, so leaving it named to this slot would run the
+        active-slot's two-source rule instead of the idle path this test is
+        for."""
         g1 = self._g1()
-        entry_id = self._stash_unresolved(switcher, g1)
+        row = self._stamped(
+            "rt-g1", self._BASE_STAMP, access_expiry_ms=self._BASE_STAMP + 1_000)
+        entry_id = self._stash_unresolved(switcher, row)
+        switcher._write_json(switcher._get_claude_config_path(), {
+            "oauthAccount": {"emailAddress": "account1@example.com",
+                              "accountUuid": "uuid-1"},
+        })
         switcher._write_account_credentials("2", "owner@example.com", g1)
         _strike(switcher, creds=g1)
 
@@ -1167,8 +1183,16 @@ class TestAnUnresolvedStashRowHealsOnLineage:
         the BACKUP -- what `_adopt_stashed_login_for_slot`'s own `stored_fp`
         always reads -- holds a DIFFERENT generation entirely. Only the
         struck-fp guard (not the stored-fp one, which cannot even see a
-        match here) can be refusing this row."""
-        g1, g0 = self._g1(), self._stamped("rt-g0", self._BASE_STAMP - 9_000)
+        match here) can be refusing this row.
+
+        ``g0`` sits inside the jitter of ``g1``'s lineage stamp (1s, not
+        9s), with an EARLIER access ``expiresAt`` than the row -- so the
+        lineage successor check (~6162) would let the row through on its
+        own, and only the struck-fp guard is left to refuse it."""
+        g0 = self._stamped("rt-g0", self._BASE_STAMP - 1_000)
+        g1 = self._stamped(
+            "rt-g1", self._BASE_STAMP,
+            access_expiry_ms=self._BASE_STAMP + 1_000)
         switcher._write_account_credentials("2", "owner@example.com", g0)
         _strike(switcher, creds=g1)
         entry_id = self._stash_unresolved(switcher, g1)
@@ -1229,10 +1253,17 @@ class TestAnUnresolvedStashRowHealsOnLineage:
     def test_an_undated_stored_backup_is_refused(self, switcher):
         """[I2] (b)'s undated arm, STORED side: the slot's own backup
         carries no `refreshTokenExpiresAt` -- `stored_at is None` is
-        likewise no evidence."""
+        likewise no evidence.
+
+        The row's access `expiresAt` is later than `FRESH`'s (9999999999000),
+        so the successor check alone would let it through -- only the
+        `stored_at is None` guard is left to refuse it."""
         switcher._write_account_credentials("2", "owner@example.com", FRESH)
         _strike(switcher, creds=FRESH)
-        entry_id = self._stash_unresolved(switcher, self._g2())
+        row = self._stamped(
+            "rt-g2", self._BASE_STAMP + 3_000,
+            access_expiry_ms=9_999_999_999_000 + 60_000)
+        entry_id = self._stash_unresolved(switcher, row)
 
         assert switcher._adopt_stashed_login_for_slot(
             "2", "owner@example.com") is False
@@ -1245,11 +1276,17 @@ class TestAnUnresolvedStashRowHealsOnLineage:
     def test_a_lineage_stamp_earlier_than_jitter_is_refused(self, switcher):
         """[I2] (b)'s other directional arm: the row is EARLIER than the
         stored backup by more than the jitter -- the backup already moved
-        past it, so this is not this slot's rotation either."""
+        past it, so this is not this slot's rotation either.
+
+        The row's access `expiresAt` is later than the stored backup's, so
+        the successor check alone would let it through -- only the
+        `newer_login(stored_at, row_at)` guard is left to refuse it."""
         g1 = self._g1()
         switcher._write_account_credentials("2", "owner@example.com", g1)
         _strike(switcher, creds=g1)
-        earlier = self._stamped("rt-earlier", self._BASE_STAMP - 8_000)
+        earlier = self._stamped(
+            "rt-earlier", self._BASE_STAMP - 8_000,
+            access_expiry_ms=self._BASE_STAMP + 5_000)
         entry_id = self._stash_unresolved(switcher, earlier)
 
         assert switcher._adopt_stashed_login_for_slot(
