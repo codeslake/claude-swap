@@ -15,6 +15,7 @@ import dataclasses
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -256,6 +257,12 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
     path = settings_path(backup_root)
+    if path.exists():
+        # Best-effort: a failed backup must never block the save itself.
+        try:
+            shutil.copy2(path, path.with_name(path.name + ".prev"))
+        except OSError as e:
+            _logger.warning("Could not back up %s (%s)", path, e)
     raw = _read_raw(path)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     section = raw.get("autoswitch")

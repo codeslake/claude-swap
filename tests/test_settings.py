@@ -123,6 +123,34 @@ class TestSaveSettings:
         mode = stat.S_IMODE(settings_path(tmp_path).stat().st_mode)
         assert mode == 0o600
 
+    def test_overwrite_backs_up_the_old_file_to_prev(self, tmp_path: Path):
+        save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
+        old_bytes = settings_path(tmp_path).read_bytes()
+
+        save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
+
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert prev.read_bytes() == old_bytes
+        assert load_settings(tmp_path).threshold == 85.0
+
+    def test_first_save_writes_no_backup(self, tmp_path: Path):
+        save_settings(tmp_path, AutoSwitchSettings())
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert not prev.exists()
+
+    def test_backup_failure_does_not_block_the_save(self, tmp_path: Path, monkeypatch):
+        from claude_swap import settings as S
+
+        save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
+
+        def _raise(*a, **kw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(S.shutil, "copy2", _raise)
+        save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
+
+        assert load_settings(tmp_path).threshold == 85.0
+
 
 class TestUiSettings:
     def test_missing_file_defaults_to_auto(self, tmp_path: Path):
