@@ -454,8 +454,8 @@ def _backup_prev(path: Path, data: dict) -> None:
     no-op (a repeated identical save must not replace the one real previous
     generation with a duplicate of itself — mirrors credentials.py's
     ``_retain_previous_backup``). Beside the LINK (``path``), never the
-    resolved target: on lmd42 settings.json is a symlink into the dotfiles
-    repo, and the backup must sit where the link is, not where it points.
+    resolved target: where settings.json is a symlink into a dotfiles
+    repo, the backup must sit where the link is, not where it points.
     Never blocks the write: a failure here is logged and dropped.
     """
     try:
@@ -468,12 +468,17 @@ def _backup_prev(path: Path, data: dict) -> None:
     if current == json.dumps(data, indent=2).encode("utf-8"):
         return
     prev_path = path.with_name(path.name + ".prev")
+    tmp_path = prev_path.with_name(prev_path.name + f".{os.getpid()}.tmp")
     try:
-        prev_path.write_bytes(current)
-        if sys.platform != "win32":
-            os.chmod(str(prev_path), 0o600)
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, current)
+        finally:
+            os.close(fd)
+        os.replace(str(tmp_path), str(prev_path))
     except OSError as e:
         _logger.warning("Could not back up %s (%s)", path, e)
+        tmp_path.unlink(missing_ok=True)
 
 
 def atomic_write_json(path: Path, data: dict) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import stat
 import sys
 from pathlib import Path
@@ -153,14 +154,14 @@ class TestSaveSettings:
 
     def test_backup_failure_does_not_block_the_save(self, tmp_path: Path, monkeypatch, caplog):
         save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
-        real_write_bytes = Path.write_bytes
+        real_replace = os.replace
 
-        def _raise_for_prev(self, data):
-            if str(self).endswith(".prev"):
+        def _raise_for_prev(src, dst):
+            if str(dst).endswith(".prev"):
                 raise OSError("disk full")
-            return real_write_bytes(self, data)
+            return real_replace(src, dst)
 
-        monkeypatch.setattr(Path, "write_bytes", _raise_for_prev)
+        monkeypatch.setattr(os, "replace", _raise_for_prev)
         with caplog.at_level(logging.WARNING):
             save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
 
@@ -168,6 +169,13 @@ class TestSaveSettings:
         prev = settings_path(tmp_path).with_name("settings.json.prev")
         assert not prev.exists()
         assert load_settings(tmp_path).threshold == 85.0
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_prev_mode_is_0600(self, tmp_path: Path):
+        save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
+        save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert stat.S_IMODE(prev.stat().st_mode) == 0o600
 
     def test_non_settings_file_gets_no_prev_backup(self, tmp_path: Path):
         other = tmp_path / "state.json"
@@ -180,20 +188,20 @@ class TestSaveSettings:
         live = tmp_path / "live"; live.mkdir()
         tracked = repo / "settings.json"
         tracked.write_text(json.dumps({"autoswitch": {"threshold": 70.0}}))
+        old_bytes = tracked.read_bytes()
         link = live / "settings.json"
         link.symlink_to(tracked)
 
         atomic_write_json(link, {"autoswitch": {"threshold": 85.0}})
 
-        assert (live / "settings.json.prev").exists()
+        prev = live / "settings.json.prev"
+        assert prev.exists()
+        assert prev.read_bytes() == old_bytes
         assert not (repo / "settings.json.prev").exists()
 
 
 class TestReadRawReturnsDict:
-    """Regression: dfd56d8d made _read_raw/_read_raw_for_write return a
-    (dict, bytes | None) tuple. Five callers outside settings.py — cswap
-    pin.py's `_pinned_email_now` and `_clear_pin_record`, cswap-pin
-    proxy.py's `save_pin` — all expect a plain dict back."""
+    """Regression: callers outside this module expect a dict back."""
 
     def test_read_raw_returns_a_dict(self, tmp_path: Path):
         from claude_swap.settings import _read_raw
