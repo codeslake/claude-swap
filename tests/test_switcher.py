@@ -2958,8 +2958,7 @@ class TestActiveAccountRefresh:
     # `_fetch_active_usage`'s success path -- itself reachable only when
     # `store.reserve` claims the slot. A live server-side backoff (429)
     # refuses every claim for up to an hour, so a re-login during that
-    # window adopted nothing until the backoff lifted (the owner's own
-    # report: they re-logged in and had to run `cswap add` by hand). The
+    # window adopted nothing until the backoff lifted. The
     # collect pass's other claims-blocked branch (just above, in
     # `_collect_usage_entries`) already re-checks expiry locally every tick
     # it cannot claim; it must also resync a healthy, rotated login the same
@@ -3096,7 +3095,7 @@ class TestActiveAccountRefresh:
     def test_resync_refuses_when_backup_already_holds_a_newer_generation(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
-        """MUST FIX interleaving: the consume gate releases the lock during
+        """The interleaving: the consume gate releases the lock during
         its POST and persists the successor to the backup ALONE. A switch
         mid-POST can leave live = the consumed predecessor while backup =
         the successor -- writing live over it would destroy the successor
