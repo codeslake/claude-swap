@@ -205,34 +205,24 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     return AutoSwitchSettings(**kwargs)
 
 
-def _read_raw(path: Path) -> tuple[dict, bytes | None]:
-    """Lenient parse: bad/missing file -> ({}, None), with a logged warning.
-
-    Returns the parsed dict plus the exact bytes read from disk (``None`` if
-    the file is absent or unreadable), so a write path can derive both the
-    merge base and a ``.prev`` backup from one read instead of two.
-    """
+def _read_raw(path: Path) -> dict:
+    """Lenient parse: bad/missing file -> {}, with a logged warning."""
     try:
-        data = path.read_bytes()
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}, None
-    except OSError as e:
+        return {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
         _logger.warning("Could not read %s (%s); using defaults", path, e)
-        return {}, None
-    try:
-        raw = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        _logger.warning("Could not read %s (%s); using defaults", path, e)
-        return {}, data
+        return {}
     if not isinstance(raw, dict):
         _logger.warning("%s is not a JSON object; using defaults", path)
-        return {}, data
-    return raw, data
+        return {}
+    return raw
 
 
 def load_settings(backup_root: Path) -> AutoSwitchSettings:
     """Load the autoswitch section; missing/corrupt file or fields → defaults."""
-    raw, _ = _read_raw(settings_path(backup_root))
+    raw = _read_raw(settings_path(backup_root))
     section = raw.get("autoswitch")
     if not isinstance(section, dict):
         return AutoSwitchSettings()
@@ -249,7 +239,7 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
 
 def load_ui_settings(backup_root: Path) -> UiSettings:
     """Load the ui section; missing/corrupt file or unknown theme → default."""
-    raw, _ = _read_raw(settings_path(backup_root))
+    raw = _read_raw(settings_path(backup_root))
     section = raw.get("ui")
     default = UiSettings()
     if not isinstance(section, dict):
@@ -267,7 +257,7 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
     path = settings_path(backup_root)
-    raw, current = _read_raw(path)
+    raw = _read_raw(path)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     section = raw.get("autoswitch")
     if not isinstance(section, dict):
@@ -275,7 +265,7 @@ def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     for field, json_key in _AUTOSWITCH_KEYS.items():
         section[json_key] = getattr(settings, field)
     raw["autoswitch"] = section
-    _write_with_backup(path, raw, current)
+    atomic_write_json(path, raw)
 
 
 def setting_spec(dotted_key: str) -> SettingSpec:
@@ -351,24 +341,18 @@ def format_setting_value(value) -> str:
     return str(value)
 
 
-def _read_raw_for_write(path: Path) -> tuple[dict, bytes | None]:
+def _read_raw_for_write(path: Path) -> dict:
     """Raw read for the config write path: a corrupt file errors, never {}.
 
     ``_read_raw``'s degrade-to-defaults is right for reads, but a
     read-modify-write starting from ``{}`` would replace a malformed (and
-    maybe hand-recoverable) file with a near-empty one. Returns the parsed
-    dict plus the exact bytes read (``None`` if absent), so the caller can
-    derive a ``.prev`` backup from the same read.
+    maybe hand-recoverable) file with a near-empty one.
     """
     try:
-        data = path.read_bytes()
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return {}, None
-    except OSError as e:
-        raise ConfigError(f"could not read {path}: {e}") from e
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as e:
+        return {}
+    except (OSError, UnicodeDecodeError) as e:
         raise ConfigError(f"could not read {path}: {e}") from e
     try:
         raw = json.loads(text)
@@ -382,7 +366,7 @@ def _read_raw_for_write(path: Path) -> tuple[dict, bytes | None]:
             f"{path} is not a JSON object; fix or delete it before "
             "changing settings"
         )
-    return raw, data
+    return raw
 
 
 def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
@@ -396,14 +380,14 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     spec = setting_spec(dotted_key)
     value = parse_setting_value(spec, raw_value)
     path = settings_path(backup_root)
-    raw, current = _read_raw_for_write(path)
+    raw = _read_raw_for_write(path)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     section = raw.get(spec.section)
     if not isinstance(section, dict):
         section = {}
     section[spec.json_key] = value
     raw[spec.section] = section
-    _write_with_backup(path, raw, current)
+    atomic_write_json(path, raw)
     return value
 
 
@@ -411,7 +395,7 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     """Remove one key from settings.json; False if it wasn't set (no write)."""
     spec = setting_spec(dotted_key)
     path = settings_path(backup_root)
-    raw, current = _read_raw_for_write(path)
+    raw = _read_raw_for_write(path)
     section = raw.get(spec.section)
     if not isinstance(section, dict) or spec.json_key not in section:
         return False
@@ -419,7 +403,7 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     del section[spec.json_key]
     if not section:
         del raw[spec.section]
-    _write_with_backup(path, raw, current)
+    atomic_write_json(path, raw)
     return True
 
 
@@ -430,7 +414,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     to the default still counts — so `cswap config`'s "(default)" marker
     reflects the file, not value equality.
     """
-    raw, _ = _read_raw(settings_path(backup_root))
+    raw = _read_raw(settings_path(backup_root))
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
@@ -462,41 +446,41 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     return _clamped(dataclasses.replace(settings, **overrides))
 
 
-def _write_with_backup(path: Path, raw: dict, current: bytes | None) -> None:
-    """Write ``raw`` to ``path``, retaining the pre-write bytes as ``.prev``.
+def _backup_prev(path: Path, data: dict) -> None:
+    """Best-effort ``.prev`` copy of ``path``'s pre-write bytes.
 
-    Shared by save_settings, set_setting and unset_setting — the three live
-    writers (cli.py, tui/app.py, menubar.py all route through set_setting/
-    unset_setting) — so every one of them leaves a recovery copy. Mirrors
-    credentials.py's ``_retain_previous_backup``: skips the backup when the
-    incoming bytes equal ``current`` (a repeated identical save must not
-    replace the one real previous generation with a duplicate of itself),
-    and takes ``current`` as already read by the caller so the backup and
-    the merge base share one disk read. Best-effort: a failed backup is
-    logged and never blocks the settings write itself.
+    Only ``atomic_write_json`` calls this, and only for settings.json.
+    Skipped when the file doesn't exist yet, or the incoming write is a
+    no-op (a repeated identical save must not replace the one real previous
+    generation with a duplicate of itself — mirrors credentials.py's
+    ``_retain_previous_backup``). Beside the LINK (``path``), never the
+    resolved target: on lmd42 settings.json is a symlink into the dotfiles
+    repo, and the backup must sit where the link is, not where it points.
+    Never blocks the write: a failure here is logged and dropped.
     """
-    new_bytes = json.dumps(raw, indent=2).encode("utf-8")
-    if current is not None and current != new_bytes:
-        prev_path = path.with_name(path.name + ".prev")
-        try:
-            _atomic_write_bytes(prev_path, current)
-        except OSError as e:
-            _logger.warning("Could not back up %s (%s)", path, e)
-    atomic_write_json(path, raw)
+    try:
+        current = path.read_bytes()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        _logger.warning("Could not read %s for backup (%s)", path, e)
+        return
+    if current == json.dumps(data, indent=2).encode("utf-8"):
+        return
+    prev_path = path.with_name(path.name + ".prev")
+    try:
+        prev_path.write_bytes(current)
+        if sys.platform != "win32":
+            os.chmod(str(prev_path), 0o600)
+    except OSError as e:
+        _logger.warning("Could not back up %s (%s)", path, e)
 
 
 def atomic_write_json(path: Path, data: dict) -> None:
     """Atomically write JSON with the backup dir's 0600/0700 modes.
 
     Shared by settings.json and the autoswitch state file (and any future
-    machine-local state files beside them). See ``_atomic_write_bytes`` for
-    the symlink/EXDEV/hardening rationale this delegates to.
-    """
-    _atomic_write_bytes(path, json.dumps(data, indent=2).encode("utf-8"))
-
-
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Atomically write bytes with the backup dir's 0600/0700 modes.
+    machine-local state files beside them).
 
     **Writes THROUGH a symlink, never over it.** A rename swaps a directory
     ENTRY and does not follow links, so renaming onto a symlinked path
@@ -504,7 +488,7 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     link target silently stops receiving updates — until something restores
     the link (a dotfiles deploy), taking every change written since with
     it. Same shape as #192/#193, which fixed ``session.py``'s own writer;
-    this is the shared writer. Three consequences, each deliberate:
+    this is the shared JSON writer. Three consequences, each deliberate:
 
     - A DANGLING link still writes where it points; linking a path is a
       request to write there.
@@ -519,12 +503,14 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     """
     target = Path(os.path.realpath(path)) if path.is_symlink() else path
     target.parent.mkdir(parents=True, exist_ok=True)
+    if path.name == SETTINGS_FILENAME:
+        _backup_prev(path, data)
     if sys.platform != "win32":
         # `path.parent`, NOT the target's: see the docstring.
         os.chmod(path.parent, 0o700)
     fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
     try:
-        os.write(fd, data)
+        os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
         os.close(fd)
         fd = -1
         replace_with_retry(tmp_path, str(target))

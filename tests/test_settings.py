@@ -152,17 +152,15 @@ class TestSaveSettings:
         assert prev.read_bytes() == first_prev_bytes
 
     def test_backup_failure_does_not_block_the_save(self, tmp_path: Path, monkeypatch, caplog):
-        from claude_swap import settings as S
-
         save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
-        real_atomic_write_bytes = S._atomic_write_bytes
+        real_write_bytes = Path.write_bytes
 
-        def _raise_for_prev(path, data):
-            if str(path).endswith(".prev"):
+        def _raise_for_prev(self, data):
+            if str(self).endswith(".prev"):
                 raise OSError("disk full")
-            return real_atomic_write_bytes(path, data)
+            return real_write_bytes(self, data)
 
-        monkeypatch.setattr(S, "_atomic_write_bytes", _raise_for_prev)
+        monkeypatch.setattr(Path, "write_bytes", _raise_for_prev)
         with caplog.at_level(logging.WARNING):
             save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
 
@@ -170,6 +168,52 @@ class TestSaveSettings:
         prev = settings_path(tmp_path).with_name("settings.json.prev")
         assert not prev.exists()
         assert load_settings(tmp_path).threshold == 85.0
+
+    def test_non_settings_file_gets_no_prev_backup(self, tmp_path: Path):
+        other = tmp_path / "state.json"
+        atomic_write_json(other, {"a": 1})
+        atomic_write_json(other, {"a": 2})
+        assert not other.with_name("state.json.prev").exists()
+
+    def test_symlinked_settings_prev_sits_beside_the_link(self, tmp_path: Path):
+        repo = tmp_path / "repo"; repo.mkdir()
+        live = tmp_path / "live"; live.mkdir()
+        tracked = repo / "settings.json"
+        tracked.write_text(json.dumps({"autoswitch": {"threshold": 70.0}}))
+        link = live / "settings.json"
+        link.symlink_to(tracked)
+
+        atomic_write_json(link, {"autoswitch": {"threshold": 85.0}})
+
+        assert (live / "settings.json.prev").exists()
+        assert not (repo / "settings.json.prev").exists()
+
+
+class TestReadRawReturnsDict:
+    """Regression: dfd56d8d made _read_raw/_read_raw_for_write return a
+    (dict, bytes | None) tuple. Five callers outside settings.py — cswap
+    pin.py's `_pinned_email_now` and `_clear_pin_record`, cswap-pin
+    proxy.py's `save_pin` — all expect a plain dict back."""
+
+    def test_read_raw_returns_a_dict(self, tmp_path: Path):
+        from claude_swap.settings import _read_raw
+
+        settings_path(tmp_path).write_text(
+            json.dumps({"remoteControl": {"pinned": True}})
+        )
+        raw = _read_raw(settings_path(tmp_path))
+        assert isinstance(raw, dict)
+        assert raw["remoteControl"]["pinned"] is True
+
+    def test_read_raw_for_write_returns_a_dict(self, tmp_path: Path):
+        from claude_swap.settings import _read_raw_for_write
+
+        settings_path(tmp_path).write_text(
+            json.dumps({"remoteControl": {"pinned": True}})
+        )
+        raw = _read_raw_for_write(settings_path(tmp_path))
+        assert isinstance(raw, dict)
+        assert raw["remoteControl"]["pinned"] is True
 
 
 class TestUiSettings:
