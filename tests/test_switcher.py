@@ -3141,13 +3141,17 @@ class TestActiveAccountRefresh:
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
         """An unreachable oracle is transient evidence-free failure: the
-        resync is skipped (backup untouched) but nothing is cached — the next
-        pass probes again and heals once the oracle answers."""
+        resync is skipped (backup untouched) and no VERDICT is cached — once
+        the retry-after cooldown elapses, the next pass probes again and
+        heals once the oracle answers."""
         switcher = self._switcher(sample_sequence_data)
+        clock = [1_000_000.0]
+        switcher._usage_store.clock = lambda: clock[0]
 
         first, write_backup, mock_probe = self._fresh_drift_pass(
             switcher, None
         )
+        clock[0] += SERVE_TTL_S + 1
         second, write_backup2, mock_probe2 = self._fresh_drift_pass(
             switcher, self._PROFILE_SELF
         )
@@ -3161,20 +3165,312 @@ class TestActiveAccountRefresh:
             "1", "test@example.com", self._REFRESHED, attributed=True
         )
 
+    def test_fresh_probe_failure_is_memoized_within_the_retry_window(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The unclaimed collect pass calls the resync unthrottled (its own
+        fetch never rides the store's reserve/claim pacing), so an
+        unresolved probe must not re-hit the oracle every pass during an
+        outage -- it is memoized per lineage until the retry-after window
+        elapses."""
+        switcher = self._switcher(sample_sequence_data)
+        clock = [1_000_000.0]
+        switcher._usage_store.clock = lambda: clock[0]
+
+        first, write_backup, mock_probe = self._fresh_drift_pass(
+            switcher, None
+        )
+        clock[0] += SERVE_TTL_S / 2
+        second, write_backup2, mock_probe2 = self._fresh_drift_pass(
+            switcher, self._PROFILE_SELF
+        )
+
+        write_backup.assert_not_called()
+        mock_probe.assert_called_once()
+        # Still cooling down: no second network call, nothing resynced.
+        mock_probe2.assert_not_called()
+        write_backup2.assert_not_called()
+
+    # -- a 429 backoff must not also block adopting a fresh login --
+    #
+    # `_resync_rotated_backup` was, until now, reachable only from
+    # `_fetch_active_usage`'s success path -- itself reachable only when
+    # `store.reserve` claims the slot. A live server-side backoff (429)
+    # refuses every claim for up to an hour, so a re-login during that
+    # window adopted nothing until the backoff lifted. The
+    # collect pass's other claims-blocked branch (just above, in
+    # `_collect_usage_entries`) already re-checks expiry locally every tick
+    # it cannot claim; it must also resync a healthy, rotated login the same
+    # way -- read-only, no fetch, no consume.
+
+    def test_backoff_blocked_active_slot_still_resyncs_a_fresh_login(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = self._switcher(sample_sequence_data)
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+        )
+        assert store.entries(identity)["1"].backoff_until is not None  # premise
+
+        fresh_login = self._REFRESHED  # a different lineage than the backup
+        info = [(1, "test@example.com", "", "", True, fresh_login, "")]
+
+        with patch.object(
+            switcher, "_read_credentials", return_value=fresh_login
+        ), patch.object(
+            switcher, "_read_account_credentials", return_value=self._EXPIRED
+        ), patch.object(
+            switcher, "_write_account_credentials"
+        ) as write_backup, patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._PROFILE_SELF,
+        ), patch.object(switcher, "_run_usage_fetches") as run_fetches:
+            switcher._collect_usage_entries(info)
+
+        run_fetches.assert_not_called()  # premise: the backoff blocked it
+        write_backup.assert_called_once_with("1", "test@example.com", fresh_login)
+
+    def test_backoff_blocked_active_slot_with_expired_login_is_not_resynced(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Control: the live token is genuinely expired — the sentinel
+        branch above handles it, and must never reach the resync."""
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = self._switcher(sample_sequence_data)
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+        )
+
+        info = [(1, "test@example.com", "", "", True, self._EXPIRED, "")]
+
+        with patch.object(switcher, "_resync_rotated_backup") as resync:
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["1"].sentinel == USAGE_TOKEN_EXPIRED
+        resync.assert_not_called()
+
+    def test_backoff_blocked_active_slot_does_not_adopt_a_foreign_login(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Control: the live bytes resolve to a DIFFERENT account. The
+        resync's own identity attribution (unchanged by this fix) must still
+        refuse to write them into slot 1's backup."""
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = self._switcher(sample_sequence_data)
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+        )
+
+        foreign_login = self._REFRESHED
+        foreign_profile = {
+            "uuid": "uuid-foreign", "email": "other@example.com",
+            "organizationUuid": None,
+        }
+        info = [(1, "test@example.com", "", "", True, foreign_login, "")]
+
+        with patch.object(
+            switcher, "_read_credentials", return_value=foreign_login
+        ), patch.object(
+            switcher, "_read_account_credentials", return_value=self._EXPIRED
+        ), patch.object(
+            switcher, "_write_account_credentials"
+        ) as write_backup, patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=foreign_profile,
+        ) as probe, patch.object(switcher, "_run_usage_fetches") as run_fetches:
+            switcher._collect_usage_entries(info)
+
+        run_fetches.assert_not_called()
+        # The identity check must actually have been REACHED, not skipped
+        # by some earlier guard that happened to also refuse the write.
+        probe.assert_called_once()
+        for call in write_backup.call_args_list:
+            assert call.args[0] != "1", "written into THIS slot"
+
+    def test_backoff_blocked_active_slot_with_degraded_read_is_not_resynced(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Control: a DEGRADED active read must never probe the oracle or
+        write the resync — the live bytes it would compare come from a read
+        that could not confirm them, even though they are unexpired and
+        differ from the backup."""
+        from claude_swap.credentials import ActiveCredentials
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = self._switcher(sample_sequence_data)
+        switcher._record_active_verdict(ActiveCredentials("", False, True))
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+        )
+
+        fresh_login = self._REFRESHED  # unexpired, differs from the backup
+        info = [(1, "test@example.com", "", "", True, fresh_login, "")]
+
+        with patch.object(
+            switcher, "_read_account_credentials", return_value=self._EXPIRED
+        ), patch.object(
+            switcher, "_write_account_credentials"
+        ) as write_backup, patch(
+            "claude_swap.oauth.fetch_oauth_profile"
+        ) as probe, patch.object(switcher, "_run_usage_fetches") as run_fetches:
+            switcher._collect_usage_entries(info)
+
+        run_fetches.assert_not_called()  # premise: the backoff blocked it
+        probe.assert_not_called()
+        write_backup.assert_not_called()
+
+    def test_resync_refuses_when_backup_already_holds_a_newer_generation(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The interleaving: the consume gate releases the lock during
+        its POST and persists the successor to the backup ALONE. A switch
+        mid-POST can leave live = the consumed predecessor while backup =
+        the successor -- writing live over it would destroy the successor
+        and kill the account. The resync must compare generations under the
+        lock, not just trust that a fingerprint mismatch means live is the
+        newer side."""
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = self._switcher(sample_sequence_data)
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+        )
+
+        predecessor = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-predecessor", "refreshToken": "rt-predecessor",
+                "expiresAt": 9999999999000,
+            }
+        })
+        successor = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-successor", "refreshToken": "rt-successor",
+                "expiresAt": 9999999999999,  # the newer generation
+            }
+        })
+        info = [(1, "test@example.com", "", "", True, predecessor, "")]
+
+        with patch.object(
+            switcher, "_read_credentials", return_value=predecessor
+        ), patch.object(
+            switcher, "_read_account_credentials", return_value=successor
+        ), patch.object(
+            switcher, "_write_account_credentials"
+        ) as write_backup, patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._PROFILE_SELF,
+        ), patch.object(switcher, "_run_usage_fetches") as run_fetches:
+            switcher._collect_usage_entries(info)
+
+        run_fetches.assert_not_called()  # premise: the backoff blocked it
+        write_backup.assert_not_called()
+
+    def test_accounts_snapshot_reconcile_carries_by_fingerprint_not_local_expiry(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """``accounts_snapshot``'s ``access_token_fp`` derivation, exercised
+        through the REAL ``accounts_snapshot`` and ``SnapshotSource``'s
+        reconcile: a 429 backoff freezes ``fetched_at`` on every
+        pass below, so only the local, no-network fingerprint -- not the
+        OLD local-expiry read, which is False on an unexpired credential
+        the server has already rejected -- decides whether a TOKEN_EXPIRED
+        sentinel a PREVIOUS pass carried is still owed."""
+        import dataclasses
+
+        from claude_swap.snapshot_source import SnapshotSource
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = self._switcher(sample_sequence_data)
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+        )
+        source = SnapshotSource(switcher)
+
+        with patch.object(
+            switcher, "_read_active_credentials",
+            return_value=ActiveCredentials(self._REFRESHED, False, False),
+        ):
+            baseline = source.take(store_only=True)
+        account = baseline.accounts[0]
+        assert account.access_token_fp == oauth.access_token_fingerprint(
+            self._REFRESHED
+        ), "premise: the real derivation ran"
+
+        # A previous pass carried the sentinel (e.g. `_read_only_fetch`'s
+        # 401 on THIS same, still-unexpired credential) -- injected here
+        # since sentinels are never persisted to the store itself.
+        source._last = dataclasses.replace(
+            baseline,
+            accounts=(
+                dataclasses.replace(
+                    account,
+                    usage=dataclasses.replace(
+                        account.usage, sentinel=USAGE_TOKEN_EXPIRED
+                    ),
+                ),
+            ),
+        )
+
+        # Control: the rejected bytes are UNCHANGED -- carries.
+        with patch.object(
+            switcher, "_read_active_credentials",
+            return_value=ActiveCredentials(self._REFRESHED, False, False),
+        ):
+            unchanged = source.take(store_only=True)
+        assert unchanged.accounts[0].usage.sentinel == USAGE_TOKEN_EXPIRED
+
+        # The credential changed (a live refresh/re-login) -- drops, even
+        # though the new bytes are also unexpired (so ``accounts_snapshot``'s
+        # OLD local-expiry read would have agreed with the rejected one:
+        # neither is locally expired, yet only one is still on disk).
+        refreshed_again = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-newer", "refreshToken": "rt-newer",
+                "expiresAt": 9999999999000,
+            }
+        })
+        with patch.object(
+            switcher, "_read_active_credentials",
+            return_value=ActiveCredentials(refreshed_again, False, False),
+        ):
+            changed = source.take(store_only=True)
+        assert changed.accounts[0].usage.sentinel is None
+
     def test_fresh_probe_unverifiable_not_cached(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
         """A slot with no stored uuid and a partial resolved identity cannot
-        be condemned OR confirmed: skip the resync, cache nothing (a cached
-        False on partial evidence would block a legitimate resync for the
-        process lifetime), re-probe next pass."""
+        be condemned OR confirmed: skip the resync, cache no VERDICT (a
+        cached False on partial evidence would block a legitimate resync for
+        the process lifetime) — re-probed once the retry-after window (not
+        immediately: `test_fresh_probe_failure_is_memoized_within_the_retry_window`'s
+        memoized cooldown) elapses."""
         sample_sequence_data["accounts"]["1"].pop("uuid")
         switcher = self._switcher(sample_sequence_data)
         partial = {"uuid": "uuid-x", "email": None, "organizationUuid": None}
+        clock = [1_000_000.0]
+        switcher._usage_store.clock = lambda: clock[0]
 
         first, write_backup, mock_probe = self._fresh_drift_pass(
             switcher, partial
         )
+        clock[0] += SERVE_TTL_S + 1
         second, write_backup2, mock_probe2 = self._fresh_drift_pass(
             switcher, partial
         )

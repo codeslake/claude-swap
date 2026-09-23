@@ -501,6 +501,19 @@ class ClaudeAccountSwitcher:
         self._resolved_owners: dict[
             tuple[str, str, str, str, str, str], dict
         ] = {}
+        # When the oracle can't settle a drifted lineage (unreachable, or an
+        # unverifiable resolution), the verdict itself is never cached (see
+        # above), but the collect pass's own resync call site (unlike the
+        # fetch path, which the store's reserve/claim already paces) probes
+        # on every unclaimed pass -- unthrottled, it would hit the endpoint
+        # every TUI tick and, during an outage, stall each one for the
+        # profile GET's timeout. Keyed the same as `_probe_verdicts`: the
+        # epoch after which a retry is licensed, so an unresolved lineage is
+        # probed at most once per `poll_policy.SERVE_TTL_S` -- the same
+        # cadence bound every other surface already honors.
+        self._probe_retry_after: dict[
+            tuple[str, str, str, str, str, str], float
+        ] = {}
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -3115,6 +3128,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    access_token_fp=oauth.access_token_fingerprint(_creds),
                 )
             )
         return AccountsSnapshot(
@@ -7338,10 +7352,18 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                     self._resolved_owners.pop(lineage, None)
                 return
             if verdict is not True:
+                now = self._usage_store.clock()
+                retry_at = self._probe_retry_after.get(lineage)
+                if retry_at is not None and now < retry_at:
+                    # Still cooling down from the last unresolved probe on
+                    # this exact lineage -- skip the network call rather
+                    # than repeat it every collect pass.
+                    return
                 resolved = oauth.fetch_oauth_profile(
                     oauth.extract_access_token(creds) or ""
                 )
                 if resolved is None:
+                    self._probe_retry_after[lineage] = now + poll_policy.SERVE_TTL_S
                     self._logger.debug(
                         "Ownership probe for account %s's drifted live "
                         "credential failed; resync skipped this pass.",
@@ -7352,6 +7374,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                     account_num, resolved
                 )
                 if match is None:
+                    self._probe_retry_after[lineage] = now + poll_policy.SERVE_TTL_S
                     self._logger.debug(
                         "Ownership of account %s's drifted live credential "
                         "is unverifiable (no stored uuid, partial profile); "
@@ -7364,6 +7387,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 # the identity consults will rebuild from now on.
                 lineage = self._lineage_key(account_num, email, fp)
                 self._probe_verdicts[lineage] = match
+                self._probe_retry_after.pop(lineage, None)
                 if not match:
                     # `resolved` names the account the server says owns these
                     # bytes; the adopt stores them in that account's slot, or
@@ -7409,6 +7433,29 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 # attributed=True: the oracle above (`_resolved_matches_slot_identity`)
                 # already positively verified this lineage belongs to
                 # `account_num`'s identity, re-checked under this lock.
+                # Re-read the BACKUP too, under the same lock: the pre-lock
+                # read above can be stale by now (the oracle probe is a
+                # network call, and the lock itself may have waited) -- and
+                # the consume gate persists its successor to the backup
+                # ALONE, lock-free, while its own POST is in flight. A switch
+                # mid-POST can leave live = the consumed predecessor while
+                # backup = the successor; writing live over it would destroy
+                # that successor and kill the account. Refuse on either the
+                # backup moving since the pre-lock read, or already holding a
+                # newer generation than `live` (expiresAt moves forward on
+                # every rotation, same convention as the recovery branch's
+                # own generation ordering).
+                backup_now = self._read_account_credentials(account_num, email)
+                if oauth.credential_fingerprint(
+                    backup_now
+                ) != oauth.credential_fingerprint(backup):
+                    return
+                backup_exp = (
+                    oauth.extract_oauth_data(backup_now) or {}
+                ).get("expiresAt") or 0
+                live_exp = live_oauth.get("expiresAt") or 0
+                if backup_exp > live_exp:
+                    return
                 self._write_account_credentials(
                     account_num, email, live, attributed=True
                 )
@@ -7808,6 +7855,17 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 active_oauth.get("expiresAt")
             ):
                 sentinels[num] = USAGE_TOKEN_EXPIRED
+            elif active_oauth and not self._active_read_degraded:
+                # Adoption otherwise rides the fetch path alone (via
+                # `_fetch_active_usage`'s success branch), so the same gate
+                # that blocks the fetch here also blocked a fresh re-login
+                # from resyncing — for as long as the backoff holds. Healthy
+                # and possibly rotated: resync now, under every guard
+                # `_resync_rotated_backup` already has (identity, its own
+                # fingerprint no-op check, the lock) — called directly, since
+                # a pre-check here would just repeat that no-op check at the
+                # cost of a second backup read on every pass.
+                self._resync_rotated_backup(num, info[1], info[3], info[5])
 
         if claims:
             pre = entries

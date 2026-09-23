@@ -234,6 +234,7 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
 
 def _read_raw(path: Path) -> dict:
+    """Lenient parse: bad/missing file -> {}, with a logged warning."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -473,6 +474,42 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     return _clamped(dataclasses.replace(settings, **overrides))
 
 
+def _backup_prev(path: Path, data: dict) -> None:
+    """Best-effort ``.prev`` copy of ``path``'s pre-write bytes.
+
+    Only ``atomic_write_json`` calls this, and only for settings.json.
+    Skipped when the file doesn't exist yet, or the incoming write is a
+    no-op (a repeated identical save must not replace the one real previous
+    generation with a duplicate of itself — mirrors credentials.py's
+    ``_retain_previous_backup``). Beside the LINK (``path``), never the
+    resolved target: where settings.json is a symlink into a dotfiles
+    repo, the backup must sit where the link is, not where it points.
+    Never blocks the write: a failure here is logged and dropped.
+    """
+    try:
+        current = path.read_bytes()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        _logger.warning("Could not read %s for backup (%s)", path, e)
+        return
+    if current == json.dumps(data, indent=2).encode("utf-8"):
+        return
+    prev_path = path.with_name(path.name + ".prev")
+    tmp_path = prev_path.with_name(prev_path.name + f".{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(str(tmp_path), flags, 0o600)
+        try:
+            os.write(fd, current)
+        finally:
+            os.close(fd)
+        os.replace(str(tmp_path), str(prev_path))
+    except OSError as e:
+        _logger.warning("Could not back up %s (%s)", path, e)
+        tmp_path.unlink(missing_ok=True)
+
+
 def atomic_write_json(path: Path, data: dict) -> None:
     """Atomically write JSON with the backup dir's 0600/0700 modes.
 
@@ -500,6 +537,8 @@ def atomic_write_json(path: Path, data: dict) -> None:
     """
     target = Path(os.path.realpath(path)) if path.is_symlink() else path
     target.parent.mkdir(parents=True, exist_ok=True)
+    if path.name == SETTINGS_FILENAME:
+        _backup_prev(path, data)
     if sys.platform != "win32":
         # `path.parent`, NOT the target's: see the docstring.
         os.chmod(path.parent, 0o700)
