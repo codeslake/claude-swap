@@ -2952,7 +2952,7 @@ class TestActiveAccountRefresh:
         mock_probe2.assert_not_called()
         write_backup2.assert_not_called()
 
-    # -- item 3: a 429 backoff must not also block adopting a fresh login --
+    # -- a 429 backoff must not also block adopting a fresh login --
     #
     # `_resync_rotated_backup` was, until now, reachable only from
     # `_fetch_active_usage`'s success path -- itself reachable only when
@@ -3144,9 +3144,9 @@ class TestActiveAccountRefresh:
     def test_accounts_snapshot_reconcile_carries_by_fingerprint_not_local_expiry(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
-        """switcher.py:1838's ``access_token_fp`` derivation, exercised
+        """``accounts_snapshot``'s ``access_token_fp`` derivation, exercised
         through the REAL ``accounts_snapshot`` and ``SnapshotSource``'s
-        reconcile (item 1): a 429 backoff freezes ``fetched_at`` on every
+        reconcile: a 429 backoff freezes ``fetched_at`` on every
         pass below, so only the local, no-network fingerprint -- not the
         OLD local-expiry read, which is False on an unexpired credential
         the server has already rejected -- decides whether a TOKEN_EXPIRED
@@ -3198,7 +3198,7 @@ class TestActiveAccountRefresh:
         assert unchanged.accounts[0].usage.sentinel == USAGE_TOKEN_EXPIRED
 
         # The credential changed (a live refresh/re-login) -- drops, even
-        # though the new bytes are also unexpired (so switcher.py:1838's
+        # though the new bytes are also unexpired (so ``accounts_snapshot``'s
         # OLD local-expiry read would have agreed with the rejected one:
         # neither is locally expired, yet only one is still on disk).
         refreshed_again = json.dumps({
@@ -3221,7 +3221,8 @@ class TestActiveAccountRefresh:
         be condemned OR confirmed: skip the resync, cache no VERDICT (a
         cached False on partial evidence would block a legitimate resync for
         the process lifetime) — re-probed once the retry-after window (not
-        immediately: item 2's memoized cooldown) elapses."""
+        immediately: `test_fresh_probe_failure_is_memoized_within_the_retry_window`'s
+        memoized cooldown) elapses."""
         sample_sequence_data["accounts"]["1"].pop("uuid")
         switcher = self._switcher(sample_sequence_data)
         partial = {"uuid": "uuid-x", "email": None, "organizationUuid": None}

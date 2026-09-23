@@ -439,7 +439,7 @@ class TestSnapshotSource:
         assert source.take(store_only=True).accounts[0].usage.sentinel is None
 
     def test_expired_sentinel_clears_once_credential_is_healthy_again(self, tmp_path):
-        # Item 2: the sentinel was minted on a genuinely rejected credential;
+        # The sentinel was minted on a genuinely rejected credential;
         # Claude Code then refreshed it (a new access_token_fp) while a 429
         # backoff held `fetched_at` still (no fetch can run). The next
         # snapshot must drop the badge — a local fingerprint re-check, not

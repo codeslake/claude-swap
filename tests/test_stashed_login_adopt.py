@@ -1001,7 +1001,7 @@ class TestTheResyncAdoptDeliberatelyHasNoSpentGuard:
 
 
 class TestAnUnresolvedStashRowHealsOnLineage:
-    """T0925: the switch-time profile probe (`_probe_target_credential` ->
+    """The switch-time profile probe (`_probe_target_credential` ->
     `consume_backup_grant`) can answer a real 401 without the escalation
     ever confirming an identity, so the row it parks carries no
     `resolvedIdentity` at all -- only `liveOauthAccount` and the credential

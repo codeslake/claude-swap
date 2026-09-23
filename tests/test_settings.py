@@ -141,8 +141,8 @@ class TestSaveSettings:
         assert not prev.exists()
 
     def test_identical_second_save_leaves_prev_unchanged(self, tmp_path: Path):
-        # r8's regression: a repeated identical save must not overwrite a
-        # real `.prev` with a duplicate of the bytes already on disk.
+        # A repeated identical save must not overwrite a real `.prev` with
+        # a duplicate of the bytes already on disk.
         save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
         save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
         prev = settings_path(tmp_path).with_name("settings.json.prev")
