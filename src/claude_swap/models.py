@@ -143,12 +143,15 @@ class AccountSnapshot:
     # RUNNING engine leaves a disabled ACTIVE on its next tick, so the explicit
     # switch holds only while auto is stopped.
     disabled: bool = False
-    # A local, no-network expiry read (oauth.is_oauth_token_expired) taken
-    # fresh every snapshot. Lets a reconciler require it before carrying a
-    # stale "token expired" sentinel forward, so a credential Claude Code
-    # already refreshed drops the label on the next pass even while a 429
-    # backoff blocks every usage fetch.
-    token_expired: bool = False
+    # The access token's fingerprint (oauth.access_token_fingerprint), taken
+    # fresh every snapshot. Lets a reconciler require it to match before
+    # carrying a stale "token expired" sentinel forward: unchanged bytes mean
+    # the rejected credential is still what's on disk (worth carrying even
+    # while a 429 backoff blocks every usage fetch), while a changed
+    # fingerprint means Claude Code already refreshed it, so the label drops
+    # on the next pass regardless of whether that refresh happened to land
+    # before or after the token's own local expiry.
+    access_token_fp: str | None = None
 
     @property
     def display_tag(self) -> str:

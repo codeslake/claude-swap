@@ -85,7 +85,7 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
-    token_expired: bool = False,
+    access_token_fp: str | None = None,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -98,7 +98,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
-        token_expired=token_expired,
+        access_token_fp=access_token_fp,
     )
 
 
@@ -415,17 +415,19 @@ class TestSnapshotSource:
         assert fake.fetch_sets == [set()]
 
     def test_expired_sentinel_retained_until_fetched_at_advances(self, tmp_path):
-        # The credential is genuinely STILL expired here (token_expired=True
-        # on both passes) — the worker just hasn't produced a new fetch yet.
-        # Distinct from the healthy-credential-under-backoff case below.
+        # The credential is genuinely STILL the rejected bytes here (same
+        # access_token_fp on both passes) — the worker just hasn't produced
+        # a new fetch yet. Distinct from the healthy-credential-under-backoff
+        # case below.
         expired = make_account(
             1,
             active=True,
             entry=make_usage_at(100.0, sentinel=USAGE_TOKEN_EXPIRED),
-            token_expired=True,
+            access_token_fp="fp-rejected",
         )
         fresh_same_stamp = make_account(
-            1, active=True, entry=make_usage_at(100.0), token_expired=True
+            1, active=True, entry=make_usage_at(100.0),
+            access_token_fp="fp-rejected",
         )
         fresh_new_stamp = make_account(1, active=True, entry=make_usage_at(101.0))
         fake, source = self._source(tmp_path, [expired])
@@ -437,18 +439,20 @@ class TestSnapshotSource:
         assert source.take(store_only=True).accounts[0].usage.sentinel is None
 
     def test_expired_sentinel_clears_once_credential_is_healthy_again(self, tmp_path):
-        # Item 2: the sentinel was minted on a genuinely expired credential;
-        # Claude Code then refreshed it while a 429 backoff held `fetched_at`
-        # still (no fetch can run). The next snapshot must drop the badge —
-        # a local, no-network expiry re-check, not the frozen fetch.
+        # Item 2: the sentinel was minted on a genuinely rejected credential;
+        # Claude Code then refreshed it (a new access_token_fp) while a 429
+        # backoff held `fetched_at` still (no fetch can run). The next
+        # snapshot must drop the badge — a local fingerprint re-check, not
+        # the frozen fetch.
         expired = make_account(
             1,
             active=True,
             entry=make_usage_at(100.0, sentinel=USAGE_TOKEN_EXPIRED),
-            token_expired=True,
+            access_token_fp="fp-rejected",
         )
         healthy_same_stamp = make_account(
-            1, active=True, entry=make_usage_at(100.0), token_expired=False
+            1, active=True, entry=make_usage_at(100.0),
+            access_token_fp="fp-refreshed",
         )
         fake, source = self._source(tmp_path, [expired])
 
