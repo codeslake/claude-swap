@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import stat
 import sys
 from pathlib import Path
@@ -138,17 +139,36 @@ class TestSaveSettings:
         prev = settings_path(tmp_path).with_name("settings.json.prev")
         assert not prev.exists()
 
-    def test_backup_failure_does_not_block_the_save(self, tmp_path: Path, monkeypatch):
+    def test_identical_second_save_leaves_prev_unchanged(self, tmp_path: Path):
+        # r8's regression: a repeated identical save must not overwrite a
+        # real `.prev` with a duplicate of the bytes already on disk.
+        save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
+        save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        first_prev_bytes = prev.read_bytes()
+
+        save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
+
+        assert prev.read_bytes() == first_prev_bytes
+
+    def test_backup_failure_does_not_block_the_save(self, tmp_path: Path, monkeypatch, caplog):
         from claude_swap import settings as S
 
         save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
+        real_atomic_write_bytes = S._atomic_write_bytes
 
-        def _raise(*a, **kw):
-            raise OSError("disk full")
+        def _raise_for_prev(path, data):
+            if str(path).endswith(".prev"):
+                raise OSError("disk full")
+            return real_atomic_write_bytes(path, data)
 
-        monkeypatch.setattr(S.shutil, "copy2", _raise)
-        save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
+        monkeypatch.setattr(S, "_atomic_write_bytes", _raise_for_prev)
+        with caplog.at_level(logging.WARNING):
+            save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
 
+        assert "back up" in caplog.text.lower()
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert not prev.exists()
         assert load_settings(tmp_path).threshold == 85.0
 
 
@@ -264,6 +284,27 @@ class TestSetUnsetSetting:
     def test_unset_absent_key_is_noop(self, tmp_path: Path):
         assert unset_setting(tmp_path, "autoswitch.threshold") is False
         assert not settings_path(tmp_path).exists()
+
+    def test_set_setting_backs_up_existing_file_to_prev(self, tmp_path: Path):
+        # set_setting is a live writer (cli.py, tui/app.py, menubar.py); it
+        # must leave a `.prev` recovery copy like save_settings does.
+        set_setting(tmp_path, "autoswitch.threshold", "70")
+        old_bytes = settings_path(tmp_path).read_bytes()
+
+        set_setting(tmp_path, "autoswitch.threshold", "85")
+
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert prev.read_bytes() == old_bytes
+
+    def test_unset_setting_backs_up_existing_file_to_prev(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.threshold", "70")
+        set_setting(tmp_path, "autoswitch.cooldownSeconds", "60")
+        old_bytes = settings_path(tmp_path).read_bytes()
+
+        unset_setting(tmp_path, "autoswitch.cooldownSeconds")
+
+        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        assert prev.read_bytes() == old_bytes
 
 
 class TestEffectiveSettings:
