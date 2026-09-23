@@ -11,6 +11,7 @@ import shutil
 import threading
 import sys
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -5723,8 +5724,11 @@ class ClaudeAccountSwitcher:
             for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info
         }
         info_by_num = {str(info[0]): info for info in accounts_info}
-        # Scoped-window models so the 429-stale trust bound honors per-model
-        # (e.g. Fable) resets, matching the poll planner's window view.
+        # Scoped-window models, passed through to `entries()` for call-site
+        # symmetry with `UsageStore.mark_at_limit` (T1102 removed the
+        # 429-stale trust bound that used to read per-model resets here —
+        # `entries()` no longer itself does anything with `models`; see its
+        # own docstring).
         _threshold, models = self._poll_policy_inputs()
         sentinels: dict[str, str] = {}
         for num, info in info_by_num.items():
@@ -7226,6 +7230,7 @@ class ClaudeAccountSwitcher:
         models: tuple[str, ...] | None = None,
         model_source: str | None = None,
         current_at_limit: bool = False,
+        exclude: Iterable[str] = (),
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -7242,6 +7247,24 @@ class ClaudeAccountSwitcher:
             model_source: Where ``models`` came from (``"cli"`` or
                   ``"autoswitch.model"``) — announced up front so a config
                   fallback silently steering the pick is impossible.
+            exclude: Slot numbers the CALLER already observed at-limit
+                  out-of-band (the pin's own 429s) and must not land on this
+                  call — e.g. a straggling 429 on a bearer from a wall the
+                  fleet already left, so the account live when this call runs
+                  need not be the one that actually saw it (issue: marking
+                  "whichever account is live" risked walling a healthy,
+                  just-switched-to account for hours). Unioned into the
+                  ``struck`` set every candidate search already excludes.
+                  When ``current_at_limit=True``, every slot in ``exclude`` is
+                  ALSO persisted walled (``UsageStore.mark_at_limit``,
+                  identity-guarded per slot's own roster identity) — the
+                  CURRENT account is marked only when it is itself in
+                  ``exclude``. With no ``exclude`` (today's pin, before it
+                  adopts this parameter — detected via
+                  ``"exclude" in inspect.signature(switch).parameters``),
+                  ``current_at_limit=True`` persists nothing; only
+                  ``_select_best_switchable``'s existing one-selection zeroing
+                  (this call's own ranking, never persisted) applies.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -7257,8 +7280,11 @@ class ClaudeAccountSwitcher:
         # needs a second strike before it agrees (see
         # `_select_best_switchable`'s `exclude` docstring), so without a
         # local memory a candidate this same call just proved dead is
-        # eligible again on the very next pass.
-        struck: set[str] = set()
+        # eligible again on the very next pass. The caller's own observed
+        # walls (`exclude`) join it from the start, so no path below can land
+        # on one even outside the `current_at_limit` marking arm.
+        excluded_slots = {str(n) for n in exclude}
+        struck: set[str] = set(excluded_slots)
         if strategy_label == "rotation":
             models = ()  # model limits only steer the usage-aware strategies
         elif models is None:
@@ -7432,17 +7458,26 @@ class ClaudeAccountSwitcher:
         # account is provably better; otherwise stays put (never moves onto a
         # worse or unverifiable account). Bare `cswap --switch` rotates anyway.
         if strategy == "best":
-            if current_at_limit and current_num is not None:
-                # The caller measured the limit somewhere the poller cannot
-                # see. Persist it: past this call, every later reader of
-                # `current_num`'s entry (autoswitch's own tick, the TUI, the
-                # next switch) must see it as at-limit too, not just this one
-                # selection — see UsageStore.mark_at_limit.
-                self._usage_store.mark_at_limit(
-                    current_num,
-                    {current_num: (current_email, current_org_uuid)},
-                    models,
-                )
+            if current_at_limit and excluded_slots:
+                # Mark every slot the CALLER observed at-limit out-of-band
+                # (the pin's own 429s) -- not "whichever account is live
+                # when switch() runs", which can be a healthy,
+                # just-switched-to account racing a straggling 429 from a
+                # wall the fleet already left (see `exclude`'s docstring
+                # above). The current account is marked only when it is
+                # itself in `exclude`. Past this call, every later reader of
+                # a marked slot's entry (autoswitch's own tick, the TUI, the
+                # next switch) sees it as at-limit too, not just this one
+                # selection — see UsageStore.mark_at_limit. Identity-guarded
+                # per slot's own roster identity, not the CURRENT account's.
+                roster = {
+                    num: (info.get("email", ""), info.get("organizationUuid", "") or "")
+                    for num, info in data.get("accounts", {}).items()
+                }
+                for num in excluded_slots:
+                    identity = roster.get(num)
+                    if identity is not None:
+                        self._usage_store.mark_at_limit(num, {num: identity}, models)
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(

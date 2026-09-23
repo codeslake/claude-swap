@@ -13,7 +13,6 @@ from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
     CLAIM_TTL_S,
-    RATE_LIMIT_TRUST_MAX_AGE_S,
     SERVE_TTL_S,
     STALE_OK_S,
     TRUST_MAX_AGE_S,
@@ -213,9 +212,15 @@ class TestExtendedTrust:
         assert store.entries(IDENT)["1"].decision_value() is None
 
     def test_trust_ceiling_wins_over_non_failed_stale_plan(self, store, clock):
-        # A row past TRUST_MAX_AGE_S with no failure and no live plan reads as
-        # unknown -- the unknown-path machinery must take back over.
+        # A row past TRUST_MAX_AGE_S with no failure reads as unknown even
+        # with a LIVE plan (nextPollAt still ahead) -- the ceiling must win
+        # over the scheduler-cadence extension, not just over "no plan at
+        # all" (which trust_extended would already refuse for its own
+        # reason).
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan(
+            {"1": (clock.now + TRUST_MAX_AGE_S + 500.0, 500.0)}, IDENT
+        )
         clock.advance(TRUST_MAX_AGE_S + 1)
         entry = store.entries(IDENT)["1"]
         assert entry.consecutive_failures == 0
@@ -245,30 +250,58 @@ class TestMarkAtLimit:
         self, store, clock
     ):
         usage = self._usage_resetting_at(clock, 600.0)  # resets in 10 min
+        iso = usage["five_hour"]["resets_at"]
         store.record({"1": FetchRecord(usage=usage)}, IDENT)
         store.mark_at_limit("1", IDENT)
 
+        # five_hour forced full at the mark's own deadline; seven_day kept
+        # from the stored reading (I1: a reader like autoswitch's
+        # `_seven_day_reset_unmeasured` must see the real weekly reset, not
+        # "never reported").
         assert store.entries(IDENT)["1"].decision_value() == {
-            "five_hour": {"pct": 100.0}
+            "five_hour": {"pct": 100.0, "resets_at": iso},
+            "seven_day": {"pct": 10.0, "resets_at": iso},
         }
 
         clock.advance(300.0)  # a poll taken while still walled...
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         assert store.entries(IDENT)["1"].decision_value() == {
-            "five_hour": {"pct": 100.0}
-        }  # ...does not clear the mark early
+            "five_hour": {"pct": 100.0, "resets_at": iso},
+            "seven_day": {"pct": 10.0},
+        }  # ...does not clear the mark early, but the polled seven_day
+        # (no resets_at this time) still passes through unchanged.
 
         clock.advance(301.0)  # past the mark's own deadline
         fresh = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0}}
         store.record({"1": FetchRecord(usage=fresh)}, IDENT)
         assert store.entries(IDENT)["1"].decision_value() == fresh
 
+    def test_a_far_future_reset_is_capped_at_the_wall_fallback_span(
+        self, store, clock
+    ):
+        # I2: `walledUntil = min(earliest future stored reset, now +
+        # WALL_FALLBACK_S)` -- a stored reset further out than the fallback
+        # (a 7d window, or a malformed far-future one) must not park the
+        # mark past WALL_FALLBACK_S.
+        usage = self._usage_resetting_at(clock, WALL_FALLBACK_S + 1000.0)
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.mark_at_limit("1", IDENT)
+
+        clock.advance(WALL_FALLBACK_S - 1)
+        assert store.entries(IDENT)["1"].walled  # still inside the cap
+        clock.advance(2)
+        assert not store.entries(IDENT)["1"].walled  # capped, not the far reset
+
     def test_no_stored_reading_falls_back_to_the_wall_fallback_span(
         self, store, clock
     ):
         store.mark_at_limit("1", IDENT)  # nothing stored to key a reset on
+        resets_at = usage_store._reset_ts_to_resets_at(clock.now + WALL_FALLBACK_S)
+        # I1: with nothing stored to keep, seven_day is synthesized full at
+        # the same deadline instead of being silently dropped.
         assert store.entries(IDENT)["1"].decision_value() == {
-            "five_hour": {"pct": 100.0}
+            "five_hour": {"pct": 100.0, "resets_at": resets_at},
+            "seven_day": {"pct": 100.0, "resets_at": resets_at},
         }
         clock.advance(WALL_FALLBACK_S - 1)
         assert store.entries(IDENT)["1"].walled
@@ -483,71 +516,17 @@ class TestBackoff:
                 f"ask {ask} -> wait {wait}, expected {expected}"
             )
 
-    def test_the_cap_sits_inside_the_trust_it_relies_on(self):
-        """The cap has a floor test and no ceiling; the ceiling is the invariant.
-
-        `RETRY_AFTER_FLOOR_CAP_S`'s own comment justifies the 429-only margin
-        with "a 4500s wait sits comfortably inside its own trust"
-        (RATE_LIMIT_TRUST_MAX_AGE_S = 7200). Nothing asserted it. Measured on
-        this tree by mutating the constant and running the full suite, the
-        inequality below admits `[4500, 7200]` — 4499 fails 12, 7201 fails 5
-        (re-measured 2026-08-03: this PR added four more tests that also bind
-        the constant since the "1" was first measured).
-
-        The inequality is NOT what bounds blind time. It compares two
-        constants; raising the cap to 7200 satisfies it while, at an ask of
-        6300s or more (where the wait itself reaches the raised cap), more
-        than doubling the blind window over consecutive blocks (6300s ->
-        14400s, measured). The IDENTITY assertion below is what actually
-        stops that drift, and it is the reason this test still fails at
-        7200. See
-        `test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success`.
-
-        That leaves 2700s of slack in which the constant can drift silently, so
-        the arithmetic identity its comment states ("40 of 41 observed blocks
-        opened at exactly 3600, and 3600 + 900 = this" — re-measured
-        2026-08-03) is pinned outright below. The inequality stays as the
-        invariant that explains WHY the margin is 429-only.
-
-        The same bound neutralises `Retry-After: inf`, which reaches
-        `min(inf + 900, cap)` and is finite only because of it.
-        """
-        assert usage_store.RETRY_AFTER_FLOOR_CAP_S == (
-            3600.0 + usage_store.RETRY_AFTER_MARGIN_S
-        ), (
-            f"cap {usage_store.RETRY_AFTER_FLOOR_CAP_S} is no longer the "
-            "measured block (3600s) plus the margin — the inequality below "
-            "admits up to 7200, so nothing else would catch the drift"
-        )
-        assert (
-            usage_store.RETRY_AFTER_FLOOR_CAP_S
-            <= usage_store.RATE_LIMIT_TRUST_MAX_AGE_S
-        ), (
-            f"cap {usage_store.RETRY_AFTER_FLOOR_CAP_S} exceeds the 429 trust "
-            f"ceiling {usage_store.RATE_LIMIT_TRUST_MAX_AGE_S}, so a single "
-            "header can park a row past the moment its own data goes unknown"
-        )
-        # And the wait it produces stays inside that ceiling for any ask.
-        for ask in (3600.0, 4500.0, 50_000.0, 86_400.0, float("inf")):
-            wait = usage_store._failure_backoff_s(1, ask, rate_limited=True)
-            assert wait <= usage_store.RATE_LIMIT_TRUST_MAX_AGE_S, (
-                f"ask {ask} produced a {wait}s wait, past the trust ceiling"
-            )
-
     def test_each_arm_is_bounded_by_the_ceiling_its_own_trust_uses(self):
         """A non-429 park must never outlast TRUST_MAX_AGE_S, its own ceiling.
 
         Pins the PARK duration alone, against the constants `_failure_backoff_s`
         itself is built from — not `entries()`'s decision trust, which a failed
         row (T1102) now caps at `poll_policy.POST_429_MIN_INTERVAL_S` (360s)
-        regardless of arm, well inside either park cap below. Before this fix
-        (pre-T1102), the PARK BOUND capped every ask at `RETRY_AFTER_FLOOR_CAP_S`
-        (4500s) regardless of which arm produced it, so a non-429 ask above 3600
-        parked the row past its own park ceiling (`TRUST_MAX_AGE_S`, 3600s) — a
-        regression this PR introduced against upstream/main, where
-        `RETRY_AFTER_FLOOR_CAP_S` was 3600, identical to `TRUST_MAX_AGE_S`. The
-        429 arm keeps `RETRY_AFTER_FLOOR_CAP_S`, correctly inside
-        `RATE_LIMIT_TRUST_MAX_AGE_S` (7200s).
+        regardless of arm, well inside this park cap. The 429 arm's own park
+        cap (`RETRY_AFTER_FLOOR_CAP_S`, 4500s) is pinned separately by
+        `test_hour_scale_retry_after_honored` / `test_retry_after_floor_is_capped`
+        — there is no longer a wider 429-only trust ceiling to check it
+        against (the old `RATE_LIMIT_TRUST_MAX_AGE_S` this replaced is gone).
         """
         for ask in (3601.0, 4500.0, 7200.0, 86_400.0, float("inf")):
             wait = usage_store._failure_backoff_s(1, ask, rate_limited=False)
@@ -555,12 +534,6 @@ class TestBackoff:
                 f"non-429 ask {ask} produced a {wait}s park, past its own "
                 f"trust ceiling {usage_store.TRUST_MAX_AGE_S}s — blind for "
                 f"{wait - usage_store.TRUST_MAX_AGE_S:.0f}s"
-            )
-        for ask in (4500.0, 7200.0, 50_000.0, 86_400.0, float("inf")):
-            wait = usage_store._failure_backoff_s(1, ask, rate_limited=True)
-            assert wait <= usage_store.RATE_LIMIT_TRUST_MAX_AGE_S, (
-                f"429 ask {ask} produced a {wait}s park, past the 429 trust "
-                f"ceiling {usage_store.RATE_LIMIT_TRUST_MAX_AGE_S}s"
             )
 
     def test_the_margin_never_lifts_the_floor_cap(self):

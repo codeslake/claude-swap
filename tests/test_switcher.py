@@ -19969,6 +19969,13 @@ class TestFailedReadingLosesToAFresherWorseReading:
             {"3": FetchRecord(usage=self._usage(70.0))}, self._IDENT
         )
 
+        # The setup actually produced what the test claims: one failure atop
+        # a stored 58% reading, not e.g. an empty row (which would also read
+        # None, for the wrong reason).
+        entries = s._usage_store.entries(self._IDENT)
+        assert entries["2"].last_good == self._usage(58.0)
+        assert entries["2"].consecutive_failures == 1
+
         usage = self._decision_usage(s)
         assert usage["2"] is None  # too stale to trust
 
@@ -19993,13 +20000,17 @@ class TestFailedReadingLosesToAFresherWorseReading:
 
 
 class TestSwitchPersistsTheAtLimitMark:
-    """Rule 2 (T1102) wiring: `switch(current_at_limit=True)` must itself call
-    `UsageStore.mark_at_limit` on the CURRENT slot through the real store --
+    """Rule 2 (T1102) wiring, interface updated for I3 (pass 2): `switch(
+    current_at_limit=True, exclude={...})` calls `UsageStore.mark_at_limit`
+    on every slot the CALLER named in `exclude` through the real store --
     not just zero this one selection (`_select_best_switchable`'s existing
     `current_at_limit` arm) -- so a later reader (autoswitch's tick, the TUI,
-    the next switch) sees the same slot at-limit too."""
+    the next switch) sees the same slot at-limit too, even though its own
+    fresh poll reads healthy. `switch_off_at_limit_account` (today's pin's
+    entry point) passes no `exclude`, so it now persists nothing -- see
+    `TestSwitchOffAtLimitAccount` and the no-exclude case below."""
 
-    def test_switch_marks_the_current_slot_at_limit(self, temp_home):
+    def _seed_two(self, temp_home):
         s = TestCurrentAtLimitOverridesTheFrozenPct()._setup(temp_home)
         seed = TestCurrentAtLimitOverridesTheFrozenPct()._seed
         seed(s, 1, "a@example.com")
@@ -20011,17 +20022,113 @@ class TestSwitchPersistsTheAtLimitMark:
             "oauthAccount": {"emailAddress": "a@example.com",
                              "accountUuid": "uuid-1"}
         }))
+        return s
+
+    def test_switch_marks_the_excluded_current_slot_despite_a_fresh_poll(
+        self, temp_home
+    ):
+        s = self._seed_two(temp_home)
         ident = {"1": ("a@example.com", "")}
         usage = {"1": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
                  "2": {"five_hour": {"pct": 56.0}, "seven_day": {"pct": 0.0}}}
 
         with patch.object(s, "_usage_by_account", return_value=usage):
-            result = switch_off_at_limit_account(s)
+            result = s.switch(
+                strategy="best", json_output=True,
+                current_at_limit=True, exclude={"1"},
+            )
 
         assert result["switched"] is True
         entry = s._usage_store.entries(ident)["1"]
         assert entry.walled
-        assert entry.decision_value() == {"five_hour": {"pct": 100.0}}
+        assert entry.decision_value()["five_hour"]["pct"] == 100.0
+
+        # A fresh poll reading a healthy 58% afterwards does not clear the
+        # mark early -- decision_value() still reports the slot full.
+        s._usage_store.record(
+            {"1": FetchRecord(
+                usage={"five_hour": {"pct": 58.0}, "seven_day": {"pct": 0.0}}
+            )},
+            ident,
+        )
+        entry = s._usage_store.entries(ident)["1"]
+        assert entry.walled
+        assert entry.decision_value()["five_hour"]["pct"] == 100.0
+
+    def test_switch_with_no_exclude_persists_nothing(self, temp_home):
+        # Today's pin: `current_at_limit=True` with no `exclude` keyword.
+        # Control for the case above -- `switch_off_at_limit_account` (its
+        # actual entry point) exercises this same path in
+        # `TestSwitchOffAtLimitAccount`.
+        s = self._seed_two(temp_home)
+        ident = {"1": ("a@example.com", "")}
+        usage = {"1": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
+                 "2": {"five_hour": {"pct": 56.0}, "seven_day": {"pct": 0.0}}}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            result = s.switch(
+                strategy="best", json_output=True, current_at_limit=True,
+            )
+
+        assert result["switched"] is True
+        assert not s._usage_store.entries(ident)["1"].walled
+
+
+class TestSwitchExcludeNeverLandsOnAnObservedWall:
+    """I3: every slot in `exclude` is excluded from the candidate search
+    itself (unioned into `struck`), independent of whether it also gets
+    marked -- so the fleet never re-lands on an account it just walled."""
+
+    def _setup_four(self, temp_home):
+        s = TestCurrentAtLimitOverridesTheFrozenPct()._setup(temp_home)
+        seed = TestCurrentAtLimitOverridesTheFrozenPct()._seed
+        for num, email in (
+            (1, "a@x.com"), (2, "b@x.com"), (3, "c@x.com"), (4, "d@x.com"),
+        ):
+            seed(s, num, email)
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-live"}})
+        )
+        # "2" is the live account.
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@x.com", "accountUuid": "uuid-2"}
+        }))
+        return s
+
+    @pytest.mark.parametrize("exclude,expect_marked", [
+        (set(), set()),
+        ({"4"}, {"4"}),
+    ])
+    def test_exclude_marks_only_the_named_slots_and_switch_never_lands_on_them(
+        self, temp_home, exclude, expect_marked
+    ):
+        s = self._setup_four(temp_home)
+        ident = {
+            "1": ("a@x.com", ""), "2": ("b@x.com", ""),
+            "3": ("c@x.com", ""), "4": ("d@x.com", ""),
+        }
+        # "4" has by far the most headroom -- the natural target when it is
+        # not excluded.
+        usage = {
+            "1": {"five_hour": {"pct": 90.0}, "seven_day": {"pct": 0.0}},
+            "2": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
+            "3": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 0.0}},
+            "4": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0}},
+        }
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            result = s.switch(
+                strategy="best", json_output=True,
+                current_at_limit=True, exclude=exclude,
+            )
+
+        marked = {
+            num for num in ("1", "2", "3", "4")
+            if s._usage_store.entries(ident)[num].walled
+        }
+        assert marked == expect_marked
+        if "4" in exclude:
+            assert result["to"]["email"] != "d@x.com"
 
 
 class TestAnEmptySlotLandingKeepsTheWarningsAlreadyEarned:
