@@ -2689,13 +2689,18 @@ class TestUnswitchableRowsAreListed:
         )
         return a
 
-    def _render(self, snap, active, *, settings=None):
+    def _render(self, snap, active, *, settings=None, backup_dir=None):
         from unittest.mock import MagicMock, patch
         from claude_swap.tui.autoview import AutoScreen
         from claude_swap.settings import AutoSwitchSettings
 
         v = AutoScreen.__new__(AutoScreen)
         v._settings = settings or AutoSwitchSettings()
+        # Real read off `backup_dir`'s state file when a test supplies one
+        # (`data.read_last_active_at`'s own safety contract otherwise applies
+        # to `getattr`'s `{}` default -- no `backup_dir` here is not the
+        # panel's "no access", just this call not exercising it).
+        v._last_active_at = tui_data.read_last_active_at(backup_dir) if backup_dir else {}
         from claude_swap.tui.theme import CSWAP_DARK
         app = MagicMock()
         app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
@@ -2993,6 +2998,47 @@ class TestUnswitchableRowsAreListed:
             snap, settings, time.time(), "1"
         )
         assert ordered == ["3", "2"], ordered
+
+    def test_a_warm_partner_outranks_a_sooner_cold_reset(self, tmp_path):
+        """`_rank_dynamic_on` used to pass a hardcoded `{}` for
+        `last_active_at`, so `_is_warm` was False for every candidate and
+        the warm tier was always empty (#375's own warm/cold pass never ran
+        here). The engine writes `lastActiveAt` to `<backup_dir>/
+        autoswitch_state.json` on every switch (autoswitch.py's
+        `_mutate_state` call in the switch path) -- this panel must read
+        THAT file, read-only, and rank through it: "2" was active 20m ago
+        (warm, inside the default 1h `cache_ttl_seconds`) with a 5-day
+        weekly reset; "3" has never been active (cold) with the SOONER
+        1-day reset. On reset alone "3" would rank first, but a warm
+        candidate ranks ahead of every cold one regardless of reset time
+        (`_rank_dynamic_candidates`) -- "2" must be first. Also covers the
+        axis legend: the engine's own name for this ranking is "soonest
+        reset", never the recovery axis' "soonest to recover" (that name
+        belongs to the at-limit escape order alone).
+        """
+        active = {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 50.0}}
+        warm_partner = {
+            "five_hour": {"pct": 40.0},
+            "seven_day": {"pct": 40.0, "resets_at": _iso_in(5 * 86400)},
+        }
+        cold_sooner = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(1 * 86400)},
+        }
+        (tmp_path / "autoswitch_state.json").write_text(json.dumps({
+            "lastActiveAt": {"2": time.time() - 20 * 60},
+        }))
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "warm@x.com", switchable=True, last_good=warm_partner),
+            self._acct("3", "cold@x.com", switchable=True, last_good=cold_sooner),
+        ), active="1", settings=settings, backup_dir=tmp_path)
+        assert out.index("warm@x.com") < out.index("cold@x.com"), (
+            f"the sooner-reset cold candidate outranked the warm one -- "
+            f"lastActiveAt never reached this panel: {out!r}"
+        )
+        assert "Next best (soonest reset)" in out, out
 
     def test_a_disabled_account_with_the_most_headroom_is_not_offered(self):
         """Every OTHER unswitchable/blocked row already says why; `disabled`

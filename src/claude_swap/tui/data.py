@@ -14,15 +14,18 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from claude_swap import oauth, printer, usage_store
 from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
+    STATE_FILENAME,
     _binding_recovery_ts,
     _classify_dynamic_trigger,
     _dynamic_active_headroom,
@@ -217,11 +220,31 @@ def clock_stamp() -> str:
     return time.strftime("%H:%M:%S")
 
 
+def read_last_active_at(backup_dir: Path) -> dict:
+    """Read-only ``lastActiveAt`` off the engine's own state file
+    (``<backup_dir>/autoswitch_state.json``).
+
+    ``AutoSwitchEngine._read_state`` is a bound method needing a live
+    engine (state_path, a lock file), so it is not importable as a pure
+    function here -- this mirrors its exact safety contract instead: a
+    missing or garbled file reads as no cached warm context, never raises.
+    """
+    try:
+        raw = json.loads((backup_dir / STATE_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    last_active_at = raw.get("lastActiveAt")
+    return last_active_at if isinstance(last_active_at, dict) else {}
+
+
 def rank_switch_candidates(
     snap: AccountsSnapshot,
     settings: "AutoSwitchSettings",
     now: float,
     active_number: str | None,
+    last_active_at: dict | None = None,
 ) -> tuple[list[str], str | None, str, bool]:
     """(ordered, rank_axis, trigger, unmodeled): mirrors the engine's own
     admission and order. THE shared computation -- ``ordered_accounts`` and
@@ -274,23 +297,35 @@ def rank_switch_candidates(
         MARGIN over the active, which a warm candidate with less headroom
         than a cold one can never clear against an about-to-wall active
         (autoswitch.py's own comment at the `_dynamic_rank` call site).
-        `last_active_at` is always `{}` here -- this panel has no access to
-        the live engine's warm-context cache, and an unmeasured candidate
-        reads cold, never warm (`_is_warm`'s own contract). Display-only,
-        unlike the tick's `dynamic_ordered`: a cold candidate under
-        `settings.cold_switch_cost_pct` is ranked LAST here, never dropped
-        -- this panel shows who is next, not whether a tick would act on it
-        this instant.
+        `last_active_at` comes from the caller (`read_last_active_at`, the
+        SAME state file the engine itself writes `lastActiveAt` to on every
+        switch, read-only, never `{}` by construction) -- an unmeasured
+        candidate still reads cold, never warm (`_is_warm`'s own contract),
+        the file just being unreadable or stale here is no different from
+        the engine's own read. Display-only, unlike the tick's
+        `dynamic_ordered`: a cold candidate under `settings.
+        cold_switch_cost_pct` is ranked LAST here, never dropped -- this
+        panel shows who is next, not whether a tick would act on it this
+        instant. Only this ranking and the at-limit recovery order below
+        (`rank_candidates_pass`) are emulated here -- the healthy arm's own
+        alternation dwell/giveback rules (`alternation_chunk_seconds`,
+        `ALTERNATION_MAX_GIVEBACK_PCT`) are a tick-only decision, not a
+        display one, and are deliberately not built here.
         """
         headroom = _headroom_by_account(usage, axis)
         warm, cold = _rank_dynamic_candidates(
-            oauth_candidates, headroom, usage, now, {}, settings.cache_ttl_seconds,
+            oauth_candidates, headroom, usage, now, last_active_at or {},
+            settings.cache_ttl_seconds,
         )
         cold_floor = settings.cold_switch_cost_pct
         cold_clears = [n for n in cold if headroom[n] >= cold_floor]
         cold_rest = [n for n in cold if n not in cold_clears]
         ordered = warm + cold_clears + cold_rest
-        return ordered, ("soonest to recover" if ordered else None)
+        # "soonest reset" -- the axis `_rank_dynamic_candidates` actually
+        # sorts by (autoswitch.py's own name for it, ~3775); "soonest to
+        # recover" is the DIFFERENT binding-recovery axis `rank_candidates_
+        # pass` uses for the at-limit escape order, below.
+        return ordered, ("soonest reset" if ordered else None)
 
     def _rank_on(axis: tuple[str, ...], trigger: str) -> tuple[list[str], str | None]:
         if trigger in _UNMODELED_TRIGGERS:
@@ -404,6 +439,7 @@ __all__ = [
     "last_seen_note",
     "ordered_accounts",
     "rank_switch_candidates",
+    "read_last_active_at",
     "reset_clock",
     "reset_text",
     "run_action",

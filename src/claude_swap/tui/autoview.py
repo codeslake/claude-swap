@@ -375,6 +375,7 @@ class AutoScreen(Screen):
     def _on_snapshot(self, snap: AccountsSnapshot | None) -> None:
         if snap is None:
             return
+        self._last_active_at = data.read_last_active_at(self.app.switcher.backup_dir)
         self.query_one("#candidates", Static).update(
             self._candidates_text(snap, active_number=snap.active_number)
         )
@@ -398,8 +399,11 @@ class AutoScreen(Screen):
         now = time.time()
         # THE engine's own admission and order -- `ordered_accounts` (data.py)
         # reads off this exact same call for every other listing screen.
+        # `getattr` (never plain `self._last_active_at`): a test instance
+        # built via `AutoScreen.__new__` skips `__init__`/`_on_snapshot`.
+        last_active_at = getattr(self, "_last_active_at", None) or {}
         ordered, rank_axis, trigger, unmodeled = data.rank_switch_candidates(
-            snap, settings, now, active_number
+            snap, settings, now, active_number, last_active_at
         )
         ordered_rank = {num: i for i, num in enumerate(ordered)}
         # Captured before the loop rebinds `now` below (per-row, for the
