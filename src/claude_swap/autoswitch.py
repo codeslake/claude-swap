@@ -2161,25 +2161,24 @@ class AutoSwitchEngine:
                 )
                 floor_headroom = unmodeled
                 model_window_dropped = True
-            # Item 3b/3c: cold admissible only past the floor, and never
-            # below it here — item 3c reserves a below-floor cold candidate
-            # for the at-limit/failover escape, which never sets this
-            # trigger. ONLY on the unmodeled-retry path above
-            # (`model_window_dropped`) does the floor change at all:
-            # `cold_switch_cost_pct` is priced for an ordinary cold switch
-            # away from a healthy active, but here the active is genuinely
-            # fleet-wide model-walled with nothing better to hold out for.
-            # A flat `SPENT_HEADROOM_PCT` floor there is not lower, it is NO
-            # floor: `_rank_dynamic_candidates` already drops every entry at
-            # or under that value before `cold_ordered` exists, so every
-            # survivor already clears it and the comparison never refuses
-            # anything (measured: this round's own gate). The floor that
-            # question actually needs is relative to what the active itself
-            # already reads on this axis — a real but modest unmodeled
-            # candidate (owner specimen: #3 at 12%, active at 5%) is a
-            # genuine rescue and must clear it; a peer merely level with, or
-            # barely above, the active's own reading is not (measured
-            # 2026-09-08).
+            # Item 3c, corrected (2026-09-23 P0, #321 follow-up): the
+            # `cold_switch_cost_pct` floor never vetoes a cold candidate on
+            # THIS arm. The active is already walled (headroom in
+            # `(0, SPENT_HEADROOM_PCT]`) -- staying put is not an
+            # alternative here (see the comment above `_dynamic_rank`), and
+            # ADR 0010 R1 says the cold floor is a preference, never a
+            # wall. Pre-fix, a genuinely spent active sat refused
+            # (`below-floor`) against every cold candidate under the floor
+            # for as long as none of them cleared it, and only moved once
+            # it hit 100% (`at-limit`) -- onto the very candidate the floor
+            # had just refused. ONLY on the unmodeled-retry path
+            # (`model_window_dropped`) does a floor still bind: there the
+            # active is genuinely fleet-wide model-walled with a real
+            # unmodeled reading of its own to weigh a rescue against, and
+            # the bar is `_blackout_retry_admission_bar`'s margin relative
+            # to that reading (owner specimen: #3 at unmodeled 12 against
+            # an active at 5, measured 2026-09-08) -- not the flat,
+            # absolute `cold_switch_cost_pct` this arm no longer applies.
             if model_window_dropped:
                 cold_floor = _blackout_retry_admission_bar(floor_headroom, current)
                 cold_clears_floor = [
@@ -2187,16 +2186,13 @@ class AutoSwitchEngine:
                     if floor_headroom.get(n, 0.0) > cold_floor
                 ]
             else:
-                cold_floor = settings.cold_switch_cost_pct
-                cold_clears_floor = [
-                    n for n in cold_ordered
-                    if floor_headroom.get(n, 0.0) >= cold_floor
-                ]
+                cold_clears_floor = list(cold_ordered)
             dynamic_ordered = warm_ordered + cold_clears_floor
             if not dynamic_ordered and cold_ordered:
-                # Real headroom exists but none of it clears the floor
-                # (item 3c: below-floor cold is for at-limit/failover only)
-                # -- a deliberate refusal, stay on the normal poll cadence.
+                # Reachable only via the model-window-dropped path above:
+                # off that path `cold_clears_floor` already equals
+                # `cold_ordered`, so a non-empty `cold_ordered` always
+                # keeps `dynamic_ordered` non-empty too.
                 self._emit(
                     NoSwitchEvent(
                         reason="below-floor",
