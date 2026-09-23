@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import urllib.request
+from importlib.metadata import distribution
 from pathlib import Path
 
 from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
@@ -18,6 +19,15 @@ PYPI_URL = "https://pypi.org/pypi/claude-swap/json"
 
 def _parse_version(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in v.split("."))
+
+
+def _is_editable_install() -> bool:
+    """Return True if claude-swap runs from an editable install (PEP 610)."""
+    try:
+        text = distribution("claude-swap").read_text("direct_url.json")
+        return bool(text and json.loads(text).get("dir_info", {}).get("editable"))
+    except Exception:
+        return False
 
 
 def _detect_install_method() -> str | None:
@@ -46,6 +56,9 @@ def _detect_install_method() -> str | None:
 def check_for_update(current_version: str) -> str | None:
     """Return a notification string if a newer version exists, else None."""
     try:
+        if _is_editable_install():
+            return None
+
         latest_version = None
 
         # Try reading cache
