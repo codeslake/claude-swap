@@ -485,7 +485,10 @@ class AccountsPanel(Static):
         blocks: list[Text] = []
         pinned_identity = self._pinned_identity
         by_number = {acc.number: acc for acc in snap.accounts}
-        order = data.ordered_accounts(snap, app.auto_settings, now)
+        order = data.ordered_accounts(
+            snap, app.auto_settings, now,
+            data.read_last_active_at(app.switcher.backup_dir),
+        )
         for number in order:
             acc = by_number[number]
             pinned = pin.account_is_pinned(pinned_identity, acc.email, acc.org_uuid)

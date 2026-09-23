@@ -29,7 +29,7 @@ from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
-    _seven_day_reset_ts,
+    _binding_recovery_ts,
     binding_pct,
     classify_candidate_block,
     model_block_label,
@@ -86,7 +86,6 @@ _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 # Trigger names keyed to WHY the ranking pass never ran -- never "no
 # candidate qualifies", the claim only a real, empty pass earns.
 _UNMODELED_TEXT = {
-    "dynamic-unmodeled": "not previewed (dynamic warm/cold state)",
     "below-threshold": "not previewed (active below threshold)",
     "unreadable-active": "not previewed (active status unknown)",
 }
@@ -383,6 +382,7 @@ class AutoScreen(Screen):
     def _on_snapshot(self, snap: AccountsSnapshot | None) -> None:
         if snap is None:
             return
+        self._last_active_at = data.read_last_active_at(self.app.switcher.backup_dir)
         self.query_one("#candidates", Static).update(
             self._candidates_text(snap, active_number=snap.active_number)
         )
@@ -435,11 +435,15 @@ class AutoScreen(Screen):
         now = time.time()
         # THE engine's own admission and order -- `ordered_accounts` (data.py)
         # reads off this exact same call for every other listing screen.
+        # `getattr` (never plain `self._last_active_at`): a test instance
+        # built via `AutoScreen.__new__` skips `__init__`/`_on_snapshot`.
+        last_active_at = getattr(self, "_last_active_at", None) or {}
         ordered, rank_axis, trigger, unmodeled = data.rank_switch_candidates(
             snap, settings, now, active_number,
             probe_cooldown=(_eng._last_probe_cooldown
                             if (_eng := getattr(self, "_engine", None)) is not None
                             else None),
+            last_active_at=last_active_at,
         )
         ordered_rank = {num: i for i, num in enumerate(ordered)}
         # Captured before the loop rebinds `now` below (per-row, for the
@@ -604,11 +608,15 @@ class AutoScreen(Screen):
                     entry.append("  stale", style=palette.sev_warn)
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
-                # a model-only block (the engine's fallback ranks around it),
-                # and the two must read the same way here as in the decision
-                # log — same helper, `classify_candidate_block`. Always on
-                # `models`, the full pinned set: this label explains why the
-                # row is not simply "open" on the criteria the user actually
+                # a model-only block (the engine's fallback ranks around it)
+                # — classified here and in the decision log through the SAME
+                # helper, `classify_candidate_block`, though the two print
+                # `kind == "full"` in different words on purpose (the elif
+                # below): the log always says "full", this panel reserves
+                # "full" for a window actually at or over 100 and names the
+                # bar it was judged against otherwise. Always on `models`,
+                # the full pinned set: this label explains why the row is
+                # not simply "open" on the criteria the user actually
                 # configured, independent of whether the pass above retried
                 # on the 5h/7d-only axis for ORDERING purposes.
                 kind = "open"
@@ -678,17 +686,20 @@ class AutoScreen(Screen):
                 # Position from `ordered_rank` (the engine's own pass, called
                 # once above), never a locally re-derived key -- but a row
                 # the pass never ranked at all still needs a DETERMINISTIC
-                # order among its peers: soonest 7-day reset first, unknown
-                # last (`+inf`, `consume_first_rank_key`'s reading). Only
-                # two unranked rows sharing that same reset still fall to
-                # `sorted(ranked)`'s own residual tie-break, the account
-                # number as a string -- never touching a row the pass DID
-                # admit.
-                reset_ts = _seven_day_reset_ts(acc.usage.last_good, admission_now)
+                # order among its peers: soonest BINDING-window recovery
+                # first, unknown last (`+inf`, `_binding_recovery_ts`'s
+                # reading -- the window that actually blocks the account,
+                # not always the 7-day one). Only two unranked rows sharing
+                # that same recovery still fall to `sorted(ranked)`'s own
+                # residual tie-break, the account number as a string --
+                # never touching a row the pass DID admit. A disabled row
+                # shares the sentinel branch's fixed tier (998.0) above,
+                # never this reset-ordered one: the engine will not land
+                # here automatically however soon it recovers.
                 key = (
-                    (0, ordered_rank[acc.number])
-                    if acc.number in ordered_rank
-                    else (1, reset_ts if reset_ts is not None else float("inf"))
+                    (0, ordered_rank[acc.number]) if acc.number in ordered_rank
+                    else (998.0,) if acc.disabled
+                    else (1, _binding_recovery_ts(acc.usage.last_good, models, admission_now))
                 )
                 ranked.append((key, acc.number))
             # Outside the usage branches on purpose: an account whose usage is

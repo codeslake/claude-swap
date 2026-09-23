@@ -14,21 +14,25 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from claude_swap import oauth, printer, usage_store
 from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
+    STATE_FILENAME,
+    _binding_recovery_ts,
     _classify_dynamic_trigger,
     _dynamic_active_headroom,
     _headroom_by_account,
     _model_window_binds_everywhere,
-    _seven_day_reset_ts,
+    _rank_dynamic_candidates,
     rank_candidates_pass,
 )
 from claude_swap.exceptions import ClaudeSwitchError
@@ -43,9 +47,7 @@ if TYPE_CHECKING:
 
 # Triggers where the ranking pass never runs -- keys the auto view's own
 # `_UNMODELED_TEXT` shares (kept in sync by a test, not by import).
-_UNMODELED_TRIGGERS = frozenset(
-    {"dynamic-unmodeled", "below-threshold", "unreadable-active"}
-)
+_UNMODELED_TRIGGERS = frozenset({"below-threshold", "unreadable-active"})
 
 
 # ---------------------------------------------------------------------------
@@ -337,11 +339,31 @@ def clock_stamp() -> str:
     return time.strftime("%H:%M:%S")
 
 
+def read_last_active_at(backup_dir: Path) -> dict:
+    """Read-only ``lastActiveAt`` off the engine's own state file
+    (``<backup_dir>/autoswitch_state.json``).
+
+    ``AutoSwitchEngine._read_state`` is a bound method needing a live
+    engine (state_path, a lock file), so it is not importable as a pure
+    function here -- this mirrors its exact safety contract instead: a
+    missing or garbled file reads as no cached warm context, never raises.
+    """
+    try:
+        raw = json.loads((backup_dir / STATE_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    last_active_at = raw.get("lastActiveAt")
+    return last_active_at if isinstance(last_active_at, dict) else {}
+
+
 def rank_switch_candidates(
     snap: AccountsSnapshot,
     settings: "AutoSwitchSettings",
     now: float,
     active_number: str | None,
+    last_active_at: dict | None = None,
     probe_cooldown: dict[str, float] | None = None,
 ) -> tuple[list[str], str | None, str, bool]:
     """(ordered, rank_axis, trigger, unmodeled): mirrors the engine's own
@@ -379,8 +401,7 @@ def rank_switch_candidates(
         if active_headroom is None:
             return "unreadable-active"
         if settings.strategy == "dynamic":
-            kind = _classify_dynamic_trigger(active_headroom)
-            return "at-limit" if kind == "at-limit" else "dynamic-unmodeled"
+            return _classify_dynamic_trigger(active_headroom)
         if (100.0 - active_headroom) < settings.threshold:
             return (
                 settings.strategy
@@ -389,9 +410,60 @@ def rank_switch_candidates(
             )
         return "at-limit" if active_headroom <= 0 else "proactive"
 
+    def _rank_dynamic_on(
+        axis: tuple[str, ...], trigger: str
+    ) -> tuple[list[str], str | None]:
+        """`dynamic`'s own healthy/proactive ranking -- `_rank_dynamic_
+        candidates` (warm/cold tiered, soonest weekly reset), never
+        `rank_candidates_pass`: that pass's landing gate is a hysteresis
+        MARGIN over the active, which a warm candidate with less headroom
+        than a cold one can never clear against an about-to-wall active
+        (autoswitch.py's own comment at the `_dynamic_rank` call site).
+        `last_active_at` comes from the caller (`read_last_active_at`, the
+        SAME state file the engine itself writes `lastActiveAt` to on every
+        switch, read-only, never `{}` by construction) -- an unmeasured
+        candidate still reads cold, never warm (`_is_warm`'s own contract),
+        the file just being unreadable or stale here is no different from
+        the engine's own read. `settings.cold_switch_cost_pct` only
+        reorders cold candidates (floor-clearing first, never dropped) on
+        the `proactive` trigger -- the tick's own `_tick_inner` applies
+        that same partition ONLY there (`dynamic_ordered = warm_ordered +
+        cold_clears_floor`, reached only when `trigger == "proactive"`);
+        on `dynamic-healthy` the tick never applies it (the alternation
+        arm's own admissible-partner filter is a SEPARATE, tick-only
+        question), so this display stays on `_rank_dynamic_candidates`'
+        own order there -- soonest weekly reset, warm before cold, a
+        headroom candidate with hours to reset ranked ahead of one with
+        more headroom but a reset days out (the owner's 2026-09-19 case).
+        Only this ranking and the at-limit recovery order below
+        (`rank_candidates_pass`) are emulated here -- the healthy arm's own
+        alternation dwell/giveback rules (`alternation_chunk_seconds`,
+        `ALTERNATION_MAX_GIVEBACK_PCT`) are a tick-only decision, not a
+        display one, and are deliberately not built here.
+        """
+        headroom = _headroom_by_account(usage, axis)
+        warm, cold = _rank_dynamic_candidates(
+            oauth_candidates, headroom, usage, now, last_active_at or {},
+            settings.cache_ttl_seconds,
+        )
+        if trigger == "proactive":
+            cold_floor = settings.cold_switch_cost_pct
+            cold_clears = [n for n in cold if headroom[n] >= cold_floor]
+            cold_rest = [n for n in cold if n not in cold_clears]
+            ordered = warm + cold_clears + cold_rest
+        else:
+            ordered = warm + cold
+        # "soonest reset" -- the axis `_rank_dynamic_candidates` actually
+        # sorts by (autoswitch.py's own name for it, ~3775); "soonest to
+        # recover" is the DIFFERENT binding-recovery axis `rank_candidates_
+        # pass` uses for the at-limit escape order, below.
+        return ordered, ("soonest reset" if ordered else None)
+
     def _rank_on(axis: tuple[str, ...], trigger: str) -> tuple[list[str], str | None]:
         if trigger in _UNMODELED_TRIGGERS:
             return [], None
+        if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
+            return _rank_dynamic_on(axis, trigger)
         headroom = _headroom_by_account(usage, axis)
         ordered, _any_known, _reset_ts, _waiting, rank_axis = rank_candidates_pass(
             models=axis,
@@ -439,16 +511,25 @@ def rank_switch_candidates(
 
 
 def ordered_accounts(
-    snap: AccountsSnapshot, settings: "AutoSwitchSettings", now: float
+    snap: AccountsSnapshot,
+    settings: "AutoSwitchSettings",
+    now: float,
+    last_active_at: dict | None = None,
 ) -> list[str]:
     """Every account number, active first, then the rest as the engine's own
-    pass would rank them: ranked-and-open, usable-but-refused, sentinel-
-    blocked, spend-only, unswitchable last. THE one order every screen
+    pass would rank them: ranked-and-open, usable-but-refused (waiting,
+    soonest binding recovery first), non-target (disabled, sentinel-
+    blocked, spend-only), unswitchable last. THE one order every screen
     renders in -- a screen keeping slot order says so at its own call site.
+    ``last_active_at`` is the caller's own ``read_last_active_at`` read (one
+    file read feeds every screen), so ``dynamic``'s warm/cold pass ranks
+    the same way here as it does in the "Next best" panel.
     """
     active_number = snap.active_number
     others = [acc for acc in snap.accounts if acc.number != active_number]
-    ordered, *_ = rank_switch_candidates(snap, settings, now, active_number)
+    ordered, *_ = rank_switch_candidates(
+        snap, settings, now, active_number, last_active_at
+    )
     ordered_rank = {num: i for i, num in enumerate(ordered)}
     models = parse_model_names(settings.model)
 
@@ -457,19 +538,37 @@ def ordered_accounts(
             return (4,)
         if acc.number in ordered_rank:
             return (0, ordered_rank[acc.number])
+        # A disabled slot is a non-target -- the engine never lands on one
+        # automatically, however soon its own window recovers -- so it
+        # sorts with the other non-targets, never inside the waiting tier
+        # below by reset-time coincidence.
         if acc.usage.sentinel is not None:
             return (2,)
         if binding_pct(acc.usage.last_good, models) is None:
+            # Spend-only: the same bucket whether disabled or not -- a
+            # spend axis carries no window pct to gate `disabled` against,
+            # and the auto view's own key (autoview.py:485-488) reads it
+            # this way too. `disabled` must not pull this row into the
+            # sentinel-like tier above, or the two screens disagree on the
+            # same snapshot.
             return (3,)
-        # Soonest 7-day reset first, unknown last -- matches the auto
-        # view's own fallback key for a row its admission pass refused
-        # (autoview.py's `_candidates_text`), or the two screens can list
-        # this same unranked row in two different orders.
-        reset_ts = _seven_day_reset_ts(acc.usage.last_good, now)
-        return (1, reset_ts if reset_ts is not None else float("inf"))
+        if acc.disabled:
+            return (2,)
+        # Soonest BINDING-window recovery first, unknown last -- matches
+        # the auto view's own fallback key for a row its admission pass
+        # refused (autoview.py's `_candidates_text`), or the two screens
+        # can list this same unranked row in two different orders. Not the
+        # 7-day reset alone: the window that actually blocks an account is
+        # whichever is highest, and that is routinely the 5-hour one.
+        return (1, _binding_recovery_ts(acc.usage.last_good, models, now))
 
     others.sort(key=lambda a: (bucket(a), a.number))  # matches the auto view's tie-break
     numbers = [acc.number for acc in others]
+    # Active pinned first, not ranked among `others`: the engine's own pass
+    # (`rank_switch_candidates`) never names the active account a candidate
+    # to switch TO, so it has no rank of its own to sort by -- its place
+    # here is fixed, with its own "active" label, not a position the
+    # ranking axis assigns.
     return ([active_number] if active_number is not None else []) + numbers
 
 
@@ -482,6 +581,7 @@ __all__ = [
     "last_seen_note",
     "ordered_accounts",
     "rank_switch_candidates",
+    "read_last_active_at",
     "reset_clock",
     "reset_text",
     "run_action",
