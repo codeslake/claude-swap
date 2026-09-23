@@ -14,8 +14,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from claude_swap import oauth
+from claude_swap.json_output import USAGE_NO_CREDENTIALS
 from claude_swap.models import AccountSnapshot
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import ClaudeAccountSwitcher, _usage_entry_lines
 from claude_swap.tui import widgets
 from claude_swap.tui.theme import Palette
 from claude_swap.usage_store import UsageEntry
@@ -55,6 +56,14 @@ class TestFormatLoginExpiry:
 
     def test_unknown(self):
         assert oauth.format_login_expiry(None, False) == "?     "
+
+    @pytest.mark.parametrize("stamp", [float("nan"), float("inf"), float("-inf")])
+    def test_a_non_finite_stamp_reads_as_unknown(self, stamp):
+        """A NaN/Infinity ``refreshTokenExpiresAt`` reads "?", not a crash at
+        ``int(remaining)`` inside the formatter."""
+        creds = json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": stamp}})
+        expires_at = oauth.login_expires_at_epoch(creds)
+        assert oauth.format_login_expiry(expires_at, False) == "?     "
 
     def test_every_shape_is_the_same_width(self):
         now = 1_000_000.0
@@ -139,42 +148,65 @@ class TestCliListAlignment:
         assert value_at == in_at
         assert line_login[value_at:].strip().endswith("h")  # "23d0Nh" shape
 
+    def test_login_column_aligns_for_a_no_credentials_slot(self):
+        """A sentinel row (no stored credentials) must get the same `└ `
+        glyph a measured row's login line gets, or its value starts two
+        columns earlier than the column every other row's countdown lines
+        up on."""
+        now = time.time()
+        login_expires_at = now + 23 * 86400 + 4 * 3600
+        measured = _usage_entry_lines(
+            UsageEntry(
+                last_good={"five_hour": {"pct": 10.0}, "seven_day": {"pct": 50.0}},
+                fetched_at=now,
+            ),
+            login_expires_at,
+        )
+        no_creds = _usage_entry_lines(
+            UsageEntry(sentinel=USAGE_NO_CREDENTIALS), login_expires_at
+        )
+
+        measured_login = next(line for line in measured if "login:" in line)
+        no_creds_login = next(line for line in no_creds if "login:" in line)
+        assert measured_login.index("login:") == no_creds_login.index("login:")
+        assert measured_login.startswith("└ ") and no_creds_login.startswith("└ ")
+
 
 # ---------------------------------------------------------------------------
 # TUI dashboard inactive rows: `tui.widgets.mini_account_text`
 # ---------------------------------------------------------------------------
 
 
-def _snapshot(number: int, email: str, login_expires_at: float | None) -> AccountSnapshot:
-    return AccountSnapshot(
-        number=str(number),
-        email=email,
-        org_name="",
-        org_uuid="",
-        is_active=False,
-        kind="oauth",
-        switchable=True,
-        usage=UsageEntry(),
-        login_expires_at=login_expires_at,
-    )
-
-
 class TestDashboardMiniRowAlignment:
-    def test_login_column_starts_at_the_same_offset(self):
+    @pytest.mark.asyncio
+    async def test_login_column_starts_at_the_same_offset(self, tmp_path):
+        # Rendered through the real `AccountsPanel` (not a hand-computed
+        # `email_width`), so this fails if the panel ever stops passing the
+        # width it measures to `mini_account_text`. Includes an aliased slot:
+        # its displayed name is `alias (email)`, wider than the raw email
+        # `email_width` used to be measured over.
         now = time.time()
         accounts = [
-            _snapshot(1, "a@example.com", now + 23 * 86400 + 4 * 3600),
-            _snapshot(2, "a-much-longer-email@example.com", None),
-            _snapshot(3, "mid@example.com", now + 5 * 3600 + 7 * 60),
+            _replace_login(make_account(1, email="a@example.com"), now + 23 * 86400 + 4 * 3600),
+            _replace_login(
+                make_account(2, email="a-much-longer-email@example.com"), None
+            ),
+            _replace_login(
+                make_account(3, email="mid@example.com", alias="dev"),
+                now + 5 * 3600 + 7 * 60,
+            ),
         ]
-        email_width = max(len(a.email) for a in accounts)
-        offsets = []
-        for acc in accounts:
-            text = widgets.mini_account_text(
-                acc, now, email_width=email_width, palette=Palette.DARK
-            )
-            offsets.append(text.plain.index("login"))
-        assert len(set(offsets)) == 1
+        fake = FakeSwitcher(accounts, tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountsPanel
+
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            lines = [line for line in panel.splitlines() if "login" in line]
+            assert len(lines) == 3
+            offsets = {line.index("login") for line in lines}
+            assert len(offsets) == 1
 
 
 # ---------------------------------------------------------------------------

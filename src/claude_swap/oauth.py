@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import sys
 import urllib.error
 import urllib.request
@@ -76,7 +77,12 @@ def _refresh_token_expires_at_ms(credentials: str) -> float | None:
     :func:`login_expires_at_epoch` so there is one reader of the field."""
     data = extract_oauth_data(credentials)
     value = data.get("refreshTokenExpiresAt") if data else None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
         return None
     return float(value)
 
@@ -126,7 +132,7 @@ def format_login_expiry(
     / ``"0h45m"`` under a day (zero-padded minutes), ``"needed"`` once the
     expiry is at or before now or the account is quarantined (dead
     refresh-token lineage — the same fact either signals), ``"?"`` when the
-    stamp is missing or unreadable. Left-padded to the widest shape
+    stamp is missing or unreadable. Right-padded to the widest shape
     (``_LOGIN_VALUE_WIDTH``) so a column of these lines up.
     """
     if quarantined:

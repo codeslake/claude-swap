@@ -168,10 +168,18 @@ def _pad_row(label: str, body: str, width: int) -> str:
     return f"{label + ':':<{width}} {body}"
 
 
-def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[str]:
-    # Pad every label to the widest one so per-model names (e.g. "Fable")
-    # don't shift the columns of the other lines.
-    rows = _usage_rows(usage, fetched_at)
+def _format_usage_lines(
+    usage: dict,
+    fetched_at: float | None = None,
+    extra_rows: tuple[tuple[str, str], ...] = (),
+) -> list[str]:
+    """Padded "label: body" lines for one usage measurement.
+
+    ``extra_rows`` (the caller's login-expiry row, in ``_usage_entry_lines``)
+    join the width computation and the output, appended after the usage
+    rows, so a wider label there still lines every column up.
+    """
+    rows = [*_usage_rows(usage, fetched_at), *extra_rows]
     width = max((len(label) for label, _ in rows), default=0) + 1  # label + ':'
     return [_pad_row(label, body, width) for label, body in rows]
 
@@ -273,22 +281,24 @@ def _usage_entry_lines(
     if entry.sentinel is not None:
         out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
         last_seen = last_seen_note(entry)
+        children = []
         if last_seen is not None and entry.sentinel != USAGE_API_KEY:
-            out.append(f"{dimmed('└')} {muted(last_seen)}")
-        out.append(muted(_pad_row(*login_row, len(login_row[0]) + 1)))
+            children.append(muted(last_seen))
+        children.append(muted(_pad_row(*login_row, len(login_row[0]) + 1)))
+        out.extend(
+            f"{dimmed('└' if j == len(children) - 1 else '├')} {line}"
+            for j, line in enumerate(children)
+        )
         return out
     if entry.last_good is not None:
-        rows = _usage_rows(entry.last_good, entry.fetched_at)
-        width = max(len(label) for label, _ in [*rows, login_row]) + 1
-        lines = [_pad_row(label, body, width) for label, body in rows]
+        lines = _format_usage_lines(entry.last_good, entry.fetched_at, extra_rows=(login_row,))
         if (
-            lines
+            len(lines) > 1
             and entry.age_s is not None
             and entry.age_s > _USAGE_AGE_NOTE_S
             and entry.fetched_at is not None
         ):
-            lines[-1] += f" · {format_age(int(entry.fetched_at * 1000))}"
-        lines.append(_pad_row(*login_row, width))
+            lines[-2] += f" · {format_age(int(entry.fetched_at * 1000))}"
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)
@@ -296,7 +306,8 @@ def _usage_entry_lines(
     detail = "usage unavailable"
     if entry.last_error:
         detail += f" ({ERROR_NOTES.get(entry.last_error, entry.last_error)})"
-    return [dimmed(detail), muted(_pad_row(*login_row, len(login_row[0]) + 1))]
+    login_line = muted(_pad_row(*login_row, len(login_row[0]) + 1))
+    return [dimmed(detail), f"{dimmed('└')} {login_line}"]
 
 
 def _label_token_status(source: str, credentials: str) -> str | None:

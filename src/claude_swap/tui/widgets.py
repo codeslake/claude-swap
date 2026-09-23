@@ -259,6 +259,13 @@ def account_card_text(
     return text
 
 
+def mini_row_display_name(acc: AccountSnapshot) -> str:
+    """The name shown in a mini row: ``alias (email)`` when aliased, else the
+    plain email — what ``email_width`` below must be measured over, so an
+    aliased slot's login column lines up with the rest."""
+    return f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+
+
 def mini_account_text(
     acc: AccountSnapshot, now: float, *, email_width: int = 0, palette: Palette = Palette.DARK
 ) -> Text:
@@ -275,7 +282,8 @@ def mini_account_text(
         text.append(acc.alias, style=f"bold {palette.accent}")
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
-        text.append(f"{acc.email:<{email_width}}", style=palette.foreground)
+        text.append(acc.email, style=palette.foreground)
+    text.append(" " * max(0, email_width - len(mini_row_display_name(acc))))
     quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
     login_value = oauth.format_login_expiry(acc.login_expires_at, quarantined, now)
     text.append(f"  {_LOGIN_LABEL} {login_value}", style=palette.muted)
@@ -356,10 +364,11 @@ class AccountsPanel(Static):
             )
         now = time.time()
         width = (self.size.width or 80) - 2
-        # Widest email among the mini rows, so their login columns start at
-        # the same offset regardless of which account's email is longest.
+        # Widest displayed name (alias included) among the mini rows, so
+        # their login columns start at the same offset regardless of which
+        # account's name is longest.
         email_width = max(
-            (len(acc.email) for acc in snap.accounts if not acc.is_active),
+            (len(mini_row_display_name(acc)) for acc in snap.accounts if not acc.is_active),
             default=0,
         )
         blocks: list[Text] = []
