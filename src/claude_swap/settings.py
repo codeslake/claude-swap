@@ -499,15 +499,25 @@ def _backup_prev(path: Path, data: dict) -> None:
     tmp_path = prev_path.with_name(prev_path.name + f".{os.getpid()}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     try:
-        fd = os.open(str(tmp_path), flags, 0o600)
         try:
-            os.write(fd, current)
+            fd = os.open(str(tmp_path), flags, 0o600)
+        except OSError:
+            # NOT OURS TO REMOVE: O_EXCL refused because somebody
+            # else already holds this exact pid-stamped name, so
+            # the cleanup below must not unlink a file this call
+            # never created (same idiom as switcher.py's own
+            # O_EXCL create).
+            tmp_path = None
+            raise
+        try:
+            write_all(fd, current)
         finally:
             os.close(fd)
         os.replace(str(tmp_path), str(prev_path))
     except OSError as e:
         _logger.warning("Could not back up %s (%s)", path, e)
-        tmp_path.unlink(missing_ok=True)
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def atomic_write_json(path: Path, data: dict) -> None:

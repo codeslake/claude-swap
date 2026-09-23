@@ -473,7 +473,18 @@ class TestAtomicWriteThroughSymlink:
 
         atomic_write_json(link, {"x": 1})
 
-        assert seen == [str(repo)], f"tmp must land beside the target, got {seen}"
+        # `_backup_prev` (T0938, settings.py) makes its OWN `.prev` copy
+        # first, beside the LINK's own directory by design (that
+        # function's own docstring: the backup must sit where the
+        # link is, not where it points) -- but #199 (which adds it)
+        # is still an open PR, so this checks its own premise rather
+        # than assuming every tree already carries it.
+        expected = [str(live), str(repo)] if hasattr(S, "_backup_prev") else [str(repo)]
+        assert seen == expected, (
+            f"tmp must land beside the link (_backup_prev) first when "
+            f"it exists, then beside the target (the main write), got "
+            f"{seen}"
+        )
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
     def test_hardening_stays_on_the_directory_cswap_owns(self, tmp_path):
