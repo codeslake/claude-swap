@@ -353,11 +353,19 @@ def _cooldown_yields_to_the_wall(
     would refuse to land on is one it must be free to leave.
 
     IT CANNOT FLAP, BY CONSTRUCTION, and that is the check the tests make
-    rather than a scenario: landing requires `h > SPENT_HEADROOM_PCT` and
-    this departure requires `h <= SPENT_HEADROOM_PCT`. The two conditions
-    are disjoint, so the account just left can never be the one next
-    landed on; the bypass can only produce a chain of departures onto
-    accounts with room, bounded by the roster.
+    rather than a scenario: outside the at-limit escape
+    (`dynamic_at_limit_escape`, T0938), landing requires `h >
+    SPENT_HEADROOM_PCT` and this departure requires `h <=
+    SPENT_HEADROOM_PCT` — the two conditions are disjoint, so the ordinary
+    landing path can never pick the account just left. The escape itself
+    CAN land on an `h <= SPENT_HEADROOM_PCT` candidate (that is its whole
+    purpose — choosing WHERE a walled fleet is stuck), but it fires only
+    when the active is ALSO walled (`about_to_wall`, the same condition
+    this function gates cooldown on), and the account just left is
+    excluded by its own number (`no_return`), not by headroom, so the
+    escape's bypass cannot re-pick it either. Either path, the bypass can
+    only produce a chain of departures onto accounts with room or a
+    genuinely sooner recovery, bounded by the roster.
 
     NOT the exemption `_in_cooldown`'s docstring records as reverted: that
     one lived inside `_in_cooldown` on its own fresh, unwidened `h <= 0`
@@ -801,6 +809,8 @@ class PollEvent(AutoSwitchEvent):
             "headroomPct": self.headroom,
             "threshold": self.threshold,
         }
+        if self.switch_bar is not None:
+            fields["switchBar"] = self.switch_bar
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
@@ -962,11 +972,18 @@ class AllExhaustedEvent(AutoSwitchEvent):
     # gate: every candidate was read, and the consumer separately requires
     # that one of them still holds room.
     deliberate_wait: bool = False
+    # T0938: the account `earliest_reset_at` is timing, an account_ref shape
+    # (`_ref`) like `active`/`from_ref`/`to_ref` elsewhere -- `_earliest_
+    # recovery` takes the minimum over EVERY account, active included, so
+    # without this `human()` had no way to say whether the wait it announced
+    # was for the active's own reset or a peer's. Additive field.
+    waiting_on: dict | None = None
 
     def _fields(self) -> dict:
         return {
             "earliestResetAt": self.earliest_reset_at,
             "deliberateWait": self.deliberate_wait,
+            "waitingOn": self.waiting_on,
         }
 
     def human(self) -> str:
@@ -975,8 +992,9 @@ class AllExhaustedEvent(AutoSwitchEvent):
             if self.deliberate_wait
             else "all accounts exhausted"
         )
+        who = f" (Account-{self.waiting_on['number']})" if self.waiting_on else ""
         if self.earliest_reset_at:
-            return f"{what}; earliest reset {self.earliest_reset_at}"
+            return f"{what}; earliest reset {self.earliest_reset_at}{who}"
         return f"{what}; no reset time known"
 
 
@@ -3432,7 +3450,7 @@ class AutoSwitchEngine:
             # the block above, it kept the ordinary cadence for the whole
             # window and never named the reset it had just measured.
             self._blocked_wait_long = True
-            earliest, all_provable = self._earliest_recovery(usage)
+            earliest, earliest_num, all_provable = self._earliest_recovery(usage)
             earliest_ts = earliest.timestamp() if earliest is not None else None
             if not all_provable:
                 # A blocked account that cannot prove its return may beat any
@@ -3444,6 +3462,7 @@ class AutoSwitchEngine:
                 # which is what it is holding out for.
                 if truly_exhausted:
                     earliest_ts = None
+                    earliest_num = None
             elif earliest_ts is not None:
                 self._sleep_until_ts = earliest_ts + RESET_SLACK_S
             self._emit(
@@ -3456,6 +3475,11 @@ class AutoSwitchEngine:
                         else None
                     ),
                     deliberate_wait=not truly_exhausted,
+                    waiting_on=(
+                        _ref(earliest_num, self.switcher.account_email(earliest_num))
+                        if earliest_num is not None
+                        else None
+                    ),
                 )
             )
             return TickOutcome.BLOCKED
@@ -4341,8 +4365,10 @@ class AutoSwitchEngine:
         # strategy including dynamic's own genuine at-limit blackouts, and
         # narrowing this definition silently zeroed it for dynamic. The
         # `not dynamic_landing` exclusion belongs where `by_recovery` is
-        # actually CONSUMED, at the `if by_recovery_axis and not
-        # dynamic_landing:` key selection below.
+        # actually CONSUMED, at the `if by_recovery_axis and (not
+        # dynamic_landing or dynamic_at_limit_escape):` key selection below
+        # (T0938 widened that key to the at-limit escape too, gated on
+        # `about_to_wall` -- see `dynamic_at_limit_escape`'s own comment).
         by_recovery_axis = all_above and (
             trigger in ("proactive", *CONSUME_FIRST_STRATEGIES)
             or (
@@ -4365,6 +4391,37 @@ class AutoSwitchEngine:
                 # neighbour through every mutation check.
                 and best_candidate_headroom <= SPENT_HEADROOM_PCT
             )
+        )
+        # T0938: `dynamic`'s own landing bar (below) exists to keep a
+        # PROACTIVE move off a still-walled candidate — it has no business
+        # gating the at-limit escape, which is choosing WHERE to be stuck,
+        # not whether to move at all. Scoped to exactly the case
+        # `by_recovery_axis` already carved out for every other strategy
+        # (at-limit, all_above, a knowable return, nothing healthy to land
+        # on): there `dynamic` takes the same recovery gate and sort key as
+        # `best`/`consume-first` do, below. Every other dynamic landing
+        # decision (the bar itself, the proactive/all_above case) is
+        # unchanged.
+        #
+        # `about_to_wall` EARNS THE BYPASS; `by_recovery_axis` ALONE DOES
+        # NOT. `by_recovery_axis`'s at-limit disjunct reads
+        # `best_candidate_headroom` (the fleet's best offer), never the
+        # ACTIVE's own headroom — so on the 5h/7d retry (the same "active
+        # not `about_to_wall`" call `test_the_at_limit_arm_never_lands_on_
+        # a_candidate_still_at_the_wall` covers) a fleet where every
+        # candidate happens to sit inside `SPENT_HEADROOM_PCT` made
+        # `by_recovery_axis` true while the active itself was never stuck,
+        # and an escape gated on that alone bypassed the landing-health
+        # gate onto a still-walled candidate the ordinary rule refuses
+        # (measured: `test_the_at_limit_escape_never_bypasses_the_landing_
+        # bar_for_a_healthy_active`, active headroom 8, candidate headroom
+        # 2). "Choosing WHERE to be stuck" presupposes the active IS
+        # stuck.
+        dynamic_at_limit_escape = (
+            dynamic_landing
+            and trigger == "at-limit"
+            and about_to_wall
+            and by_recovery_axis
         )
 
         # THE BAR MOST ADMISSION/RANKING/LABEL DECISIONS BELOW READ (#321):
@@ -4476,22 +4533,29 @@ class AutoSwitchEngine:
                 # on every tick, `[2,1,2,1,...]`).
                 # THE LANDING RULE (dynamic only): never admit a candidate
                 # with no room on the axis this pass ranks by, even when
-                # every account is above the threshold. The `all_above`
-                # recovery-axis escape below exists so a proactive/at-limit
-                # trigger can wait on whichever account recovers soonest when
-                # nothing currently qualifies — but "recovers soonest" is a
-                # future fact, and landing on it NOW moved the engine onto an
+                # every account is above the threshold — UNLESS the active
+                # itself is genuinely walled (`dynamic_at_limit_escape`,
+                # T0938): there "recovers soonest" is not a future
+                # optimisation, it is the only question left, the same one
+                # `best`/`consume-first`'s own at-limit escape below already
+                # answers on a spent active. The `all_above` recovery-axis
+                # escape below exists so a proactive/at-limit trigger can
+                # wait on whichever account recovers soonest when nothing
+                # currently qualifies — but for a trigger OTHER than a
+                # genuinely walled at-limit, "recovers soonest" is a future
+                # fact, and landing on it NOW moved the engine onto an
                 # account that was ITSELF still blocked (measured live: a
                 # proactive move onto an account whose own 5h was already at
                 # the switch threshold, which the very next tick read as
                 # `cooldown` while still blocked, and the tick after that had
                 # burned worse). `best`/`consume-first` keep the escape
-                # unchanged — this is additive, gated on the strategy alone.
+                # unchanged — this is additive, gated on the strategy AND on
+                # `about_to_wall`, not the strategy alone.
                 if (100.0 - h) >= bar and not (
-                    all_above and not dynamic_landing
+                    (all_above and not dynamic_landing) or dynamic_at_limit_escape
                 ):
                     continue
-                if all_above and not dynamic_landing:
+                if (all_above and not dynamic_landing) or dynamic_at_limit_escape:
                     # Checked before the strategies, because with nothing below
                     # the threshold the strategy question is moot: consume-first
                     # exists to spend perishable WEEKLY quota, and every account
@@ -4629,7 +4693,7 @@ class AutoSwitchEngine:
                     # an improvement on the axis that admitted it.
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if by_recovery_axis and not dynamic_landing:
+            if by_recovery_axis and (not dynamic_landing or dynamic_at_limit_escape):
                 # Ranked on the axis its own gate decided, and TIERED so the two
                 # stay comparable: a candidate returning inside the horizon
                 # beats one that does not, whatever its headroom. Untiered, the
@@ -4667,10 +4731,14 @@ class AutoSwitchEngine:
                 # below-threshold peer clears it, and `failover` never
                 # satisfies it at all. `dynamic` (#321) never satisfies it
                 # either: whenever `all_above` holds, `dynamic_landing`
-                # keeps the `by_recovery_axis and not dynamic_landing` key
-                # a few lines above out of reach too (its own comment), so
-                # every dynamic candidate reaching this key selection with
-                # `all_above` true falls to the escape key below instead.
+                # keeps the `by_recovery_axis and (not dynamic_landing or
+                # dynamic_at_limit_escape)` key a few lines above out of
+                # reach too (its own comment) — this `elif`'s own guard,
+                # `trigger != "at-limit"`, is what keeps `dynamic_at_limit_
+                # escape` False here too (T0938: it requires `trigger ==
+                # "at-limit"`), so every dynamic candidate reaching this key
+                # selection with `all_above` true still falls to the escape
+                # key below instead.
                 #
                 # TIERED, because `disabled-active` and `failover` reach this
                 # arm with NO admission axis (both skip the landing gate), and
@@ -5306,9 +5374,9 @@ class AutoSwitchEngine:
 
     def _earliest_recovery(
         self, usage: dict[str, dict | str | None]
-    ) -> tuple[datetime | None, bool]:
-        """Earliest moment any account becomes usable again (UTC), and whether
-        every blocked account could prove one.
+    ) -> tuple[datetime | None, str | None, bool]:
+        """Earliest moment any account becomes usable again (UTC), which
+        account that is, and whether every blocked account could prove one.
 
         Per account that's the *latest* reset among its ≥100% relevant
         windows — an account blocked on both 5h and a scoped weekly limit
@@ -5316,14 +5384,15 @@ class AutoSwitchEngine:
         accounts, the active one included (its recovery also ends the
         blocked state). A blocked account whose exhausted windows carry no
         reset time at all could recover at any moment. That does not erase
-        what the others proved, so it is reported as the second element
-        rather than by discarding the first: the caller ANNOUNCES the
+        what the others proved, so it is reported as the third element
+        rather than by discarding the first two: the caller ANNOUNCES the
         earliest provable moment and keeps the bounded blocked-cadence
         re-check, rather than sleeping toward a reset that peer may beat."""
         earliest: float | None = None
+        earliest_num: str | None = None
         all_provable = True
         now = self.clock()
-        for value in usage.values():
+        for num, value in usage.items():
             if not isinstance(value, dict):
                 continue
             blocked = [
@@ -5339,9 +5408,14 @@ class AutoSwitchEngine:
                 continue
             if earliest is None or usable_at < earliest:
                 earliest = usable_at
+                earliest_num = num
         if earliest is None:
-            return None, all_provable
-        return datetime.fromtimestamp(earliest, tz=timezone.utc), all_provable
+            return None, None, all_provable
+        return (
+            datetime.fromtimestamp(earliest, tz=timezone.utc),
+            earliest_num,
+            all_provable,
+        )
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         # `human()` is what the TUI panel renders, so log and screen cannot

@@ -6135,6 +6135,40 @@ class TestAModelWindowIsNotABlackout:
         assert "#4: 5h 5% · 7d 95%" in text, text
         assert "full" not in text, text
 
+    def test_the_poll_payload_carries_switch_bar(self):
+        """T0815: `switch_bar` already drives `human()`/`_describe()` (the
+        test above) but `_fields()` never put it in the JSON payload a
+        consumer reads -- so a client rendering the poll never learned the
+        dynamic bar differs from `threshold`. Additive field."""
+        event = PollEvent(
+            active={"number": 7, "email": "a@example.com"},
+            headroom={"7": 82.0, "4": 5.0},
+            threshold=90.0,
+            switch_bar=97.0,
+        )
+        payload = event.to_json()
+        assert payload["switchBar"] == 97.0, payload
+        assert payload["threshold"] == 90.0, payload
+
+    def test_the_poll_payload_carries_switch_bar_for_a_non_dynamic_strategy_too(
+        self, harness
+    ):
+        """The additive contract is at the `PollEvent` class level, not the
+        engine's: a hand-built event that never sets `switch_bar` omits the
+        key, but the engine (autoswitch.py:1872) always passes
+        `switch_bar=proactive_switch_bar_pct(strategy, threshold)`, and
+        that function returns the raw `threshold` unchanged for every
+        non-`dynamic` strategy — so a real `best`/`consume-first` poll DOES
+        carry `switchBar`, equal to `threshold`. Additive and harmless (a
+        UI reading only `threshold` sees nothing new), but the payload
+        gains one more, equal, key rather than omitting it."""
+        harness.tick_with_usage(
+            {"1": _usage(42), "2": _usage(10), "3": _usage(50)}
+        )
+        poll = next(e for e in harness.events if isinstance(e, PollEvent))
+        payload = poll.to_json()
+        assert payload["switchBar"] == payload["threshold"] == 90.0, payload
+
     def test_a_spend_only_account_prints_its_credit_figure_not_a_bare_mark(
         self,
     ):
@@ -6439,10 +6473,15 @@ class TestDynamicStrategy:
     each tick, and a landing rule that never lands on a candidate with no
     room on the axis in force — even when every account is above the
     threshold, where the pre-existing ``all_above`` recovery-axis escape
-    otherwise admits one on a "recovers soonest" basis alone. Scoped to
-    ``strategy == "dynamic"`` throughout: `best`/`consume-first` keep
-    whatever they did before this class exists, and several tests below
-    assert that directly, on the SAME inputs.
+    otherwise admits one on a "recovers soonest" basis alone. One
+    exception (T0938): when the ACTIVE is itself genuinely walled
+    (``about_to_wall``) on an ``at-limit`` trigger, the escape
+    (``dynamic_at_limit_escape``) does bypass that landing rule, ranked by
+    soonest recovery — "choosing WHERE to be stuck" rather than "landing
+    somewhere healthy". Scoped to ``strategy == "dynamic"`` throughout:
+    `best`/`consume-first` keep whatever they did before this class
+    exists, and several tests below assert that directly, on the SAME
+    inputs.
     """
 
     @staticmethod
@@ -6695,6 +6734,44 @@ class TestDynamicStrategy:
                 "at-limit escape must not bypass the landing bar for "
                 "dynamic just because `about_to_wall` is false on this axis"
             )
+
+    def test_the_at_limit_escape_never_bypasses_the_landing_bar_for_a_healthy_active(
+        self, temp_home
+    ):
+        """Mirrors `test_the_at_limit_escape_still_lands_when_the_active_
+        is_genuinely_spent` below with one flip: the active is healthy
+        (headroom 8, same as the test above -- NOT `about_to_wall`) while
+        the ONLY candidate is itself still walled (headroom 2, inside
+        `SPENT_HEADROOM_PCT`). `best_candidate_headroom <=
+        SPENT_HEADROOM_PCT` alone made `by_recovery_axis`'s at-limit
+        disjunct true, and an escape gated on that alone bypassed the
+        landing-health gate onto a still-walled candidate for an active
+        that was never actually stuck. The escape earns its bypass from
+        the ACTIVE being walled, not from the candidate being spent."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        usage = {
+            "6": {  # active: healthy, headroom 8 — NOT about_to_wall
+                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {  # candidate: spent-band, headroom 2 — itself still walled
+                "five_hour": {"pct": 98.0, "resets_at": _iso_at(now + 300)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"6": 8.0, "2": 2.0}
+        args = self._args(
+            h, usage=usage, current="6", oauth_candidates=["2"],
+            headroom=headroom, active_headroom=8.0,
+            trigger="at-limit", strategy="dynamic",
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert ordered == [], (
+            f"got {ordered} — the at-limit escape must not bypass the "
+            "landing bar onto a still-walled candidate (headroom 2) when "
+            "the active itself is healthy (headroom 8, not about_to_wall)"
+        )
 
     def test_the_at_limit_escape_still_lands_when_the_active_is_genuinely_spent(
         self, temp_home
@@ -7164,6 +7241,102 @@ class TestDynamicStrategy:
         assert cooldown.get("2") is not None and cooldown["2"] > h.clock.now, (
             f"got {cooldown!r} — a probe switch must record a cooldown for "
             "the account it landed on, same as any other probe"
+        )
+
+    def test_the_wall_is_taken_on_the_account_that_lifts_first_under_dynamic(
+        self, temp_home
+    ):
+        """T0938 item 1, `dynamic` twin of
+        `TestDecisionTable.test_the_wall_is_taken_on_the_account_that_lifts_first`.
+
+        The owner's live case: both accounts spent (97-100% used), and
+        `dynamic`'s own landing bar (97, #321) refused every peer with that
+        little headroom outright -- including inside the at-limit escape's
+        own `by_recovery_axis` case, which exists exactly to pick WHERE a
+        spent fleet is stuck. The engine parked on the active reading a
+        multi-hour wait while a peer reset in minutes. Both accounts spent
+        here too (headroom 0, the plainest case the bar swallowed): `dynamic`
+        must still switch onto the one that lifts first, and then hold there
+        once it has -- the peer is now the nearer reset, not the account just
+        vacated, so bouncing back would be strictly worse.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, hysteresis_pct=5.0, strategy="dynamic",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(100.0, 60.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        soonest = _usage7(100.0, 60.0)
+        soonest["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        usage = {"1": active, "2": soonest}
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            "dynamic must switch onto the peer that lifts first too -- the "
+            "landing bar exists to keep a proactive move off a still-walled "
+            "candidate, not to gate the at-limit escape"
+        )
+        assert h.active_number() == 2
+
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        payload = poll.to_json()
+        assert payload["switchBar"] == 97.0, payload
+        assert payload["threshold"] == 90.0, payload
+
+        # Then it waits: account 2 is now active, and it is ITSELF the
+        # nearer reset in the fleet (ten minutes vs. three hours), so the
+        # very next tick must not bounce back to account 1 -- it holds, and
+        # names account 2 as what it is waiting on.
+        h.events.clear()
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 2
+        exhausted = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
+        assert exhausted.waiting_on == {"number": 2, "email": "b@example.com"}, (
+            exhausted.waiting_on
+        )
+        assert "Account-2" in exhausted.human(), exhausted.human()
+
+    def test_the_soonest_reset_wins_among_several_walled_candidates_under_dynamic(
+        self, temp_home
+    ):
+        """T0938 item 1, three-account version of the test above: with a
+        SINGLE walled candidate, that test only ever exercises the at-limit
+        escape's landing-gate bypass, never the tiered KEY (~3853) that
+        chooses BETWEEN two such candidates. Active and Y are both fully
+        spent (headroom 0); X sits at headroom 2 -- MORE headroom than Y --
+        but Y's 5h window resets in ten minutes against X's two hours. The
+        recovery axis must decide on reset time, not headroom: `dynamic`
+        switches to Y, the soonest recovery.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, hysteresis_pct=5.0, strategy="dynamic",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "x@example.com")
+        h.seed(3, "y@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(100.0, 60.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        x = _usage7(98.0, 60.0)
+        x["five_hour"]["resets_at"] = _iso_at(now + 2 * 3600)
+        y = _usage7(100.0, 60.0)
+        y["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        usage = {"1": active, "2": x, "3": y}
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} instead of account 3 (Y) -- Y's "
+            "ten-minute reset must beat X's two extra headroom points and "
+            "X's own two-hour reset"
         )
 
 
