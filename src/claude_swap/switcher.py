@@ -5945,12 +5945,14 @@ class ClaudeAccountSwitcher:
                 reverse=True,
             ):
                 meta = meta or {}
-                resolved = meta.get("resolvedIdentity") or {}
+                raw_resolved = meta.get("resolvedIdentity")
+                resolved = raw_resolved or {}
                 # IDENTITY AUTHORIZES THE WRITE, not the slot being dead. uuid is
                 # the positive key; the address only decides when the stash
                 # predates uuid capture, and never against a DIFFERENT uuid.
                 r_uuid = (resolved.get("uuid") or "").strip()
                 r_email = (resolved.get("email") or "").strip().lower()
+                via_lineage = False
                 if uuid and r_uuid:
                     if r_uuid != uuid:
                         continue
@@ -5964,18 +5966,34 @@ class ClaudeAccountSwitcher:
                         data, resolved
                     ) != num:
                         continue
-                elif not r_email or r_email != want_email:
-                    continue
-                elif self._slot_owning_resolved_identity(
-                    data, resolved
-                ) not in (None, num):
-                    # This slot's own record carries no uuid, so the branch
-                    # above never ran — but the stash entry's OWN uuid can
-                    # still resolve unambiguously to a DIFFERENT slot (opus
-                    # review, round 400 pass 2). Only a POSITIVE claim on
-                    # another slot refuses; `None` (ambiguous, or no uuid
-                    # anywhere to resolve) leaves the address-only heal this
-                    # branch exists for untouched.
+                elif r_email:
+                    if r_email != want_email:
+                        continue
+                    if self._slot_owning_resolved_identity(
+                        data, resolved
+                    ) not in (None, num):
+                        # This slot's own record carries no uuid, so the
+                        # branch above never ran — but the stash entry's OWN
+                        # uuid can still resolve unambiguously to a
+                        # DIFFERENT slot (opus review, round 400 pass 2).
+                        # Only a POSITIVE claim on another slot refuses;
+                        # `None` (ambiguous, or no uuid anywhere to
+                        # resolve) leaves the address-only heal this branch
+                        # exists for untouched.
+                        continue
+                elif raw_resolved is None and self._unresolved_row_names_slot(
+                    meta, email, uuid
+                ):
+                    # NO ORACLE VERDICT AT ALL — the switch-time profile
+                    # probe (`_probe_target_credential` ->
+                    # `consume_backup_grant`) 401'd without the escalation
+                    # ever resolving an identity, so the row carries only
+                    # `liveOauthAccount`, never `resolvedIdentity`. The
+                    # lineage stamp against this slot's own stored backup
+                    # (checked below, once the credential bytes are read)
+                    # stands in for the missing verdict.
+                    via_lineage = True
+                else:
                     continue
                 creds, unreadable = self._store._read_unclaimed_credential(entry_id)
                 if unreadable or not creds:
@@ -5999,6 +6017,10 @@ class ClaudeAccountSwitcher:
                 # strike binds to them anyway — so clearing it here would
                 # erase an accurate verdict and spend a stash entry.
                 if stored_fp is not None and creds_fp == stored_fp:
+                    continue
+                if via_lineage and not self._unresolved_row_is_slots_own_rotation(
+                    num, stored, creds, data
+                ):
                     continue
                 try:
                     # attributed=True: `r_uuid`/`r_email` were just matched
@@ -6052,6 +6074,68 @@ class ClaudeAccountSwitcher:
             return False
         finally:
             lock.release()
+
+    @staticmethod
+    def _unresolved_row_names_slot(meta: dict, email: str, uuid: str) -> bool:
+        """(a) of the unresolved-row heal: does the row's OWN
+        ``liveOauthAccount`` -- the live config identity captured at stash
+        time, the only identity such a row carries -- name this slot, and
+        never contradict a uuid this slot already has on file?
+        """
+        live = meta.get("liveOauthAccount")
+        if not isinstance(live, dict):
+            return False
+        live_email = (live.get("emailAddress") or "").strip().lower()
+        if not live_email or live_email != email.strip().lower():
+            return False
+        live_uuid = (live.get("accountUuid") or "").strip()
+        if uuid and live_uuid and live_uuid != uuid:
+            return False
+        return True
+
+    def _unresolved_row_is_slots_own_rotation(
+        self, num: str, stored: str, creds: str, data: dict,
+    ) -> bool:
+        """(b) + (d) of the unresolved-row heal, run once the row's bytes
+        are in hand.
+
+        (b) The row's ``refreshTokenExpiresAt`` must be the SAME LINEAGE as
+        this slot's own stored backup -- within ``newer_login``'s jitter,
+        neither side strictly later -- proof this is a rotation of what the
+        slot already held, never an unrelated login riding the address
+        match alone.
+
+        (d) No OTHER slot's stored backup may carry that same stamp: two
+        slots sharing a lineage stamp means the row's owner is ambiguous,
+        and this heal refuses rather than guess.
+        """
+        stored_at = _refresh_expiry(stored)
+        row_at = _refresh_expiry(creds)
+        if (
+            row_at is None or stored_at is None
+            or newer_login(row_at, stored_at)
+            or newer_login(stored_at, row_at)
+        ):
+            return False
+        for other_num, acct in (data.get("accounts") or {}).items():
+            if str(other_num) == str(num):
+                continue
+            other_email = acct.get("email") or ""
+            if not other_email:
+                continue
+            other_backup, other_unreadable = self._read_account_credentials_ex(
+                str(other_num), other_email
+            )
+            if other_unreadable or not other_backup:
+                continue
+            other_at = _refresh_expiry(other_backup)
+            if (
+                other_at is not None
+                and not newer_login(row_at, other_at)
+                and not newer_login(other_at, row_at)
+            ):
+                return False
+        return True
 
     def _adopt_into_dead_slot(
         self, foreign_slot: str | None, credentials: str, data: dict
