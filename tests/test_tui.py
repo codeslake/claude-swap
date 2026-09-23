@@ -1976,6 +1976,74 @@ class TestOrderedAccounts:
         assert order == ["1", "2", "3"], order
         assert order[1:] == _autoview_order(snap, "1", settings)
 
+    def test_full_accounts_never_outrank_a_waiting_candidate_with_headroom(self):
+        """The owner's report: with no candidate qualifying, "Next best"
+        read a FULL account (every relevant window at or over 100%) ABOVE
+        an account that still has headroom in every window, because the
+        waiting tier's only key was soonest `_binding_recovery_ts` -- so a
+        full "6" (7d 100%, back in 20m) outranked a merely-refused "2" (5h
+        97%, back in 30m), though "2" is usable right now and "6" is not
+        usable until it resets. Headroom-everywhere accounts ("2","4","3")
+        must sort before every full one ("6","7","5"); only inside each
+        half does soonest recovery break the tie. "8" (no stored login)
+        stays last, in its own unswitchable tier. "9" is the CONTROL: a
+        genuinely admitted candidate still ranks first, ahead of both
+        halves of the waiting tier."""
+        active = {"five_hour": {"pct": 95.0, "resets_at": _iso_in(600)},
+                  "seven_day": {"pct": 20.0, "resets_at": _iso_in(86400)}}
+        best_candidate = {"five_hour": {"pct": 5.0, "resets_at": _iso_in(7200)},
+                           "seven_day": {"pct": 5.0, "resets_at": _iso_in(86400)}}
+        headroom_soonest = {  # "2": binds at 97% on 5h, back in 30m
+            "five_hour": {"pct": 97.0, "resets_at": _iso_in(30 * 60)},
+            "seven_day": {"pct": 72.0, "resets_at": _iso_in(86400 * 3)},
+        }
+        headroom_mid = {  # "4": binds at 97% on 7d, back in 5h
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
+            "seven_day": {"pct": 97.0, "resets_at": _iso_in(5 * 3600)},
+        }
+        headroom_last = {  # "3": binds at 97% on 7d, back in 10h
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
+            "seven_day": {"pct": 97.0, "resets_at": _iso_in(10 * 3600)},
+        }
+        full_soonest = {  # "6": 7d full, back in 20m
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(20 * 60)},
+        }
+        full_mid = {  # "7": 7d full, back in 1h
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(3600)},
+        }
+        full_last = {  # "5": 7d full, back in 2h
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(2 * 3600)},
+        }
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=UsageEntry(
+                    last_good=active, fetched_at=time.time(), age_s=0.0)),
+                make_account(9, entry=UsageEntry(
+                    last_good=best_candidate, fetched_at=time.time(), age_s=0.0)),
+                make_account(2, entry=UsageEntry(
+                    last_good=headroom_soonest, fetched_at=time.time(), age_s=0.0)),
+                make_account(4, entry=UsageEntry(
+                    last_good=headroom_mid, fetched_at=time.time(), age_s=0.0)),
+                make_account(3, entry=UsageEntry(
+                    last_good=headroom_last, fetched_at=time.time(), age_s=0.0)),
+                make_account(6, entry=UsageEntry(
+                    last_good=full_soonest, fetched_at=time.time(), age_s=0.0)),
+                make_account(7, entry=UsageEntry(
+                    last_good=full_mid, fetched_at=time.time(), age_s=0.0)),
+                make_account(5, entry=UsageEntry(
+                    last_good=full_last, fetched_at=time.time(), age_s=0.0)),
+                make_account(8, switchable=False),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "9", "2", "4", "3", "6", "7", "5", "8"], order
+        assert order[1:] == _autoview_order(snap, "1", settings)
+
     def test_a_disabled_slot_never_outranks_a_waiting_candidate(self):
         """CONTROL, isolated from the fixture above: a disabled slot with
         the SOONEST reset of the fleet must still sort after a genuine

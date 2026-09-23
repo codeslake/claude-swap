@@ -510,6 +510,20 @@ def rank_switch_candidates(
     return ordered, rank_axis, trigger, unmodeled
 
 
+def waiting_tail_key(usage: dict | None, models: tuple[str, ...], now: float) -> tuple:
+    """Sort key for a row the admission pass refused but that still has a
+    usable window: every account with headroom in ALL its windows before
+    every account with ANY window at or over 100% -- a full account is
+    unusable until it resets, however soon that is, so it must never
+    outrank one usable right now. Soonest binding recovery breaks ties
+    inside each half. `ordered_accounts` and the auto view's own
+    `_candidates_text` (autoview.py) both call this, or the two screens
+    can rank this tier two different ways on the same snapshot.
+    """
+    full = 1 if binding_pct(usage, models) >= 100.0 else 0
+    return (full, _binding_recovery_ts(usage, models, now))
+
+
 def ordered_accounts(
     snap: AccountsSnapshot,
     settings: "AutoSwitchSettings",
@@ -560,7 +574,7 @@ def ordered_accounts(
         # can list this same unranked row in two different orders. Not the
         # 7-day reset alone: the window that actually blocks an account is
         # whichever is highest, and that is routinely the 5-hour one.
-        return (1, _binding_recovery_ts(acc.usage.last_good, models, now))
+        return (1,) + waiting_tail_key(acc.usage.last_good, models, now)
 
     others.sort(key=lambda a: (bucket(a), a.number))  # matches the auto view's tie-break
     numbers = [acc.number for acc in others]
