@@ -3078,6 +3078,55 @@ class TestUnswitchableRowsAreListed:
         )
         assert ordered == ["3", "2"], ordered
 
+    def test_the_panel_admits_a_headroom_candidate_with_hours_to_reset_under_dynamic(
+        self,
+    ):
+        """The owner's live case, 2026-09-19 (#321): account 4 at 7d 95%
+        (headroom 5) with its reset hours away must read as open on the
+        panel too, and rank ahead of a peer with more headroom but a
+        reset days out -- the panel's label and its "Next best" order
+        must never disagree with the engine (`proactive_switch_bar_pct`,
+        97 under dynamic). `_rank_dynamic_on` used to apply the proactive
+        arm's cold-floor partition (floor-clearing cold first) on the
+        HEALTHY trigger too; the engine only ever applies that partition
+        on the `proactive` arm (`_tick_inner`'s own `dynamic_ordered =
+        warm_ordered + cold_clears_floor`, reached only when `trigger ==
+        "proactive"`) -- on `dynamic-healthy` the order is `_rank_dynamic_
+        candidates`' own (soonest 7-day reset, warm before cold), which
+        ranks #4 (reset ~6.5h out) ahead of #2 (reset ~5.8d out) even
+        though #2 clears the cold floor and #4, cold at only 5 headroom,
+        does not.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+        from tests.test_autoswitch import _iso_at
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("7", "active@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 18.0},
+            }),
+            self._acct("4", "close@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {
+                    "pct": 95.0, "resets_at": _iso_at(time.time() + 23340),
+                },
+            }),
+            self._acct("2", "far@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {
+                    "pct": 40.0, "resets_at": _iso_at(time.time() + 500000),
+                },
+            }),
+        ), active="7", settings=settings)
+
+        rows = {
+            email: next(line for line in out.split("\n") if email in line)
+            for email in ("close@x.com", "far@x.com")
+        }
+        assert "full" not in rows["close@x.com"], rows["close@x.com"]
+        assert ">=" not in rows["close@x.com"], rows["close@x.com"]
+        assert out.index("close@x.com") < out.index("far@x.com"), (
+            f"the panel's 'Next best' order disagrees with the engine: {out!r}"
+        )
+
     def test_a_warm_partner_outranks_a_sooner_cold_reset(self, tmp_path):
         """`_rank_dynamic_on` used to pass a hardcoded `{}` for
         `last_active_at`, so `_is_warm` was False for every candidate and
@@ -3334,7 +3383,10 @@ class TestUnswitchableRowsAreListed:
         alone does not say which window blocked: it is driven by the fixed
         WARN/CRIT constants in `theme.py`, not by `settings.threshold`, so
         at an off-default threshold the colour and the block classification
-        can disagree."""
+        can disagree. `full` is reserved for actual exhaustion (100%,
+        `test_the_full_tag_reads_the_dynamic_switch_bar_not_the_threshold`)
+        so the full-block fixture here must genuinely exhaust its window,
+        not merely sit at/over the bar."""
         from claude_swap.settings import AutoSwitchSettings
 
         settings = AutoSwitchSettings(model="Fable", threshold=90.0)
@@ -3346,9 +3398,10 @@ class TestUnswitchableRowsAreListed:
                 "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
                 "scoped": [{"name": "Fable", "pct": 95.0}],
             }),
-            # Full block: 5h itself is over the bar, no model choice escapes it.
+            # Full block: 5h itself is genuinely exhausted, no model choice
+            # escapes it.
             self._acct("3", "c@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 5.0},
+                "five_hour": {"pct": 100.0}, "seven_day": {"pct": 5.0},
                 "scoped": [{"name": "Fable", "pct": 10.0}],
             }),
         ), active="1", settings=settings)
@@ -3356,18 +3409,17 @@ class TestUnswitchableRowsAreListed:
         assert "  5h full" in out, out
 
     def test_the_full_tag_reads_the_dynamic_switch_bar_not_the_threshold(self):
-        """Under `dynamic`, the engine's own landing gate fires at
-        `proactive_switch_bar_pct` (97% at the default threshold, #321's
-        `SPENT_HEADROOM_PCT`), not at `settings.threshold` (90%). A
-        candidate sitting between the two — blocked on the raw threshold,
-        still open on the engine's actual bar — must read "open" here too,
-        never `full`: the `full` tag names a window nothing can escape, not
-        a candidate the cold floor (`settings.cold_switch_cost_pct`) merely
-        orders LAST among the survivors that do clear it -- ranked behind
-        every warm/floor-clearing peer is not the same claim as "blocked".
-        CONTROL: a genuinely full row (at/over the dynamic bar) must still
-        read `full`, proving the absence below is not a panel that never
-        prints the tag at all.
+        """`full` is reserved for actual exhaustion (a window's own pct at
+        or over 100) -- never merely at or over the landing bar
+        (`proactive_switch_bar_pct`, 97% at the default threshold under
+        `dynamic`, #321's `SPENT_HEADROOM_PCT`). A window at or over that
+        bar but still under 100 names the bar it was judged against
+        instead, in the ">= <bar>%" form -- the same convention #325's
+        panel tests hold `dynamic` to elsewhere. A candidate under the bar
+        (over the raw `settings.threshold` of 90, still open on the
+        engine's actual bar) reads plain "open", neither tag. CONTROL:
+        a genuinely exhausted row (100%) must still read `full`, proving
+        the fix does not just delete the tag.
         """
         from claude_swap.settings import AutoSwitchSettings
 
@@ -3376,21 +3428,29 @@ class TestUnswitchableRowsAreListed:
             self._acct("1", "a@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
             }),
-            # 92%: over the raw threshold (90) but under the dynamic switch
-            # bar (97) -- the engine would still rank this account.
-            self._acct("2", "between@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 92.0},
+            # 95%: over the raw threshold (90) but under the dynamic switch
+            # bar (97) -- open, no block label at all.
+            self._acct("2", "open@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 95.0},
             }),
-            # CONTROL: 98%, at/over the dynamic switch bar itself.
-            self._acct("3", "full@x.com", switchable=True, last_good={
+            # 98%: at/over the dynamic switch bar, still under 100 -- the
+            # ">=" wording, never "full".
+            self._acct("3", "between@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 10.0}, "seven_day": {"pct": 98.0},
             }),
+            # CONTROL: 100%, genuinely exhausted.
+            self._acct("4", "full@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 100.0},
+            }),
         ), active="1", settings=settings)
-        assert "between@x.com" in out, out
-        row2 = out[out.index("between@x.com"):out.index("full@x.com")]
-        assert "7d full" not in row2, out
-        row3 = out[out.index("full@x.com"):]
-        assert "7d full" in row3, out
+        row2 = out[out.index("open@x.com"):out.index("between@x.com")]
+        assert "full" not in row2 and ">=" not in row2, out
+        row3 = out[out.index("between@x.com"):out.index("full@x.com")]
+        assert "7d 98% >= 97%" in row3, out
+        assert "full" not in row3, out
+        row4 = out[out.index("full@x.com"):]
+        assert "7d full" in row4, out
+        assert ">=" not in row4, out
 
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a

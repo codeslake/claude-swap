@@ -529,11 +529,11 @@ class AutoScreen(Screen):
                     # `dynamic` they diverge (`proactive_switch_bar_pct`), and
                     # a row between the two would read "full" here while the
                     # engine itself still ranks it.
+                    bar = proactive_switch_bar_pct(
+                        self._settings.strategy, self._settings.threshold
+                    )
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows),
-                        proactive_switch_bar_pct(
-                            self._settings.strategy, self._settings.threshold
-                        ),
+                        ((label, p) for label, p, _ in windows), bar,
                     )
                     if kind == "model":
                         entry.append(
@@ -541,7 +541,23 @@ class AutoScreen(Screen):
                             style=palette.muted,
                         )
                     elif kind == "full":
-                        entry.append(f"  {blocked_model} full", style=palette.muted)
+                        # "full" is reserved for actual exhaustion (the
+                        # window's own pct at or over 100); a window merely
+                        # at or over the bar names the bar it was judged
+                        # against instead.
+                        window_pct = next(
+                            p for label, p, _ in windows if label == blocked_model
+                        )
+                        if window_pct >= 100.0:
+                            entry.append(
+                                f"  {blocked_model} full", style=palette.muted
+                            )
+                        else:
+                            entry.append(
+                                f"  {blocked_model} {pct_label(window_pct)}%"
+                                f" >= {pct_label(bar)}%",
+                                style=palette.muted,
+                            )
                 if acc.disabled:
                     entry.append("  auto-swap disabled", style=palette.muted)
                 elif (
