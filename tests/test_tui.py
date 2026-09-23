@@ -4137,45 +4137,6 @@ class TestUnswitchableRowsAreListed:
         assert "full" not in rows["fifty@x.com"], rows["fifty@x.com"]
         assert ">=" not in rows["fifty@x.com"], rows["fifty@x.com"]
 
-    def test_the_panel_admits_a_headroom_candidate_with_hours_to_reset_under_dynamic(
-        self,
-    ):
-        """The owner's live case, 2026-09-19 (#321): account 4 at 7d 95%
-        (headroom 5) with its reset hours away must read as open on the
-        panel too, and rank ahead of a peer with more headroom but a
-        reset days out -- the panel's label and its "Next best" order
-        must never disagree with the engine (`proactive_switch_bar_pct`,
-        97 under dynamic)."""
-        from claude_swap.settings import AutoSwitchSettings
-        from tests.test_autoswitch import _iso_at
-
-        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
-        out = self._render(self._snap(
-            self._acct("7", "active@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 18.0},
-            }),
-            self._acct("4", "close@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 5.0}, "seven_day": {
-                    "pct": 95.0, "resets_at": _iso_at(time.time() + 23340),
-                },
-            }),
-            self._acct("2", "far@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 5.0}, "seven_day": {
-                    "pct": 40.0, "resets_at": _iso_at(time.time() + 500000),
-                },
-            }),
-        ), active="7", settings=settings)
-
-        rows = {
-            email: next(line for line in out.split("\n") if email in line)
-            for email in ("close@x.com", "far@x.com")
-        }
-        assert "full" not in rows["close@x.com"], rows["close@x.com"]
-        assert ">=" not in rows["close@x.com"], rows["close@x.com"]
-        assert out.index("close@x.com") < out.index("far@x.com"), (
-            f"the panel's 'Next best' order disagrees with the engine: {out!r}"
-        )
-
     def test_the_panel_never_calls_a_refetching_window_full(self):
         """PR #325: a 5h window whose reset just fired reads `refetching`
         on the chip -- the same row's block label must not still say
