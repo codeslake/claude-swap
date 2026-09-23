@@ -17,6 +17,7 @@ import time
 import pytest
 
 from claude_swap import oauth
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.locking import FileLock
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.json_output import USAGE_RELOGIN_REQUIRED, USAGE_TOKEN_EXPIRED
@@ -997,3 +998,380 @@ class TestTheResyncAdoptDeliberatelyHasNoSpentGuard:
         resync is unreachable altogether."""
         assert self._resync_reached(
             switcher, monkeypatch, usage={"five_hour": {"pct": 1.0}}) is True
+
+
+class TestAnUnresolvedStashRowHealsOnLineage:
+    """T0925: the switch-time profile probe (`_probe_target_credential` ->
+    `consume_backup_grant`) can answer a real 401 without the escalation
+    ever confirming an identity, so the row it parks carries no
+    `resolvedIdentity` at all -- only `liveOauthAccount` and the credential
+    bytes themselves. The uuid/email match above never reaches such a row,
+    so a slot struck on its stored generation stayed quarantined with its
+    own unconsumed successor sitting unresolved in the stash.
+
+    A lineage-stamp match -- `refreshTokenExpiresAt` within
+    `LINEAGE_STAMP_JITTER_MS` of the slot's own stored backup, via this
+    file's existing `newer_login` -- stands in for the oracle verdict, and
+    must win over the failed probe. It heals only THIS slot's own rotation,
+    never a stranger's: the email must match, a known uuid must never be
+    contradicted, and no OTHER slot's backup may share the same stamp.
+    """
+
+    _BASE_STAMP = _NOW_MS + 20 * _DAY_MS
+
+    @pytest.fixture
+    def switcher(self, temp_home, mock_claude_config, sample_sequence_data):
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sample_sequence_data["accounts"]["2"]["email"] = "owner@example.com"
+        sample_sequence_data["accounts"]["2"]["uuid"] = "uuid-owner"
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        return sw
+
+    @staticmethod
+    def _stamped(refresh, refresh_expiry_ms, access_expiry_ms=None):
+        """A credential dated on BOTH axes: ``refreshTokenExpiresAt`` (the
+        lineage stamp, jitter-tolerant) and the access token's own
+        ``expiresAt`` (advances on every real refresh -- a later one is what
+        proves "minted after" within the same lineage). Defaults the second
+        to the first so a caller that only cares about the lineage stamp
+        still gets a monotonic access-token ordering for free."""
+        blob = json.loads(_creds(refresh))
+        blob["claudeAiOauth"]["refreshTokenExpiresAt"] = refresh_expiry_ms
+        blob["claudeAiOauth"]["expiresAt"] = (
+            refresh_expiry_ms if access_expiry_ms is None else access_expiry_ms
+        )
+        return json.dumps(blob)
+
+    def _g1(self):
+        """The struck generation the dead slot's own backup still holds."""
+        return self._stamped("rt-g1", self._BASE_STAMP)
+
+    def _g2(self, jitter_ms=3_000):
+        """G1's own successor: same lineage, jittered by less than
+        `LINEAGE_STAMP_JITTER_MS` (5s) -- a rotation, not a different
+        login -- and minted later, so it is the SUCCESSOR, not merely a
+        same-lineage sibling."""
+        return self._stamped("rt-g2", self._BASE_STAMP + jitter_ms)
+
+    def _stash_unresolved(self, sw, creds, email="owner@example.com",
+                           uuid="uuid-owner", reason="displaced-live-login"):
+        """Through the real writer, not a hand-spelled stash dict: a rename
+        of `liveOauthAccount`'s shape must break this test too."""
+        sw._write_json(sw._get_claude_config_path(), {
+            "oauthAccount": {"emailAddress": email, "accountUuid": uuid},
+        })
+        return sw._stash_live_credential(creds, reason, "2", None)
+
+    def test_todays_shape_a_struck_slots_own_unresolved_successor_heals(
+            self, switcher):
+        """THE CASE. G1 struck, G2 -- the unconsumed successor of the same
+        lineage -- parked unresolved. The heal adopts G2, and the stash row
+        is retired only after the slot write lands."""
+        g1, g2 = self._g1(), self._g2()
+        switcher._write_account_credentials("2", "owner@example.com", g1)
+        _strike(switcher, creds=g1)
+        entry_id = self._stash_unresolved(switcher, g2)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is True
+
+        stored, unreadable = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert not unreadable
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(g2)
+        assert entry_id not in switcher._store._list_unclaimed_credentials()
+
+    def test_a_different_lineage_stamp_is_refused(self, switcher):
+        """CONTROL (a): 8s past the 5s jitter is a DIFFERENT login, not a
+        rotation of G1 -- the stash row is not proven to be this slot's."""
+        g1 = self._g1()
+        switcher._write_account_credentials("2", "owner@example.com", g1)
+        _strike(switcher, creds=g1)
+        far = _dated("rt-far", self._BASE_STAMP + 8_000)
+        entry_id = self._stash_unresolved(switcher, far)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(g1)
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_an_email_mismatch_is_refused(self, switcher):
+        """CONTROL (b): the row's own `liveOauthAccount` names somebody
+        else -- the lineage stamp alone is never a licence."""
+        g1 = self._g1()
+        switcher._write_account_credentials("2", "owner@example.com", g1)
+        _strike(switcher, creds=g1)
+        entry_id = self._stash_unresolved(
+            switcher, self._g2(), email="someone@else.example")
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(g1)
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_another_slots_backup_sharing_the_stamp_is_refused(
+            self, switcher):
+        """CONTROL (c): AMBIGUITY. Slot 1's own stored backup carries the
+        exact SAME lineage stamp as the row -- different bytes, not the
+        same refresh token, so this is the stamp alone doing the work, not
+        a fingerprint coincidence -- and the row could just as well be
+        slot 1's own rotation, so refuse rather than guess."""
+        g1 = self._g1()
+        switcher._write_account_credentials("2", "owner@example.com", g1)
+        _strike(switcher, creds=g1)
+        switcher._write_account_credentials(
+            "1", "account1@example.com",
+            self._stamped("rt-someone-elses-login", self._BASE_STAMP + 3_000))
+        entry_id = self._stash_unresolved(switcher, self._g2())
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(g1)
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_the_struck_fingerprint_itself_is_refused(self, switcher):
+        """CONTROL (d): the row holds the exact bytes the endpoint
+        condemned -- the same generation, not a successor. Idle slot: G1 is
+        both struck AND stored, so this alone cannot say which of the two
+        fingerprint guards (struck-fp, stored-fp) is doing the refusing --
+        see the active-slot variant below for that.
+
+        Stashed BEFORE the backup write: the real writer's own sweep drops
+        an entry byte-identical to what a slot already stores, which this
+        row deliberately is -- stashing it first, while the backup is still
+        empty, is what lets it survive to reach the adopt path at all.
+
+        The row's access ``expiresAt`` is LATER than the stored backup's, so
+        the lineage successor check (~6162) does not also refuse this on its
+        own tie -- only a fingerprint guard can. And the slot is made
+        genuinely idle AFTER the stash (pointing ``~/.claude.json`` at
+        another slot): the stash above still captures this slot's own
+        ``liveOauthAccount``, but ``current_account_number()`` is re-read
+        live by the adopt, so leaving it named to this slot would run the
+        active-slot's two-source rule instead of the idle path this test is
+        for."""
+        g1 = self._g1()
+        row = self._stamped(
+            "rt-g1", self._BASE_STAMP, access_expiry_ms=self._BASE_STAMP + 1_000)
+        entry_id = self._stash_unresolved(switcher, row)
+        switcher._write_json(switcher._get_claude_config_path(), {
+            "oauthAccount": {"emailAddress": "account1@example.com",
+                              "accountUuid": "uuid-1"},
+        })
+        switcher._write_account_credentials("2", "owner@example.com", g1)
+        _strike(switcher, creds=g1)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_the_struck_fingerprint_is_refused_on_an_active_slot_too(
+            self, switcher, monkeypatch):
+        """CONTROL (d), ACTIVE-SLOT VARIANT: the strike binds to the LIVE
+        store (`_slot_token_dead`'s two-source rule for an active slot), and
+        the BACKUP -- what `_adopt_stashed_login_for_slot`'s own `stored_fp`
+        always reads -- holds a DIFFERENT generation entirely. Only the
+        struck-fp guard (not the stored-fp one, which cannot even see a
+        match here) can be refusing this row.
+
+        ``g0`` sits inside the jitter of ``g1``'s lineage stamp (1s, not
+        9s), with an EARLIER access ``expiresAt`` than the row -- so the
+        lineage successor check (~6162) would let the row through on its
+        own, and only the struck-fp guard is left to refuse it."""
+        g0 = self._stamped("rt-g0", self._BASE_STAMP - 1_000)
+        g1 = self._stamped(
+            "rt-g1", self._BASE_STAMP,
+            access_expiry_ms=self._BASE_STAMP + 1_000)
+        switcher._write_account_credentials("2", "owner@example.com", g0)
+        _strike(switcher, creds=g1)
+        entry_id = self._stash_unresolved(switcher, g1)
+
+        monkeypatch.setattr(switcher, "current_account_number", lambda: "2")
+        monkeypatch.setattr(
+            switcher._store, "_read_active_credentials",
+            lambda: ActiveCredentials(g1, False, False),
+        )
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(g0), "the backup was overwritten"
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_an_unreadable_other_slots_backup_refuses_the_lineage_arm(
+            self, switcher, monkeypatch):
+        """[I1] UNKNOWN is not "does not share the lineage": an unreadable
+        other-slot backup must refuse the whole lineage arm, the same
+        direction `_slot_token_dead` takes on its own unreadable read --
+        never fall through to "no conflict found"."""
+        g1 = self._g1()
+        switcher._write_account_credentials("2", "owner@example.com", g1)
+        _strike(switcher, creds=g1)
+        entry_id = self._stash_unresolved(switcher, self._g2())
+        real_read = switcher._read_account_credentials_ex
+
+        def _fake_read(num, email):
+            if str(num) == "1":
+                return "", True
+            return real_read(num, email)
+
+        monkeypatch.setattr(switcher, "_read_account_credentials_ex", _fake_read)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_an_undated_stash_row_is_refused(self, switcher):
+        """[I2] (b)'s undated arm, ROW side: `row_at is None` is no evidence
+        of a rotation -- never a licence to adopt."""
+        g1 = self._g1()
+        switcher._write_account_credentials("2", "owner@example.com", g1)
+        _strike(switcher, creds=g1)
+        entry_id = self._stash_unresolved(switcher, FRESH)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(g1)
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_an_undated_stored_backup_is_refused(self, switcher):
+        """[I2] (b)'s undated arm, STORED side: the slot's own backup
+        carries no `refreshTokenExpiresAt` -- `stored_at is None` is
+        likewise no evidence.
+
+        The row's access `expiresAt` is later than `FRESH`'s (9999999999000),
+        so the successor check alone would let it through -- only the
+        `stored_at is None` guard is left to refuse it."""
+        switcher._write_account_credentials("2", "owner@example.com", FRESH)
+        _strike(switcher, creds=FRESH)
+        row = self._stamped(
+            "rt-g2", self._BASE_STAMP + 3_000,
+            access_expiry_ms=9_999_999_999_000 + 60_000)
+        entry_id = self._stash_unresolved(switcher, row)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(FRESH)
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_a_lineage_stamp_earlier_than_jitter_is_refused(self, switcher):
+        """[I2] (b)'s other directional arm: the row is EARLIER than the
+        stored backup by more than the jitter -- the backup already moved
+        past it, so this is not this slot's rotation either.
+
+        The row's access `expiresAt` is later than the stored backup's, so
+        the successor check alone would let it through -- only the
+        `newer_login(stored_at, row_at)` guard is left to refuse it."""
+        g1 = self._g1()
+        switcher._write_account_credentials("2", "owner@example.com", g1)
+        _strike(switcher, creds=g1)
+        earlier = self._stamped(
+            "rt-earlier", self._BASE_STAMP - 8_000,
+            access_expiry_ms=self._BASE_STAMP + 5_000)
+        entry_id = self._stash_unresolved(switcher, earlier)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(g1)
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_a_same_lineage_row_older_than_the_backup_is_refused(
+            self, switcher):
+        """[m2] SAME lineage (within jitter) is not enough -- the row must
+        be the SUCCESSOR. An older sibling within that lineage, minted
+        before the backup's own generation, must not overwrite it even
+        though the two share a lineage stamp within jitter."""
+        newer = self._stamped("rt-newer", self._BASE_STAMP + 3_000)
+        switcher._write_account_credentials("2", "owner@example.com", newer)
+        _strike(switcher, creds=newer)
+        older_sibling = self._stamped("rt-older", self._BASE_STAMP + 1_000)
+        entry_id = self._stash_unresolved(switcher, older_sibling)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(newer), "an older sibling was adopted"
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_an_ownership_verdict_reason_is_refused(self, switcher):
+        """[m1] "foreign"/"alien"/"known-foreign" are POSITIVE ownership
+        verdicts -- 'this slot does NOT own these bytes' -- and a
+        lineage-stamp coincidence must never override one, an
+        oracle-failure retry (`known-foreign`) included."""
+        g1 = self._g1()
+        switcher._write_account_credentials("2", "owner@example.com", g1)
+        _strike(switcher, creds=g1)
+        for reason in ("foreign", "alien", "known-foreign"):
+            entry_id = self._stash_unresolved(
+                switcher, self._g2(), reason=reason)
+            assert switcher._adopt_stashed_login_for_slot(
+                "2", "owner@example.com") is False, reason
+            assert entry_id in switcher._store._list_unclaimed_credentials()
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(g1)
+
+    def test_a_live_uuid_resolving_to_another_slot_is_refused(
+            self, switcher):
+        """[m1] The row's own uuid can still resolve unambiguously to a
+        DIFFERENT slot even when THIS slot carries none on file to
+        contradict it with directly -- the same gap the r_email branch
+        above already closes via `_slot_owning_resolved_identity`."""
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"]["uuid"] = ""      # nothing on file to contradict
+        switcher._write_json(switcher.sequence_file, data)
+        g1 = self._g1()
+        switcher._write_account_credentials("2", "owner@example.com", g1)
+        _strike(switcher, creds=g1)
+        # Slot 1's own uuid ("uuid-1", from the base fixture) is what the
+        # row names -- it belongs to account 1, not this one.
+        entry_id = self._stash_unresolved(
+            switcher, self._g2(), uuid="uuid-1")
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(g1)
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_a_healthy_not_dead_slot_is_refused(self, switcher):
+        """CONTROL (e): no strike at all -- the pre-check refuses before
+        the lineage match is ever consulted."""
+        g1 = self._g1()
+        switcher._write_account_credentials("2", "owner@example.com", g1)
+        entry_id = self._stash_unresolved(switcher, self._g2())
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(g1)
+        assert entry_id in switcher._store._list_unclaimed_credentials()
