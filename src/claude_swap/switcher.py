@@ -5982,7 +5982,7 @@ class ClaudeAccountSwitcher:
                         # exists for untouched.
                         continue
                 elif raw_resolved is None and self._unresolved_row_names_slot(
-                    meta, email, uuid
+                    data, num, meta, email, uuid
                 ):
                     # NO ORACLE VERDICT AT ALL — the switch-time profile
                     # probe (`_probe_target_credential` ->
@@ -6023,11 +6023,15 @@ class ClaudeAccountSwitcher:
                 ):
                     continue
                 try:
-                    # attributed=True: `r_uuid`/`r_email` were just matched
-                    # above against this slot's OWN recorded identity
-                    # (`uuid`/`want_email`, read from the roster under the
-                    # lock) — a uuid match when both sides carry one, an
-                    # exact email match otherwise.
+                    # attributed=True: on the uuid/email arms, `r_uuid`/
+                    # `r_email` were just matched above against this slot's
+                    # OWN recorded identity (`uuid`/`want_email`, read from
+                    # the roster under the lock) — a uuid match when both
+                    # sides carry one, an exact email match otherwise. On the
+                    # lineage arm (`via_lineage`) neither was matched at all
+                    # -- the attribution there is the lineage-stamp match
+                    # against this slot's own stored backup, confirmed
+                    # unambiguous against every sibling slot.
                     self._write_account_credentials(
                         num, email, creds, attributed=True
                     )
@@ -6076,12 +6080,26 @@ class ClaudeAccountSwitcher:
             lock.release()
 
     @staticmethod
-    def _unresolved_row_names_slot(meta: dict, email: str, uuid: str) -> bool:
+    def _unresolved_row_names_slot(
+        data: dict, num: str, meta: dict, email: str, uuid: str,
+    ) -> bool:
         """(a) of the unresolved-row heal: does the row's OWN
         ``liveOauthAccount`` -- the live config identity captured at stash
         time, the only identity such a row carries -- name this slot, and
         never contradict a uuid this slot already has on file?
+
+        Also refuses outright on an ownership VERDICT reason -- ``foreign``,
+        ``alien``, ``known-foreign`` are ``_stash_live_credential``'s own
+        "preserved, never written" kinds (a positive "not yours" finding,
+        ``known-foreign`` included: an oracle-failure RETRY of a lineage the
+        endpoint already condemned), and a lineage-stamp coincidence must
+        never override one. And on a live uuid that resolves unambiguously to
+        a DIFFERENT slot, the same check the r_email branch above runs via
+        `_slot_owning_resolved_identity` -- needed here too because this
+        slot's OWN record can carry no uuid to contradict it with directly.
         """
+        if meta.get("reason") in ("foreign", "alien", "known-foreign"):
+            return False
         live = meta.get("liveOauthAccount")
         if not isinstance(live, dict):
             return False
@@ -6091,6 +6109,17 @@ class ClaudeAccountSwitcher:
         live_uuid = (live.get("accountUuid") or "").strip()
         if uuid and live_uuid and live_uuid != uuid:
             return False
+        if live_uuid:
+            owner = ClaudeAccountSwitcher._slot_owning_resolved_identity(
+                data,
+                {
+                    "uuid": live_uuid,
+                    "email": live_email,
+                    "organizationUuid": live.get("organizationUuid") or "",
+                },
+            )
+            if owner not in (None, num):
+                return False
         return True
 
     def _unresolved_row_is_slots_own_rotation(
@@ -6103,11 +6132,21 @@ class ClaudeAccountSwitcher:
         this slot's own stored backup -- within ``newer_login``'s jitter,
         neither side strictly later -- proof this is a rotation of what the
         slot already held, never an unrelated login riding the address
-        match alone.
+        match alone. Same lineage is not enough on its own: the row must
+        also be the SUCCESSOR, never an older sibling the backup already
+        moved past -- the lineage stamp is jitter-tolerant noise between
+        generations, but the access token's own ``expiresAt`` advances on
+        every real refresh, so a later one there is what proves "minted
+        after", the one thing the lineage stamp cannot.
 
         (d) No OTHER slot's stored backup may carry that same stamp: two
         slots sharing a lineage stamp means the row's owner is ambiguous,
-        and this heal refuses rather than guess.
+        and this heal refuses rather than guess. UNKNOWN is not a licence
+        here either: a slot this loop cannot read the backup of, or cannot
+        even look up an email for, is not proven silent -- it refuses the
+        whole lineage arm rather than treat "could not check" as "does not
+        share it", the same direction `_slot_token_dead` takes on its own
+        unreadable read.
         """
         stored_at = _refresh_expiry(stored)
         row_at = _refresh_expiry(creds)
@@ -6117,16 +6156,25 @@ class ClaudeAccountSwitcher:
             or newer_login(stored_at, row_at)
         ):
             return False
+        row_exp = (oauth.extract_oauth_data(creds) or {}).get("expiresAt")
+        stored_exp = (oauth.extract_oauth_data(stored) or {}).get("expiresAt")
+        try:
+            if not (float(row_exp or 0) > float(stored_exp or 0)):
+                return False
+        except (TypeError, ValueError):
+            return False
         for other_num, acct in (data.get("accounts") or {}).items():
             if str(other_num) == str(num):
                 continue
             other_email = acct.get("email") or ""
             if not other_email:
-                continue
+                return False
             other_backup, other_unreadable = self._read_account_credentials_ex(
                 str(other_num), other_email
             )
-            if other_unreadable or not other_backup:
+            if other_unreadable:
+                return False
+            if not other_backup:
                 continue
             other_at = _refresh_expiry(other_backup)
             if (
