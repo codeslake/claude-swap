@@ -1445,11 +1445,11 @@ class TestWatchScreen:
 
 def _order_fixture_accounts():
     """Active "3", usable "5" (ranks first only by admission, never by
-    sorting numbers), unusable "2"/"4"/"12" (disabled/expired/full). "2"
-    and "12" carry DIFFERENT 7-day resets (3d vs. 6d) -- both land in the
-    same never-ranked tier, and an equal reset on both would let any
-    ordering pass this test by coincidence, proving nothing about the
-    tie-break itself."""
+    sorting numbers), unusable "2"/"4"/"12" (disabled/expired/full). "12"
+    is a genuine candidate the pass refused -- still in the waiting tier,
+    ordered by its own reset -- while "2" (disabled) and "4" (expired) are
+    non-targets the engine will never pick automatically, however soon
+    either resets."""
     return [
         make_account(3, active=True, entry=make_entry(95.0, 95.0)),
         make_account(5, entry=make_entry(5.0, 5.0)),
@@ -1488,10 +1488,12 @@ class TestOrderedAccounts:
     """One order every listing screen renders -- never a re-derived key."""
 
     def test_matches_the_auto_switch_view_and_sorts_unusable_last(self):
-        """Also the tie-break control: never-ranked "2" (3d reset) sorts
-        before "12" (6d reset) on BOTH screens -- the account number plays
-        no part, which this fixture's distinct resets would catch either
-        screen falling back to."""
+        """Non-targets sort dead last, on BOTH screens: "12" is a real
+        candidate the engine's own pass refused (still waiting on its own
+        reset) and must outrank "2", a disabled slot -- the engine will
+        never pick a disabled account automatically, however soon its
+        window resets, so it belongs with the other non-targets (token-
+        expired "4"), not mixed into the waiting tier by reset time."""
         snap = AccountsSnapshot(
             accounts=_order_fixture_accounts(), active_number="3", taken_at=0.0
         )
@@ -1500,7 +1502,7 @@ class TestOrderedAccounts:
         assert order[1:] == _autoview_order(snap, "3", _ORDER_SETTINGS)
         for unusable in ("2", "4", "12"):  # disabled / token-expired / 7d-full
             assert order.index("5") < order.index(unusable)
-        assert order.index("2") < order.index("12")
+        assert order.index("12") < order.index("2")
 
     def test_unmodeled_trigger_keys_stay_in_sync_with_the_auto_view_text(self):
         """Two files key the same trigger names; a name added to one alone
@@ -1508,6 +1510,73 @@ class TestOrderedAccounts:
         from claude_swap.tui import autoview
 
         assert set(autoview._UNMODELED_TEXT) == tui_data._UNMODELED_TRIGGERS
+
+    def test_waiting_tier_orders_by_binding_recovery_not_the_weekly_reset(self):
+        """Two never-ranked candidates: "2"'s BINDING window is its 5-hour
+        one (99%, back in 1h) with a distant, irrelevant 7-day reset (5d);
+        "3"'s binding window is its 7-day one (99%, back in 2d) with a
+        near, irrelevant 5-hour reset. The engine would fail over to
+        whichever recovers first -- "2" -- so the waiting tier must use
+        `_binding_recovery_ts` (the window that actually blocks each
+        account), not a flat 7-day-reset key that reads "3" as sooner
+        because it never looks at which window binds."""
+        active = {"five_hour": {"pct": 95.0, "resets_at": _iso_in(600)},
+                  "seven_day": {"pct": 20.0, "resets_at": _iso_in(86400)}}
+        soonest_via_5h = {
+            "five_hour": {"pct": 99.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 50.0, "resets_at": _iso_in(86400 * 5)},
+        }
+        later_via_7d = {
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(1800)},
+            "seven_day": {"pct": 99.0, "resets_at": _iso_in(86400 * 2)},
+        }
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=UsageEntry(
+                    last_good=active, fetched_at=time.time(), age_s=0.0)),
+                make_account(2, entry=UsageEntry(
+                    last_good=soonest_via_5h, fetched_at=time.time(), age_s=0.0)),
+                make_account(3, entry=UsageEntry(
+                    last_good=later_via_7d, fetched_at=time.time(), age_s=0.0)),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "2", "3"], order
+        assert order[1:] == _autoview_order(snap, "1", settings)
+
+    def test_a_disabled_slot_never_outranks_a_waiting_candidate(self):
+        """CONTROL, isolated from the fixture above: a disabled slot with
+        the SOONEST reset of the fleet must still sort after a genuine
+        waiting candidate -- proving the non-target tier is a separate
+        tier, not just a reset-based tie-break "2" happens to lose."""
+        active = {"five_hour": {"pct": 95.0, "resets_at": _iso_in(600)},
+                  "seven_day": {"pct": 20.0, "resets_at": _iso_in(86400)}}
+        waiting = {
+            "five_hour": {"pct": 99.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 99.0, "resets_at": _iso_in(86400 * 2)},
+        }
+        disabled_soon = {
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(300)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(600)},
+        }
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=UsageEntry(
+                    last_good=active, fetched_at=time.time(), age_s=0.0)),
+                make_account(3, entry=UsageEntry(
+                    last_good=waiting, fetched_at=time.time(), age_s=0.0)),
+                make_account(2, entry=UsageEntry(
+                    last_good=disabled_soon, fetched_at=time.time(), age_s=0.0),
+                    disabled=True),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "3", "2"], order
+        assert order[1:] == _autoview_order(snap, "1", settings)
 
 
 @pytest.mark.asyncio
@@ -3103,6 +3172,29 @@ class TestUnswitchableRowsAreListed:
         ), active="1", settings=settings)
         assert "Fable-walled" in out, out
         assert "  5h full" in out, out
+
+    def test_the_full_tag_reads_the_dynamic_switch_bar_not_the_threshold(self):
+        """Under `dynamic`, the engine's own landing gate fires at
+        `proactive_switch_bar_pct` (97% at the default threshold, #321's
+        `SPENT_HEADROOM_PCT`), not at `settings.threshold` (90%). A
+        candidate sitting between the two — blocked on the raw threshold,
+        still open on the engine's actual bar — must read "open" here too,
+        or this panel tags a row `full` the engine itself would still rank.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(threshold=90.0, strategy="dynamic")
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+            }),
+            # 92%: over the raw threshold (90) but under the dynamic switch
+            # bar (97) -- the engine would still rank this account.
+            self._acct("2", "between@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 92.0},
+            }),
+        ), active="1", settings=settings)
+        assert "7d full" not in out, out
 
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a

@@ -29,7 +29,7 @@ from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
-    _seven_day_reset_ts,
+    _binding_recovery_ts,
     binding_pct,
     classify_candidate_block,
     model_block_label,
@@ -522,8 +522,15 @@ class AutoScreen(Screen):
                 # on the 5h/7d-only axis for ORDERING purposes.
                 kind = "open"
                 if self._settings:
+                    # The engine's own landing bar, not the raw setting: under
+                    # `dynamic` they diverge (`proactive_switch_bar_pct`), and
+                    # a row between the two would read "full" here while the
+                    # engine itself still ranks it.
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows), self._settings.threshold
+                        ((label, p) for label, p, _ in windows),
+                        proactive_switch_bar_pct(
+                            self._settings.strategy, self._settings.threshold
+                        ),
                     )
                     if kind == "model":
                         entry.append(
@@ -550,17 +557,20 @@ class AutoScreen(Screen):
                 # Position from `ordered_rank` (the engine's own pass, called
                 # once above), never a locally re-derived key -- but a row
                 # the pass never ranked at all still needs a DETERMINISTIC
-                # order among its peers: soonest 7-day reset first, unknown
-                # last (`+inf`, `consume_first_rank_key`'s reading). Only
-                # two unranked rows sharing that same reset still fall to
-                # `sorted(ranked)`'s own residual tie-break, the account
-                # number as a string -- never touching a row the pass DID
-                # admit.
-                reset_ts = _seven_day_reset_ts(acc.usage.last_good, admission_now)
+                # order among its peers: soonest BINDING-window recovery
+                # first, unknown last (`+inf`, `_binding_recovery_ts`'s
+                # reading -- the window that actually blocks the account,
+                # not always the 7-day one). Only two unranked rows sharing
+                # that same recovery still fall to `sorted(ranked)`'s own
+                # residual tie-break, the account number as a string --
+                # never touching a row the pass DID admit. A disabled row
+                # shares the sentinel branch's fixed tier (998.0) above,
+                # never this reset-ordered one: the engine will not land
+                # here automatically however soon it recovers.
                 key = (
-                    (0, ordered_rank[acc.number])
-                    if acc.number in ordered_rank
-                    else (1, reset_ts if reset_ts is not None else float("inf"))
+                    (0, ordered_rank[acc.number]) if acc.number in ordered_rank
+                    else (998.0,) if acc.disabled
+                    else (1, _binding_recovery_ts(acc.usage.last_good, models, admission_now))
                 )
                 ranked.append((key, acc.number))
             lines[acc.number] = entry

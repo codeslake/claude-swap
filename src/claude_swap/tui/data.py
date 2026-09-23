@@ -23,11 +23,11 @@ from typing import TYPE_CHECKING, Callable
 from claude_swap import oauth, printer, usage_store
 from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
+    _binding_recovery_ts,
     _classify_dynamic_trigger,
     _dynamic_active_headroom,
     _headroom_by_account,
     _model_window_binds_everywhere,
-    _seven_day_reset_ts,
     rank_candidates_pass,
 )
 from claude_swap.exceptions import ClaudeSwitchError
@@ -321,8 +321,9 @@ def ordered_accounts(
     snap: AccountsSnapshot, settings: "AutoSwitchSettings", now: float
 ) -> list[str]:
     """Every account number, active first, then the rest as the engine's own
-    pass would rank them: ranked-and-open, usable-but-refused, sentinel-
-    blocked, spend-only, unswitchable last. THE one order every screen
+    pass would rank them: ranked-and-open, usable-but-refused (waiting,
+    soonest binding recovery first), non-target (disabled, sentinel-
+    blocked, spend-only), unswitchable last. THE one order every screen
     renders in -- a screen keeping slot order says so at its own call site.
     """
     active_number = snap.active_number
@@ -336,19 +337,29 @@ def ordered_accounts(
             return (4,)
         if acc.number in ordered_rank:
             return (0, ordered_rank[acc.number])
-        if acc.usage.sentinel is not None:
+        # A disabled slot is a non-target -- the engine never lands on one
+        # automatically, however soon its own window recovers -- so it
+        # sorts with the other non-targets, never inside the waiting tier
+        # below by reset-time coincidence.
+        if acc.disabled or acc.usage.sentinel is not None:
             return (2,)
         if binding_pct(acc.usage.last_good, models) is None:
             return (3,)
-        # Soonest 7-day reset first, unknown last -- matches the auto
-        # view's own fallback key for a row its admission pass refused
-        # (autoview.py's `_candidates_text`), or the two screens can list
-        # this same unranked row in two different orders.
-        reset_ts = _seven_day_reset_ts(acc.usage.last_good, now)
-        return (1, reset_ts if reset_ts is not None else float("inf"))
+        # Soonest BINDING-window recovery first, unknown last -- matches
+        # the auto view's own fallback key for a row its admission pass
+        # refused (autoview.py's `_candidates_text`), or the two screens
+        # can list this same unranked row in two different orders. Not the
+        # 7-day reset alone: the window that actually blocks an account is
+        # whichever is highest, and that is routinely the 5-hour one.
+        return (1, _binding_recovery_ts(acc.usage.last_good, models, now))
 
     others.sort(key=lambda a: (bucket(a), a.number))  # matches the auto view's tie-break
     numbers = [acc.number for acc in others]
+    # Active pinned first, not ranked among `others`: the engine's own pass
+    # (`rank_switch_candidates`) never names the active account a candidate
+    # to switch TO, so it has no rank of its own to sort by -- its place
+    # here is fixed, with its own "active" label, not a position the
+    # ranking axis assigns.
     return ([active_number] if active_number is not None else []) + numbers
 
 
