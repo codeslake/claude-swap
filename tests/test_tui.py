@@ -3222,6 +3222,7 @@ class TestUnswitchableRowsAreListed:
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
+        a.login_expires_at = None
         # A real UsageEntry, not a MagicMock -- `.decision_value()` (the
         # ranking pass's own read) is real code, not an auto-mocked
         # callable, and needs actual `sentinel`/`last_good`/`age_s` to
