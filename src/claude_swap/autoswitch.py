@@ -2743,52 +2743,48 @@ class AutoSwitchEngine:
                 )
                 floor_headroom = unmodeled
                 model_window_dropped = True
-            # Item 3b/3c: cold admissible only past the floor, and never
-            # below it here — item 3c reserves a below-floor cold candidate
-            # for the at-limit/failover escape, which never sets this
-            # trigger. ONLY on the unmodeled-retry path above
-            # (`model_window_dropped`) does the floor change at all:
-            # `cold_switch_cost_pct` is priced for an ordinary cold switch
-            # away from a healthy active, but here the active is genuinely
-            # fleet-wide model-walled with nothing better to hold out for.
-            # A flat `SPENT_HEADROOM_PCT` floor there is not lower, it is NO
-            # floor: `_rank_dynamic_candidates` already drops every entry at
-            # or under that value before `cold_ordered` exists, so every
-            # survivor already clears it and the comparison never refuses
-            # anything (measured: this round's own gate). The floor that
-            # question actually needs is relative to what the active itself
-            # already reads on this axis — a real but modest unmodeled
-            # candidate (owner specimen: #3 at 12%, active at 5%) is a
-            # genuine rescue and must clear it; a peer merely level with, or
-            # barely above, the active's own reading is not (measured
-            # 2026-09-08).
+            # Item 3c, corrected again (2026-09-23, #321 follow-up): on
+            # THIS arm the `cold_switch_cost_pct` floor is a PREFERENCE,
+            # never a veto (ADR 0010, "Why never-wall beats warm-cache":
+            # "the cold floor is a preference, never a veto" -- not R1,
+            # which is the unrelated land-bar/hold-bar rule). The active is
+            # already walled (headroom in `(0, SPENT_HEADROOM_PCT]`) --
+            # staying put is not an alternative here (see the comment
+            # above `_dynamic_rank`). A flat `>=` filter (pre-#321) dropped
+            # every below-floor candidate outright, so a genuinely spent
+            # active with none clearing the floor sat refused
+            # (`below-floor`) tick after tick and only moved once it hit
+            # 100% (`at-limit`) -- onto the very candidate the floor had
+            # just refused. Taking `cold_ordered` unpartitioned (this
+            # round's first attempt) over-corrected: a below-floor
+            # candidate that merely resets sooner then outranked a
+            # floor-clearing one, landing on the worse account. A STABLE
+            # PARTITION keeps `cold_ordered`'s own order within each half
+            # but always tries every floor-clearing candidate first.
             if model_window_dropped:
                 cold_floor = _blackout_retry_admission_bar(floor_headroom, current)
                 cold_clears_floor = [
                     n for n in cold_ordered
                     if floor_headroom.get(n, 0.0) > cold_floor
                 ]
-            else:
-                cold_floor = settings.cold_switch_cost_pct
-                cold_clears_floor = [
-                    n for n in cold_ordered
-                    if floor_headroom.get(n, 0.0) >= cold_floor
-                ]
-            dynamic_ordered = warm_ordered + cold_clears_floor
-            if not dynamic_ordered and cold_ordered:
-                # Real headroom exists but none of it clears the floor
-                # (item 3c: below-floor cold is for at-limit/failover only)
-                # -- a deliberate refusal, stay on the normal poll cadence.
-                self._emit(
-                    NoSwitchEvent(
-                        reason="below-floor",
-                        detail=(
-                            f"{len(cold_ordered)} cold candidate(s) below "
-                            f"the {pct_label(cold_floor)}% floor"
-                        ),
+                if not warm_ordered and not cold_clears_floor and cold_ordered:
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="below-floor",
+                            detail=(
+                                f"{len(cold_ordered)} cold candidate(s) below "
+                                f"the {pct_label(cold_floor)}% floor"
+                            ),
+                        )
                     )
+                    return TickOutcome.NO_ACTION
+            else:
+                floor = settings.cold_switch_cost_pct
+                cold_clears_floor = sorted(
+                    cold_ordered,
+                    key=lambda n: floor_headroom.get(n, 0.0) < floor,
                 )
-                return TickOutcome.NO_ACTION
+            dynamic_ordered = warm_ordered + cold_clears_floor
             if not dynamic_ordered and bar_active:
                 # The no-return bar (item 2) is holding this, not a
                 # genuinely viable-free fleet -- a deliberate hold pending

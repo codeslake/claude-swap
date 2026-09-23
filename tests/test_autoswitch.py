@@ -7281,18 +7281,68 @@ class TestWarmthAndAlternation375:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    def test_f2_walled_active_refuses_the_cold_candidate_below_floor(
+    def test_f2_walled_active_switches_to_the_cold_candidate_below_floor(
         self, temp_home
     ):
+        """#321 incident (2026-09-23): once the active is walled (headroom
+        in `(0, SPENT_HEADROOM_PCT]`), staying put is not an alternative --
+        the ordinary `cold_switch_cost_pct` floor never vetoes a cold
+        candidate here (ADR 0010, "Why never-wall beats warm-cache": "the
+        cold floor is a preference, never a veto" -- not R1, which is the
+        unrelated land-bar/hold-bar rule). Pre-fix this held at
+        `below-floor` for four ticks running
+        on the live fleet and only moved once the active hit 100%
+        (`at-limit`, onto the very candidate the floor had refused)."""
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
-            "2": _usage(96.0),  # cold, headroom 4 -- below the floor
+            "2": _usage(96.0),  # cold, headroom 4 -- below the 20 floor
         })
-        assert outcome is TickOutcome.NO_ACTION
-        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["below-floor"], reasons
-        assert h.active_number() == 1
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive", sw.trigger
+        assert h.active_number() == 2
+
+    def test_f2_walled_active_switches_to_a_cold_candidate_far_below_floor(
+        self, temp_home
+    ):
+        """Today's shape (2026-09-23): active at the top of the proactive
+        window (headroom 3), the only candidate cold with real headroom
+        (14) still well under the 20 floor. Must switch rather than hold
+        for `at-limit`."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(97.0),  # active, headroom 3 -- top of the proactive window
+            "2": _usage(86.0),  # cold, headroom 14 -- below the 20 floor
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive", sw.trigger
+        assert h.active_number() == 2
+
+    def test_f2_walled_active_prefers_the_floor_clearing_cold_candidate(
+        self, temp_home
+    ):
+        """The floor is a preference (ADR 0010, "Why never-wall beats
+        warm-cache": "a preference, never a veto"), so it must still ORDER
+        cold candidates, not just refuse to veto them. #2 is below the
+        floor (headroom 4) but resets soonest; #3 clears the floor
+        (headroom 50) but resets later. Landing on #2 risks a wall on
+        arrival -- its own headroom is under the ~19-point re-write cost
+        (`settings.cold_switch_cost_pct`); #3 could actually serve."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0),  # active, headroom 2 -- walled
+            "2": _usage7(96.0, 0.0, _iso_at(now + 3600)),
+            # cold, headroom 4 -- below the 20 floor, resets in 1h
+            "3": _usage7(50.0, 0.0, _iso_at(now + 6 * 86400)),
+            # cold, headroom 50 -- clears the floor, resets in 6d
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive", sw.trigger
+        assert h.active_number() == 3
 
     def test_f2_at_limit_escapes_to_a_below_floor_candidate(self, temp_home):
         h = self._harness(temp_home)
