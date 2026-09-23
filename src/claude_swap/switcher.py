@@ -7432,6 +7432,17 @@ class ClaudeAccountSwitcher:
         # account is provably better; otherwise stays put (never moves onto a
         # worse or unverifiable account). Bare `cswap --switch` rotates anyway.
         if strategy == "best":
+            if current_at_limit and current_num is not None:
+                # The caller measured the limit somewhere the poller cannot
+                # see. Persist it: past this call, every later reader of
+                # `current_num`'s entry (autoswitch's own tick, the TUI, the
+                # next switch) must see it as at-limit too, not just this one
+                # selection — see UsageStore.mark_at_limit.
+                self._usage_store.mark_at_limit(
+                    current_num,
+                    {current_num: (current_email, current_org_uuid)},
+                    models,
+                )
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(

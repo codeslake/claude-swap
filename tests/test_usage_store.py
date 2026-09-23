@@ -8,6 +8,7 @@ import logging
 import pytest
 
 from claude_swap import oauth, usage_store
+from claude_swap.poll_policy import POST_429_MIN_INTERVAL_S
 from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
@@ -16,6 +17,7 @@ from claude_swap.usage_store import (
     SERVE_TTL_S,
     STALE_OK_S,
     TRUST_MAX_AGE_S,
+    WALL_FALLBACK_S,
     FetchRecord,
     UsageEntry,
     UsageStore,
@@ -121,29 +123,83 @@ class TestStaleOnError:
 
 
 class TestExtendedTrust:
-    """Deliberate staleness (failure state, scheduler cadence) stays trusted."""
+    """Deliberate staleness stays trusted past STALE_OK_S, capped at
+    TRUST_MAX_AGE_S -- but only for a row that has NOT failed (scheduler
+    cadence, a live fetch lease).
 
-    def test_in_backoff_past_stale_ok_is_still_trusted(self, store, clock):
+    A row whose last poll attempt FAILED is capped at POST_429_MIN_INTERVAL_S
+    instead (T1102), whatever the error kind, Retry-After, backoff state or a
+    window's own reset says: a reading the poller could not refresh must go
+    unknown quickly, not stay trusted on a stale percentage. This replaces
+    the old rule (commits 64840952, dd5c9ac1) that extended a 429's trust to
+    its window's reset or RATE_LIMIT_TRUST_MAX_AGE_S -- the owner's order
+    overrides that past the poll period; an out-of-band wall the pin itself
+    saw is UsageStore.mark_at_limit's job instead (see TestMarkAtLimit).
+    """
+
+    @pytest.mark.parametrize("error,kwargs", [
+        ("http-429", {"retry_after_s": 480.0}),
+        ("timeout", {}),
+    ])
+    def test_a_failed_reading_is_trusted_up_to_the_poll_period(
+        self, store, clock, error, kwargs
+    ):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
-        clock.advance(STALE_OK_S)
-        store.record(
-            {"1": FetchRecord(error="http-429", retry_after_s=480.0)}, IDENT
-        )
-        clock.advance(60)
+        store.record({"1": FetchRecord(error=error, **kwargs)}, IDENT)
+        clock.advance(POST_429_MIN_INTERVAL_S)
         entry = store.entries(IDENT)["1"]
-        assert entry.age_s > STALE_OK_S
-        assert entry.in_backoff(clock.now)
         assert entry.trust_extended
         assert entry.decision_value() == USAGE
 
-    def test_failure_state_after_backoff_expiry_is_still_trusted(self, store, clock):
+    @pytest.mark.parametrize("error,kwargs", [
+        ("http-429", {"retry_after_s": 480.0}),
+        ("timeout", {}),
+    ])
+    def test_a_failed_reading_past_the_poll_period_is_unknown(
+        self, store, clock, error, kwargs
+    ):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
-        clock.advance(60)
-        store.record({"1": FetchRecord(error="timeout")}, IDENT)
-        clock.advance(BACKOFF_BASE_S + STALE_OK_S)  # backoff long expired
+        store.record({"1": FetchRecord(error=error, **kwargs)}, IDENT)
+        clock.advance(POST_429_MIN_INTERVAL_S + 1)
         entry = store.entries(IDENT)["1"]
-        assert not entry.in_backoff(clock.now)
-        assert entry.decision_value() == USAGE
+        assert not entry.trust_extended
+        assert entry.decision_value() is None
+
+    def test_backoff_expiry_does_not_extend_trust_past_the_poll_period(
+        self, store, clock
+    ):
+        # The old rule kept a failed row trusted once its OWN backoff expired,
+        # up to TRUST_MAX_AGE_S. That extension is gone: backoff state no
+        # longer matters to trust, only age since the last success does.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        clock.advance(BACKOFF_BASE_S + 1)
+        assert not store.entries(IDENT)["1"].in_backoff(clock.now)
+        clock.advance(POST_429_MIN_INTERVAL_S)  # ...but still past the cap
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_a_far_future_429_reset_does_not_extend_trust_either(
+        self, store, clock
+    ):
+        # The old rule trusted a 429-frozen reading up to its window's own
+        # reset. Gone: a reset far in the future no longer rescues a stale
+        # poll past the poll period.
+        from datetime import datetime, timezone
+
+        far = (
+            datetime.fromtimestamp(clock.now + 100_000.0, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        usage = {
+            "five_hour": {"pct": 25.0, "resets_at": far},
+            "seven_day": {"pct": 10.0, "resets_at": far},
+        }
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        clock.advance(POST_429_MIN_INTERVAL_S + 1)
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() is None
 
     def test_within_poll_plan_past_stale_ok_is_trusted(self, store, clock):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
@@ -156,17 +212,21 @@ class TestExtendedTrust:
         clock.advance(250)
         assert store.entries(IDENT)["1"].decision_value() is None
 
-    def test_trust_ceiling_wins_over_non_429_failure_state(self, store, clock):
-        # A non-429 failure (timeout/network) past the general ceiling reads as
-        # unknown: such an error is no evidence the last_good still holds, so
-        # the unknown-path machinery must take back over.
+    def test_trust_ceiling_wins_over_non_failed_stale_plan(self, store, clock):
+        # A row past TRUST_MAX_AGE_S with no failure and no live plan reads as
+        # unknown -- the unknown-path machinery must take back over.
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
-        store.record({"1": FetchRecord(error="timeout")}, IDENT)
         clock.advance(TRUST_MAX_AGE_S + 1)
-        store.record({"1": FetchRecord(error="timeout")}, IDENT)
         entry = store.entries(IDENT)["1"]
-        assert entry.consecutive_failures == 2
+        assert entry.consecutive_failures == 0
         assert entry.decision_value() is None
+
+
+class TestMarkAtLimit:
+    """Rule 2 (T1102): an out-of-band at-limit signal the poller cannot see
+    (the pin's own 429 on /v1/messages, via UsageStore.mark_at_limit) makes
+    decision_value() report the slot full until a persisted deadline, whatever
+    a poll taken meanwhile says."""
 
     def _usage_resetting_at(self, clock, seconds_ahead):
         from datetime import datetime, timezone
@@ -181,128 +241,39 @@ class TestExtendedTrust:
             "seven_day": {"pct": 10.0, "resets_at": iso},
         }
 
-    def test_429_staleness_trusted_until_window_reset(self, store, clock):
-        # A usage-endpoint 429 throttles polling; it does NOT move the account's
-        # real windows. Usage only rises within a window (monotone until reset),
-        # so last_good is a valid lower bound — trust it up to its reset, as long
-        # as that reset is within the client-side ceiling. Reset inside the
-        # ceiling → trusted right up to it, past the general TRUST_MAX_AGE_S.
-        reset_ahead = (TRUST_MAX_AGE_S + RATE_LIMIT_TRUST_MAX_AGE_S) / 2  # < ceiling
-        usage = self._usage_resetting_at(clock, reset_ahead)
-        store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(TRUST_MAX_AGE_S + 1)  # past the general ceiling...
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        entry = store.entries(IDENT)["1"]
-        assert entry.trust_extended
-        assert entry.decision_value() == usage  # ...but before the reset
-
-    def test_429_staleness_expires_at_window_reset(self, store, clock):
-        # Once the window has reset, usage is zeroed and last_good is obsolete —
-        # it reads as unknown so the unknown-path machinery takes over. This is
-        # the natural, data-driven bound (no fixed clock): trust ends exactly
-        # when the measured value can no longer hold.
-        usage = self._usage_resetting_at(clock, 600.0)  # resets in 10 min
-        store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(601.0)  # past the window reset
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        entry = store.entries(IDENT)["1"]
-        assert entry.decision_value() is None
-        assert entry.last_good == usage  # display still sees it
-
-    def test_429_staleness_without_reset_info_falls_back_to_ceiling(
+    def test_full_before_the_earliest_reset_and_the_poll_after_it(
         self, store, clock
     ):
-        # Older stored data may carry no resets_at. Fall back to the fixed
-        # rate-limit ceiling so such an entry still can't be trusted forever.
-        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)  # no resets_at
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(TRUST_MAX_AGE_S + 1)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() == USAGE  # within
-        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() is None  # past cap
-
-
-class TestRateLimitTrustBounds:
-    """The 429-stale trust must be bounded even with reset metadata present:
-    (a) clamped to a client-side ceiling so a far-future/malformed resets_at
-    can't grant indefinite trust, (b) keyed on the EARLIEST future reset (any
-    relevant window reset invalidates the snapshot), and (c) robust to partial
-    metadata (a window missing resets_at must not let a longer window's reset
-    override the ceiling).
-    """
-
-    def _usage(self, clock, five_h_ahead, seven_d_ahead):
-        from datetime import datetime, timezone
-
-        def iso(ahead):
-            if ahead is None:
-                return None
-            return (
-                datetime.fromtimestamp(clock.now + ahead, tz=timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-
-        five = {"pct": 25.0}
-        if five_h_ahead is not None:
-            five["resets_at"] = iso(five_h_ahead)
-        seven = {"pct": 10.0}
-        if seven_d_ahead is not None:
-            seven["resets_at"] = iso(seven_d_ahead)
-        return {"five_hour": five, "seven_day": seven}
-
-    def test_far_future_reset_is_clamped_to_the_ceiling(self, store, clock):
-        # A malformed/far-future resets_at (year 2099) must NOT grant unbounded
-        # trust: the client-side ceiling caps it.
-        far = 10 * 365 * 24 * 3600.0  # ~10 years
-        usage = self._usage(clock, far, far)
+        usage = self._usage_resetting_at(clock, 600.0)  # resets in 10 min
         store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S + 1)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        # past the ceiling → no longer trusted, despite the far-future reset
-        assert store.entries(IDENT)["1"].decision_value() is None
+        store.mark_at_limit("1", IDENT)
 
-    def test_trust_keys_on_earliest_future_reset(self, store, clock):
-        # 5h resets soon, 7d resets far ahead. The snapshot is invalid once the
-        # SOONER window rolls over (usage zeroes there), so trust must end at the
-        # earliest reset, not the latest.
-        usage = self._usage(clock, 600.0, 100 * 3600.0)  # 5h: 10min, 7d: far
-        store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(601.0)  # past the 5h reset, long before the 7d one
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() is None
+        assert store.entries(IDENT)["1"].decision_value() == {
+            "five_hour": {"pct": 100.0}
+        }
 
-    def test_partial_metadata_still_bounded_by_ceiling(self, store, clock):
-        # 5h has NO resets_at (a shape the server actually sends); 7d resets far
-        # ahead. The missing-reset window must not let the far 7d reset grant
-        # near-unbounded trust — the ceiling still applies.
-        usage = self._usage(clock, None, 100 * 3600.0)
-        store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S + 1)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() is None
+        clock.advance(300.0)  # a poll taken while still walled...
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == {
+            "five_hour": {"pct": 100.0}
+        }  # ...does not clear the mark early
 
-    def test_ceiling_wins_when_reset_is_beyond_it(self, store, clock):
-        # Reset farther out than the ceiling: trusted up to the ceiling, then
-        # unknown — the ceiling, not the reset, is the bound.
-        usage = self._usage(
-            clock, RATE_LIMIT_TRUST_MAX_AGE_S * 3, RATE_LIMIT_TRUST_MAX_AGE_S * 3
-        )
-        store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        clock.advance(RATE_LIMIT_TRUST_MAX_AGE_S - 60)  # just inside the ceiling
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() == usage
-        clock.advance(120)  # now just past the ceiling
-        store.record({"1": FetchRecord(error="http-429")}, IDENT)
-        assert store.entries(IDENT)["1"].decision_value() is None
+        clock.advance(301.0)  # past the mark's own deadline
+        fresh = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0}}
+        store.record({"1": FetchRecord(usage=fresh)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == fresh
+
+    def test_no_stored_reading_falls_back_to_the_wall_fallback_span(
+        self, store, clock
+    ):
+        store.mark_at_limit("1", IDENT)  # nothing stored to key a reset on
+        assert store.entries(IDENT)["1"].decision_value() == {
+            "five_hour": {"pct": 100.0}
+        }
+        clock.advance(WALL_FALLBACK_S - 1)
+        assert store.entries(IDENT)["1"].walled
+        clock.advance(2)
+        assert not store.entries(IDENT)["1"].walled
 
 
 class TestBackoff:
@@ -566,16 +537,17 @@ class TestBackoff:
     def test_each_arm_is_bounded_by_the_ceiling_its_own_trust_uses(self):
         """A non-429 park must never outlast TRUST_MAX_AGE_S, its own ceiling.
 
-        `entries()` reads a non-429 row unknown once `TRUST_MAX_AGE_S` (3600s)
-        elapses past the last success — that is the ceiling this arm's trust
-        actually uses. Before this fix, the PARK BOUND capped every ask at
-        `RETRY_AFTER_FLOOR_CAP_S` (4500s) regardless of which arm produced it,
-        so a non-429 ask above 3600 parked the row past its own trust: blind
-        (un-pollable AND unknown) for up to 900s — a regression this PR
-        introduced against upstream/main, where `RETRY_AFTER_FLOOR_CAP_S` was
-        3600, identical to `TRUST_MAX_AGE_S`, so the blind window was always
-        0. The 429 arm keeps `RETRY_AFTER_FLOOR_CAP_S`, correctly inside its
-        own ceiling `RATE_LIMIT_TRUST_MAX_AGE_S` (7200s).
+        Pins the PARK duration alone, against the constants `_failure_backoff_s`
+        itself is built from — not `entries()`'s decision trust, which a failed
+        row (T1102) now caps at `poll_policy.POST_429_MIN_INTERVAL_S` (360s)
+        regardless of arm, well inside either park cap below. Before this fix
+        (pre-T1102), the PARK BOUND capped every ask at `RETRY_AFTER_FLOOR_CAP_S`
+        (4500s) regardless of which arm produced it, so a non-429 ask above 3600
+        parked the row past its own park ceiling (`TRUST_MAX_AGE_S`, 3600s) — a
+        regression this PR introduced against upstream/main, where
+        `RETRY_AFTER_FLOOR_CAP_S` was 3600, identical to `TRUST_MAX_AGE_S`. The
+        429 arm keeps `RETRY_AFTER_FLOOR_CAP_S`, correctly inside
+        `RATE_LIMIT_TRUST_MAX_AGE_S` (7200s).
         """
         for ask in (3601.0, 4500.0, 7200.0, 86_400.0, float("inf")):
             wait = usage_store._failure_backoff_s(1, ask, rate_limited=False)
@@ -590,178 +562,6 @@ class TestBackoff:
                 f"429 ask {ask} produced a {wait}s park, past the 429 trust "
                 f"ceiling {usage_store.RATE_LIMIT_TRUST_MAX_AGE_S}s"
             )
-
-    def test_a_soon_resetting_window_can_end_trust_before_the_429_wait_releases(
-        self, store, clock
-    ):
-        """The other half of the bound: `min(earliest reset, age-ceiling)`.
-
-        `test_the_cap_sits_inside_the_trust_it_relies_on` only pins the
-        age-ceiling half (RATE_LIMIT_TRUST_MAX_AGE_S = 7200) — it never gives
-        `last_good` a `resets_at`, so `_earliest_reset` is always None there
-        and only the ceiling can bind. Trust actually ends at
-        `min(earliest reset, fetched_at + ceiling)`, and a 5h window that
-        resets sooner than that ends it first.
-
-        Retry-After 3600 -> a 429 wait released at +4500s (measured in
-        `test_hour_scale_retry_after_honored`). Here the 5h window resets at
-        +1800s, well before that release: the row goes untrusted while still
-        in backoff (un-pollable AND unknown at once) — a blind gap that
-        exists and is bounded, not the "sits comfortably inside its own
-        trust" the old comment claimed.
-
-        The reset is fixed at +1800s, not +3600s: at +3600s the reset lands
-        exactly on `TRUST_MAX_AGE_S`, where this test's own branch (the 429
-        trust bound, `_rate_limited_trust_ok`) and the general age-ceiling
-        branch (`age_s <= TRUST_MAX_AGE_S`) give identical answers at all
-        three instants this test checks — a mutation that routes 429 rows
-        through the general branch (`if row.get("lastError") == "http-429"`
-        -> `if False`) survives here even though it kills 8 tests elsewhere.
-        +1800 makes the two branches disagree (confirmed: MUT-D reads
-        `decision_value() == usage` at t0+1801 instead of `None`), so this
-        test now actually depends on the 429-specific trust path it exists
-        to pin.
-        """
-        from datetime import datetime, timezone
-
-        def iso(ahead):
-            return (
-                datetime.fromtimestamp(clock.now + ahead, tz=timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-
-        usage = {
-            "five_hour": {"pct": 25.0, "resets_at": iso(1800.0)},
-            "seven_day": {"pct": 10.0, "resets_at": iso(100 * 3600.0)},
-        }
-        # Schema gotcha: the window key is "pct", not "utilization" — confirm
-        # the fixture actually produces relevant windows before trusting
-        # anything measured against it.
-        assert oauth.relevant_windows(usage, ()) != []
-
-        store.record({"1": FetchRecord(usage=usage)}, IDENT)
-        store.record(
-            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
-        )
-        wait = usage_store._failure_backoff_s(1, 3600.0, rate_limited=True)
-        assert wait == pytest.approx(4500.0)
-
-        clock.advance(1799.0)  # just before the 5h reset
-        entry = store.entries(IDENT)["1"]
-        assert entry.in_backoff(clock.now)
-        assert entry.decision_value() == usage
-
-        clock.advance(2.0)  # just past the 5h reset, still well inside backoff
-        entry = store.entries(IDENT)["1"]
-        assert entry.in_backoff(clock.now)  # still can't be re-polled...
-        assert entry.decision_value() is None  # ...and already unknown
-
-        clock.advance(wait - 1801.0)  # past the wait's release
-        entry = store.entries(IDENT)["1"]
-        assert not entry.in_backoff(clock.now)
-        assert entry.decision_value() is None
-
-    def test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success(
-        self, store, clock
-    ):
-        """The blind gap is bounded PER BLOCK, never across a chain of them.
-
-        The 429 comment presents the un-pollable-and-unknown window as caused
-        by "a window that resets before the ceiling". That is one way in. The
-        age-ceiling half opens the same gap with NO early reset at all, because
-        `record()` writes `fetchedAt` only when `rec.error is None`
-        (usage_store.py, the success branch) — a chain of failed blocks never
-        refreshes it, so trust keeps expiring against the FIRST success while
-        each new block adds another full wait. Driven through the real
-        `store.record()`/`store.entries()` round trip, not a hand-rolled
-        stand-in, so a regression in the success-only write actually fails
-        this test.
-
-        Measured here with far-future resets only, so `_earliest_reset` can
-        never bind and only the ceiling can:
-
-            block 1  wait [    0,  4500]  trust ends 7200  blind      0s
-            block 2  wait [ 4500,  9000]  trust ends 7200  blind   1800s
-            block 3  wait [ 9000, 13500]  trust ends 7200  blind   4500s
-
-        By block 3 the row is blind for the ENTIRE wait. `cap <= TRUST` says
-        nothing about this: it bounds ONE wait against the ceiling, and the
-        ceiling does not move.
-
-        WHY THIS IS A TEST AND NOT A COMMENT FIX. The inequality in
-        `test_the_cap_sits_inside_the_trust_it_relies_on` admits [4500, 7200],
-        and at 7200 an ask of 6300s or more drives the wait itself to 7200,
-        taking the same three blocks from 6300s to 14400s blind — 2.3x. What
-        actually stops that drift is the IDENTITY assertion
-        (`cap == 3600 + MARGIN`) in that same test, not the inequality the
-        comment reasons from. Pin the consequence directly so the bound is
-        argued from blind time rather than from a constant comparison that
-        does not imply it.
-        """
-        import datetime
-
-        def iso(t):
-            return (
-                datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-
-        far = 10 ** 9
-        last_good = {
-            "five_hour": {"pct": 25.0, "resets_at": iso(far)},
-            "seven_day": {"pct": 10.0, "resets_at": iso(far)},
-        }
-        # NON-VACUITY: with an empty window list every trust question answers
-        # the same way and the test proves nothing. The schema key is `pct`,
-        # not `utilization` — a probe using the wrong one returned [] here and
-        # read as green.
-        assert oauth.relevant_windows(last_good, ()) != []
-        assert usage_store._earliest_reset(last_good) is not None
-
-        # ONE success establishes fetchedAt; every record() after this is a
-        # 429 failure, so a chain of them must never move it again.
-        store.record({"1": FetchRecord(usage=last_good)}, IDENT)
-        fetched_at = store.entries(IDENT)["1"].fetched_at
-
-        blind_per_block = []
-        for _ in range(3):
-            store.record(
-                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
-            )
-            entry = store.entries(IDENT)["1"]
-            assert entry.fetched_at == fetched_at, (
-                "a failed record() moved fetchedAt — the chain premise this "
-                "test pins no longer holds"
-            )
-            assert entry.backoff_until is not None
-            block_end = entry.backoff_until
-            wait = block_end - clock.now
-
-            # Ask the REAL read model at each second-boundary of this block.
-            blind = 0.0
-            while clock.now < block_end:
-                if store.entries(IDENT)["1"].decision_value() is None:
-                    blind = block_end - clock.now
-                    break
-                clock.advance(60.0)
-            blind_per_block.append(blind)
-            clock.advance(max(block_end - clock.now, 0.0))
-
-        assert wait == pytest.approx(4500.0)
-        assert blind_per_block[0] == 0.0, (
-            "the first block is supposed to sit inside its trust — if this "
-            "fires, the single-block claim itself is wrong"
-        )
-        assert blind_per_block[1] > 0.0, (
-            "a second consecutive block must show the gap the comment "
-            "attributes only to an early reset"
-        )
-        assert blind_per_block[2] == pytest.approx(wait), (
-            f"by the third block the row should be blind for the whole wait; "
-            f"got {blind_per_block[2]}"
-        )
 
     def test_the_margin_never_lifts_the_floor_cap(self):
         """`RETRY_AFTER_FLOOR_CAP_S` bounds how long a server ask can park us.
@@ -793,103 +593,6 @@ class TestBackoff:
         # the block is exactly that long — honored as the floor, with no margin
         # added: 300 is under BACKOFF_CAP_S, where our own curve governs.
         assert usage_store._failure_backoff_s(1, 300.0) == pytest.approx(300.0)
-
-    def test_park_bound_blind_window_equals_age_at_failure(self, tmp_path):
-        """PIN, not fix: the PARK BOUND caps the park, never the blind window.
-
-        The PARK BOUND (`asked = min(asked, ceiling ...)`, right below this
-        test's target) compares a `now`-relative duration (`asked`) against a
-        `fetchedAt`-relative ceiling (`TRUST_MAX_AGE_S` /
-        `RATE_LIMIT_TRUST_MAX_AGE_S`). Those only agree when the row was
-        already fresh (age 0) at the moment it failed — round-7 review found
-        an earlier comment here wrongly claimed this bound closed the gap in
-        general ("the blind window was always 0"); it does not, on either
-        arm, and this is pre-existing upstream behaviour left open
-        (documented, not fixed, in this PR — see the PARK BOUND comment).
-
-        Driven end-to-end through the real `store.record()` /
-        `entries().decision_value()`, not a hand-rolled stand-in, on the
-        non-429 arm where the park cap equals TRUST_MAX_AGE_S (3600)
-        exactly, so the gap is the whole story rather than diluted by 429
-        trust's extra slack. `age_at_fail=0` is the CONTROL: no gap.
-
-        The non-429 rows below are also the CONTROL for the 429-arm rows
-        that follow: identical harness, only `error` differs, so any drift
-        here would show the probe itself moved rather than the arm under
-        test. On the 429 arm (`RETRY_AFTER_FLOOR_CAP_S` 4500 vs the non-429
-        arm's `TRUST_MAX_AGE_S` 3600, both bounded by
-        `RATE_LIMIT_TRUST_MAX_AGE_S` 7200) the identity `blind ==
-        age_at_fail` does NOT hold -- the cap and the trust ceiling are
-        different constants there, so
-        `blind = age_at_fail - (ceiling - park) = age_at_fail - 2700`. This
-        PR raises the 429 cap 3600 -> 4500, which moves the 429 blind onset
-        900s earlier (age 3600 -> 2700) and adds a flat +900s at every age
-        past that, compared to upstream. See the PARK BOUND comment.
-        """
-        IDENT_1 = {"1": ("a@example.com", "")}
-
-        def blind_window(age_at_fail: float, ask: float, error: str = "http-500") -> float:
-            clock = FakeClock()
-            store = UsageStore(
-                tmp_path / f"cache-{error}-{age_at_fail}-{ask}", clock=clock
-            )
-            store.record({"1": FetchRecord(usage={"five_hour": {"pct": 1.0}})}, IDENT_1)
-            clock.advance(age_at_fail)
-            store.record(
-                {"1": FetchRecord(error=error, retry_after_s=ask)}, IDENT_1
-            )
-            park_end = store.entries(IDENT_1)["1"].backoff_until
-            assert park_end is not None
-            blind_start = None
-            t = clock.now
-            while t < park_end:
-                clock.now = t
-                entry = store.entries(IDENT_1)["1"]
-                if entry.in_backoff(clock.now) and entry.decision_value() is None:
-                    blind_start = t
-                    break
-                t += 1.0
-            clock.now = park_end
-            return 0.0 if blind_start is None else park_end - blind_start
-
-        # (age_at_fail, ask, expected blind window) -- non-429 arm, also the
-        # CONTROL for the 429-arm cases below.
-        cases = [
-            (0.0, 5000.0, 0.0),  # CONTROL: fresh at failure, no gap
-            (1.0, 5000.0, 1.0),
-            (120.0, 5000.0, 120.0),
-            (300.0, 5000.0, 300.0),
-            (1800.0, 5000.0, 1800.0),
-            (3599.0, 5000.0, 3599.0),
-            (300.0, 4000.0, 300.0),
-            (300.0, 3600.0, 300.0),
-            (300.0, 600.0, 0.0),  # park itself (600) is short: never blind
-        ]
-        for age_at_fail, ask, expected in cases:
-            blind = blind_window(age_at_fail, ask)
-            assert blind == pytest.approx(expected, abs=2.0), (
-                f"age@fail={age_at_fail:.0f} ask={ask:.0f}: blind window "
-                f"{blind:.0f}s, expected {expected:.0f}s"
-            )
-
-        # 429 ARM (rate_limited) -- `blind = age_at_fail - 2700`, clamped to
-        # [0, park]. `ask=5000` (not 3600) is deliberate: at ask=3600 the
-        # margin-adjusted ask (4500) already sits exactly on
-        # RETRY_AFTER_FLOOR_CAP_S, so the row would read the same whether the
-        # cap were 4500 or 7200 -- an ask above 3600 is needed for the cap to
-        # actually bind and for mutation M5 (cap -> 7200) to move this test.
-        rate_limited_cases = [
-            (0.0, 5000.0, 0.0),  # CONTROL: fresh at failure, no gap
-            (2701.0, 5000.0, 1.0),
-            (3600.0, 5000.0, 900.0),
-            (5000.0, 5000.0, 2300.0),
-        ]
-        for age_at_fail, ask, expected in rate_limited_cases:
-            blind = blind_window(age_at_fail, ask, error="http-429")
-            assert blind == pytest.approx(expected, abs=2.0), (
-                f"[429 arm] age@fail={age_at_fail:.0f} ask={ask:.0f}: blind "
-                f"window {blind:.0f}s, expected {expected:.0f}s"
-            )
 
 
 class TestIdentityGuard:

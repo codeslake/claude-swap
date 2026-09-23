@@ -1346,6 +1346,40 @@ class TestDecisionTable:
         assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
 
 
+class TestAtLimitWallMarkOverridesTheActiveReading:
+    """Rule 2 (T1102): `UsageStore.mark_at_limit`'s wall mark makes
+    `decision_value()` report the active account full for decisions
+    regardless of a fresh poll, so autoswitch does not hold it as healthy --
+    proven through the real tick (`entry.decision_value()` is what the
+    engine actually reads), not a hand-rolled usage check."""
+
+    def test_walled_active_is_left_despite_a_healthy_fresh_poll(self, harness):
+        harness.engine.settings = replace(harness.engine.settings, strategy="best")
+        now = harness.clock.now
+        entries = {
+            "1": UsageEntry(
+                last_good=_usage(58.0), fetched_at=now, age_s=0.0, walled=True
+            ),
+            "2": _entry_for(_usage(10.0), now),
+            "3": _entry_for(_usage(20.0), now),
+        }
+        outcome = harness.tick_with_entries(entries)
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() != 1
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_the_same_active_fresh_with_no_mark_is_held(self, harness):
+        harness.engine.settings = replace(harness.engine.settings, strategy="best")
+        outcome = harness.tick_with_usage({
+            "1": _usage(58.0), "2": _usage(10.0), "3": _usage(20.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+
 class TestIdleHold:
     """Active token expired while Claude Code owns it → hold, don't fail over."""
 
@@ -1669,9 +1703,11 @@ class TestAdaptiveScheduler:
 
     def test_active_in_backoff_keeps_trusted_headroom(self, temp_home, monkeypatch):
         # The active account's fetches are being refused (429 with a long
-        # Retry-After). Its last-good data ages past STALE_OK_S, but the
-        # staleness is deliberate: headroom stays known, so no unhealthy
-        # ticks and no escalate-all burst while the server is rate limiting.
+        # Retry-After). Its last-good data ages past STALE_OK_S but stays
+        # within poll_policy.POST_429_MIN_INTERVAL_S (T1102: a failed row is
+        # capped there, not at the old, much longer ceiling): headroom stays
+        # known, so no unhealthy ticks and no escalate-all burst while the
+        # server is rate limiting.
         h = self._harness(temp_home, monkeypatch)
         usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
@@ -1682,7 +1718,7 @@ class TestAdaptiveScheduler:
             {"1": FetchRecord(error="http-429", retry_after_s=600.0)},
             {"1": ("a@example.com", "")},
         )
-        h.clock.advance(400)  # active data now well past STALE_OK_S, in backoff
+        h.clock.advance(290)  # +350 total: past STALE_OK_S, still <= 360
         counts.clear()
         outcome = self._tick(h, counts, usage)
         assert outcome is TickOutcome.NO_ACTION
@@ -1752,84 +1788,6 @@ class TestAdaptiveScheduler:
         assert _failure_backoff_s(1, float("inf"), rate_limited=True) == 4500.0, (
             "the 429 arm's own inf handling regressed"
         )
-
-    def test_shortening_a_429_wait_cannot_move_when_the_row_goes_unknown(
-        self, temp_home
-    ):
-        """Un-pollable and unknown are independent axes, and this is why.
-
-        A previous round clipped the 429 wait to `min(earliest reset, fetchedAt
-        + ceiling) - now`, reading the row's remaining trust as a second
-        deadline the wait had to respect. The reasoning was that a wait running
-        past that instant leaves the row un-pollable AND unknown, which the
-        unhealthy-tick counter converts into a failover.
-
-        The blind window is real. Shortening the wait does not touch it.
-        `entries()` decides trust from `lastGood`/`fetchedAt`, and `record()`
-        writes both in the SUCCESS branch only — a 429 refreshes neither. So
-        the instant the row goes unknown is fixed by the last SUCCESSFUL fetch,
-        and no choice of backoff can move it by one second. A shorter wait only
-        samples that same instant more often, at one request each.
-
-        Asserted by driving two histories that differ ONLY in how long they
-        waited, and reading `decision_value()` at fixed, cadence-independent
-        instants either side of the window's own reset boundary — NOT by
-        polling in a loop and reporting the first sample that observes the
-        flip. A loop's report is only as precise as its own stride, so a
-        stride that happens to divide the reset boundary (1800 % 1800 == 0)
-        agrees with a finer one by coincidence, not because the mechanism was
-        exercised: pick a stride of 2000 instead of 1800 and the same true
-        mechanism reports a different (later, sampling-limited) instant,
-        making the comparison look broken when nothing moved. Checking the
-        same two fixed instants for every cadence removes the coincidence.
-        """
-        from datetime import datetime, timezone
-
-        from claude_swap.usage_store import FetchRecord
-
-        def _at(base, seconds):
-            return (
-                datetime.fromtimestamp(base + seconds, tz=timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-
-        def decision_at(home, stride, checkpoint):
-            """`decision_value() is None`, landing the clock EXACTLY on
-            `checkpoint` (never overshooting it), having recorded a 429 every
-            `stride` seconds up to that point — so every cadence is sampled
-            at the identical absolute instant, not at "whenever the loop
-            happens to next check"."""
-            h = EngineHarness(home)
-            h.seed(1, "a@example.com")
-            store = h.switcher._usage_store
-            ids = {"1": ("a@example.com", "")}
-            t0 = h.clock.now
-            store.record({"1": FetchRecord(usage=_usage(50, _at(t0, 1800)))}, ids)
-            elapsed = 0.0
-            while elapsed < checkpoint:
-                store.record(
-                    {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ids
-                )
-                step = min(stride, checkpoint - elapsed)
-                h.clock.advance(step)
-                elapsed += step
-            assert h.clock.now - t0 == checkpoint  # landed exactly, not past it
-            return store.entries(ids)["1"].decision_value() is None
-
-        # A 37s stride and an 1801s one (effectively one big wait) do not
-        # share a divisor with 1800 or with each other, unlike the pre-fix
-        # pairing (1800 vs 1800) — a cadence that moved the lapse instant
-        # could no longer hide behind stride alignment.
-        for checkpoint, expect_unknown in ((1799.0, False), (1801.0, True)):
-            hammered = decision_at(temp_home / f"short{checkpoint}", 37.0, checkpoint)
-            honored = decision_at(temp_home / f"long{checkpoint}", 1801.0, checkpoint)
-            assert hammered == honored == expect_unknown, (
-                f"at +{checkpoint:.0f}s: hammered saw unknown={hammered}, "
-                f"honored saw unknown={honored}, expected {expect_unknown} — "
-                "the backoff cadence moved a deadline that belongs to the "
-                "last successful fetch"
-            )
 
     def test_a_re_block_chain_spends_one_request_per_block(self, temp_home):
         """A chain of blocks costs one request each, however long it runs.

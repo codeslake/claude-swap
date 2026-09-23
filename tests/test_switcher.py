@@ -16,6 +16,7 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
+from claude_swap import poll_policy
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -19915,6 +19916,112 @@ class TestSwitchOffAtLimitAccount:
         assert result["switched"] is False
         assert result["reason"] == "candidates-exhausted"
         assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+
+class TestFailedReadingLosesToAFresherWorseReading:
+    """Rule 1 (T1102): `entries()`/`decision_value()` cap a failed row's
+    trust at `poll_policy.POST_429_MIN_INTERVAL_S`, so a stale 429-frozen
+    reading with nominally MORE headroom must not beat a fresher reading with
+    less. Driven through the real selection path, `_select_best_switchable`,
+    fed by the real store's own `decision_value()` -- not a hand-rolled
+    trust check."""
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = TestCurrentAtLimitOverridesTheFrozenPct()._setup(temp_home)
+        seed = TestCurrentAtLimitOverridesTheFrozenPct()._seed
+        seed(s, 1, "cur@example.com")
+        seed(s, 2, "b@example.com")
+        seed(s, 3, "c@example.com")
+        return s
+
+    _IDENT = {
+        "1": ("cur@example.com", ""),
+        "2": ("b@example.com", ""),
+        "3": ("c@example.com", ""),
+    }
+
+    @staticmethod
+    def _usage(pct: float) -> dict:
+        return {"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}}
+
+    def _decision_usage(self, s: ClaudeAccountSwitcher) -> dict:
+        entries = s._usage_store.entries(self._IDENT)
+        return {num: e.decision_value() for num, e in entries.items()}
+
+    def test_stale_429_reading_loses_to_a_fresher_worse_reading(self, temp_home):
+        s = self._setup(temp_home)
+        # "2"'s reading is frozen by a 429 older than the poll period: a
+        # second `UsageStore` on the SAME cache, clocked into the past,
+        # writes its success far enough back that the real store (real
+        # clock) reads it as too stale to trust.
+        backdated = UsageStore(
+            s.backup_dir / "cache",
+            clock=lambda: time.time() - (poll_policy.POST_429_MIN_INTERVAL_S + 5),
+        )
+        backdated.record({"2": FetchRecord(usage=self._usage(58.0))}, self._IDENT)
+        backdated.record(
+            {"2": FetchRecord(error="http-429", retry_after_s=480.0)}, self._IDENT
+        )
+        s._usage_store.record(
+            {"1": FetchRecord(usage=self._usage(90.0))}, self._IDENT
+        )
+        s._usage_store.record(
+            {"3": FetchRecord(usage=self._usage(70.0))}, self._IDENT
+        )
+
+        usage = self._decision_usage(s)
+        assert usage["2"] is None  # too stale to trust
+
+        assert s._select_best_switchable("1", usage=usage) == ("3", "")
+
+    def test_the_same_reading_fresh_is_picked(self, temp_home):
+        s = self._setup(temp_home)
+        s._usage_store.record(
+            {"2": FetchRecord(usage=self._usage(58.0))}, self._IDENT
+        )
+        s._usage_store.record(
+            {"1": FetchRecord(usage=self._usage(90.0))}, self._IDENT
+        )
+        s._usage_store.record(
+            {"3": FetchRecord(usage=self._usage(70.0))}, self._IDENT
+        )
+
+        usage = self._decision_usage(s)
+        assert usage["2"] == self._usage(58.0)
+
+        assert s._select_best_switchable("1", usage=usage) == ("2", "")
+
+
+class TestSwitchPersistsTheAtLimitMark:
+    """Rule 2 (T1102) wiring: `switch(current_at_limit=True)` must itself call
+    `UsageStore.mark_at_limit` on the CURRENT slot through the real store --
+    not just zero this one selection (`_select_best_switchable`'s existing
+    `current_at_limit` arm) -- so a later reader (autoswitch's tick, the TUI,
+    the next switch) sees the same slot at-limit too."""
+
+    def test_switch_marks_the_current_slot_at_limit(self, temp_home):
+        s = TestCurrentAtLimitOverridesTheFrozenPct()._setup(temp_home)
+        seed = TestCurrentAtLimitOverridesTheFrozenPct()._seed
+        seed(s, 1, "a@example.com")
+        seed(s, 2, "b@example.com")
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-live"}})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"}
+        }))
+        ident = {"1": ("a@example.com", "")}
+        usage = {"1": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
+                 "2": {"five_hour": {"pct": 56.0}, "seven_day": {"pct": 0.0}}}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            result = switch_off_at_limit_account(s)
+
+        assert result["switched"] is True
+        entry = s._usage_store.entries(ident)["1"]
+        assert entry.walled
+        assert entry.decision_value() == {"five_hour": {"pct": 100.0}}
 
 
 class TestAnEmptySlotLandingKeepsTheWarningsAlreadyEarned:
