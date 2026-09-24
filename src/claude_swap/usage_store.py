@@ -490,12 +490,15 @@ class UsageEntry:
         "unmeasured since before the reset, and nothing has looked since" —
         dropping it would manufacture headroom from data nobody has
         reconfirmed. The whole reading nulls instead, same as pre-#325 (the
-        429 arm is bounded far tighter than any reset test: ``entries()``
-        caps ``trust_extended`` at ``POST_429_MIN_INTERVAL_S`` (360s) once
-        ``consecutiveFailures`` is nonzero, ageing a frozen 429 reading out
-        of this branch long before a real window's ``soonest <= now`` test
-        (``_drop_rolled_windows``'s own membership check) would ever see it
-        roll; this is the non-429 arm, which has no such 360s ceiling).
+        failed-row arm is bounded far tighter than any reset test:
+        ``entries()`` caps ``trust_extended`` at ``POST_429_MIN_INTERVAL_S``
+        (360s) once ``consecutiveFailures`` is nonzero, so a failed row's own
+        ``soonest <= now`` test (via ``_earliest_reset`` -- this method's own
+        check, not ``_drop_rolled_windows``'s) is reachable only in the narrow
+        ``STALE_OK_S``-to-360s window (300s-360s) before ``trust_extended``
+        itself goes False; a row whose last attempt
+        did not fail keeps the wider ``TRUST_MAX_AGE_S`` ceiling instead of the
+        failed-row arm's 360s cap).
 
         This CAN null a healthy account too — the scheduled-next-poll
         disjunct (``now < next_poll_at``) is true for a row simply not due
