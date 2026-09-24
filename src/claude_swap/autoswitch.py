@@ -4981,6 +4981,37 @@ class AutoSwitchEngine:
             > poll_policy.ACTIVE_MAX_INTERVAL_S
             and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
         )
+        # `_replan_new_active`'s post-switch deferral (POST_SWITCH_REPLAN_DEFER_S)
+        # can leave `nextPollAt` further out than any jittered *normal* active
+        # cadence could ever schedule from `fetchedAt` — the deferral term, not
+        # the interval, is what is holding the row not-due, and that deferral
+        # exists only to give an on-demand caller's own poll-due check a
+        # moment to be beaten by a free header reading (see poll_policy.py);
+        # the engine's own scheduled cadence must not honor it, or a reading
+        # already stale at switch time stays decision-trusted for the whole
+        # window (T1102). `record_header_reading` pushes `nextPollAt` out the
+        # same way (to `lastAttemptAt + CANDIDATE_MAX_INTERVAL_S`), but that
+        # is the intended cadence for a row fed by free readings, not a stuck
+        # defer, so the `next_poll_at - now <= POST_SWITCH_REPLAN_DEFER_S`
+        # check below keeps this scoped to a plan still inside the post-switch
+        # window instead of firing on every header-fed active slot (T1231). A
+        # widened post-429 interval (necessarily above the active ceiling) is
+        # deliberate and excluded here exactly as it is from
+        # `stale_candidate_plan` above.
+        stale_active_plan = (
+            active_pre is not None
+            and active_pre.age_s is not None
+            and active_pre.age_s >= poll_policy.ACTIVE_MAX_INTERVAL_S
+            and active_pre.next_poll_at is not None
+            and active_pre.fetched_at is not None
+            and (active_pre.poll_interval_s or 0.0)
+            <= poll_policy.ACTIVE_MAX_INTERVAL_S
+            and active_pre.next_poll_at
+            > active_pre.fetched_at
+            + poll_policy.ACTIVE_MAX_INTERVAL_S * (1.0 + poll_policy.JITTER_FRAC)
+            and active_pre.next_poll_at - now <= poll_policy.POST_SWITCH_REPLAN_DEFER_S
+            and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
+        )
         overslept_plan = (
             active_pre is not None
             and plan_oversleeps_interval(active_pre, now)
@@ -4989,6 +5020,7 @@ class AutoSwitchEngine:
             active_pre is None
             or active_pre.age_s is None
             or stale_candidate_plan
+            or stale_active_plan
             or overslept_plan
             or (
                 active_pre.next_poll_at is not None
@@ -5015,10 +5047,11 @@ class AutoSwitchEngine:
             raise _EngineStopped()
         entries = self.switcher.usage_entries_by_account(
             fetch=plan,
-            # A candidate-style plan on the active slot is deliberately
-            # overridden after the active age cap; every other baseline
-            # nomination preserves a valid future plan under the store lock.
-            scheduled=not stale_candidate_plan,
+            # A candidate-style or post-switch-deferred plan on the active
+            # slot is deliberately overridden after the active age cap;
+            # every other baseline nomination preserves a valid future plan
+            # under the store lock.
+            scheduled=not (stale_candidate_plan or stale_active_plan),
         )
         usage = {
             num: entry.decision_value(self._models) for num, entry in entries.items()

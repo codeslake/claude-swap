@@ -9065,11 +9065,20 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         Its stored plan was computed while it was an idle candidate and may
         wait up to CANDIDATE_MAX_INTERVAL_S — too slow for the account whose
         usage is about to move. The deadline anchors on the last measurement
-        (an already-old one comes due immediately, a never-measured account
+        (an already-old one comes due after POST_SWITCH_REPLAN_DEFER_S, not
+        immediately — that window is only a chance for the slot's own
+        traffic to land a free header reading and push the real poll out on
+        its own; the header throttle itself does not delay a newly live
+        slot's first reading (see poll_policy.py), a never-measured account
         is left plan-less so nothing blocks its first fetch), and the next
-        poll is only ever pulled earlier, never pushed later. Best-effort by
-        contract: the switch this rides on has already committed, so a cache
-        hiccup here must not surface as a switch failure."""
+        poll is only ever pulled earlier, never pushed later. A row with a
+        recent failed attempt skips the defer
+        term entirely: ``record_header_reading`` refuses any row with
+        ``consecutiveFailures > 0``, so no free reading can ever land there
+        and waiting out the window only delays the real retry that could
+        heal it. Best-effort by contract: the switch this rides on has
+        already committed, so a cache hiccup here must not surface as a
+        switch failure."""
         try:
             identities = {number: (email, org_uuid or "")}
             now = self._usage_store.clock()
@@ -9077,7 +9086,12 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             entry = self._usage_store.entries(identities).get(number)
             if entry is None or entry.fetched_at is None:
                 return
-            next_poll = max(now, entry.fetched_at + poll_policy.MIN_INTERVAL_S)
+            floor = entry.fetched_at + poll_policy.MIN_INTERVAL_S
+            next_poll = (
+                max(now, floor)
+                if entry.consecutive_failures > 0
+                else max(now + poll_policy.POST_SWITCH_REPLAN_DEFER_S, floor)
+            )
             if entry.next_poll_at is not None and entry.next_poll_at <= next_poll:
                 return
             self._usage_store.set_poll_plan(

@@ -1843,7 +1843,10 @@ class TestListAccountsUsage:
         switcher._replan_new_active("2", "b@x.com", "")
         assert store.entries(ident2)["2"].next_poll_at is None
 
-        # An already-old measurement comes due immediately, not 180s from now.
+        # An already-old measurement is deferred by the header-throttle
+        # window (POST_SWITCH_REPLAN_DEFER_S), not pulled all the way to now:
+        # an immediate fetch would race a free header reading that lands
+        # within that window and pushes the real poll out on its own.
         old_store = UsageStore(
             switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 400
         )
@@ -1853,6 +1856,34 @@ class TestListAccountsUsage:
         store.set_poll_plan({"2": (time_mod.time() + 600.0, 600.0)}, ident2)
         switcher._replan_new_active("2", "b@x.com", "")
         entry = store.entries(ident2)["2"]
+        deferred = time_mod.time() + poll_policy.POST_SWITCH_REPLAN_DEFER_S
+        assert entry.next_poll_at <= deferred + 1
+        assert entry.next_poll_at >= deferred - 1
+
+    def test_replan_new_active_skips_the_defer_on_a_failed_row(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        """A row a header reading can never land on
+        (`record_header_reading` refuses any row with
+        `consecutiveFailures > 0`) gets no benefit from waiting out the
+        defer window -- only a real retry can heal it, so the deferral is
+        skipped and the old immediate-catch-up behavior applies."""
+        import time as time_mod
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        ident = {"1": ("a@x.com", "")}
+        store = switcher._usage_store
+
+        old_store = UsageStore(
+            switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 400
+        )
+        old_store.record({"1": FetchRecord(usage={"five_hour": {"pct": 10}})}, ident)
+        old_store.record({"1": FetchRecord(error="timeout")}, ident)
+
+        switcher._replan_new_active("1", "a@x.com", "")
+        entry = store.entries(ident)["1"]
+        assert entry.consecutive_failures == 1
         assert entry.next_poll_at <= time_mod.time() + 1
 
     def test_replan_new_active_failure_is_logged_not_raised(
