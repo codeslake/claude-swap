@@ -226,18 +226,27 @@ def try_refresh_oauth_credentials(
             oauth["refreshToken"] = new_rt
         access_token = resp_data.get("access_token")
         expires_in = resp_data.get("expires_in")
-        if (
-            isinstance(access_token, str) and access_token
-            and isinstance(expires_in, (int, float))
-            and not isinstance(expires_in, bool)
-        ):
+        # A valid access_token is kept even when expires_in is missing or
+        # bad: the server DID issue it, and discarding a good token because
+        # a sibling field is malformed loses it for nothing (the caller
+        # would keep serving the OLD, possibly-revoked access token).
+        if isinstance(access_token, str) and access_token:
             oauth["accessToken"] = access_token
+        if (
+            isinstance(expires_in, (int, float))
+            and not isinstance(expires_in, bool)
+            and math.isfinite(expires_in)
+        ):
             oauth["expiresAt"] = now_ms + int(expires_in) * 1000
         else:
-            # A missing or mistyped pair still leaves the grant spent —
-            # force this generation to read as already-expired so the next
-            # use refreshes again, this time with whatever refresh token
-            # was captured above rather than the one just consumed.
+            # Missing, mistyped, or non-finite (Infinity/NaN, which would
+            # otherwise raise out of ``int()`` and into the generic
+            # ``except Exception`` below, reporting a spent grant as
+            # "transient" and making the caller re-POST it) — either way
+            # the grant is spent, so force this generation to read as
+            # already-expired: the next use refreshes again, this time
+            # with whatever refresh token was captured above rather than
+            # the one just consumed.
             oauth["expiresAt"] = 0
         scope = resp_data.get("scope")
         if isinstance(scope, str) and scope:
@@ -764,8 +773,8 @@ def fetch_usage(access_token: str) -> dict | None:
 # guaranteed 401 per pass to learn nothing.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
-    "identity-unreadable", "lineage-condemned", "live-store-unreadable",
-    "live-store-current",
+    "stash-write-failed", "identity-unreadable", "lineage-condemned",
+    "live-store-unreadable", "live-store-current",
 )
 
 

@@ -86,6 +86,8 @@ _SYSTEMIC_MESSAGES = {
     "stash-unreadable": "a stashed successor is unreadable — unlock the "
                         "keychain or fix the file, then retry; "
                         "`cswap unclaimed` inspects it",
+    "stash-write-failed": "an in-memory successor could not be written "
+                        "back — fix the storage failure, then retry",
     "lineage-condemned": "the slot's stored credential was condemned as "
                         "another account's — `cswap add` replaces it",
     "identity-unreadable": "the slot's session profile identity could not "

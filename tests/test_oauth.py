@@ -621,7 +621,30 @@ class TestTryRefreshOAuthCredentials:
                     "access_token": "new-access", "expires_in": "not-a-number",
                     "refresh_token": "new-refresh",
                 },
-                lambda rotated: rotated["expiresAt"] == 0,
+                lambda rotated: (
+                    rotated["expiresAt"] == 0
+                    and rotated["accessToken"] == "new-access"
+                ),
+            ),
+            (
+                {
+                    "access_token": "new-access", "expires_in": float("inf"),
+                    "refresh_token": "new-refresh",
+                },
+                lambda rotated: (
+                    rotated["expiresAt"] == 0
+                    and rotated["accessToken"] == "new-access"
+                ),
+            ),
+            (
+                {
+                    "access_token": "new-access", "expires_in": float("nan"),
+                    "refresh_token": "new-refresh",
+                },
+                lambda rotated: (
+                    rotated["expiresAt"] == 0
+                    and rotated["accessToken"] == "new-access"
+                ),
             ),
             (
                 {
@@ -635,7 +658,10 @@ class TestTryRefreshOAuthCredentials:
                 ),
             ),
         ],
-        ids=["missing-access-token", "non-numeric-expires-in", "non-string-scope"],
+        ids=[
+            "missing-access-token", "non-numeric-expires-in",
+            "infinite-expires-in", "nan-expires-in", "non-string-scope",
+        ],
     )
     def test_malformed_200_body_still_keeps_the_new_refresh_token(
         self, bad_body, check

@@ -22,6 +22,7 @@ from claude_swap.exceptions import (
     ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
+    CredentialWriteError,
     LockError,
     SessionError,
     SwitchError,
@@ -199,6 +200,10 @@ ERROR_NOTES = {
     "stash-unreadable": (
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
+    ),
+    "stash-write-failed": (
+        "this slot's in-memory successor could not be written back — fix "
+        "the storage failure, then retry"
     ),
     "identity-unreadable": (
         "the session's identity file could not be read — the slot is not "
@@ -2280,6 +2285,18 @@ class ClaudeAccountSwitcher:
                         "deferring the refresh.", account_num, exc_info=True,
                     )
                     return oauth.RefreshOutcome(None, "stash-unreadable")
+                except CredentialWriteError:
+                    # Distinct from the read failure above: the in-memory
+                    # successor IS readable, it just could not be written
+                    # back to the store. A keychain-unlock remedy would be
+                    # the wrong advice here — the fault is the write, not
+                    # the read.
+                    self._logger.info(
+                        "Account %s's in-memory successor could not be "
+                        "written back; deferring the refresh.",
+                        account_num, exc_info=True,
+                    )
+                    return oauth.RefreshOutcome(None, "stash-write-failed")
                 if adopted_creds is not None:
                     current = adopted_creds
                 if not current:
@@ -2618,38 +2635,6 @@ class ClaudeAccountSwitcher:
 
         stashed_reason = ""
 
-        # The kill window: the grant is already spent (the POST above
-        # returned), but no successor exists ANYWHERE on disk until one of
-        # the writes below lands — a SIGKILL in the next few statements (no
-        # `finally`/signal handler crosses it) would lose it outright, the
-        # one exit `_consume_backup_grant_locked`'s own except/BaseException
-        # arms cannot reach because nothing has raised yet. Bound it rather
-        # than leave it open: stash a placeholder right here, before taking
-        # the slot lock, and retire it the instant a real write (the normal
-        # persist below, or a branch's own reasoned `stash_successor`)
-        # confirms the successor is durable elsewhere. The remaining few
-        # milliseconds — before THIS write itself lands — recover only by
-        # re-login; nothing exists to stash before the POST returns.
-        early_entry_id: str | None = None
-        try:
-            early_entry_id = self._store._write_unclaimed_credential(
-                result.credentials,
-                {
-                    "reason": "consume-gate-post-window",
-                    "configSlot": account_num,
-                    "consumedFp": consumed_fp,
-                    "fingerprint": oauth.credential_fingerprint(
-                        result.credentials
-                    ),
-                },
-            )
-        except Exception:
-            self._logger.warning(
-                "Could not stash account %s's successor immediately after "
-                "the refresh POST; the kill window is unbounded for this "
-                "pass.", account_num, exc_info=True,
-            )
-
         def _retire_early_entry() -> None:
             if early_entry_id is not None:
                 self._retire_stash_entry(early_entry_id, account_num)
@@ -2678,7 +2663,39 @@ class ClaudeAccountSwitcher:
             _retire_early_entry()
 
         outcome_creds = result.credentials
+        early_entry_id: str | None = None
         try:
+            # The kill window: the grant is already spent (the POST above
+            # returned), but no successor exists ANYWHERE on disk until one
+            # of the writes below lands. Stash a placeholder right here,
+            # before taking the slot lock, and retire it the instant a real
+            # write (the normal persist below, or a branch's own reasoned
+            # `stash_successor`) confirms the successor is durable
+            # elsewhere. This write is now INSIDE the outer try: an
+            # interrupt during the placeholder write itself is caught by
+            # the `except BaseException` arm below, which retries the
+            # stash. The remaining unrecoverable window is that retry
+            # blocking on the stash manifest's own lock wait (locking.py
+            # default 10s) while a SECOND interrupt lands; only that gap
+            # recovers by re-login.
+            try:
+                early_entry_id = self._store._write_unclaimed_credential(
+                    result.credentials,
+                    {
+                        "reason": "consume-gate-post-window",
+                        "configSlot": account_num,
+                        "consumedFp": consumed_fp,
+                        "fingerprint": oauth.credential_fingerprint(
+                            result.credentials
+                        ),
+                    },
+                )
+            except Exception:
+                self._logger.warning(
+                    "Could not stash account %s's successor immediately "
+                    "after the refresh POST; the kill window is unbounded "
+                    "for this pass.", account_num, exc_info=True,
+                )
             try:
                 with FileLock(self.lock_file):
                     store_now, store_unreadable = (
@@ -2755,23 +2772,45 @@ class ClaudeAccountSwitcher:
                     "successor stashed for the next pass.",
                 )
             except Exception:
-                # Both the persist and the stash failed. stash_successor sets
-                # stashed_reason after its write, so a raising write left it
-                # empty and the guard below reported success on a spent grant
-                # with nothing stashed. Nothing on disk holds it now -- keep
-                # it in process memory so `_adopt_stashed_successor` can
-                # still write it back on a later pass in THIS process,
-                # rather than the generation being lost outright.
-                stashed_reason = "consume-gate-unpersisted"
-                self._unpersisted[account_num] = (
-                    consumed_fp, result.credentials
-                )
-                self._logger.error(
-                    "Account %s's consumed successor could not be persisted "
-                    "or stashed — it survives only for this pass. Fix the "
-                    "storage failure, then re-login and `cswap add` if the "
-                    "slot strikes.", account_num, exc_info=True,
-                )
+                if early_entry_id is not None:
+                    # The reasoned stash write failed, but the placeholder
+                    # written before the slot lock (now inside this same
+                    # try — see the kill-window comment above) already
+                    # landed on disk with these exact bytes and
+                    # `consumed_fp`: the successor is NOT lost, only the
+                    # more specific entry failed to replace it. Keep a
+                    # demoting reason other than `consume-gate-unpersisted`
+                    # so the caller still reports `stashed=True`
+                    # (session.py / `_probe_target_credential` read it).
+                    stashed_reason = "consume-gate-persist-failed"
+                    self._logger.warning(
+                        "Account %s's reasoned stash write failed after a "
+                        "persist failure; the placeholder written before "
+                        "the slot lock already holds the successor — "
+                        "nothing lost, the next pass adopts it.",
+                        account_num, exc_info=True,
+                    )
+                else:
+                    # Both the persist and the stash failed, and no
+                    # placeholder landed either. stash_successor sets
+                    # stashed_reason after its write, so a raising write
+                    # left it empty and the guard below reported success on
+                    # a spent grant with nothing stashed. Nothing on disk
+                    # holds it now -- keep it in process memory so
+                    # `_adopt_stashed_successor` can still write it back on
+                    # a later pass in THIS process, rather than the
+                    # generation being lost outright.
+                    stashed_reason = "consume-gate-unpersisted"
+                    self._unpersisted[account_num] = (
+                        consumed_fp, result.credentials
+                    )
+                    self._logger.error(
+                        "Account %s's consumed successor could not be "
+                        "persisted or stashed — it survives only for this "
+                        "pass. Fix the storage failure, then re-login and "
+                        "`cswap add` if the slot strikes.",
+                        account_num, exc_info=True,
+                    )
         except BaseException:
             # The grant IS consumed (the POST above already happened), and
             # `except Exception` above cannot see this: a Ctrl-C or
@@ -2800,12 +2839,27 @@ class ClaudeAccountSwitcher:
                 # Exception` here — the same gap this whole arm exists to
                 # close. Do not let it replace the ORIGINAL interrupt below;
                 # only log.
-                self._logger.error(
-                    "Account %s's consumed successor could not be stashed "
-                    "before an interrupt propagated — it is lost. Fix the "
-                    "storage failure, then re-login and `cswap add` if the "
-                    "slot strikes.", account_num, exc_info=True,
-                )
+                if early_entry_id is not None:
+                    # The placeholder written before the slot lock (now
+                    # inside this same try) already landed with these
+                    # exact bytes — the second interrupt only stopped the
+                    # more specific reasoned stash, not the successor
+                    # itself. Not lost; the next pass adopts it.
+                    self._logger.warning(
+                        "Account %s's second interrupt stopped the "
+                        "reasoned stash, but the placeholder written "
+                        "before the slot lock already holds the "
+                        "successor; the next pass adopts it.",
+                        account_num, exc_info=True,
+                    )
+                else:
+                    self._logger.error(
+                        "Account %s's consumed successor could not be "
+                        "stashed before an interrupt propagated — it is "
+                        "lost. Fix the storage failure, then re-login and "
+                        "`cswap add` if the slot strikes.",
+                        account_num, exc_info=True,
+                    )
             raise
         if stashed_reason in _DEMOTING_STASH_REASONS:
             # The successor is parked, not persisted: the slot still holds the
@@ -2871,9 +2925,11 @@ class ClaudeAccountSwitcher:
     def _adopt_stashed_successor(
         self, account_num: str, email: str, current: str
     ) -> str | None:
-        """Complete a prior gate's failed persist from the unclaimed stash.
+        """Complete a prior pass's failed persist from the unclaimed stash.
 
-        A stash entry records ``consumedFp`` — the generation its credential
+        Called by both the consume gate and ``_fetch_active_usage`` — either
+        one can POST a grant and fail to persist its successor. A stash
+        entry records ``consumedFp`` — the generation its credential
         superseded. When the slot still stores exactly that generation, the
         stored rt is already consumed and the stash holds its live
         successor: write it back (the pending persist) and drop the entry.
@@ -2896,7 +2952,12 @@ class ClaudeAccountSwitcher:
             try:
                 self._write_account_credentials(account_num, email, pending[1])
             except Exception:
-                raise CredentialReadError(
+                # A WRITE failure, not a read one: the successor is sitting
+                # right here in memory, readable. Its own exception type so
+                # callers don't conflate it with an unreadable on-disk
+                # stash (a keychain-unlock remedy is the wrong advice for a
+                # storage write fault).
+                raise CredentialWriteError(
                     f"account {account_num}'s in-memory successor could not "
                     "be persisted; deferring adoption rather than "
                     "discarding its generation"
@@ -5147,7 +5208,38 @@ class ClaudeAccountSwitcher:
                     # backup lineage) mean an actor is mutating the store
                     # right now — defer rather than fight it.
                     restore_source = None
-                    if live_oauth is not None and (
+                    # A prior pass may have already POSTed the backup's
+                    # refresh token and failed to persist the successor
+                    # anywhere durable (the both-fail arm below stashes it
+                    # when that happens). Adopt it before choosing what to
+                    # refresh: writing it back IS the pending persist, and
+                    # it saves re-POSTing — and striking — an already-spent
+                    # grant.
+                    try:
+                        adopted = self._adopt_stashed_successor(
+                            account_num, email, backup
+                        )
+                    except CredentialReadError:
+                        self._logger.info(
+                            "Account %s's stashed active successor is "
+                            "unreadable; deferring the refresh.",
+                            account_num, exc_info=True,
+                        )
+                        return _defer(force_refresh)
+                    except CredentialWriteError:
+                        # Distinct from the read failure above: the
+                        # in-memory successor IS readable, it just could
+                        # not be written back to the store.
+                        self._logger.info(
+                            "Account %s's in-memory active successor could "
+                            "not be written back; deferring the refresh.",
+                            account_num, exc_info=True,
+                        )
+                        return _defer(force_refresh)
+                    if adopted is not None:
+                        refresh_input = adopted
+                        restore_source = adopted
+                    elif live_oauth is not None and (
                         oauth.credential_fingerprint(live) == backup_fp
                     ):
                         # Live is the slot's own lineage (possibly drifted) —
@@ -5218,7 +5310,7 @@ class ClaudeAccountSwitcher:
                         # another actor is mutating the store; defer.
                         return _defer(force_refresh)
                     input_oauth = oauth.extract_oauth_data(refresh_input)
-                    if (
+                    if restore_source is not None or (
                         refresh_input == backup
                         and backup_usable
                         and not force_refresh
@@ -5230,10 +5322,11 @@ class ClaudeAccountSwitcher:
                         # The backup already holds a live, non-expired
                         # credential (a prior locked refresh persisted it but
                         # the live write failed, stranding the live store on
-                        # the consumed generation). Restore it — no POST, no
+                        # the consumed generation) — or a stashed successor
+                        # was just adopted above. Restore it — no POST, no
                         # generation consumed.
-                        restore_source = backup
-                        working = backup
+                        restore_source = refresh_input
+                        working = refresh_input
                     else:
                         # The POST runs while holding the account FileLock
                         # (contended by `cswap switch` with a 10s acquire
@@ -5330,16 +5423,19 @@ class ClaudeAccountSwitcher:
                                 (account_num, email, "expiry-unattributed")
                             )
                         except Exception:
+                            # The memo is best-effort; the successor's home
+                            # is the slot and live stores below (neither
+                            # reads the roster), and the both-fail arm
+                            # further down stashes it if those also fail.
+                            # Returning here would lose it: nothing else
+                            # would consume the already-spent grant.
                             self._logger.warning(
                                 "Lineage lookup failed after consuming "
-                                "account %s's refresh grant; stashing the "
-                                "successor rather than losing it.",
+                                "account %s's refresh grant; skipping the "
+                                "verdict memo and writing the successor to "
+                                "the stores.",
                                 account_num, exc_info=True,
                             )
-                            self._stash_pending_refresh(
-                                account_num, pending, consumed_fp
-                            )
-                            return _defer(force_refresh)
                     # The credential must reach the stores — after a POST the
                     # grant is consumed and the successor MUST survive in at
                     # least one of them. Attempt both; tolerate either
@@ -5473,8 +5569,11 @@ class ClaudeAccountSwitcher:
         Same mechanism `_consume_backup_grant_locked` uses for its own
         never-discard-a-consumed-generation promise: the next
         `_adopt_stashed_successor` pass on this slot writes it back once the
-        store still holds `consumed_fp`. Never raises — this already runs
-        from a last-resort handler.
+        store still holds `consumed_fp`. Never raises an `Exception` — this
+        already runs from a last-resort handler — but mirrors the gate's own
+        second-interrupt arm (~2796): a `BaseException` (a second Ctrl-C
+        landing while this write is itself blocked) is logged, then
+        re-raised so the original interrupt still reaches the caller.
         """
         try:
             self._store._write_unclaimed_credential(
@@ -5493,6 +5592,14 @@ class ClaudeAccountSwitcher:
                 "storage failure, then re-login and `cswap add` if the "
                 "slot strikes.", account_num, exc_info=True,
             )
+        except BaseException:
+            self._logger.error(
+                "Account %s's active-refresh successor could not be "
+                "stashed before an interrupt propagated — it is lost. Fix "
+                "the storage failure, then re-login and `cswap add` if the "
+                "slot strikes.", account_num, exc_info=True,
+            )
+            raise
 
     def _resync_rotated_backup(
         self, account_num: str, email: str, org_uuid: str, creds: str
@@ -8998,6 +9105,15 @@ class ClaudeAccountSwitcher:
             if reprobe_live is True:
                 return True, outcome.credentials, False, None
             if reprobe_live is False:
+                if reprobe_token == access_token:
+                    # The refresh's 200 left the SAME access token that just
+                    # answered the real 401 (a malformed response with no
+                    # usable access_token, or a lineage already rotated
+                    # elsewhere) — re-probing it confirms nothing about
+                    # whether the REFRESH GRANT itself is dead, only that
+                    # the stale token still doesn't work, which the first
+                    # probe above already established. Not proven dead.
+                    return None, creds, True, None
                 # NOT `outcome.consumed_fp` — that fingerprints the
                 # PRE-refresh bytes the gate POSTed, and the store now holds
                 # `outcome.credentials` (this branch's guard on
