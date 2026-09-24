@@ -516,6 +516,18 @@ class TestBackoff:
                 f"ask {ask} -> wait {wait}, expected {expected}"
             )
 
+    def test_the_floor_cap_is_the_measured_block_plus_the_margin(self):
+        # RETRY_AFTER_FLOOR_CAP_S's own comment justifies it as "the measured
+        # block (3600s) plus the margin" ("37 of 39 observed blocks opened at
+        # exactly 3600, and 3600 + 900 = this"). Pinned outright: neither
+        # test_hour_scale_retry_after_honored (hardcodes 4500.0, not tied to
+        # the constant) nor test_retry_after_floor_is_capped (pins only that
+        # a huge ask saturates AT the cap, whatever its value) would catch
+        # the constant drifting off that arithmetic.
+        assert usage_store.RETRY_AFTER_FLOOR_CAP_S == pytest.approx(
+            3600.0 + usage_store.RETRY_AFTER_MARGIN_S
+        )
+
     def test_each_arm_is_bounded_by_the_ceiling_its_own_trust_uses(self):
         """A non-429 park must never outlast TRUST_MAX_AGE_S, its own ceiling.
 
@@ -523,10 +535,10 @@ class TestBackoff:
         itself is built from — not `entries()`'s decision trust, which a failed
         row (T1102) now caps at `poll_policy.POST_429_MIN_INTERVAL_S` (360s)
         regardless of arm, well inside this park cap. The 429 arm's own park
-        cap (`RETRY_AFTER_FLOOR_CAP_S`, 4500s) is pinned separately by
-        `test_hour_scale_retry_after_honored` / `test_retry_after_floor_is_capped`
-        — there is no longer a wider 429-only trust ceiling to check it
-        against (the old `RATE_LIMIT_TRUST_MAX_AGE_S` this replaced is gone).
+        cap (`RETRY_AFTER_FLOOR_CAP_S`, 4500s) is pinned by
+        `test_the_floor_cap_is_the_measured_block_plus_the_margin` — there is
+        no longer a wider 429-only trust ceiling to check it against (the old
+        `RATE_LIMIT_TRUST_MAX_AGE_S` this replaced is gone).
         """
         for ask in (3601.0, 4500.0, 7200.0, 86_400.0, float("inf")):
             wait = usage_store._failure_backoff_s(1, ask, rate_limited=False)
@@ -1334,6 +1346,21 @@ class TestAttemptLedger:
         assert store.reserve(["1"], IDENT, respect_plans=True) == {}
         assert store.reserve(["1"], IDENT, respect_plans=False) == {}
 
+    def test_due_candidate_skips_a_row_at_the_attempt_cap(self, store, clock):
+        # due_candidate must not spend the auto engine's one alternate poll on
+        # a row reserve() would then refuse outright — the same waste the
+        # strike check's own docstring calls out for a struck row.
+        now = clock.now
+        self._seed(
+            store,
+            "1",
+            fetchedAt=now - SERVE_TTL_S - 1,  # stale, most due
+            nextPollAt=now - 1,  # poll-due
+            attempts=[now - i * 10 for i in range(usage_store.ATTEMPTS_PER_HOUR_MAX)],
+        )
+        entries = store.entries(IDENT)
+        assert usage_store.due_candidate(["1"], entries, now) is None
+
     def test_an_aged_out_attempt_frees_a_slot_and_is_recorded(self, store, clock):
         now = clock.now
         window = usage_store.ATTEMPT_WINDOW_S
@@ -1371,18 +1398,20 @@ class TestHeaderReading:
         clock.advance(60)
 
         five_reset_ts = clock.now + 1800.0
-        seven_reset_ts = clock.now + 3600.0
         headers = {
             usage_store.USAGE_HEADER_5H_PCT: "0.42",
             usage_store.USAGE_HEADER_5H_RESET: str(five_reset_ts),
             usage_store.USAGE_HEADER_7D_PCT: "0.1",
-            usage_store.USAGE_HEADER_7D_RESET: str(seven_reset_ts),
+            # Out of datetime's range: must fall back to "no reset known"
+            # rather than raise OverflowError into the pin's request path.
+            usage_store.USAGE_HEADER_7D_RESET: str(float("inf")),
         }
         assert store.record_header_reading("1", IDENT, headers) is True
 
         entry = store.entries(IDENT)["1"]
         assert entry.last_good["five_hour"]["pct"] == pytest.approx(42.0)
         assert entry.last_good["seven_day"]["pct"] == pytest.approx(10.0)
+        assert "resets_at" not in entry.last_good["seven_day"]
         assert usage_store.parse_reset_ts(
             entry.last_good["five_hour"]["resets_at"]
         ) == pytest.approx(five_reset_ts)
@@ -1411,6 +1440,22 @@ class TestHeaderReading:
         store.record_header_reading("1", IDENT, headers)
         row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["1"]
         assert "attempts" not in row
+
+    @pytest.mark.parametrize(
+        "seed_error",
+        ["invalid_grant", "timeout"],
+        ids=["struck_row", "failed_row"],
+    )
+    def test_skips_a_struck_or_failed_row(self, store, clock, seed_error):
+        # A row carrying an auth strike or an endpoint failure must not be
+        # refreshed by a header reading: bumping fetchedAt would erase the
+        # strike-race doubt (_strike_is_suspected_race) and would let
+        # entries() trust the row again at age 0 through the whole backoff.
+        store.record({"1": FetchRecord(error=seed_error)}, IDENT)
+        before = store.entries(IDENT)["1"]
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        assert store.record_header_reading("1", IDENT, headers) is False
+        assert store.entries(IDENT)["1"] == before
 
 
 class TestLast429Marker:

@@ -7674,16 +7674,14 @@ class ClaudeAccountSwitcher:
                     candidate,
                     data.get("accounts", {}).get(candidate, {}).get("email", ""),
                 ):
+                    detail = (
+                        "(excluded: walled)" if candidate in excluded_slots
+                        else "(credential rejected by the API)"
+                    )
                     if json_output:
-                        warnings.append(
-                            f"Skipped Account-{candidate} "
-                            "(credential rejected by the API)"
-                        )
+                        warnings.append(f"Skipped Account-{candidate} {detail}")
                     else:
-                        print(
-                            f"{accent('Skipping')} Account-{candidate} "
-                            "(credential rejected by the API)"
-                        )
+                        print(f"{accent('Skipping')} Account-{candidate} {detail}")
                     continue
                 if strategy == "next-available":
                     headroom = oauth.account_headroom(usage.get(candidate), models)
@@ -7736,14 +7734,17 @@ class ClaudeAccountSwitcher:
                 return None
 
             if next_account is None:
+                no_target = "No other accounts have valid stored credentials/config."
+                if excluded_slots:
+                    no_target += f" (excluded: {', '.join(sorted(excluded_slots))})"
                 if json_output:
                     return self._switch_noop(
                         strategy=strategy_label, reason="no-valid-target",
                         to_ref=current_ref, warnings=warnings,
-                        message="No other accounts have valid stored credentials/config.",
+                        message=no_target,
                     )
                 print(dimmed(
-                    "No other accounts have valid stored credentials/config.\n"
+                    f"{no_target}\n"
                     "Re-add a skipped slot with: cswap --add-account --slot <number>"
                 ))
                 return None

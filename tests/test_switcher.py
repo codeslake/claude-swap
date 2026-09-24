@@ -20159,6 +20159,35 @@ class TestSwitchExcludeNeverLandsOnAnObservedWall:
         assert marked == expect_marked
         if "4" in exclude:
             assert result["to"]["email"] != "d@x.com"
+        else:
+            # Control: with nothing excluded, the most-headroom slot wins.
+            assert result["to"]["email"] == "d@x.com"
+
+
+class TestExcludedSlotSkipMessageNamesTheExclusion:
+    """A slot skipped only because the CALLER excluded it (the pin's own
+    429, not a fetch) must not be blamed on the API: rotation/next-available
+    named it "(credential rejected by the API)" for that case too, which
+    points a reader at the wrong cause."""
+
+    def test_next_available_names_the_exclusion_not_the_api(self, temp_home):
+        s = TestSwitchExcludeNeverLandsOnAnObservedWall()._setup_four(temp_home)
+        # Current account is "2"; the rotation walk visits 3, 4, 1 in order,
+        # so excluding "3" (the first candidate) is what forces the walk to
+        # actually inspect and skip it before landing on "4".
+        usage = {
+            "1": {"five_hour": {"pct": 90.0}, "seven_day": {"pct": 0.0}},
+            "3": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 0.0}},
+            "4": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0}},
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            result = s.switch(
+                strategy="next-available", json_output=True, exclude={"3"},
+            )
+        joined = " ".join(result["warnings"])
+        assert "Account-3" in joined
+        assert "excluded" in joined
+        assert "credential rejected by the API" not in joined
 
 
 class TestAnEmptySlotLandingKeepsTheWarningsAlreadyEarned:

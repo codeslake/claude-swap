@@ -382,6 +382,11 @@ class UsageEntry:
     # `_seven_day_reset_unmeasured` sees a real deadline rather than "never
     # reported" and can't pick the walled slot as a last-chance probe target.
     walled_until: float | None = None
+    # Attempts still inside the trailing ATTEMPT_WINDOW_S (the same pruned
+    # count _row_eligible refuses reserve() on at ATTEMPTS_PER_HOUR_MAX).
+    # Exposed so a read-model consumer like due_candidate can honor the same
+    # cap without a second copy of the count.
+    attempts_in_window: int = 0
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -514,8 +519,11 @@ def due_candidate(
 ) -> str | None:
     """The due candidate with the stalest data, or None.
 
-    Due = past its ``nextPollAt`` and not in failure backoff. Sentinel
-    accounts (api-key / no credentials) have nothing to fetch. A
+    Due = past its ``nextPollAt``, not in failure backoff, and not already at
+    its hourly attempt cap (``ATTEMPTS_PER_HOUR_MAX``, the same count
+    ``_row_eligible`` refuses ``reserve()`` on — picking a capped row here
+    would waste the pass, since ``reserve()`` would then refuse it too).
+    Sentinel accounts (api-key / no credentials) have nothing to fetch. A
     perpetually failing account can't monopolize the slot: its backoff
     removes it from the due set between attempts.
 
@@ -545,6 +553,8 @@ def due_candidate(
             continue
         if entry.sentinel is not None:
             continue
+        if entry.attempts_in_window >= ATTEMPTS_PER_HOUR_MAX:
+            continue  # reserve() would refuse it too; don't waste the pass
         if entry.token_dead():
             continue  # quarantined; what lifts it is the docstring's business
         if entry.in_backoff(now):
@@ -624,7 +634,10 @@ def _header_pct(headers: Mapping[str, str], key: str) -> float | None:
 
 def _header_reset(headers: Mapping[str, str], key: str) -> str | None:
     """A rate-limit reset header (Unix seconds) as the stored ``resets_at``
-    ISO string, or None when absent/unparseable."""
+    ISO string, or None when absent/unparseable/out of range (``inf`` or a
+    value ``datetime.fromtimestamp`` cannot hold raises ``OverflowError``,
+    which must read as "no reset known", never propagate into the pin's
+    request path)."""
     raw = headers.get(key)
     if raw is None:
         return None
@@ -632,7 +645,10 @@ def _header_reset(headers: Mapping[str, str], key: str) -> str | None:
         ts = float(raw)
     except (TypeError, ValueError):
         return None
-    return _reset_ts_to_resets_at(ts)
+    try:
+        return _reset_ts_to_resets_at(ts)
+    except OverflowError:
+        return None
 
 
 def _walled_decision_value(last_good: dict | None, walled_until: float | None) -> dict:
@@ -1081,6 +1097,7 @@ class UsageStore:
                 claim_until=claim_until,
                 walled=walled_until is not None and now < walled_until,
                 walled_until=walled_until,
+                attempts_in_window=len(_pruned_attempts(row, now)),
             )
         return out
 
@@ -1379,12 +1396,13 @@ class UsageStore:
         cannot see (the pin's own 429 on ``/v1/messages``, not a fetch).
 
         Expires at ``min(`` the row's OWN stored reading's earliest future
-        relevant-window reset, ``now + WALL_FALLBACK_S)`` — the account
-        really is free again by the reset at latest, but the fallback span
-        also CAPS it, so a stored 7d (or scoped, or malformed far-future)
-        reset can never outlive the widest ordinary window and park the mark
-        for days; ``WALL_FALLBACK_S`` from now alone when no reading is
-        stored to key it on. While the mark has not expired, ``entries()``
+        relevant-window reset, ``now + WALL_FALLBACK_S)`` — a 5h window's
+        own reset sits inside ``WALL_FALLBACK_S`` so the mark expires at
+        that genuine reset, but a stored 7d (or scoped, or malformed
+        far-future) reset is capped at the fallback instead, well before its
+        own reset: the mark lifts on the trade that a possibly-early release
+        beats parking it for days; ``WALL_FALLBACK_S`` from now alone when no
+        reading is stored to key it on. While the mark has not expired, ``entries()``
         reports the slot as walled and ``UsageEntry.decision_value()`` reads
         it full for decisions, whatever a later poll says (a successful poll
         does not clear the mark early). A repeated call overwrites any prior
@@ -1428,8 +1446,20 @@ class UsageStore:
         per 30s per slot; a hot path replying every request would otherwise
         write the store that often.
 
+        Records nothing and returns False when the row carries any auth
+        strike (``authDeadStrikes`` > 0) or any endpoint failure
+        (``consecutiveFailures`` > 0): a header reading refreshes only a row
+        whose last endpoint fetch succeeded. Bumping ``fetchedAt`` on a
+        struck or failed row would otherwise reach past the endpoint's own
+        failure/strike machinery — erasing ``_strike_is_suspected_race``'s
+        doubt (it compares the strike time against ``fetchedAt``) and
+        letting ``entries()`` trust the row again at age 0 through the whole
+        backoff — so the strike and failure state stays keyed on the
+        endpoint alone.
+
         Returns True when a reading was recorded (the 5h utilization header
-        was present); False, recording nothing, otherwise.
+        was present and the row was eligible); False, recording nothing,
+        otherwise.
         """
         five_pct = _header_pct(headers, USAGE_HEADER_5H_PCT)
         if five_pct is None:
@@ -1437,8 +1467,16 @@ class UsageStore:
         seven_pct = _header_pct(headers, USAGE_HEADER_7D_PCT)
         five_reset = _header_reset(headers, USAGE_HEADER_5H_RESET)
         seven_reset = _header_reset(headers, USAGE_HEADER_7D_RESET)
+        recorded = False
 
         def apply(_num: str, row: dict) -> None:
+            nonlocal recorded
+            if (
+                int(row.get("authDeadStrikes") or 0) > 0
+                or int(row.get("consecutiveFailures") or 0) > 0
+            ):
+                return
+            recorded = True
             now = self.clock()
             last_good = dict(row.get("lastGood") or {})
             five_entry: dict = {"pct": five_pct}
@@ -1461,7 +1499,7 @@ class UsageStore:
             )
 
         self._mutate(identities, [num], apply)
-        return True
+        return recorded
 
     def set_poll_plan(
         self,
