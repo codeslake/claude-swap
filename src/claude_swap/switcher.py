@@ -5334,7 +5334,47 @@ class ClaudeAccountSwitcher:
                                     oauth.credential_fingerprint(live) or "",
                                 )
                             ):
-                                refresh_input = live
+                                # Attributed live is about to be POSTed. A
+                                # prior pass may already have POSTed this
+                                # exact lineage and failed to persist the
+                                # successor anywhere durable -- the
+                                # backup-keyed adopt above can never find
+                                # that stash entry, since the backup never
+                                # held live's lineage. Adopt it here,
+                                # under the same lock, before spending the
+                                # grant a second time.
+                                try:
+                                    adopted_live = self._adopt_stashed_successor(
+                                        account_num, email, live
+                                    )
+                                except (
+                                    CredentialReadError, CredentialWriteError
+                                ) as exc:
+                                    self._logger.info(
+                                        "Account %s's stashed active "
+                                        "successor could not be adopted "
+                                        "(%s); deferring the refresh.",
+                                        account_num, type(exc).__name__,
+                                        exc_info=True,
+                                    )
+                                    return FetchRecord(
+                                        error="stash-unreadable"
+                                        if isinstance(exc, CredentialReadError)
+                                        else "stash-write-failed"
+                                    )
+                                if adopted_live is not None:
+                                    refresh_input = adopted_live
+                                    backup = adopted_live
+                                    adopted_oauth = oauth.extract_oauth_data(
+                                        adopted_live
+                                    )
+                                    backup_usable = bool(
+                                        adopted_oauth
+                                        and adopted_oauth.get("accessToken")
+                                        and adopted_oauth.get("refreshToken")
+                                    )
+                                else:
+                                    refresh_input = live
                             else:
                                 key = (account_num, email,
                                        "expiry-unattributed")

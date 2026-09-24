@@ -4133,12 +4133,11 @@ class TestActiveAccountRefresh:
                    return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})):
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
-        mock_refresh.assert_called_once_with(
-            adopted_expired, timeout_s=6.0, slot="1"
-        )
-        assert call(
-            "1", "test@example.com", self._REFRESHED
-        ) in write_backup.call_args_list
+        assert mock_refresh.call_count == 1
+        assert mock_refresh.call_args.args[0] == adopted_expired
+        assert switcher._read_account_credentials(
+            "1", "test@example.com"
+        ) == self._REFRESHED
         write_live.assert_called_once_with(self._REFRESHED)
         assert result.usage == {"five_hour": {"pct": 9}}
         assert switcher.list_unclaimed_credentials() == {}
@@ -4344,6 +4343,75 @@ class TestActiveAccountRefresh:
         assert switcher._unpersisted["1"] == (
             oauth.credential_fingerprint(self._EXPIRED), self._REFRESHED
         )
+
+    def test_live_sourced_stash_successor_is_adopted_without_a_repost(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The both-fail arm above also fires on a LIVE-sourced POST (the
+        "live is newer and attributed" branch, ~5321-5350): its successor
+        is stashed under the LIVE credential's own fingerprint, which the
+        backup never held. `_adopt_stashed_successor`'s scan compares only
+        against the backup, so a next pass that only tries that match would
+        re-derive the same live-newer/attributed decision and re-POST the
+        already-spent live grant -- an invalid_grant strike on a live
+        account. The active path must also try the fresh LIVE read taken
+        under the same lock."""
+        live_newer = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-newer", "refreshToken": "rt-newer",
+                "expiresAt": 2000,        # newer than the backup, still expired
+            }
+        })
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        switcher._probe_verdicts[
+            switcher._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(live_newer),
+            )
+        ] = True
+
+        with patch.object(switcher, "_read_credentials", return_value=live_newer), \
+             patch.object(
+                 switcher, "_write_credentials", side_effect=OSError("disk full")
+             ), \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=OSError("disk full"),
+             ), \
+             patch.object(
+                 switcher._store, "_write_unclaimed_credential",
+                 side_effect=OSError("disk full"),
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"):
+            result1 = switcher._fetch_active_usage("1", "test@example.com", live_newer)
+
+        assert result1.sentinel == USAGE_TOKEN_EXPIRED
+        assert switcher._unpersisted["1"] == (
+            oauth.credential_fingerprint(live_newer), self._REFRESHED
+        )
+
+        # Pass 2: the backup is still the pre-POST generation (both writes
+        # failed) and live still holds the same spent grant -- only a match
+        # against the fresh live read finds the stashed successor.
+        with patch.object(switcher, "_read_credentials", return_value=live_newer), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials"
+             ) as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 7}})):
+            result2 = switcher._fetch_active_usage("1", "test@example.com", live_newer)
+
+        mock_refresh.assert_not_called()
+        assert switcher._read_account_credentials(
+            "1", "test@example.com"
+        ) == self._REFRESHED
+        write_live.assert_called_once_with(self._REFRESHED)
+        assert result2.usage == {"five_hour": {"pct": 7}}
+        assert "1" not in switcher._unpersisted
 
     def test_slot_write_interrupted_after_post_stashes_the_successor(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
