@@ -4334,13 +4334,21 @@ class ClaudeAccountSwitcher:
         """Complete a prior pass's failed persist from the unclaimed stash.
 
         Called by both the consume gate and ``_fetch_active_usage`` — either
-        one can POST a grant and fail to persist its successor. A stash
-        entry records ``consumedFp`` — the generation its credential
-        superseded. When the slot still stores exactly that generation, the
-        stored rt is already consumed and the stash holds its live
-        successor: write it back (the pending persist) and drop the entry.
-        Returns the adopted credentials, or None when nothing applies.
-        Caller holds the slot FileLock.
+        one can POST a grant and fail to persist its successor. ``current``
+        is the caller's own already-attributed candidate for what generation
+        this slot's grant was last consumed against — usually the slot
+        backup, but ``_fetch_active_usage``'s live-keyed arm passes the LIVE
+        credential instead, once it has independently proven (its
+        ``_probe_verdicts`` check or an on-disk stash entry naming this slot,
+        and ``_live_identity_matches``) that the live store is this slot's
+        own account. A stash entry records ``consumedFp`` — the generation
+        its credential superseded. When ``current`` fingerprints to exactly
+        that generation, the stored rt is already consumed and the stash
+        holds its live successor: write it back (the pending persist,
+        ``attributed=True`` at both of this function's writes below, since
+        the match against ``current`` IS the attribution) and drop the
+        entry. Returns the adopted credentials, or None when nothing
+        applies. Caller holds the slot FileLock.
         """
         cur_fp = oauth.credential_fingerprint(current)
         if not cur_fp:
@@ -4356,13 +4364,14 @@ class ClaudeAccountSwitcher:
         pending = self._unpersisted.get(account_num)
         if pending is not None and pending[0] == cur_fp:
             try:
-                # attributed=True: `pending[0]` (checked above) matches
-                # the slot's CURRENT stored fingerprint -- a CAS proving
-                # `pending[1]` is this slot's own pending successor, not
-                # another account's, the same reasoning the on-disk
-                # stash write below attests.
+                # attributed=True: the CAS just above (`pending[0] ==
+                # cur_fp`) matched this successor's own consumed generation
+                # against `current` (the slot's backup, or -- from the
+                # live-keyed caller -- a live credential that caller already
+                # proved is this slot's own) under the lock -- that is this
+                # call site's own independent attribution.
                 self._write_account_credentials(
-                    account_num, email, pending[1], attributed=True,
+                    account_num, email, pending[1], attributed=True
                 )
             except Exception:
                 # A WRITE failure, not a read one: the successor is sitting
@@ -4502,10 +4511,9 @@ class ClaudeAccountSwitcher:
             # here made this one call site safe and left the other two — the
             # resync and the post-POST persist — carrying the defect.
             #
-            # attributed=True: this row's `consumedFp` (checked above)
-            # matches the slot's CURRENT stored fingerprint — a CAS proving
-            # `creds` is this slot's own pending successor, not another
-            # account's stash entry.
+            # attributed=True: the manifest match just above (`configSlot`
+            # == this slot, `consumedFp` == `cur_fp`) is this call site's
+            # own independent attribution, same as the in-memory CAS above.
             self._write_account_credentials(
                 account_num, email, creds, attributed=True
             )
@@ -7279,6 +7287,17 @@ class ClaudeAccountSwitcher:
                             and adopted_oauth.get("accessToken")
                             and adopted_oauth.get("refreshToken")
                         )
+                    elif (
+                        oauth.credential_fingerprint(locked_backup) != backup_fp
+                    ):
+                        # The scan adopted nothing, but the backup moved
+                        # under the lock: `backup`/`backup_fp` below this
+                        # point are still the STALE pre-lock read. Restoring
+                        # or POSTing from them would race the writer that
+                        # moved it -- the same drift `_resync_rotated_backup`
+                        # refuses to persist. Defer to the next pass rather
+                        # than act on a copy the slot has already moved past.
+                        return _defer(force_refresh)
                     elif live_oauth is not None and (
                         oauth.credential_fingerprint(live) == backup_fp
                     ):
@@ -7322,13 +7341,67 @@ class ClaudeAccountSwitcher:
                             and live_oauth.get("refreshToken")
                             and live_exp > backup_exp
                         ):
-                            if self._probe_verdicts.get(
-                                self._lineage_key(
-                                    account_num, email,
-                                    oauth.credential_fingerprint(live) or "",
+                            # A prior pass may already have POSTed this exact
+                            # lineage and failed to persist the successor
+                            # anywhere durable -- the backup-keyed adopt
+                            # above can never find that stash entry, since
+                            # the backup never held live's lineage. Try it
+                            # here, under the same lock, before spending the
+                            # grant a second time.
+                            #
+                            # Tried BEFORE consulting `_probe_verdicts`: that
+                            # memo lives only in this process's memory, so a
+                            # restart between the both-fail pass that stashed
+                            # this entry and this one leaves it empty even
+                            # though the on-disk entry (`configSlot` == this
+                            # slot, `consumedFp` == fp(live)) is itself a
+                            # record of this tool's own POST -- the same
+                            # independent attribution `_probe_verdicts` would
+                            # have supplied. Falling through to defer there
+                            # would leave Claude Code to POST the
+                            # already-spent live grant on its next use.
+                            try:
+                                adopted_live = self._adopt_stashed_successor(
+                                    account_num, email, live
                                 )
-                            ):
-                                refresh_input = live
+                            except (
+                                CredentialReadError, CredentialWriteError
+                            ) as exc:
+                                self._logger.info(
+                                    "Account %s's stashed active "
+                                    "successor could not be adopted "
+                                    "(%s); deferring the refresh.",
+                                    account_num, type(exc).__name__,
+                                    exc_info=True,
+                                )
+                                return FetchRecord(
+                                    error="stash-unreadable"
+                                    if isinstance(exc, CredentialReadError)
+                                    else "stash-write-failed"
+                                )
+                            attributed_live = adopted_live is not None or bool(
+                                self._probe_verdicts.get(
+                                    self._lineage_key(
+                                        account_num, email,
+                                        oauth.credential_fingerprint(live)
+                                        or "",
+                                    )
+                                )
+                            )
+                            if attributed_live:
+                                if adopted_live is not None:
+                                    refresh_input = adopted_live
+                                    backup = adopted_live
+                                    adopted_oauth = oauth.extract_oauth_data(
+                                        adopted_live
+                                    )
+                                    backup_usable = bool(
+                                        adopted_oauth
+                                        and adopted_oauth.get("accessToken")
+                                        and adopted_oauth.get("refreshToken")
+                                    )
+                                else:
+                                    refresh_input = live
                             else:
                                 key = (account_num, email,
                                        "expiry-unattributed")
@@ -7350,7 +7423,7 @@ class ClaudeAccountSwitcher:
                         # another actor is mutating the store; defer.
                         return _defer(force_refresh)
                     input_oauth = oauth.extract_oauth_data(refresh_input)
-                    if restore_source is not None or (
+                    if (
                         refresh_input == backup
                         and backup_usable
                         and not force_refresh
@@ -7362,8 +7435,7 @@ class ClaudeAccountSwitcher:
                         # The backup already holds a live, non-expired
                         # credential (a prior locked refresh persisted it but
                         # the live write failed, stranding the live store on
-                        # the consumed generation) — or a stashed successor
-                        # was just adopted above. Restore it — no POST, no
+                        # the consumed generation). Restore it — no POST, no
                         # generation consumed.
                         restore_source = refresh_input
                         working = refresh_input
@@ -7685,11 +7757,17 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 },
             )
         except Exception:
+            # Both persists and this stash write are spent -- the same
+            # both-fail shape `_consume_backup_grant_locked` hits (~2803-
+            # 2806). Keep it in process memory so a later pass in THIS
+            # process still adopts it via `_adopt_stashed_successor`,
+            # rather than the generation being lost outright.
+            self._unpersisted[account_num] = (consumed_fp, creds)
             self._logger.error(
                 "Account %s's active-refresh successor could not be "
-                "stashed either; it survives only for this pass. Fix the "
-                "storage failure, then re-login and `cswap add` if the "
-                "slot strikes.", account_num, exc_info=True,
+                "stashed to disk either; kept in memory for this process "
+                "only. Fix the storage failure, then re-login and `cswap "
+                "add` if the slot strikes.", account_num, exc_info=True,
             )
         except BaseException:
             self._logger.error(
