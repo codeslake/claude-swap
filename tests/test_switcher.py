@@ -4189,37 +4189,6 @@ class TestActiveAccountRefresh:
             "1", "test@example.com", self._REFRESHED, attributed=True
         )
 
-    def test_on_disk_successor_adoption_writes_the_backup_as_attributed(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
-    ):
-        """The on-disk manifest scan's own match (`configSlot` == this slot,
-        `consumedFp` == `cur_fp`) is the same independent attribution the
-        in-memory CAS performs above -- its write-back must say so too."""
-        switcher = self._switcher(sample_sequence_data)
-        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
-        switcher._store._write_unclaimed_credential(
-            self._REFRESHED,
-            {
-                "reason": "active-refresh-unpersisted",
-                "configSlot": "1",
-                "consumedFp": oauth.credential_fingerprint(self._EXPIRED),
-                "fingerprint": oauth.credential_fingerprint(self._REFRESHED),
-            },
-        )
-
-        with patch.object(
-            switcher, "_write_account_credentials",
-            wraps=switcher._write_account_credentials,
-        ) as write_backup:
-            result = switcher._adopt_stashed_successor(
-                "1", "test@example.com", self._EXPIRED
-            )
-
-        assert result == self._REFRESHED
-        write_backup.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED, attributed=True
-        )
-
     def test_in_memory_successor_with_a_foreign_consumed_fp_is_not_adopted(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -4484,6 +4453,53 @@ class TestActiveAccountRefresh:
         write_live.assert_called_once_with(self._REFRESHED)
         assert result.usage == {"five_hour": {"pct": 3}}
         assert switcher.list_unclaimed_credentials() == {}
+
+    def test_live_keyed_adopt_defers_when_the_verdict_condemns_live(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Control for the restart-recovery adopt above: here a `_probe_
+        verdicts` entry already says live's lineage belongs to ANOTHER
+        account (`False`). The on-disk stash entry's own `configSlot`/
+        `consumedFp` match is what licenses the restart case when NO
+        verdict exists -- it must not override a verdict that already
+        condemned the lineage. Fail-closed: nothing adopted, no POST,
+        deferred to Claude Code's next use."""
+        live_newer = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-newer", "refreshToken": "rt-newer",
+                "expiresAt": 2000,
+            }
+        })
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        switcher._store._write_unclaimed_credential(
+            self._REFRESHED,
+            {
+                "reason": "active-refresh-unpersisted",
+                "configSlot": "1",
+                "consumedFp": oauth.credential_fingerprint(live_newer),
+                "fingerprint": oauth.credential_fingerprint(self._REFRESHED),
+            },
+        )
+        switcher._probe_verdicts[
+            switcher._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(live_newer),
+            )
+        ] = False
+
+        with patch.object(switcher, "_read_credentials", return_value=live_newer), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh:
+            result = switcher._fetch_active_usage("1", "test@example.com", live_newer)
+
+        mock_refresh.assert_not_called()
+        write_live.assert_not_called()
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        assert switcher._read_account_credentials(
+            "1", "test@example.com"
+        ) == self._EXPIRED  # untouched
+        assert len(switcher.list_unclaimed_credentials()) == 1  # survives, unretired
 
     def test_live_keyed_adopt_ignores_a_stash_entry_for_another_slot(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict

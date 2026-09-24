@@ -2929,20 +2929,23 @@ class ClaudeAccountSwitcher:
 
         Called by both the consume gate and ``_fetch_active_usage`` — either
         one can POST a grant and fail to persist its successor. ``current``
-        is the caller's own already-attributed candidate for what generation
-        this slot's grant was last consumed against — usually the slot
-        backup, but ``_fetch_active_usage``'s live-keyed arm passes the LIVE
-        credential instead, once it has independently proven (its
-        ``_probe_verdicts`` check or an on-disk stash entry naming this slot,
-        and ``_live_identity_matches``) that the live store is this slot's
-        own account. A stash entry records ``consumedFp`` — the generation
-        its credential superseded. When ``current`` fingerprints to exactly
-        that generation, the stored rt is already consumed and the stash
-        holds its live successor: write it back (the pending persist,
-        ``attributed=True`` at both of this function's writes below, since
-        the match against ``current`` IS the attribution) and drop the
-        entry. Returns the adopted credentials, or None when nothing
-        applies. Caller holds the slot FileLock.
+        is the caller's own candidate for what generation this slot's grant
+        was last consumed against — usually the slot backup, but
+        ``_fetch_active_usage``'s live-keyed arm passes the LIVE credential
+        instead, and neither caller proves ownership before the call: the
+        proof is this function's OWN match, verdict-free in both its forms
+        — the in-memory CAS (``pending[0] == cur_fp``) or the on-disk scan's
+        own row (``configSlot`` names this slot, ``consumedFp`` ==
+        ``cur_fp``). (The live-keyed arm does consult ``_probe_verdicts``,
+        but only to refuse a lineage a verdict already condemned as another
+        account's — never to license the adopt.) A stash entry records
+        ``consumedFp`` — the generation its credential superseded. When
+        ``current`` fingerprints to exactly that generation, the stored rt
+        is already consumed and the stash holds its live successor: write
+        it back (the pending persist, ``attributed=True`` at both of this
+        function's writes below, since the match against ``current`` IS the
+        attribution) and drop the entry. Returns the adopted credentials, or
+        None when nothing applies. Caller holds the slot FileLock.
         """
         cur_fp = oauth.credential_fingerprint(current)
         if not cur_fp:
@@ -5352,13 +5355,33 @@ class ClaudeAccountSwitcher:
                             # here, under the same lock, before spending the
                             # grant a second time.
                             #
-                            # Tried BEFORE consulting `_probe_verdicts`: that
-                            # memo lives only in this process's memory, so a
-                            # restart between the both-fail pass that stashed
-                            # this entry and this one leaves it empty even
-                            # though the on-disk entry (`configSlot` == this
-                            # slot, `consumedFp` == fp(live)) is itself a
-                            # record of this tool's own POST -- the same
+                            # A verdict already IN MEMORY takes priority
+                            # over the on-disk match below: `_probe_verdicts
+                            # .get(...) is False` is proof, independently
+                            # reached elsewhere in this same process, that
+                            # live belongs to ANOTHER account. Adopting
+                            # anyway (the stash entry's own `configSlot`/
+                            # `consumedFp` match alone) would write that
+                            # foreign successor into this slot and the live
+                            # store -- fail-closed here, the same as the
+                            # backup-keyed gate's own condemned-lineage
+                            # check above.
+                            live_verdict = self._probe_verdicts.get(
+                                self._lineage_key(
+                                    account_num, email,
+                                    oauth.credential_fingerprint(live) or "",
+                                )
+                            )
+                            if live_verdict is False:
+                                return _defer(force_refresh)
+                            # Tried BEFORE consulting `_probe_verdicts` for a
+                            # positive/absent verdict: that memo lives only
+                            # in this process's memory, so a restart between
+                            # the both-fail pass that stashed this entry and
+                            # this one leaves it empty even though the
+                            # on-disk entry (`configSlot` == this slot,
+                            # `consumedFp` == fp(live)) is itself a record
+                            # of this tool's own POST -- the same
                             # independent attribution `_probe_verdicts` would
                             # have supplied. Falling through to defer there
                             # would leave Claude Code to POST the
@@ -5382,14 +5405,8 @@ class ClaudeAccountSwitcher:
                                     if isinstance(exc, CredentialReadError)
                                     else "stash-write-failed"
                                 )
-                            attributed_live = adopted_live is not None or bool(
-                                self._probe_verdicts.get(
-                                    self._lineage_key(
-                                        account_num, email,
-                                        oauth.credential_fingerprint(live)
-                                        or "",
-                                    )
-                                )
+                            attributed_live = (
+                                adopted_live is not None or bool(live_verdict)
                             )
                             if attributed_live:
                                 if adopted_live is not None:

@@ -469,7 +469,15 @@ class UsageEntry:
         out-of-band at-limit signal outranks whatever the poller has) built
         by ``_walled_decision_value``; else last-good while it is recent
         enough to trust (≤ ``STALE_OK_S``, or ``trust_extended`` for
-        deliberate staleness); else None (unknown). Display code reads
+        deliberate staleness); else None (unknown). The ``STALE_OK_S``/
+        ``trust_extended`` test is this method's own, on age alone — it
+        never consults a window's own reset (that's ``_earliest_reset``,
+        only ``mark_at_limit``'s walled-deadline arm's job). ``entries()``
+        caps a row whose last poll attempt FAILED at
+        ``poll_policy.POST_429_MIN_INTERVAL_S`` (360s), so such a row still
+        reaches the ``trust_extended`` branch between ``STALE_OK_S`` (300s)
+        and that cap; a row that never failed keeps the wider
+        ``TRUST_MAX_AGE_S`` ceiling instead. Display code reads
         ``last_good``/``age_s`` directly instead — it may show older data,
         annotated with its age.
         """
