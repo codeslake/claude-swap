@@ -2928,13 +2928,21 @@ class ClaudeAccountSwitcher:
         """Complete a prior pass's failed persist from the unclaimed stash.
 
         Called by both the consume gate and ``_fetch_active_usage`` — either
-        one can POST a grant and fail to persist its successor. A stash
-        entry records ``consumedFp`` — the generation its credential
-        superseded. When the slot still stores exactly that generation, the
-        stored rt is already consumed and the stash holds its live
-        successor: write it back (the pending persist) and drop the entry.
-        Returns the adopted credentials, or None when nothing applies.
-        Caller holds the slot FileLock.
+        one can POST a grant and fail to persist its successor. ``current``
+        is the caller's own already-attributed candidate for what generation
+        this slot's grant was last consumed against — usually the slot
+        backup, but ``_fetch_active_usage``'s live-keyed arm passes the LIVE
+        credential instead, once it has independently proven (its
+        ``_probe_verdicts`` check or an on-disk stash entry naming this slot,
+        and ``_live_identity_matches``) that the live store is this slot's
+        own account. A stash entry records ``consumedFp`` — the generation
+        its credential superseded. When ``current`` fingerprints to exactly
+        that generation, the stored rt is already consumed and the stash
+        holds its live successor: write it back (the pending persist,
+        ``attributed=True`` at both of this function's writes below, since
+        the match against ``current`` IS the attribution) and drop the
+        entry. Returns the adopted credentials, or None when nothing
+        applies. Caller holds the slot FileLock.
         """
         cur_fp = oauth.credential_fingerprint(current)
         if not cur_fp:
@@ -2952,8 +2960,10 @@ class ClaudeAccountSwitcher:
             try:
                 # attributed=True: the CAS just above (`pending[0] ==
                 # cur_fp`) matched this successor's own consumed generation
-                # against the slot's CURRENT backup under the lock -- that
-                # is this call site's own independent attribution.
+                # against `current` (the slot's backup, or -- from the
+                # live-keyed caller -- a live credential that caller already
+                # proved is this slot's own) under the lock -- that is this
+                # call site's own independent attribution.
                 self._write_account_credentials(
                     account_num, email, pending[1], attributed=True
                 )
@@ -3094,7 +3104,13 @@ class ClaudeAccountSwitcher:
             # cannot raise past its own store write. Open-coding the split
             # here made this one call site safe and left the other two — the
             # resync and the post-POST persist — carrying the defect.
-            self._write_account_credentials(account_num, email, creds)
+            #
+            # attributed=True: the manifest match just above (`configSlot`
+            # == this slot, `consumedFp` == `cur_fp`) is this call site's
+            # own independent attribution, same as the in-memory CAS above.
+            self._write_account_credentials(
+                account_num, email, creds, attributed=True
+            )
             # Housekeeping, and non-fatal for the same reason: the slot is
             # advanced, so a raise would report a failed refresh for a
             # credential the store holds. A stale row is retried next pass or
@@ -5328,40 +5344,54 @@ class ClaudeAccountSwitcher:
                             and live_oauth.get("refreshToken")
                             and live_exp > backup_exp
                         ):
-                            if self._probe_verdicts.get(
-                                self._lineage_key(
-                                    account_num, email,
-                                    oauth.credential_fingerprint(live) or "",
+                            # A prior pass may already have POSTed this exact
+                            # lineage and failed to persist the successor
+                            # anywhere durable -- the backup-keyed adopt
+                            # above can never find that stash entry, since
+                            # the backup never held live's lineage. Try it
+                            # here, under the same lock, before spending the
+                            # grant a second time.
+                            #
+                            # Tried BEFORE consulting `_probe_verdicts`: that
+                            # memo lives only in this process's memory, so a
+                            # restart between the both-fail pass that stashed
+                            # this entry and this one leaves it empty even
+                            # though the on-disk entry (`configSlot` == this
+                            # slot, `consumedFp` == fp(live)) is itself a
+                            # record of this tool's own POST -- the same
+                            # independent attribution `_probe_verdicts` would
+                            # have supplied. Falling through to defer there
+                            # would leave Claude Code to POST the
+                            # already-spent live grant on its next use.
+                            try:
+                                adopted_live = self._adopt_stashed_successor(
+                                    account_num, email, live
                                 )
-                            ):
-                                # Attributed live is about to be POSTed. A
-                                # prior pass may already have POSTed this
-                                # exact lineage and failed to persist the
-                                # successor anywhere durable -- the
-                                # backup-keyed adopt above can never find
-                                # that stash entry, since the backup never
-                                # held live's lineage. Adopt it here,
-                                # under the same lock, before spending the
-                                # grant a second time.
-                                try:
-                                    adopted_live = self._adopt_stashed_successor(
-                                        account_num, email, live
+                            except (
+                                CredentialReadError, CredentialWriteError
+                            ) as exc:
+                                self._logger.info(
+                                    "Account %s's stashed active "
+                                    "successor could not be adopted "
+                                    "(%s); deferring the refresh.",
+                                    account_num, type(exc).__name__,
+                                    exc_info=True,
+                                )
+                                return FetchRecord(
+                                    error="stash-unreadable"
+                                    if isinstance(exc, CredentialReadError)
+                                    else "stash-write-failed"
+                                )
+                            attributed_live = adopted_live is not None or bool(
+                                self._probe_verdicts.get(
+                                    self._lineage_key(
+                                        account_num, email,
+                                        oauth.credential_fingerprint(live)
+                                        or "",
                                     )
-                                except (
-                                    CredentialReadError, CredentialWriteError
-                                ) as exc:
-                                    self._logger.info(
-                                        "Account %s's stashed active "
-                                        "successor could not be adopted "
-                                        "(%s); deferring the refresh.",
-                                        account_num, type(exc).__name__,
-                                        exc_info=True,
-                                    )
-                                    return FetchRecord(
-                                        error="stash-unreadable"
-                                        if isinstance(exc, CredentialReadError)
-                                        else "stash-write-failed"
-                                    )
+                                )
+                            )
+                            if attributed_live:
                                 if adopted_live is not None:
                                     refresh_input = adopted_live
                                     backup = adopted_live
