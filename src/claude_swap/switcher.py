@@ -7030,7 +7030,11 @@ class ClaudeAccountSwitcher:
         chance to land a free reading and push the real poll out on its own,
         a never-measured account is left plan-less so nothing blocks its
         first fetch), and the next poll is only ever pulled earlier, never
-        pushed later. Best-effort by contract: the switch this rides on has
+        pushed later. A row with a recent failed attempt skips the defer
+        term entirely: ``record_header_reading`` refuses any row with
+        ``consecutiveFailures > 0``, so no free reading can ever land there
+        and waiting out the window only delays the real retry that could
+        heal it. Best-effort by contract: the switch this rides on has
         already committed, so a cache hiccup here must not surface as a
         switch failure."""
         try:
@@ -7040,9 +7044,11 @@ class ClaudeAccountSwitcher:
             entry = self._usage_store.entries(identities).get(number)
             if entry is None or entry.fetched_at is None:
                 return
-            next_poll = max(
-                now + poll_policy.POST_SWITCH_REPLAN_DEFER_S,
-                entry.fetched_at + poll_policy.MIN_INTERVAL_S,
+            floor = entry.fetched_at + poll_policy.MIN_INTERVAL_S
+            next_poll = (
+                max(now, floor)
+                if entry.consecutive_failures > 0
+                else max(now + poll_policy.POST_SWITCH_REPLAN_DEFER_S, floor)
             )
             if entry.next_poll_at is not None and entry.next_poll_at <= next_poll:
                 return

@@ -34,7 +34,7 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
-from claude_swap.usage_store import FetchRecord, UsageEntry
+from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -1628,6 +1628,59 @@ class TestAdaptiveScheduler:
         h.clock.advance(120)  # age 360 ≥ ACTIVE_MAX_INTERVAL_S
         self._tick(h, counts, usage)
         assert counts["1"] == 2
+
+    def test_post_switch_defer_window_still_fetches_a_stale_active(
+        self, temp_home, monkeypatch
+    ):
+        # poll_policy.POST_SWITCH_REPLAN_DEFER_S holds an on-demand caller
+        # (statusline's `cswap list`) off the just-switched-to slot for 30s
+        # so a free header reading gets a chance to land first — but the
+        # engine's own tick must not honor that same deferral when the
+        # slot's reading was ALREADY older than ACTIVE_MAX_INTERVAL_S at
+        # switch time: T1102's rule (a reading past its floor never gates
+        # the active as healthy) holds inside the window too.
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {"1": _usage(50), "2": _usage(20)}
+        counts: dict[str, int] = {}
+        ident1 = {"1": ("a@example.com", "")}
+        ident2 = {"2": ("b@example.com", "")}
+        store = h.switcher._usage_store
+
+        # "1" carries a reading and plan shaped like an idle candidate right
+        # before the switch this test is about to simulate: measured 660s
+        # ago, with the wide candidate-style plan (up to 600s out) that
+        # comes with never having been the active slot.
+        old_store = UsageStore(store.path.parent, clock=lambda: h.clock.now - 660.0)
+        old_store.record({"1": FetchRecord(usage=usage["1"])}, ident1)
+        store.set_poll_plan({"1": (h.clock.now + 600.0, 600.0)}, ident1)
+        # "2" is fresh and parked far out, so this tick's only due-ness
+        # signal is "1"'s — otherwise the candidate's own decay would
+        # confound the assertion.
+        store.record(
+            {"2": FetchRecord(usage=usage["2"])},
+            ident2,
+            plans={"2": (h.clock.now + 900.0, 500.0)},
+        )
+
+        h.switcher._replan_new_active("1", "a@example.com", "")
+        entry = store.entries(ident1)["1"]
+        assert entry.next_poll_at > h.clock.now  # inside the deferred window
+        assert entry.age_s == pytest.approx(660.0)
+
+        # An on-demand caller inside the window still respects the deferral
+        # (the measured extra statusline attempt this window exists to stop).
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=self._counting_fetch(counts, usage),
+        ):
+            h.switcher.usage_entries_by_account(fetch=None)
+        assert counts.get("1", 0) == 0
+
+        h.clock.advance(10)  # 10s into the 30s window
+        outcome = self._tick(h, counts, usage)
+        assert counts.get("1", 0) == 1  # the engine fetched the stale active
+        assert counts.get("2", 0) == 0  # not escalated: the parked candidate untouched
+        assert outcome is TickOutcome.NO_ACTION
 
     def test_exhausted_active_is_rechecked_before_its_reset(
         self, temp_home, monkeypatch

@@ -1853,6 +1853,32 @@ class TestListAccountsUsage:
         assert entry.next_poll_at <= deferred + 1
         assert entry.next_poll_at >= deferred - 1
 
+    def test_replan_new_active_skips_the_defer_on_a_failed_row(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        """A row a header reading can never land on
+        (`record_header_reading` refuses any row with
+        `consecutiveFailures > 0`) gets no benefit from waiting out the
+        defer window -- only a real retry can heal it, so the deferral is
+        skipped and the old immediate-catch-up behavior applies."""
+        import time as time_mod
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        ident = {"1": ("a@x.com", "")}
+        store = switcher._usage_store
+
+        old_store = UsageStore(
+            switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 400
+        )
+        old_store.record({"1": FetchRecord(usage={"five_hour": {"pct": 10}})}, ident)
+        old_store.record({"1": FetchRecord(error="timeout")}, ident)
+
+        switcher._replan_new_active("1", "a@x.com", "")
+        entry = store.entries(ident)["1"]
+        assert entry.consecutive_failures == 1
+        assert entry.next_poll_at <= time_mod.time() + 1
+
     def test_replan_new_active_failure_is_logged_not_raised(
         self, temp_home: Path, mock_claude_config: Path, caplog
     ):

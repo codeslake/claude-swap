@@ -8,7 +8,11 @@ import logging
 import pytest
 
 from claude_swap import oauth, usage_store
-from claude_swap.poll_policy import CANDIDATE_MAX_INTERVAL_S, POST_429_MIN_INTERVAL_S
+from claude_swap.poll_policy import (
+    CANDIDATE_MAX_INTERVAL_S,
+    POST_429_MIN_INTERVAL_S,
+    POST_SWITCH_REPLAN_DEFER_S,
+)
 from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
@@ -1449,6 +1453,25 @@ class TestHeaderReading:
         store.record_header_reading("1", IDENT, headers)
         entry = store.entries(IDENT)["1"]
         assert entry.next_poll_at == pytest.approx(clock.now + CANDIDATE_MAX_INTERVAL_S)
+
+    def test_cannot_preempt_the_post_switch_defer_once_the_attempt_is_old(
+        self, store, clock
+    ):
+        # `_replan_new_active`'s defer window relies on this floor
+        # (`lastAttemptAt + CANDIDATE_MAX_INTERVAL_S`) landing AFTER its own
+        # near-term deadline for a header reading to have any effect. Once
+        # the last endpoint attempt is already >= 570s old at switch time,
+        # the floor lands at or before that deadline and a header reading
+        # cannot push it out: the deferred poll still fires on schedule.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)  # lastAttemptAt = t0
+        clock.advance(600.0)  # the last attempt is now >= 570s old
+        deferred = clock.now + POST_SWITCH_REPLAN_DEFER_S
+        store.set_poll_plan({"1": (deferred, 180.0)}, IDENT)  # the replan's shape
+
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        assert store.record_header_reading("1", IDENT, headers) is True
+        entry = store.entries(IDENT)["1"]
+        assert entry.next_poll_at == pytest.approx(deferred)  # unmoved
 
     def test_does_not_join_the_attempt_ledger(self, store, clock):
         headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}

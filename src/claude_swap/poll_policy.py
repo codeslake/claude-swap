@@ -94,13 +94,22 @@ CANDIDATE_DEFAULT_INTERVAL_S = 300.0
 CANDIDATE_MAX_INTERVAL_S = 600.0
 
 # A just-activated account's stale candidate plan (``_replan_new_active``) is
-# never pulled all the way to "now": that fires an immediate endpoint fetch
-# before the pin's own per-slot header throttle (``record_header_reading``,
-# called at most once per 30s per slot) gets a chance to land a free reading
-# and push the real poll out on its own. Measured 2026-09-24 (T1231, on
-# T1178's analyzer): with header readings already wired in, slot 6 still
-# logged 8 usage-endpoint attempts in one hour against a target of at most 6,
-# traced to this immediate re-plan firing 0.55s before the next header reply.
+# never pulled all the way to "now": an immediate deadline would leave the
+# row already due for the moment an ON-DEMAND caller (e.g. the statusline's
+# `cswap list`) next reads it, and that caller re-fetches on its own. The
+# pin's own per-slot header throttle (``record_header_reading``, called at
+# most once per 30s per slot) does NOT delay the FIRST reading on a newly
+# live slot -- the very first ``/v1/messages`` reply already records one --
+# so this window is only a chance for that reply's traffic to arrive before
+# an on-demand caller is allowed to poll on its own; a header reading only
+# ever pushes ``nextPollAt`` OUT (``max(existing, lastAttemptAt +
+# CANDIDATE_MAX_INTERVAL_S)``, never earlier), so once the last endpoint
+# attempt is already >= 570s old that floor lands at or before this window's
+# own deadline and the deferred poll fires on schedule regardless. Measured
+# 2026-09-24 (T1231, on T1178's analyzer): with header readings already
+# wired in, slot 6 still logged 8 usage-endpoint attempts in one hour
+# against a target of at most 6, traced to the statusline's own fetch
+# landing 0.55s after the switch.
 POST_SWITCH_REPLAN_DEFER_S = 30.0
 
 # Exhaustion is stable enough to poll slowly, but not to stop polling until a
