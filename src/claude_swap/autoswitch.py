@@ -4716,8 +4716,23 @@ class AutoSwitchEngine:
                 # whichever came first in the list. Headroom still decides
                 # first within the tier; the reset only breaks its ties, where
                 # sooner is plainly better than lower slot number.
+                #
+                # A FULL ACCOUNT (h <= 0) SERVES NOTHING UNTIL IT RESETS,
+                # HOWEVER SOON; AN ACCOUNT AT 0 < h SERVES NOW. Under
+                # `dynamic` the `by_recovery` tier ranked two such
+                # candidates purely on reset time, so a peer fully spent on
+                # one window but resetting sooner outranked a peer still
+                # holding real headroom on every window (measured, T1083:
+                # active at-limit on 5h, a peer at 3 points of 5h headroom
+                # (30-minute reset) lost to a peer fully spent on its own
+                # 7d window (10-minute reset)). Gated on `dynamic_landing`
+                # so `best`/`consume-first` (never reached with it True)
+                # stay byte-identical; among peers on the SAME side of the
+                # gate, recovery order still decides, unchanged.
                 key: tuple = (
-                    (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
+                    (0, dynamic_landing and h <= 0, recovery_ts, -h)
+                    if by_recovery
+                    else (1, -h, recovery_ts)
                 )
                 key_axis[num] = "soonest to recover" if by_recovery else "most headroom"
             elif consume_first and trigger != "at-limit" and not all_above:

@@ -7296,17 +7296,59 @@ class TestDynamicStrategy:
         )
         assert "Account-2" in exhausted.human(), exhausted.human()
 
+    def test_a_peer_with_real_headroom_beats_a_fully_spent_one_under_dynamic(
+        self, temp_home
+    ):
+        """T1083: the at-limit escape's tier-0 key ranked two candidates
+        purely by which recovers sooner, even when one of them (headroom 0,
+        every window gone) cannot serve at all until then and the other
+        (headroom > 0) can serve right now. Measured live
+        (task-T1084/usage-poll-hypothesis.md): active spent on 5h, account 2
+        at 5h 97%/7d 72% (3 points of real headroom, 5h resetting in 30
+        minutes) lost to account 6 fully spent on its own 7d window (5h
+        0%/7d 100%, resetting in 10 minutes) purely because 10 minutes beats
+        30. A full account serves nothing until it resets, however soon; an
+        account at 0 < h serves now and must win regardless of whose reset
+        is closer.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, hysteresis_pct=5.0, strategy="dynamic",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(6, "f@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(100.0, 60.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        real_headroom = _usage7(97.0, 72.0)
+        real_headroom["five_hour"]["resets_at"] = _iso_at(now + 30 * 60)
+        real_headroom["seven_day"]["resets_at"] = _iso_at(now + 6 * 3600)
+        fully_spent = _usage7(0.0, 100.0)
+        fully_spent["seven_day"]["resets_at"] = _iso_at(now + 10 * 60)
+        usage = {"1": active, "2": real_headroom, "6": fully_spent}
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            f"landed on account {h.active_number()} instead of account 2 -- "
+            "a peer with real headroom (3 points) must beat one that is "
+            "fully spent (0), whatever their reset order"
+        )
+
     def test_the_soonest_reset_wins_among_several_walled_candidates_under_dynamic(
         self, temp_home
     ):
         """T0938 item 1, three-account version of the test above: with a
         SINGLE walled candidate, that test only ever exercises the at-limit
         escape's landing-gate bypass, never the tiered KEY (~3853) that
-        chooses BETWEEN two such candidates. Active and Y are both fully
-        spent (headroom 0); X sits at headroom 2 -- MORE headroom than Y --
-        but Y's 5h window resets in ten minutes against X's two hours. The
-        recovery axis must decide on reset time, not headroom: `dynamic`
-        switches to Y, the soonest recovery.
+        chooses BETWEEN two such candidates. Active, X and Y are all fully
+        spent (headroom 0, T1083: a peer with any real headroom left now
+        wins outright regardless of reset order, so this stays the "which
+        of several FULL peers" case) -- but Y's 5h window resets in ten
+        minutes against X's two hours. Among equally full peers the
+        recovery axis must still decide on reset time: `dynamic` switches
+        to Y, the soonest recovery.
         """
         h = EngineHarness(
             temp_home, threshold=90.0, hysteresis_pct=5.0, strategy="dynamic",
@@ -7318,7 +7360,7 @@ class TestDynamicStrategy:
         now = h.clock.now
         active = _usage7(100.0, 60.0)
         active["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
-        x = _usage7(98.0, 60.0)
+        x = _usage7(100.0, 60.0)
         x["five_hour"]["resets_at"] = _iso_at(now + 2 * 3600)
         y = _usage7(100.0, 60.0)
         y["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
@@ -7327,8 +7369,8 @@ class TestDynamicStrategy:
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3, (
-            f"landed on {h.active_number()} instead of account 3 (Y) -- Y's "
-            "ten-minute reset must beat X's two extra headroom points and "
+            f"landed on {h.active_number()} instead of account 3 (Y) -- "
+            "among two equally full peers, Y's ten-minute reset must beat "
             "X's own two-hour reset"
         )
 
