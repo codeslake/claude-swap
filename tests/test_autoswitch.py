@@ -34,7 +34,12 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
-from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
+from claude_swap.usage_store import (
+    USAGE_HEADER_5H_PCT,
+    FetchRecord,
+    UsageEntry,
+    UsageStore,
+)
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -1680,6 +1685,36 @@ class TestAdaptiveScheduler:
         outcome = self._tick(h, counts, usage)
         assert counts.get("1", 0) == 1  # the engine fetched the stale active
         assert counts.get("2", 0) == 0  # not escalated: the parked candidate untouched
+        assert outcome is TickOutcome.NO_ACTION
+
+    def test_header_reading_does_not_retrigger_stale_active_plan(
+        self, temp_home, monkeypatch
+    ):
+        # `record_header_reading` pushes `nextPollAt` out to `lastAttemptAt +
+        # CANDIDATE_MAX_INTERVAL_S` the same way `_replan_new_active`'s
+        # post-switch deferral does, but it is not a stuck defer — readings
+        # keep arriving on their own. `stale_active_plan` must not mistake
+        # that steady header-fed cadence for the stuck shape, or the engine
+        # re-fetches every ~360s instead of the ~600s these readings are
+        # meant to buy (T1231).
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {"1": _usage(50), "2": _usage(20)}
+        counts: dict[str, int] = {}
+        ident1 = {"1": ("a@example.com", "")}
+        ident2 = {"2": ("b@example.com", "")}
+        store = h.switcher._usage_store
+
+        self._tick(h, counts, usage)  # t=0: baseline fetch of "1" and "2"
+        assert counts["1"] == 1
+        store.set_poll_plan({"2": (h.clock.now + 900.0, 500.0)}, ident2)
+
+        h.clock.advance(60)  # t=60: a free header reading lands on "1"
+        headers = {USAGE_HEADER_5H_PCT: "0.5"}
+        assert store.record_header_reading("1", ident1, headers) is True
+
+        h.clock.advance(300)  # t=360: the reading is only 300s old
+        outcome = self._tick(h, counts, usage)
+        assert counts["1"] == 1  # not re-fetched: the header reading still serves
         assert outcome is TickOutcome.NO_ACTION
 
     def test_exhausted_active_is_rechecked_before_its_reset(

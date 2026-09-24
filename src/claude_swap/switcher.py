@@ -7026,11 +7026,13 @@ class ClaudeAccountSwitcher:
         wait up to CANDIDATE_MAX_INTERVAL_S — too slow for the account whose
         usage is about to move. The deadline anchors on the last measurement
         (an already-old one comes due after POST_SWITCH_REPLAN_DEFER_S, not
-        immediately — that window gives the pin's own header throttle a
-        chance to land a free reading and push the real poll out on its own,
-        a never-measured account is left plan-less so nothing blocks its
-        first fetch), and the next poll is only ever pulled earlier, never
-        pushed later. A row with a recent failed attempt skips the defer
+        immediately — that window is only a chance for the slot's own
+        traffic to land a free header reading and push the real poll out on
+        its own; the header throttle itself does not delay a newly live
+        slot's first reading (see poll_policy.py), a never-measured account
+        is left plan-less so nothing blocks its first fetch), and the next
+        poll is only ever pulled earlier, never pushed later. A row with a
+        recent failed attempt skips the defer
         term entirely: ``record_header_reading`` refuses any row with
         ``consecutiveFailures > 0``, so no free reading can ever land there
         and waiting out the window only delays the real retry that could
