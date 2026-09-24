@@ -609,6 +609,59 @@ class TestTryRefreshOAuthCredentials:
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
             assert oauth.refresh_oauth_credentials(self._make_credentials()) is None
 
+    @pytest.mark.parametrize(
+        "bad_body,check",
+        [
+            (
+                {"refresh_token": "new-refresh"},
+                lambda rotated: rotated["expiresAt"] == 0,
+            ),
+            (
+                {
+                    "access_token": "new-access", "expires_in": "not-a-number",
+                    "refresh_token": "new-refresh",
+                },
+                lambda rotated: rotated["expiresAt"] == 0,
+            ),
+            (
+                {
+                    "access_token": "new-access", "expires_in": 3600,
+                    "refresh_token": "new-refresh", "scope": ["user:profile"],
+                },
+                lambda rotated: (
+                    rotated["scopes"]
+                    == ["user:profile", "user:inference", "user:sessions:claude_code"]
+                    and rotated["expiresAt"] > 0
+                ),
+            ),
+        ],
+        ids=["missing-access-token", "non-numeric-expires-in", "non-string-scope"],
+    )
+    def test_malformed_200_body_still_keeps_the_new_refresh_token(
+        self, bad_body, check
+    ):
+        """The token endpoint already answered 200 -- the grant is consumed
+        whatever the body's shape. A missing/mistyped `access_token` or
+        `expires_in` must not raise into the generic `except Exception`
+        (which reports `transient` and makes the caller re-POST the very
+        refresh token the server just spent); it must still capture a new
+        `refresh_token` when the body carries one, forcing `expiresAt` to 0
+        so the next reader refreshes again instead."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(bad_body).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+        assert outcome.error is None
+        rotated = json.loads(outcome.credentials)["claudeAiOauth"]
+        assert rotated["refreshToken"] == "new-refresh"
+        assert check(rotated)
+
 
 class TestBuildTokenStatus:
     """Test token status formatting."""

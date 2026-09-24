@@ -461,6 +461,14 @@ class ClaudeAccountSwitcher:
         self._probe_retry_after: dict[
             tuple[str, str, str, str, str, str], float
         ] = {}
+        # A consume-gate successor that could be written to NEITHER the
+        # slot backup NOR the unclaimed-credential stash (disk full, a
+        # read-only mount) -- the last resort so the never-discard promise
+        # holds even when every on-disk path failed. Keyed by slot;
+        # `_adopt_stashed_successor` checks it first, before any POST, and
+        # clears it once the write lands. In-memory only: it cannot outlive
+        # this process, but neither can the failure that put it here.
+        self._unpersisted: dict[str, tuple[str, str]] = {}
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -1894,7 +1902,9 @@ class ClaudeAccountSwitcher:
         ``UsageStore.record_header_reading`` for the header names, the
         utilization scale, and the throttle contract (the pin calls this at
         most once per 30s per slot). Returns False, recording nothing, for
-        an unknown slot or a reply carrying no 5h utilization header.
+        an unknown slot, a reply carrying no 5h utilization header, or a row
+        currently struck (``authDeadStrikes`` > 0) or failed
+        (``consecutiveFailures`` > 0) — see ``record_header_reading``.
         """
         data = self._get_sequence_data() or {}
         info = data.get("accounts", {}).get(num)
@@ -2608,11 +2618,49 @@ class ClaudeAccountSwitcher:
 
         stashed_reason = ""
 
+        # The kill window: the grant is already spent (the POST above
+        # returned), but no successor exists ANYWHERE on disk until one of
+        # the writes below lands — a SIGKILL in the next few statements (no
+        # `finally`/signal handler crosses it) would lose it outright, the
+        # one exit `_consume_backup_grant_locked`'s own except/BaseException
+        # arms cannot reach because nothing has raised yet. Bound it rather
+        # than leave it open: stash a placeholder right here, before taking
+        # the slot lock, and retire it the instant a real write (the normal
+        # persist below, or a branch's own reasoned `stash_successor`)
+        # confirms the successor is durable elsewhere. The remaining few
+        # milliseconds — before THIS write itself lands — recover only by
+        # re-login; nothing exists to stash before the POST returns.
+        early_entry_id: str | None = None
+        try:
+            early_entry_id = self._store._write_unclaimed_credential(
+                result.credentials,
+                {
+                    "reason": "consume-gate-post-window",
+                    "configSlot": account_num,
+                    "consumedFp": consumed_fp,
+                    "fingerprint": oauth.credential_fingerprint(
+                        result.credentials
+                    ),
+                },
+            )
+        except Exception:
+            self._logger.warning(
+                "Could not stash account %s's successor immediately after "
+                "the refresh POST; the kill window is unbounded for this "
+                "pass.", account_num, exc_info=True,
+            )
+
+        def _retire_early_entry() -> None:
+            if early_entry_id is not None:
+                self._retire_stash_entry(early_entry_id, account_num)
+
         def stash_successor(reason: str, note: str) -> None:
             # A consumed generation is never discarded: park the successor
             # where the next gate pass adopts it (see
             # ``_adopt_stashed_successor``; ``consumedFp`` is the adoption
-            # key — the generation this successor superseded).
+            # key — the generation this successor superseded). Retiring the
+            # placeholder only AFTER this write lands means a failure here
+            # leaves the placeholder as the surviving copy, never neither.
             self._store._write_unclaimed_credential(
                 result.credentials,
                 {
@@ -2627,6 +2675,7 @@ class ClaudeAccountSwitcher:
             nonlocal stashed_reason
             stashed_reason = reason
             self._logger.warning(note, account_num)
+            _retire_early_entry()
 
         outcome_creds = result.credentials
         try:
@@ -2678,6 +2727,8 @@ class ClaudeAccountSwitcher:
                         self._write_account_credentials(
                             account_num, email, result.credentials
                         )
+                        # Durably persisted — the placeholder is redundant.
+                        _retire_early_entry()
             except LockError:
                 # The grant IS consumed — the successor must survive even
                 # though the persist lock is unavailable. The token works;
@@ -2707,8 +2758,14 @@ class ClaudeAccountSwitcher:
                 # Both the persist and the stash failed. stash_successor sets
                 # stashed_reason after its write, so a raising write left it
                 # empty and the guard below reported success on a spent grant
-                # with nothing stashed.
+                # with nothing stashed. Nothing on disk holds it now -- keep
+                # it in process memory so `_adopt_stashed_successor` can
+                # still write it back on a later pass in THIS process,
+                # rather than the generation being lost outright.
                 stashed_reason = "consume-gate-unpersisted"
+                self._unpersisted[account_num] = (
+                    consumed_fp, result.credentials
+                )
                 self._logger.error(
                     "Account %s's consumed successor could not be persisted "
                     "or stashed — it survives only for this pass. Fix the "
@@ -2826,6 +2883,31 @@ class ClaudeAccountSwitcher:
         cur_fp = oauth.credential_fingerprint(current)
         if not cur_fp:
             return None
+        # A successor that could not be persisted to disk at all (see
+        # `_consume_backup_grant_locked`'s both-fail arm) survives only in
+        # this process's memory. Try it first, before any POST: the slot
+        # still holding the generation it superseded means writing it back
+        # IS the pending persist, same as an on-disk stash entry. A second
+        # write failure means the storage fault is still live -- defer
+        # rather than fall through to POST the slot's already-spent
+        # generation again.
+        pending = self._unpersisted.get(account_num)
+        if pending is not None and pending[0] == cur_fp:
+            try:
+                self._write_account_credentials(account_num, email, pending[1])
+            except Exception:
+                raise CredentialReadError(
+                    f"account {account_num}'s in-memory successor could not "
+                    "be persisted; deferring adoption rather than "
+                    "discarding its generation"
+                ) from None
+            del self._unpersisted[account_num]
+            self._logger.info(
+                "Adopted account %s's in-memory successor: the stored "
+                "generation was already consumed by a gate pass that could "
+                "not persist it to disk.", account_num,
+            )
+            return pending[1]
         # A row that is merely unreadable THIS instant (locked keychain,
         # transient EIO) must not abort the scan before a later, readable
         # sibling on the same generation is tried (repeated persist-failures
@@ -4931,6 +5013,14 @@ class ClaudeAccountSwitcher:
             return _defer(force_refresh)
         self._provenance_warned.discard((account_num, email, "unattributable"))
 
+        # Set the instant our own POST consumes the slot's one-time grant
+        # (never for an adopt or a backup restore below, neither of which
+        # spends one); cleared once the successor survives in a store.
+        # Every exit between those two points stashes it via
+        # `_stash_pending_refresh` rather than losing it.
+        pending: str | None = None
+        consumed_fp = ""
+
         # Claude Code's own sequence: locks → re-read → decide → POST →
         # persist unconditionally → release. A concurrently refreshing CC is
         # serialized here and adopts our rotation on its next locked re-read.
@@ -5216,19 +5306,40 @@ class ClaudeAccountSwitcher:
                             # Transient (network) failure: backoff via store.
                             return FetchRecord(error="refresh-failed")
                         working = result.credentials
+                        consumed_fp = oauth.credential_fingerprint(
+                            refresh_input
+                        )
+                        pending = working
                         # Our own POST produced this lineage — self-attributed,
                         # no oracle needed. The verdict is what lets the next
                         # expiry consume it if the backup write below fails.
-                        self._probe_verdicts[
-                            self._lineage_key(
-                                account_num, email,
-                                oauth.credential_fingerprint(working or "")
-                                or "",
+                        # A torn `sequence.json` (a roster renumber
+                        # mid-flight) makes `account_identity` raise here —
+                        # wrapped as b77c2167 wrapped the pre-consume gate's
+                        # own read: degrade rather than lose the
+                        # already-consumed successor by escaping uncaught.
+                        try:
+                            self._probe_verdicts[
+                                self._lineage_key(
+                                    account_num, email,
+                                    oauth.credential_fingerprint(working or "")
+                                    or "",
+                                )
+                            ] = True
+                            self._provenance_warned.discard(
+                                (account_num, email, "expiry-unattributed")
                             )
-                        ] = True
-                        self._provenance_warned.discard(
-                            (account_num, email, "expiry-unattributed")
-                        )
+                        except Exception:
+                            self._logger.warning(
+                                "Lineage lookup failed after consuming "
+                                "account %s's refresh grant; stashing the "
+                                "successor rather than losing it.",
+                                account_num, exc_info=True,
+                            )
+                            self._stash_pending_refresh(
+                                account_num, pending, consumed_fp
+                            )
+                            return _defer(force_refresh)
                     # The credential must reach the stores — after a POST the
                     # grant is consumed and the successor MUST survive in at
                     # least one of them. Attempt both; tolerate either
@@ -5296,6 +5407,16 @@ class ClaudeAccountSwitcher:
                                 "no longer active; a re-login repairs it.",
                                 account_num,
                             )
+                    if backup_ok or live_ok:
+                        pending = None
+                    elif pending is not None:
+                        # Both writes are spent — including the retry above
+                        # — and the successor exists nowhere durable. Stash
+                        # it rather than let it die with this pass.
+                        self._stash_pending_refresh(
+                            account_num, pending, consumed_fp
+                        )
+                        pending = None
                     if not live_ok:
                         # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.
@@ -5315,12 +5436,25 @@ class ClaudeAccountSwitcher:
         except Exception:
             # _fetch_account_usage promises never to raise into the collect
             # pass (a raising worker would kill the whole pass for every
-            # account). Config/lock-file I/O errors land here.
+            # account). Config/lock-file I/O errors land here. `pending` is
+            # set only once our own POST has already spent the grant — stash
+            # it rather than let this catch-all silently discard it.
+            if pending is not None:
+                self._stash_pending_refresh(account_num, pending, consumed_fp)
             self._logger.warning(
                 "Active-token refresh for account %s failed unexpectedly; "
                 "deferring to the next pass.", account_num, exc_info=True,
             )
             return _defer(force_refresh)
+        except BaseException:
+            # A Ctrl-C/SystemExit during one of the writes above is a
+            # BaseException, invisible to their own `except Exception` — it
+            # propagates past every inner handler to here. The grant IS
+            # consumed; stash the successor before the interrupt continues,
+            # mirroring `_consume_backup_grant_locked`'s own BaseException arm.
+            if pending is not None:
+                self._stash_pending_refresh(account_num, pending, consumed_fp)
+            raise
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
@@ -5330,6 +5464,35 @@ class ClaudeAccountSwitcher:
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
         )
+
+    def _stash_pending_refresh(
+        self, account_num: str, creds: str, consumed_fp: str
+    ) -> None:
+        """Park a POSTed-but-unpersisted `_fetch_active_usage` successor.
+
+        Same mechanism `_consume_backup_grant_locked` uses for its own
+        never-discard-a-consumed-generation promise: the next
+        `_adopt_stashed_successor` pass on this slot writes it back once the
+        store still holds `consumed_fp`. Never raises — this already runs
+        from a last-resort handler.
+        """
+        try:
+            self._store._write_unclaimed_credential(
+                creds,
+                {
+                    "reason": "active-refresh-unpersisted",
+                    "configSlot": account_num,
+                    "consumedFp": consumed_fp,
+                    "fingerprint": oauth.credential_fingerprint(creds),
+                },
+            )
+        except Exception:
+            self._logger.error(
+                "Account %s's active-refresh successor could not be "
+                "stashed either; it survives only for this pass. Fix the "
+                "storage failure, then re-login and `cswap add` if the "
+                "slot strikes.", account_num, exc_info=True,
+            )
 
     def _resync_rotated_backup(
         self, account_num: str, email: str, org_uuid: str, creds: str

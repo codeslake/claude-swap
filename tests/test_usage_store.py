@@ -1361,6 +1361,15 @@ class TestAttemptLedger:
         entries = store.entries(IDENT)
         assert usage_store.due_candidate(["1"], entries, now) is None
 
+        # Control: the refusal tracks the trailing window, not something
+        # permanent — once the OLDEST attempt ages past ATTEMPT_WINDOW_S,
+        # exactly one slot frees and the row is picked again.
+        window = usage_store.ATTEMPT_WINDOW_S
+        oldest = now - (usage_store.ATTEMPTS_PER_HOUR_MAX - 1) * 10
+        clock.advance(oldest + window + 1 - now)
+        entries = store.entries(IDENT)
+        assert usage_store.due_candidate(["1"], entries, clock.now) == "1"
+
     def test_an_aged_out_attempt_frees_a_slot_and_is_recorded(self, store, clock):
         now = clock.now
         window = usage_store.ATTEMPT_WINDOW_S
@@ -1385,8 +1394,13 @@ class TestAttemptLedger:
 class TestHeaderReading:
     """record_header_reading: a reply's own rate-limit headers, no fetch."""
 
+    @pytest.mark.parametrize(
+        "bad_7d_reset",
+        [float("inf"), 1790206800000.0, float("nan")],
+        ids=["overflow", "ms-epoch-out-of-range", "nan"],
+    )
     def test_records_a_reading_without_disturbing_attempts_or_other_windows(
-        self, store, clock
+        self, store, clock, bad_7d_reset
     ):
         # A prior real fetch left a per-model (scoped) window, a far-future
         # AIMD-backed-off plan, and its own lastAttemptAt.
@@ -1402,9 +1416,11 @@ class TestHeaderReading:
             usage_store.USAGE_HEADER_5H_PCT: "0.42",
             usage_store.USAGE_HEADER_5H_RESET: str(five_reset_ts),
             usage_store.USAGE_HEADER_7D_PCT: "0.1",
-            # Out of datetime's range: must fall back to "no reset known"
-            # rather than raise OverflowError into the pin's request path.
-            usage_store.USAGE_HEADER_7D_RESET: str(float("inf")),
+            # Out of datetime's range (OverflowError), a millisecond epoch
+            # that overflows the year field (ValueError: year 58699), and
+            # NaN (ValueError) must all fall back to "no reset known" rather
+            # than raise into the pin's request path.
+            usage_store.USAGE_HEADER_7D_RESET: str(bad_7d_reset),
         }
         assert store.record_header_reading("1", IDENT, headers) is True
 
@@ -1441,17 +1457,37 @@ class TestHeaderReading:
         row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["1"]
         assert "attempts" not in row
 
-    @pytest.mark.parametrize(
-        "seed_error",
-        ["invalid_grant", "timeout"],
-        ids=["struck_row", "failed_row"],
-    )
-    def test_skips_a_struck_or_failed_row(self, store, clock, seed_error):
-        # A row carrying an auth strike or an endpoint failure must not be
-        # refreshed by a header reading: bumping fetchedAt would erase the
-        # strike-race doubt (_strike_is_suspected_race) and would let
-        # entries() trust the row again at age 0 through the whole backoff.
-        store.record({"1": FetchRecord(error=seed_error)}, IDENT)
+    def test_skips_a_struck_row(self, store, clock):
+        # A row carrying an auth strike must not be refreshed by a header
+        # reading: bumping fetchedAt would erase the strike-race doubt
+        # (_strike_is_suspected_race) and would let entries() trust the row
+        # again at age 0 through the whole backoff. Seeded directly with
+        # consecutiveFailures at 0 (a fingerprint-healed strike leaves
+        # exactly this shape) so this exercises the ``authDeadStrikes > 0``
+        # arm of the skip condition alone — record()-ing a permanent-auth
+        # FetchRecord bumps both fields together and would leave that arm
+        # untested independent of the consecutiveFailures one below.
+        store.path.parent.mkdir(parents=True, exist_ok=True)
+        store.path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                "1": {
+                    "email": IDENT["1"][0],
+                    "organizationUuid": IDENT["1"][1],
+                    "authDeadStrikes": 1,
+                    "consecutiveFailures": 0,
+                }
+            },
+        }), encoding="utf-8")
+        before = store.entries(IDENT)["1"]
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        assert store.record_header_reading("1", IDENT, headers) is False
+        assert store.entries(IDENT)["1"] == before
+
+    def test_skips_a_failed_row(self, store, clock):
+        # The other arm of the OR: a transient endpoint failure alone
+        # (authDeadStrikes stays 0 for "timeout") must also skip.
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
         before = store.entries(IDENT)["1"]
         headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
         assert store.record_header_reading("1", IDENT, headers) is False

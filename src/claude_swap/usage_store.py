@@ -634,10 +634,11 @@ def _header_pct(headers: Mapping[str, str], key: str) -> float | None:
 
 def _header_reset(headers: Mapping[str, str], key: str) -> str | None:
     """A rate-limit reset header (Unix seconds) as the stored ``resets_at``
-    ISO string, or None when absent/unparseable/out of range (``inf`` or a
-    value ``datetime.fromtimestamp`` cannot hold raises ``OverflowError``,
-    which must read as "no reset known", never propagate into the pin's
-    request path)."""
+    ISO string, or None when absent/unparseable/out of range: ``inf``
+    (``OverflowError``), a millisecond epoch overflowing the year field
+    (``ValueError``, e.g. "1790206800000"), "nan" (``ValueError``), or a
+    platform ``time_t`` rejection (``OSError``) must all read as "no reset
+    known", never propagate into the pin's request path."""
     raw = headers.get(key)
     if raw is None:
         return None
@@ -647,7 +648,7 @@ def _header_reset(headers: Mapping[str, str], key: str) -> str | None:
         return None
     try:
         return _reset_ts_to_resets_at(ts)
-    except OverflowError:
+    except (OverflowError, ValueError, OSError):
         return None
 
 

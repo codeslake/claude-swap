@@ -4069,6 +4069,41 @@ class TestLoopObeysThePollPlan:
             f"{delay}, not the configured 360s cadence"
         )
 
+    def test_a_capped_candidates_frozen_plan_never_pins_the_floor(
+        self, harness
+    ):
+        """A row already at its hourly ATTEMPTS_PER_HOUR_MAX cap is the same
+        "cannot be fetched this pass" shape `due_candidate` already refuses
+        (`reserve()` would refuse it too) — it must not vote here either, or
+        an overdue-but-capped row pins the sleep at the floor for as long as
+        its attempt window stays full."""
+        harness.engine.settings = replace(
+            harness.engine.settings, interval_seconds=360.0
+        )
+        current = harness.engine.switcher.current_account_number()
+        capped = "2" if current != "2" else "3"
+        path = harness.switcher._usage_store.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        now = harness.clock.now
+        path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                capped: {
+                    "email": f"{'b' if capped == '2' else 'c'}@example.com",
+                    "organizationUuid": "",
+                    "attempts": [now - 10.0] * poll_policy.ATTEMPTS_PER_HOUR_MAX,
+                    "fetchedAt": now - 1000.0,
+                    "nextPollAt": now - 500.0,
+                    "lastGood": {"five_hour": {"pct": 10.0}},
+                }
+            },
+        }))
+        delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
+        assert 0.9 * 360 <= delay <= 1.1 * 360, (
+            f"a capped row's overdue plan pinned the sleep at {delay}, not "
+            f"the configured 360s cadence"
+        )
+
     def test_a_disabled_slots_frozen_plan_never_pins_the_floor(self, harness):
         """A slot taken out of rotation by `cswap disable` is dropped from
         `switchable_account_numbers()`, not from the usage store — its own

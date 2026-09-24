@@ -3925,6 +3925,104 @@ class TestActiveAccountRefresh:
             f"a contended consume must report its own kind, got {out.error!r}"
         )
 
+    # `_fetch_active_usage`'s POST-consumed exit: once `try_refresh_oauth_
+    # credentials` returns, the grant is spent and the successor MUST reach
+    # the unclaimed stash if it reaches neither store — a torn roster read,
+    # a failed pair of writes, or an interrupt mid-write must not discard it.
+
+    def test_lineage_lookup_failure_after_post_stashes_the_successor(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A torn `sequence.json` mid-flight makes `account_identity` (via
+        `_lineage_key`'s self-attributed-verdict lookup) raise -- after the
+        grant is already consumed. The successor must survive in the
+        unclaimed stash, not vanish with the exception."""
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "account_identity",
+                 side_effect=ConfigError("torn roster"),
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"):
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1, entries
+        entry_id, meta = next(iter(entries.items()))
+        assert meta["configSlot"] == "1"
+        creds, unreadable = switcher._store._read_unclaimed_credential(entry_id)
+        assert not unreadable
+        assert creds == self._REFRESHED
+
+    def test_both_writes_failing_after_post_stashes_the_successor(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Neither the slot backup nor the live store can be written after a
+        consumed refresh -- the successor is stashed for the next pass to
+        adopt rather than lost with the failed writes."""
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_write_credentials", side_effect=OSError("disk full")
+             ), \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=OSError("disk full"),
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"):
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1, entries
+        entry_id, meta = next(iter(entries.items()))
+        creds, unreadable = switcher._store._read_unclaimed_credential(entry_id)
+        assert not unreadable
+        assert creds == self._REFRESHED
+
+    def test_slot_write_interrupted_after_post_stashes_the_successor(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Ctrl-C during the post-refresh backup write is a BaseException,
+        invisible to the write's own `except Exception`. The grant is
+        already consumed; the successor is stashed before the interrupt
+        propagates."""
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=KeyboardInterrupt,
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"):
+            with pytest.raises(KeyboardInterrupt):
+                switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1, entries
+        entry_id, meta = next(iter(entries.items()))
+        creds, unreadable = switcher._store._read_unclaimed_credential(entry_id)
+        assert not unreadable
+        assert creds == self._REFRESHED
+
 
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""
@@ -15403,6 +15501,45 @@ class TestGateUltraReviewFixes:
         s._write_json(s.sequence_file, sample_sequence_data)
         return s
 
+    def test_the_post_window_is_stashed_before_the_slot_write(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """The kill window: between the POST returning and the slot lock, no
+        successor exists anywhere durable — a SIGKILL there would lose it
+        outright, and nothing in this function's own except/BaseException
+        arms can reach it (nothing has raised yet). Bound it: by the time
+        the normal persist write itself runs, a placeholder must already be
+        on disk; once that write succeeds, the placeholder is redundant and
+        must not linger as a duplicate."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        seen = {}
+        real_write = ClaudeAccountSwitcher._write_account_credentials
+
+        def recording_write(self_s, num, email, creds, **kw):
+            seen["entries"] = self_s.list_unclaimed_credentials()
+            return real_write(self_s, num, email, creds, **kw)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_write_account_credentials", recording_write
+        )
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)):
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert out.error is None
+        assert out.credentials == self._NEW
+        assert seen["entries"], (
+            "the successor must already be stashed before the slot write "
+            "runs -- a kill in between would otherwise lose it"
+        )
+        (meta,) = seen["entries"].values()
+        assert meta["reason"] == "consume-gate-post-window"
+        assert meta["consumedFp"] == oauth.credential_fingerprint(self._OLD)
+        # The write succeeded normally -- the placeholder is redundant now
+        # and must be retired, not left as a duplicate of the durable copy.
+        assert not s.list_unclaimed_credentials()
+
     def test_a_cas_conflict_is_not_reported_as_a_failed_freshen(
         self, temp_home: Path, sample_sequence_data: dict
     ):
@@ -15637,8 +15774,9 @@ class TestGateUltraReviewFixes:
         """
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
-        state = {"post_done": False}
+        state = {"post_done": False, "post_count": 0}
         real_write = ClaudeAccountSwitcher._write_account_credentials
+        real_stash = s._store._write_unclaimed_credential
 
         def failing_write(self_s, num, email, creds, **kw):
             if state["post_done"]:
@@ -15650,6 +15788,7 @@ class TestGateUltraReviewFixes:
 
         def mock_refresh(credentials, **kw):
             state["post_done"] = True
+            state["post_count"] += 1
             return oauth.RefreshOutcome(self._NEW, None)
 
         monkeypatch.setattr(
@@ -15665,6 +15804,24 @@ class TestGateUltraReviewFixes:
             "reported success on a spent grant with nothing stashed"
         )
         assert out.credentials == self._NEW
+
+        # Lift the patches: on-disk persistence works again. The successor
+        # survived only in `self._unpersisted` — the next consume must
+        # adopt it from THERE, write it back, and never re-POST the grant
+        # this pass already spent.
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_write_account_credentials", real_write
+        )
+        monkeypatch.setattr(
+            s._store, "_write_unclaimed_credential", real_stash
+        )
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            out2 = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert state["post_count"] == 1, "re-POSTed a grant already consumed"
+        assert out2.credentials == self._NEW
+        assert s._read_account_credentials("1", "test@example.com") == self._NEW
 
     def test_interrupt_during_persist_stashes_before_propagating(
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
@@ -15724,7 +15881,8 @@ class TestGateUltraReviewFixes:
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         real_write = ClaudeAccountSwitcher._write_account_credentials
-        state = {"post_done": False}
+        real_stash = s._store._write_unclaimed_credential
+        state = {"post_done": False, "stash_calls": 0}
         first_interrupt = KeyboardInterrupt("first")
 
         def failing_write(self_s, num, email, creds, **kw):
@@ -15733,6 +15891,13 @@ class TestGateUltraReviewFixes:
             return real_write(self_s, num, email, creds, **kw)
 
         def failing_stash(creds, ctx):
+            # The FIRST call is the placeholder the gate writes immediately
+            # after the POST, before either interrupt fires — let it
+            # through, or this test cannot reach its own premise (a second
+            # interrupt racing the LATER, reasoned stash attempt).
+            if state["stash_calls"] == 0:
+                state["stash_calls"] += 1
+                return real_stash(creds, ctx)
             raise KeyboardInterrupt("second")
 
         def mock_refresh(credentials, **kw):
@@ -15758,9 +15923,15 @@ class TestGateUltraReviewFixes:
         assert any(
             "it is lost" in r.getMessage() for r in caplog.records
         ), "a stash failure during an interrupt must still be logged"
-        assert not s.list_unclaimed_credentials(), (
-            "the failing stash must not have written a partial entry"
+        entries = s.list_unclaimed_credentials()
+        assert entries, (
+            "the placeholder stashed right after the POST must survive "
+            "when every later write is also interrupted — the successor "
+            "must not be lost"
         )
+        (entry,) = entries.values()
+        assert entry["reason"] == "consume-gate-post-window"
+        assert entry["consumedFp"] == oauth.credential_fingerprint(self._OLD)
 
     # -- consumed_fp on failure outcomes ---------------------------------
 
