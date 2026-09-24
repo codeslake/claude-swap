@@ -111,6 +111,18 @@ MOVEMENT_DELTA_PCT = 1.0
 # (watch + menu bar + auto) drift apart instead of fetching in lockstep.
 JITTER_FRAC = 0.1
 
+# Hard cap on raw fetch attempts per identity per trailing hour — refuses
+# eligibility outright (``usage_store._row_eligible``), independent of and in
+# addition to every cadence/backoff decision above, so no caller (forced or
+# scheduled) can push a burst past what the endpoint itself allows. Measured
+# 2026-09-23: probe3 (see the module docstring) admitted 30 from a rested
+# identity; 27-32 per host per trailing hour read clean over the same window
+# in the live fleet's logs. The steady scheduled cadence runs ~18/h on the
+# active account, so this only binds during a burst (switch flapping,
+# escalation, pre-switch refetch).
+ATTEMPTS_PER_HOUR_MAX = 28
+ATTEMPT_WINDOW_S = 3600.0
+
 # Reaction to a 429 with ``Retry-After: 0`` (the saturated-window edge):
 # probe at most every 5 minutes (≤12/hour) so aging-out — up to ~30/hour —
 # outpaces the probing (used by the usage store's failure backoff)...

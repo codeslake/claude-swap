@@ -20,6 +20,7 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
+from claude_swap import poll_policy
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -1931,6 +1932,36 @@ class TestUsageFetchStamps:
         stamps = switcher.usage_fetch_stamps()
         assert stamps["1"] is not None
         assert stamps["2"] is None
+
+
+class TestRecordUsageHeaders:
+    """The pin-facing entry point: a slot number + reply headers, no
+    identity of its own to pass in."""
+
+    def test_slot_number_alone_resolves_identity_and_records(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        headers = {"anthropic-ratelimit-unified-5h-utilization": "0.3"}
+        assert switcher.record_usage_headers("1", headers) is True
+
+        entry = UsageStore(switcher.backup_dir / "cache").entries(
+            {"1": ("account1@example.com", "")}
+        )["1"]
+        assert entry.last_good["five_hour"]["pct"] == pytest.approx(30.0)
+
+    def test_unknown_slot_records_nothing(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        headers = {"anthropic-ratelimit-unified-5h-utilization": "0.3"}
+        assert switcher.record_usage_headers("9", headers) is False
 
 
 @pytest.fixture
@@ -4136,6 +4167,344 @@ class TestActiveAccountRefresh:
         assert out.error == "consume-busy", (
             f"a contended consume must report its own kind, got {out.error!r}"
         )
+
+    # `_fetch_active_usage`'s POST-consumed exit: once `try_refresh_oauth_
+    # credentials` returns, the grant is spent and the successor MUST reach
+    # the unclaimed stash if it reaches neither store — a torn roster read,
+    # a failed pair of writes, or an interrupt mid-write must not discard it.
+
+    def test_lineage_lookup_failure_after_post_still_reaches_the_stores(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A torn `sequence.json` mid-flight makes `account_identity` (via
+        `_lineage_key`'s self-attributed-verdict lookup) raise -- after the
+        grant is already consumed. The memo lookup is best-effort only:
+        neither store read below it depends on the roster, so the successor
+        must still reach the slot backup and the live store, not be stashed
+        and deferred (which would cost a pass for nothing and, worse, is a
+        NO-OP on a slot the both-fail arm never reaches)."""
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "account_identity",
+                 side_effect=ConfigError("torn roster"),
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})):
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert result.sentinel is None
+        assert result.usage == {"five_hour": {"pct": 3}}
+        write_backup.assert_called_once_with("1", "test@example.com", self._REFRESHED)
+        write_live.assert_called_once_with(self._REFRESHED)
+        assert switcher.list_unclaimed_credentials() == {}
+
+    def test_stashed_active_successor_is_adopted_without_a_post(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A prior pass POSTed the backup's refresh token and could not
+        persist the successor anywhere durable, parking it in
+        `self._unpersisted`. The next pass must adopt it before choosing a
+        refresh_input, not re-POST the now-spent backup token."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        switcher._unpersisted["1"] = (
+            oauth.credential_fingerprint(self._EXPIRED), self._REFRESHED
+        )
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 wraps=switcher._write_account_credentials,
+             ) as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        mock_refresh.assert_not_called()
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED
+        )
+        write_live.assert_called_once_with(self._REFRESHED)
+        mock_fetch.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED, is_active=True
+        )
+        assert result.usage == {"five_hour": {"pct": 9}}
+        assert "1" not in switcher._unpersisted
+
+    def test_on_disk_active_refresh_unpersisted_stash_is_adopted_without_a_post(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Same as the in-memory case above, but the prior pass's successor
+        survives only in the on-disk unclaimed stash (`_stash_pending_
+        refresh`'s own write, `self._unpersisted` empty) -- the manifest
+        scan inside `_adopt_stashed_successor` must find and adopt it too,
+        and a still-valid adopted access token must not be re-POSTed."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        switcher._store._write_unclaimed_credential(
+            self._REFRESHED,
+            {
+                "reason": "active-refresh-unpersisted",
+                "configSlot": "1",
+                "consumedFp": oauth.credential_fingerprint(self._EXPIRED),
+                "fingerprint": oauth.credential_fingerprint(self._REFRESHED),
+            },
+        )
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 wraps=switcher._write_account_credentials,
+             ) as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        mock_refresh.assert_not_called()
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED
+        )
+        write_live.assert_called_once_with(self._REFRESHED)
+        mock_fetch.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED, is_active=True
+        )
+        assert result.usage == {"five_hour": {"pct": 9}}
+        assert switcher.list_unclaimed_credentials() == {}
+
+    def test_stashed_successor_matching_only_the_stale_prelock_backup_is_not_adopted(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """`backup` is read once before the consume/slot locks and used only
+        for attribution; the adopt call re-reads it under the lock. A stash
+        entry whose `consumedFp` matches the STALE pre-lock copy but not the
+        fresh under-lock read must not be adopted -- the slot already moved
+        past that generation. The newer successor already in the slot must
+        survive untouched, and the mismatched entry must stay unretired."""
+        switcher = self._switcher(sample_sequence_data)
+        old_backup = self._EXPIRED
+        newer_backup = self._REFRESHED
+        switcher._write_account_credentials("1", "test@example.com", newer_backup)
+        switcher._store._write_unclaimed_credential(
+            self._FOREIGN_LIVE,
+            {
+                "reason": "active-refresh-unpersisted",
+                "configSlot": "1",
+                "consumedFp": oauth.credential_fingerprint(old_backup),
+                "fingerprint": oauth.credential_fingerprint(self._FOREIGN_LIVE),
+            },
+        )
+        reads = [(old_backup, False), (newer_backup, False)]
+
+        with patch.object(switcher, "_read_credentials", return_value=old_backup), \
+             patch.object(
+                 switcher, "_read_account_credentials_ex",
+                 side_effect=lambda *a, **kw: reads.pop(0),
+             ), \
+             patch.object(switcher, "_write_credentials"), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})):
+            switcher._fetch_active_usage("1", "test@example.com", old_backup)
+
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1, entries  # the mismatched entry survives, unretired
+        assert switcher._read_account_credentials(
+            "1", "test@example.com"
+        ) == self._REFRESHED  # the legitimate POST's successor, never the stash's bytes
+
+    def test_unreadable_stash_manifest_surfaces_stash_unreadable_not_expired(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        """The active path's own adopt call must surface an unreadable
+        manifest as `stash-unreadable` (renders the ERROR_NOTES remedy), not
+        `_defer`'s generic `USAGE_TOKEN_EXPIRED` sentinel or a masked
+        `http-401`, either of which would hide the actual remedy."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        switcher._store._write_unclaimed_credential(
+            self._REFRESHED,
+            {
+                "reason": "active-refresh-unpersisted",
+                "configSlot": "1",
+                "consumedFp": oauth.credential_fingerprint(self._EXPIRED),
+                "fingerprint": oauth.credential_fingerprint(self._REFRESHED),
+            },
+        )
+
+        def _deny(real):
+            def denied(path, *a, **kw):
+                if path.name == ".unclaimed-manifest.json":
+                    raise PermissionError(13, "Permission denied")
+                return real(path, *a, **kw)
+            return denied
+
+        monkeypatch.setattr(Path, "read_bytes", _deny(Path.read_bytes))
+        monkeypatch.setattr(Path, "read_text", _deny(Path.read_text))
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        mock_refresh.assert_not_called()
+        assert result.error == "stash-unreadable"
+
+    def test_in_memory_successor_write_failure_surfaces_stash_write_failed(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Distinct from the read failure above: the in-memory successor IS
+        readable, it just cannot be written back -- must surface as
+        `stash-write-failed`, not `_defer`'s generic sentinel/masked error."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        switcher._unpersisted["1"] = (
+            oauth.credential_fingerprint(self._EXPIRED), self._REFRESHED
+        )
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=OSError("disk full"),
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        mock_refresh.assert_not_called()
+        assert result.error == "stash-write-failed"
+
+    def test_both_writes_failing_after_post_stashes_the_successor(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Neither the slot backup nor the live store can be written after a
+        consumed refresh -- the successor is stashed for the next pass to
+        adopt rather than lost with the failed writes."""
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_write_credentials", side_effect=OSError("disk full")
+             ), \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=OSError("disk full"),
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"):
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1, entries
+        entry_id, meta = next(iter(entries.items()))
+        creds, unreadable = switcher._store._read_unclaimed_credential(entry_id)
+        assert not unreadable
+        assert creds == self._REFRESHED
+
+    def test_slot_write_interrupted_after_post_stashes_the_successor(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Ctrl-C during the post-refresh backup write is a BaseException,
+        invisible to the write's own `except Exception`. The grant is
+        already consumed; the successor is stashed before the interrupt
+        propagates."""
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=KeyboardInterrupt,
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"):
+            with pytest.raises(KeyboardInterrupt):
+                switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1, entries
+        entry_id, meta = next(iter(entries.items()))
+        creds, unreadable = switcher._store._read_unclaimed_credential(entry_id)
+        assert not unreadable
+        assert creds == self._REFRESHED
+
+    def test_stash_pending_refresh_logs_before_a_second_interrupt_propagates(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, caplog,
+    ):
+        """Mirrors `_consume_backup_grant_locked`'s own second-interrupt arm
+        (~2796): a Ctrl-C landing while THIS stash write is itself blocked
+        must be logged, not vanish silently, before the interrupt reaches
+        the caller."""
+        import logging
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(
+            switcher._store, "_write_unclaimed_credential",
+            side_effect=KeyboardInterrupt,
+        ), caplog.at_level(logging.ERROR, logger="claude-swap"):
+            with pytest.raises(KeyboardInterrupt):
+                switcher._stash_pending_refresh("1", self._REFRESHED, "fp-old")
+
+        assert any(
+            "could not be stashed before an interrupt" in r.getMessage()
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_a_second_interrupt_during_the_stash_does_not_replace_the_original(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, caplog,
+    ):
+        """A SECOND interrupt landing while `_stash_pending_refresh` is
+        itself blocked (its own second-interrupt arm logs and re-raises)
+        must not replace the ORIGINAL interrupt this arm is already
+        handling -- the caller must see the FIRST Ctrl-C, not the second
+        one that hit the stash write."""
+        import logging
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=KeyboardInterrupt,
+             ), \
+             patch.object(
+                 switcher._store, "_write_unclaimed_credential",
+                 side_effect=SystemExit,
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"), \
+             caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with pytest.raises(KeyboardInterrupt):
+                switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert any(
+            "second interrupt" in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
 
 
 class TestPerformSwitchPostDisplay:
@@ -18010,6 +18379,94 @@ class TestConsumeGate:
         )
 
 
+class TestProbeTargetCredentialReprobe:
+    """`_probe_target_credential`'s escalation re-probes whatever
+    `consume_backup_grant` hands back before trusting it live or dead."""
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    def test_unchanged_reprobe_token_is_not_struck(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The escalation answered success (`error is None`) but its
+        credentials carry the SAME access token that just answered the
+        real 401 (a malformed refresh response with no usable
+        access_token, or a lineage already rotated elsewhere) -- re-probing
+        it proves nothing about whether the REFRESH GRANT is dead, only
+        that the stale token still doesn't work, which the first probe
+        already established. Must not strike."""
+        s = self._switcher(sample_sequence_data)
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-stale", "refreshToken": "rt-old",
+                "expiresAt": 9999999999000,
+            }
+        })
+        # Same access token, but escalation-shaped bytes (e.g. a fresh
+        # refreshToken) -- only accessToken has to match for the guard.
+        unchanged = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-stale", "refreshToken": "rt-new",
+                "expiresAt": 9999999999000,
+            }
+        })
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live", return_value=False
+        ) as mock_probe, patch.object(
+            s, "consume_backup_grant",
+            return_value=oauth.RefreshOutcome(unchanged, None),
+        ), patch.object(s, "_strike_dead_target") as mock_strike:
+            live, creds_out, proven_401, stash_state = (
+                s._probe_target_credential("1", "test@example.com", creds)
+            )
+
+        assert mock_probe.call_count == 2, "must still re-probe once"
+        mock_strike.assert_not_called()
+        assert live is None
+        assert proven_401 is True
+
+    def test_changed_reprobe_token_still_dead_is_struck(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """CONTROL: a genuinely NEW access token that also answers dead is
+        real evidence -- the strike must still fire."""
+        s = self._switcher(sample_sequence_data)
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-stale", "refreshToken": "rt-old",
+                "expiresAt": 9999999999000,
+            }
+        })
+        rotated = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-fresh", "refreshToken": "rt-new",
+                "expiresAt": 9999999999000,
+            }
+        })
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live", return_value=False
+        ), patch.object(
+            s, "consume_backup_grant",
+            return_value=oauth.RefreshOutcome(rotated, None),
+        ), patch.object(s, "_strike_dead_target") as mock_strike:
+            live, creds_out, proven_401, stash_state = (
+                s._probe_target_credential("1", "test@example.com", creds)
+            )
+
+        mock_strike.assert_called_once_with(
+            "1", "test@example.com", oauth.credential_fingerprint(rotated)
+        )
+        assert live is False
+        assert proven_401 is True
+
+
 class TestInactiveRefreshRoutesThroughGate:
     """M2: the collector's inactive-account refresh consumes via the gate,
     not via a direct POST of its own snapshot."""
@@ -18927,6 +19384,32 @@ class TestPermanentlyUnreadableStashRow:
         assert "cswap unclaimed" in ERROR_NOTES["stash-unreadable"]
         assert "stash-unreadable" in _DETERMINISTIC_REFRESH_ERRORS
 
+    def test_in_memory_successor_write_failure_reports_its_own_reason(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A write-back failure for an IN-MEMORY stashed successor (see
+        `_adopt_stashed_successor`'s `self._unpersisted` branch) is a
+        storage WRITE fault, not a read one — the bytes are sitting right
+        there in memory. It must report its own kind, not `stash-unreadable`
+        (whose remedy, "unlock the keychain or fix the file", is the wrong
+        advice for a write failure)."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._unpersisted["1"] = (
+            oauth.credential_fingerprint(self._OLD), self._NEW
+        )
+
+        with patch.object(
+            s, "_write_account_credentials", side_effect=OSError("disk full")
+        ), patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert not post.called, "the spent generation must never be re-POSTed"
+        assert out.error == "stash-write-failed", out.error
+        assert "1" in s._unpersisted, (
+            "the write failed -- the in-memory successor must stay parked"
+        )
+
 
 class TestHealedStrikeUnblocksFetching:
     """Review finding 5: a fingerprint-healed strike must also unblock
@@ -18985,6 +19468,45 @@ class TestGateUltraReviewFixes:
         s._setup_directories()
         s._write_json(s.sequence_file, sample_sequence_data)
         return s
+
+    def test_the_post_window_is_stashed_before_the_slot_write(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """The kill window: between the POST returning and the slot lock, no
+        successor exists anywhere durable — a SIGKILL there would lose it
+        outright, and nothing in this function's own except/BaseException
+        arms can reach it (nothing has raised yet). Bound it: by the time
+        the normal persist write itself runs, a placeholder must already be
+        on disk; once that write succeeds, the placeholder is redundant and
+        must not linger as a duplicate."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        seen = {}
+        real_write = ClaudeAccountSwitcher._write_account_credentials
+
+        def recording_write(self_s, num, email, creds, **kw):
+            seen["entries"] = self_s.list_unclaimed_credentials()
+            return real_write(self_s, num, email, creds, **kw)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_write_account_credentials", recording_write
+        )
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)):
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert out.error is None
+        assert out.credentials == self._NEW
+        assert seen["entries"], (
+            "the successor must already be stashed before the slot write "
+            "runs -- a kill in between would otherwise lose it"
+        )
+        (meta,) = seen["entries"].values()
+        assert meta["reason"] == "consume-gate-post-window"
+        assert meta["consumedFp"] == oauth.credential_fingerprint(self._OLD)
+        # The write succeeded normally -- the placeholder is redundant now
+        # and must be retired, not left as a duplicate of the durable copy.
+        assert not s.list_unclaimed_credentials()
 
     def test_a_cas_conflict_is_not_reported_as_a_failed_freshen(
         self, temp_home: Path, sample_sequence_data: dict
@@ -19222,8 +19744,9 @@ class TestGateUltraReviewFixes:
         """
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
-        state = {"post_done": False}
+        state = {"post_done": False, "post_count": 0}
         real_write = ClaudeAccountSwitcher._write_account_credentials
+        real_stash = s._store._write_unclaimed_credential
 
         def failing_write(self_s, num, email, creds, **kw):
             if state["post_done"]:
@@ -19235,6 +19758,7 @@ class TestGateUltraReviewFixes:
 
         def mock_refresh(credentials, **kw):
             state["post_done"] = True
+            state["post_count"] += 1
             return oauth.RefreshOutcome(self._NEW, None)
 
         monkeypatch.setattr(
@@ -19250,6 +19774,81 @@ class TestGateUltraReviewFixes:
             "reported success on a spent grant with nothing stashed"
         )
         assert out.credentials == self._NEW
+
+        # Lift the patches: on-disk persistence works again. The successor
+        # survived only in `self._unpersisted` — the next consume must
+        # adopt it from THERE, write it back, and never re-POST the grant
+        # this pass already spent.
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_write_account_credentials", real_write
+        )
+        monkeypatch.setattr(
+            s._store, "_write_unclaimed_credential", real_stash
+        )
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            out2 = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert state["post_count"] == 1, "re-POSTed a grant already consumed"
+        assert out2.credentials == self._NEW
+        assert s._read_account_credentials("1", "test@example.com") == self._NEW
+
+    def test_placeholder_survives_when_the_reasoned_stash_also_fails(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch, caplog
+    ):
+        """The reasoned stash write (after a normal-persist failure) can
+        itself fail — but the placeholder written right after the POST,
+        before the slot lock, already holds the successor durably. Report
+        `stashed=True` (not the unrecoverable `consume-gate-unpersisted`
+        shape session.py reads as "the successor is gone") and do not log
+        "it is lost"."""
+        import logging
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        real_write = ClaudeAccountSwitcher._write_account_credentials
+        real_stash = s._store._write_unclaimed_credential
+        state = {"post_done": False, "stash_calls": 0}
+
+        def failing_write(self_s, num, email, creds, **kw):
+            if state["post_done"]:
+                raise OSError(28, "No space left on device")
+            return real_write(self_s, num, email, creds, **kw)
+
+        def flaky_stash(creds, ctx):
+            state["stash_calls"] += 1
+            if state["stash_calls"] == 1:
+                # The placeholder, written right after the POST — let it land.
+                return real_stash(creds, ctx)
+            raise OSError(28, "No space left on device")
+
+        def mock_refresh(credentials, **kw):
+            state["post_done"] = True
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+        )
+        monkeypatch.setattr(s._store, "_write_unclaimed_credential", flaky_stash)
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                       side_effect=mock_refresh):
+                out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert out.error == "transient"
+        assert out.stashed is True, (
+            "the placeholder already holds the successor -- must not "
+            "report stashed=False"
+        )
+        entries = s.list_unclaimed_credentials()
+        assert entries, "the placeholder must survive on disk"
+        (entry,) = entries.values()
+        assert entry["reason"] == "consume-gate-post-window"
+        assert "1" not in s._unpersisted, (
+            "no need for the in-memory fallback -- the placeholder already "
+            "covers it"
+        )
+        assert not any("it is lost" in r.message for r in caplog.records)
 
     def test_interrupt_during_persist_stashes_before_propagating(
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
@@ -19292,6 +19891,45 @@ class TestGateUltraReviewFixes:
         # resurrected it, only the stash carries the successor
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
+    def test_interrupt_during_the_placeholder_write_still_stashes(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """The placeholder write (`consume-gate-post-window`) taken right
+        after the POST, before the slot lock, is now INSIDE the outer try —
+        a KeyboardInterrupt racing that write itself must be caught by the
+        `except BaseException` arm below it and stashed via the reasoned
+        `stash_successor` call, not escape uncaught (which would lose the
+        successor outright, since nothing else has stashed anything yet)."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        real_stash = s._store._write_unclaimed_credential
+        state = {"calls": 0}
+
+        def flaky_stash(creds, ctx):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise KeyboardInterrupt("during the placeholder write")
+            return real_stash(creds, ctx)
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        monkeypatch.setattr(s._store, "_write_unclaimed_credential", flaky_stash)
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            with pytest.raises(KeyboardInterrupt):
+                s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        entries = s.list_unclaimed_credentials()
+        assert entries, (
+            "an interrupt during the placeholder write itself must not "
+            "lose the successor"
+        )
+        (entry,) = entries.values()
+        assert entry["reason"] == "consume-gate-interrupted"
+        assert entry["consumedFp"] == oauth.credential_fingerprint(self._OLD)
+
     def test_second_interrupt_during_the_stash_attempt_still_reraises_the_first(
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch, caplog
     ):
@@ -19300,16 +19938,19 @@ class TestGateUltraReviewFixes:
         invisible to a plain `except Exception` guarding the stash attempt —
         a hole in the very arm meant to close this window (opus review,
         round 400 pass 1). Without `except BaseException` there, the second
-        interrupt escapes straight past the "it is lost" log AND past the
-        outer `raise`, so the ORIGINAL interrupt is replaced by the second
-        one — losing which interrupt reached the caller and losing the
-        error log both."""
+        interrupt escapes straight past its own log AND past the outer
+        `raise`, so the ORIGINAL interrupt is replaced by the second one —
+        losing which interrupt reached the caller and losing the log both.
+        The placeholder written right after the POST DID land here (the
+        test's own setup lets that first stash call through), so the log
+        must say the successor is safe, not "it is lost"."""
         import logging
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         real_write = ClaudeAccountSwitcher._write_account_credentials
-        state = {"post_done": False}
+        real_stash = s._store._write_unclaimed_credential
+        state = {"post_done": False, "stash_calls": 0}
         first_interrupt = KeyboardInterrupt("first")
 
         def failing_write(self_s, num, email, creds, **kw):
@@ -19318,6 +19959,13 @@ class TestGateUltraReviewFixes:
             return real_write(self_s, num, email, creds, **kw)
 
         def failing_stash(creds, ctx):
+            # The FIRST call is the placeholder the gate writes immediately
+            # after the POST, before either interrupt fires — let it
+            # through, or this test cannot reach its own premise (a second
+            # interrupt racing the LATER, reasoned stash attempt).
+            if state["stash_calls"] == 0:
+                state["stash_calls"] += 1
+                return real_stash(creds, ctx)
             raise KeyboardInterrupt("second")
 
         def mock_refresh(credentials, **kw):
@@ -19332,7 +19980,7 @@ class TestGateUltraReviewFixes:
         )
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh), \
-             caplog.at_level(logging.ERROR, logger="claude-swap"):
+             caplog.at_level(logging.WARNING, logger="claude-swap"):
             with pytest.raises(KeyboardInterrupt) as exc_info:
                 s.consume_backup_grant("1", "test@example.com", self._OLD)
 
@@ -19341,11 +19989,22 @@ class TestGateUltraReviewFixes:
             "attempt) replaced the original one that was propagating"
         )
         assert any(
-            "it is lost" in r.getMessage() for r in caplog.records
+            "the placeholder" in r.getMessage() and "before the slot lock"
+            in r.getMessage()
+            for r in caplog.records
         ), "a stash failure during an interrupt must still be logged"
-        assert not s.list_unclaimed_credentials(), (
-            "the failing stash must not have written a partial entry"
+        assert not any(
+            "it is lost" in r.getMessage() for r in caplog.records
+        ), "the placeholder landed -- the successor is not lost"
+        entries = s.list_unclaimed_credentials()
+        assert entries, (
+            "the placeholder stashed right after the POST must survive "
+            "when every later write is also interrupted — the successor "
+            "must not be lost"
         )
+        (entry,) = entries.values()
+        assert entry["reason"] == "consume-gate-post-window"
+        assert entry["consumedFp"] == oauth.credential_fingerprint(self._OLD)
 
     # -- consumed_fp on failure outcomes ---------------------------------
 
@@ -21369,7 +22028,10 @@ class TestUltraReviewCoverageGaps:
 
         def read_backup(num, email):
             reads["n"] += 1
-            if reads["n"] <= 1:
+            # First two reads succeed (the pre-lock attribution read, then
+            # `_fetch_active_usage`'s own under-lock re-read before the
+            # adopt call); only the LATER demotion re-read fails.
+            if reads["n"] <= 2:
                 return self._EXPIRED
             raise OSError("transient read failure")
 
@@ -23531,6 +24193,248 @@ class TestSwitchOffAtLimitAccount:
         assert result["switched"] is False
         assert result["reason"] == "candidates-exhausted"
         assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+
+class TestFailedReadingLosesToAFresherWorseReading:
+    """Rule 1 (T1102): `entries()`/`decision_value()` cap a failed row's
+    trust at `poll_policy.POST_429_MIN_INTERVAL_S`, so a stale 429-frozen
+    reading with nominally MORE headroom must not beat a fresher reading with
+    less. Driven through the real selection path, `_select_best_switchable`,
+    fed by the real store's own `decision_value()` -- not a hand-rolled
+    trust check."""
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = TestCurrentAtLimitOverridesTheFrozenPct()._setup(temp_home)
+        seed = TestCurrentAtLimitOverridesTheFrozenPct()._seed
+        seed(s, 1, "cur@example.com")
+        seed(s, 2, "b@example.com")
+        seed(s, 3, "c@example.com")
+        return s
+
+    _IDENT = {
+        "1": ("cur@example.com", ""),
+        "2": ("b@example.com", ""),
+        "3": ("c@example.com", ""),
+    }
+
+    @staticmethod
+    def _usage(pct: float) -> dict:
+        return {"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}}
+
+    def _decision_usage(self, s: ClaudeAccountSwitcher) -> dict:
+        entries = s._usage_store.entries(self._IDENT)
+        return {num: e.decision_value() for num, e in entries.items()}
+
+    def test_stale_429_reading_loses_to_a_fresher_worse_reading(self, temp_home):
+        s = self._setup(temp_home)
+        # "2"'s reading is frozen by a 429 older than the poll period: a
+        # second `UsageStore` on the SAME cache, clocked into the past,
+        # writes its success far enough back that the real store (real
+        # clock) reads it as too stale to trust.
+        backdated = UsageStore(
+            s.backup_dir / "cache",
+            clock=lambda: time.time() - (poll_policy.POST_429_MIN_INTERVAL_S + 5),
+        )
+        backdated.record({"2": FetchRecord(usage=self._usage(58.0))}, self._IDENT)
+        backdated.record(
+            {"2": FetchRecord(error="http-429", retry_after_s=480.0)}, self._IDENT
+        )
+        s._usage_store.record(
+            {"1": FetchRecord(usage=self._usage(90.0))}, self._IDENT
+        )
+        s._usage_store.record(
+            {"3": FetchRecord(usage=self._usage(70.0))}, self._IDENT
+        )
+
+        # The setup actually produced what the test claims: one failure atop
+        # a stored 58% reading, not e.g. an empty row (which would also read
+        # None, for the wrong reason).
+        entries = s._usage_store.entries(self._IDENT)
+        assert entries["2"].last_good == self._usage(58.0)
+        assert entries["2"].consecutive_failures == 1
+
+        usage = self._decision_usage(s)
+        assert usage["2"] is None  # too stale to trust
+
+        assert s._select_best_switchable("1", usage=usage) == ("3", "")
+
+    def test_the_same_reading_fresh_is_picked(self, temp_home):
+        s = self._setup(temp_home)
+        s._usage_store.record(
+            {"2": FetchRecord(usage=self._usage(58.0))}, self._IDENT
+        )
+        s._usage_store.record(
+            {"1": FetchRecord(usage=self._usage(90.0))}, self._IDENT
+        )
+        s._usage_store.record(
+            {"3": FetchRecord(usage=self._usage(70.0))}, self._IDENT
+        )
+
+        usage = self._decision_usage(s)
+        assert usage["2"] == self._usage(58.0)
+
+        assert s._select_best_switchable("1", usage=usage) == ("2", "")
+
+
+class TestSwitchPersistsTheAtLimitMark:
+    """Rule 2 (T1102) wiring, interface updated for I3 (pass 2): `switch(
+    current_at_limit=True, exclude={...})` calls `UsageStore.mark_at_limit`
+    on every slot the CALLER named in `exclude` through the real store --
+    not just zero this one selection (`_select_best_switchable`'s existing
+    `current_at_limit` arm) -- so a later reader (autoswitch's tick, the TUI,
+    the next switch) sees the same slot at-limit too, even though its own
+    fresh poll reads healthy. `switch_off_at_limit_account` (today's pin's
+    entry point) passes no `exclude`, so it now persists nothing -- see
+    `TestSwitchOffAtLimitAccount` and the no-exclude case below."""
+
+    def _seed_two(self, temp_home):
+        s = TestCurrentAtLimitOverridesTheFrozenPct()._setup(temp_home)
+        seed = TestCurrentAtLimitOverridesTheFrozenPct()._seed
+        seed(s, 1, "a@example.com")
+        seed(s, 2, "b@example.com")
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-live"}})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"}
+        }))
+        return s
+
+    def test_switch_marks_the_excluded_current_slot_despite_a_fresh_poll(
+        self, temp_home
+    ):
+        s = self._seed_two(temp_home)
+        ident = {"1": ("a@example.com", "")}
+        usage = {"1": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
+                 "2": {"five_hour": {"pct": 56.0}, "seven_day": {"pct": 0.0}}}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            result = s.switch(
+                strategy="best", json_output=True,
+                current_at_limit=True, exclude={"1"},
+            )
+
+        assert result["switched"] is True
+        entry = s._usage_store.entries(ident)["1"]
+        assert entry.walled
+        assert entry.decision_value()["five_hour"]["pct"] == 100.0
+
+        # A fresh poll reading a healthy 58% afterwards does not clear the
+        # mark early -- decision_value() still reports the slot full.
+        s._usage_store.record(
+            {"1": FetchRecord(
+                usage={"five_hour": {"pct": 58.0}, "seven_day": {"pct": 0.0}}
+            )},
+            ident,
+        )
+        entry = s._usage_store.entries(ident)["1"]
+        assert entry.walled
+        assert entry.decision_value()["five_hour"]["pct"] == 100.0
+
+    def test_switch_with_no_exclude_persists_nothing(self, temp_home):
+        # Today's pin: `current_at_limit=True` with no `exclude` keyword.
+        # Control for the case above -- `switch_off_at_limit_account` (its
+        # actual entry point) exercises this same path in
+        # `TestSwitchOffAtLimitAccount`.
+        s = self._seed_two(temp_home)
+        ident = {"1": ("a@example.com", "")}
+        usage = {"1": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
+                 "2": {"five_hour": {"pct": 56.0}, "seven_day": {"pct": 0.0}}}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            result = s.switch(
+                strategy="best", json_output=True, current_at_limit=True,
+            )
+
+        assert result["switched"] is True
+        assert not s._usage_store.entries(ident)["1"].walled
+
+
+class TestSwitchExcludeNeverLandsOnAnObservedWall:
+    """I3: every slot in `exclude` is excluded from the candidate search
+    itself (unioned into `struck`), independent of whether it also gets
+    marked -- so the fleet never re-lands on an account it just walled."""
+
+    def _setup_four(self, temp_home):
+        s = TestCurrentAtLimitOverridesTheFrozenPct()._setup(temp_home)
+        seed = TestCurrentAtLimitOverridesTheFrozenPct()._seed
+        for num, email in (
+            (1, "a@x.com"), (2, "b@x.com"), (3, "c@x.com"), (4, "d@x.com"),
+        ):
+            seed(s, num, email)
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-live"}})
+        )
+        # "2" is the live account.
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@x.com", "accountUuid": "uuid-2"}
+        }))
+        return s
+
+    @pytest.mark.parametrize("exclude,expect_marked", [
+        (set(), set()),
+        ({"4"}, {"4"}),
+    ])
+    def test_exclude_marks_only_the_named_slots_and_switch_never_lands_on_them(
+        self, temp_home, exclude, expect_marked
+    ):
+        s = self._setup_four(temp_home)
+        ident = {
+            "1": ("a@x.com", ""), "2": ("b@x.com", ""),
+            "3": ("c@x.com", ""), "4": ("d@x.com", ""),
+        }
+        # "4" has by far the most headroom -- the natural target when it is
+        # not excluded.
+        usage = {
+            "1": {"five_hour": {"pct": 90.0}, "seven_day": {"pct": 0.0}},
+            "2": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
+            "3": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 0.0}},
+            "4": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0}},
+        }
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            result = s.switch(
+                strategy="best", json_output=True,
+                current_at_limit=True, exclude=exclude,
+            )
+
+        marked = {
+            num for num in ("1", "2", "3", "4")
+            if s._usage_store.entries(ident)[num].walled
+        }
+        assert marked == expect_marked
+        if "4" in exclude:
+            assert result["to"]["email"] != "d@x.com"
+        else:
+            # Control: with nothing excluded, the most-headroom slot wins.
+            assert result["to"]["email"] == "d@x.com"
+
+
+class TestExcludedSlotSkipMessageNamesTheExclusion:
+    """A slot skipped only because the CALLER excluded it (the pin's own
+    429, not a fetch) must not be blamed on the API: rotation/next-available
+    named it "(credential rejected by the API)" for that case too, which
+    points a reader at the wrong cause."""
+
+    def test_next_available_names_the_exclusion_not_the_api(self, temp_home):
+        s = TestSwitchExcludeNeverLandsOnAnObservedWall()._setup_four(temp_home)
+        # Current account is "2"; the rotation walk visits 3, 4, 1 in order,
+        # so excluding "3" (the first candidate) is what forces the walk to
+        # actually inspect and skip it before landing on "4".
+        usage = {
+            "1": {"five_hour": {"pct": 90.0}, "seven_day": {"pct": 0.0}},
+            "3": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 0.0}},
+            "4": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0}},
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            result = s.switch(
+                strategy="next-available", json_output=True, exclude={"3"},
+            )
+        joined = " ".join(result["warnings"])
+        assert "Account-3" in joined
+        assert "excluded" in joined
+        assert "credential rejected by the API" not in joined
 
 
 class TestAnEmptySlotLandingKeepsTheWarningsAlreadyEarned:

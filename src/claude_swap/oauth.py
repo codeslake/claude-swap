@@ -352,12 +352,45 @@ def try_refresh_oauth_credentials(
             resp_data = json.loads(resp.read().decode())
 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        oauth["accessToken"] = resp_data["access_token"]
-        oauth["expiresAt"] = now_ms + resp_data["expires_in"] * 1000
-        if resp_data.get("refresh_token"):
-            oauth["refreshToken"] = resp_data["refresh_token"]
-        if resp_data.get("scope"):
-            oauth["scopes"] = resp_data["scope"].split()
+        if not isinstance(resp_data, dict):
+            resp_data = {}
+        # The grant is consumed the instant the server answers 200, whatever
+        # the body's shape — read `refresh_token` FIRST and apply it
+        # unconditionally, so a malformed `access_token`/`expires_in` below
+        # can never discard a rotation the server already committed. A
+        # caller that got "transient" here would retry with the refresh
+        # token the server just spent, and the very next response
+        # invalid_grants a live account.
+        new_rt = resp_data.get("refresh_token")
+        if isinstance(new_rt, str) and new_rt:
+            oauth["refreshToken"] = new_rt
+        access_token = resp_data.get("access_token")
+        expires_in = resp_data.get("expires_in")
+        # A valid access_token is kept even when expires_in is missing or
+        # bad: the server DID issue it, and discarding a good token because
+        # a sibling field is malformed loses it for nothing (the caller
+        # would keep serving the OLD, possibly-revoked access token).
+        if isinstance(access_token, str) and access_token:
+            oauth["accessToken"] = access_token
+        if (
+            isinstance(expires_in, (int, float))
+            and not isinstance(expires_in, bool)
+            and math.isfinite(expires_in)
+        ):
+            oauth["expiresAt"] = now_ms + int(expires_in) * 1000
+        else:
+            # Missing, mistyped, or non-finite (Infinity/NaN, which would
+            # otherwise raise out of ``int()`` and into the generic
+            # ``except Exception`` below, reporting a spent grant as
+            # "transient" and making the caller re-POST it) — either way
+            # the grant is spent, so force this generation to read as
+            # already-expired: the next use refreshes again, this time
+            # with whatever refresh token was captured above rather than
+            # the one just consumed.
+            oauth["expiresAt"] = 0
+        scope = resp_data.get("scope")
+        if isinstance(scope, str) and scope:
+            oauth["scopes"] = scope.split()
 
         # The refresh grant says nothing about the account's tier. Claude
         # Code skips its own profile fetch while these two fields are
@@ -894,9 +927,8 @@ def fetch_usage(access_token: str) -> dict | None:
 # guaranteed 401 per pass to learn nothing.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
-    "identity-unreadable", "lineage-condemned", "live-store-unreadable",
-    "live-store-current",
-    "foreign-lineage",
+    "stash-write-failed", "identity-unreadable", "lineage-condemned",
+    "live-store-unreadable", "live-store-current", "foreign-lineage",
 )
 
 

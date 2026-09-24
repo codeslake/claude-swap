@@ -83,6 +83,7 @@ _SYSTEMIC_KINDS = (
     "store-unmirrored",
     "invalid_client",
     "stash-unreadable",
+    "stash-write-failed",
     "lineage-condemned",
     "identity-unreadable",
     "live-store-unreadable",
@@ -5629,9 +5630,11 @@ class AutoSwitchEngine:
           builds — a disabled slot or one in the engine's own quarantine
           ledger is never planned or fetched regardless of its stored state;
         - at the store: ``due_candidate`` additionally skips a row that is
-          ``sentinel``, in backoff, or a dead token (e.g. quarantined by
-          ``authDeadStrikes``) even though it passed the structural test —
-          same reason, a different mechanism recording it.
+          ``sentinel``, in backoff, a dead token (e.g. quarantined by
+          ``authDeadStrikes``), or already at its hourly attempt cap
+          (``ATTEMPTS_PER_HOUR_MAX`` — ``reserve()`` would refuse it too)
+          even though it passed the structural test — same reason, a
+          different mechanism recording it.
 
         The active row is exempt from the store-level test (it always votes
         when eligible at all), matching every other call site that reads its
@@ -5690,7 +5693,11 @@ class AutoSwitchEngine:
                 and (
                     num == current
                     or not (
-                        entry.sentinel or entry.in_backoff(now) or entry.token_dead()
+                        entry.sentinel
+                        or entry.in_backoff(now)
+                        or entry.token_dead()
+                        or entry.attempts_in_window
+                        >= poll_policy.ATTEMPTS_PER_HOUR_MAX
                     )
                 )
             ]
