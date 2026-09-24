@@ -5215,9 +5215,23 @@ class ClaudeAccountSwitcher:
                     # refresh: writing it back IS the pending persist, and
                     # it saves re-POSTing — and striking — an already-spent
                     # grant.
+                    #
+                    # `backup` above was read before the consume/slot locks
+                    # (this function's precondition attribution check) — a
+                    # concurrent pass could have persisted a newer successor
+                    # in that window. Re-read it under this lock, as the
+                    # consume gate does for the same adoption call, and
+                    # match the stash against THAT: matching a stale
+                    # pre-lock copy would adopt an entry the slot has
+                    # already moved past.
+                    locked_backup, locked_backup_unreadable = (
+                        self._read_account_credentials_ex(account_num, email)
+                    )
+                    if locked_backup_unreadable:
+                        return _defer(force_refresh)
                     try:
                         adopted = self._adopt_stashed_successor(
-                            account_num, email, backup
+                            account_num, email, locked_backup
                         )
                     except CredentialReadError:
                         self._logger.info(
@@ -5225,7 +5239,7 @@ class ClaudeAccountSwitcher:
                             "unreadable; deferring the refresh.",
                             account_num, exc_info=True,
                         )
-                        return _defer(force_refresh)
+                        return FetchRecord(error="stash-unreadable")
                     except CredentialWriteError:
                         # Distinct from the read failure above: the
                         # in-memory successor IS readable, it just could
@@ -5235,10 +5249,25 @@ class ClaudeAccountSwitcher:
                             "not be written back; deferring the refresh.",
                             account_num, exc_info=True,
                         )
-                        return _defer(force_refresh)
+                        return FetchRecord(error="stash-write-failed")
                     if adopted is not None:
                         refresh_input = adopted
-                        restore_source = adopted
+                        # `_adopt_stashed_successor` already wrote this
+                        # generation into the slot backup -- treat it as
+                        # that (now current) backup rather than forcing a
+                        # restore: the shared restore-or-POST test below
+                        # then decides on ITS OWN expiry check, same as any
+                        # other backup-sourced candidate (an already-expired
+                        # adopted access token must still POST its
+                        # still-valid refresh token, not be served as
+                        # though freshly restored).
+                        backup = adopted
+                        adopted_oauth = oauth.extract_oauth_data(adopted)
+                        backup_usable = bool(
+                            adopted_oauth
+                            and adopted_oauth.get("accessToken")
+                            and adopted_oauth.get("refreshToken")
+                        )
                     elif live_oauth is not None and (
                         oauth.credential_fingerprint(live) == backup_fp
                     ):
@@ -5549,7 +5578,24 @@ class ClaudeAccountSwitcher:
             # consumed; stash the successor before the interrupt continues,
             # mirroring `_consume_backup_grant_locked`'s own BaseException arm.
             if pending is not None:
-                self._stash_pending_refresh(account_num, pending, consumed_fp)
+                try:
+                    self._stash_pending_refresh(
+                        account_num, pending, consumed_fp
+                    )
+                except BaseException:
+                    # A SECOND interrupt landing while THIS stash write is
+                    # itself blocked is a BaseException too, and
+                    # `_stash_pending_refresh` already logged it (its own
+                    # last-resort handler). Swallow it here rather than let
+                    # it replace the exception below: re-raising it would
+                    # report the second Ctrl-C to the caller instead of the
+                    # original one this arm exists to preserve.
+                    self._logger.warning(
+                        "Account %s's active-refresh successor stash hit a "
+                        "second interrupt; the original interrupt "
+                        "continues to propagate.",
+                        account_num, exc_info=True,
+                    )
             raise
 
         outcome = oauth.try_fetch_usage_for_account(
@@ -5573,7 +5619,11 @@ class ClaudeAccountSwitcher:
         already runs from a last-resort handler — but mirrors the gate's own
         second-interrupt arm (~2796): a `BaseException` (a second Ctrl-C
         landing while this write is itself blocked) is logged, then
-        re-raised so the original interrupt still reaches the caller.
+        re-raised. That re-raise is THIS call's own exception, not
+        necessarily the one the caller was already handling — a caller
+        invoking this from its own `except BaseException` arm must catch
+        it and prefer its original exception, the way `_fetch_active_usage`
+        does, so a second interrupt here cannot silently replace the first.
         """
         try:
             self._store._write_unclaimed_credential(

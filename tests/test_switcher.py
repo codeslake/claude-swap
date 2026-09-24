@@ -3999,6 +3999,150 @@ class TestActiveAccountRefresh:
         assert result.usage == {"five_hour": {"pct": 9}}
         assert "1" not in switcher._unpersisted
 
+    def test_on_disk_active_refresh_unpersisted_stash_is_adopted_without_a_post(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Same as the in-memory case above, but the prior pass's successor
+        survives only in the on-disk unclaimed stash (`_stash_pending_
+        refresh`'s own write, `self._unpersisted` empty) -- the manifest
+        scan inside `_adopt_stashed_successor` must find and adopt it too,
+        and a still-valid adopted access token must not be re-POSTed."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        switcher._store._write_unclaimed_credential(
+            self._REFRESHED,
+            {
+                "reason": "active-refresh-unpersisted",
+                "configSlot": "1",
+                "consumedFp": oauth.credential_fingerprint(self._EXPIRED),
+                "fingerprint": oauth.credential_fingerprint(self._REFRESHED),
+            },
+        )
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 wraps=switcher._write_account_credentials,
+             ) as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        mock_refresh.assert_not_called()
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED
+        )
+        write_live.assert_called_once_with(self._REFRESHED)
+        mock_fetch.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED, is_active=True
+        )
+        assert result.usage == {"five_hour": {"pct": 9}}
+        assert switcher.list_unclaimed_credentials() == {}
+
+    def test_stashed_successor_matching_only_the_stale_prelock_backup_is_not_adopted(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """`backup` is read once before the consume/slot locks and used only
+        for attribution; the adopt call re-reads it under the lock. A stash
+        entry whose `consumedFp` matches the STALE pre-lock copy but not the
+        fresh under-lock read must not be adopted -- the slot already moved
+        past that generation. The newer successor already in the slot must
+        survive untouched, and the mismatched entry must stay unretired."""
+        switcher = self._switcher(sample_sequence_data)
+        old_backup = self._EXPIRED
+        newer_backup = self._REFRESHED
+        switcher._write_account_credentials("1", "test@example.com", newer_backup)
+        switcher._store._write_unclaimed_credential(
+            self._FOREIGN_LIVE,
+            {
+                "reason": "active-refresh-unpersisted",
+                "configSlot": "1",
+                "consumedFp": oauth.credential_fingerprint(old_backup),
+                "fingerprint": oauth.credential_fingerprint(self._FOREIGN_LIVE),
+            },
+        )
+        reads = [(old_backup, False), (newer_backup, False)]
+
+        with patch.object(switcher, "_read_credentials", return_value=old_backup), \
+             patch.object(
+                 switcher, "_read_account_credentials_ex",
+                 side_effect=lambda *a, **kw: reads.pop(0),
+             ), \
+             patch.object(switcher, "_write_credentials"), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})):
+            switcher._fetch_active_usage("1", "test@example.com", old_backup)
+
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1, entries  # the mismatched entry survives, unretired
+        assert switcher._read_account_credentials(
+            "1", "test@example.com"
+        ) == self._REFRESHED  # the legitimate POST's successor, never the stash's bytes
+
+    def test_unreadable_stash_manifest_surfaces_stash_unreadable_not_expired(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        """The active path's own adopt call must surface an unreadable
+        manifest as `stash-unreadable` (renders the ERROR_NOTES remedy), not
+        `_defer`'s generic `USAGE_TOKEN_EXPIRED` sentinel or a masked
+        `http-401`, either of which would hide the actual remedy."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        switcher._store._write_unclaimed_credential(
+            self._REFRESHED,
+            {
+                "reason": "active-refresh-unpersisted",
+                "configSlot": "1",
+                "consumedFp": oauth.credential_fingerprint(self._EXPIRED),
+                "fingerprint": oauth.credential_fingerprint(self._REFRESHED),
+            },
+        )
+
+        def _deny(real):
+            def denied(path, *a, **kw):
+                if path.name == ".unclaimed-manifest.json":
+                    raise PermissionError(13, "Permission denied")
+                return real(path, *a, **kw)
+            return denied
+
+        monkeypatch.setattr(Path, "read_bytes", _deny(Path.read_bytes))
+        monkeypatch.setattr(Path, "read_text", _deny(Path.read_text))
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        mock_refresh.assert_not_called()
+        assert result.error == "stash-unreadable"
+
+    def test_in_memory_successor_write_failure_surfaces_stash_write_failed(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Distinct from the read failure above: the in-memory successor IS
+        readable, it just cannot be written back -- must surface as
+        `stash-write-failed`, not `_defer`'s generic sentinel/masked error."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        switcher._unpersisted["1"] = (
+            oauth.credential_fingerprint(self._EXPIRED), self._REFRESHED
+        )
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=OSError("disk full"),
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        mock_refresh.assert_not_called()
+        assert result.error == "stash-write-failed"
+
     def test_both_writes_failing_after_post_stashes_the_successor(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -4082,6 +4226,41 @@ class TestActiveAccountRefresh:
         assert any(
             "could not be stashed before an interrupt" in r.getMessage()
             for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_a_second_interrupt_during_the_stash_does_not_replace_the_original(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, caplog,
+    ):
+        """A SECOND interrupt landing while `_stash_pending_refresh` is
+        itself blocked (its own second-interrupt arm logs and re-raises)
+        must not replace the ORIGINAL interrupt this arm is already
+        handling -- the caller must see the FIRST Ctrl-C, not the second
+        one that hit the stash write."""
+        import logging
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=KeyboardInterrupt,
+             ), \
+             patch.object(
+                 switcher._store, "_write_unclaimed_credential",
+                 side_effect=SystemExit,
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"), \
+             caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with pytest.raises(KeyboardInterrupt):
+                switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        assert any(
+            "second interrupt" in r.getMessage() for r in caplog.records
         ), [r.getMessage() for r in caplog.records]
 
 
@@ -18233,7 +18412,10 @@ class TestUltraReviewCoverageGaps:
 
         def read_backup(num, email):
             reads["n"] += 1
-            if reads["n"] <= 1:
+            # First two reads succeed (the pre-lock attribution read, then
+            # `_fetch_active_usage`'s own under-lock re-read before the
+            # adopt call); only the LATER demotion re-read fails.
+            if reads["n"] <= 2:
                 return self._EXPIRED
             raise OSError("transient read failure")
 
