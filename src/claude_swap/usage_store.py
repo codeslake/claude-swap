@@ -32,7 +32,7 @@ import logging
 import json
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +40,9 @@ from pathlib import Path
 from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
+    ATTEMPT_WINDOW_S,
+    ATTEMPTS_PER_HOUR_MAX,
+    CANDIDATE_MAX_INTERVAL_S,
     EDGE_BACKOFF_S,
     EXHAUSTED_INTERVAL_S,
     JITTER_FRAC,
@@ -590,6 +593,48 @@ def _reset_ts_to_resets_at(ts: float) -> str:
     )
 
 
+# The same 5h/7d rate-limit headers Claude Code itself reads off every
+# ``/v1/messages`` reply (confirmed against the 2.1.281 binary), free on any
+# request that already went out. No per-model window rides in them.
+USAGE_HEADER_5H_PCT = "anthropic-ratelimit-unified-5h-utilization"
+USAGE_HEADER_5H_RESET = "anthropic-ratelimit-unified-5h-reset"
+USAGE_HEADER_7D_PCT = "anthropic-ratelimit-unified-7d-utilization"
+USAGE_HEADER_7D_RESET = "anthropic-ratelimit-unified-7d-reset"
+
+
+def _header_pct(headers: Mapping[str, str], key: str) -> float | None:
+    """A rate-limit header's utilization, as this store's 0-100 ``pct``
+    scale (``oauth.build_usage_result``'s shape).
+
+    The header itself is a 0-1 FRACTION, clamped — confirmed against Claude
+    Code 2.1.281's own parser (``Math.max(0, Math.min(1, Number(raw)))``,
+    then rendered for display as ``Math.round(utilization*100)``), matching
+    a 2026-07-28 probe that read ``0.12`` off a live reply. None when the
+    header is absent or not a number.
+    """
+    raw = headers.get(key)
+    if raw is None:
+        return None
+    try:
+        fraction = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, fraction)) * 100.0
+
+
+def _header_reset(headers: Mapping[str, str], key: str) -> str | None:
+    """A rate-limit reset header (Unix seconds) as the stored ``resets_at``
+    ISO string, or None when absent/unparseable."""
+    raw = headers.get(key)
+    if raw is None:
+        return None
+    try:
+        ts = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return _reset_ts_to_resets_at(ts)
+
+
 def _walled_decision_value(last_good: dict | None, walled_until: float | None) -> dict:
     """The synthetic full reading ``UsageEntry.decision_value`` reports while
     ``walled``.
@@ -1093,7 +1138,11 @@ class UsageStore:
         claiming separately lets two collectors both pass the check and both
         fetch; the re-check under the lock closes that window. Eligibility:
         not quarantined (dead token), not in failure backoff, not claimed
-        within ``CLAIM_TTL_S``, and then by caller mode —
+        within ``CLAIM_TTL_S``, not already holding ``ATTEMPTS_PER_HOUR_MAX``
+        attempts inside the trailing ``ATTEMPT_WINDOW_S`` (the row's own
+        ``attempts`` ledger, pruned and stamped with ``now`` here on a win —
+        binds in every caller mode below, forced or scheduled), and then by
+        caller mode —
 
         - ``respect_plans=True`` (on-demand callers: list/status/switch,
           dashboards): the entry must be stale (older than ``SERVE_TTL_S``)
@@ -1137,6 +1186,7 @@ class UsageStore:
                 ):
                     row["struckAt"] = row.get("lastAttemptAt")
                 row["lastAttemptAt"] = now
+                row["attempts"] = _pruned_attempts(row, now) + [now]
                 row["claimId"] = claim_id
                 row["claimUntil"] = now + CLAIM_TTL_S
                 won[num] = claim_id
@@ -1352,6 +1402,67 @@ class UsageStore:
 
         self._mutate(identities, [num], apply)
 
+    def record_header_reading(
+        self,
+        num: str,
+        identities: dict[str, Identity],
+        headers: Mapping[str, str],
+    ) -> bool:
+        """Record a 5h/7d reading straight off a ``/v1/messages`` reply's own
+        rate-limit headers (see the ``USAGE_HEADER_*`` names above) — no
+        fetch involved, free on a request that already went out. Not an
+        attempt: never touches the attempt ledger and never resets
+        failure/backoff state (a header reading says nothing about whether
+        the next real fetch will succeed). Other stored windows (per-model,
+        extra usage — the headers carry neither) are left as they were.
+
+        Sets ``fetchedAt`` to ``now`` so the reading is trusted immediately,
+        but leaves the real endpoint still due at ``lastAttemptAt +
+        CANDIDATE_MAX_INTERVAL_S`` (``nextPollAt = max(existing, that)`` —
+        never pulled EARLIER than a plan already in place), so while replies
+        keep flowing the endpoint is still asked at least every
+        ``CANDIDATE_MAX_INTERVAL_S`` for what these headers don't carry,
+        instead of on every scheduled tick.
+
+        Callers must throttle themselves — the pin calls this at most once
+        per 30s per slot; a hot path replying every request would otherwise
+        write the store that often.
+
+        Returns True when a reading was recorded (the 5h utilization header
+        was present); False, recording nothing, otherwise.
+        """
+        five_pct = _header_pct(headers, USAGE_HEADER_5H_PCT)
+        if five_pct is None:
+            return False
+        seven_pct = _header_pct(headers, USAGE_HEADER_7D_PCT)
+        five_reset = _header_reset(headers, USAGE_HEADER_5H_RESET)
+        seven_reset = _header_reset(headers, USAGE_HEADER_7D_RESET)
+
+        def apply(_num: str, row: dict) -> None:
+            now = self.clock()
+            last_good = dict(row.get("lastGood") or {})
+            five_entry: dict = {"pct": five_pct}
+            if five_reset is not None:
+                five_entry["resets_at"] = five_reset
+            last_good["five_hour"] = five_entry
+            if seven_pct is not None:
+                seven_entry: dict = {"pct": seven_pct}
+                if seven_reset is not None:
+                    seven_entry["resets_at"] = seven_reset
+                last_good["seven_day"] = seven_entry
+            row["lastGood"] = last_good
+            row["fetchedAt"] = now
+            floor = (
+                _num_or_none(row.get("lastAttemptAt")) or now
+            ) + CANDIDATE_MAX_INTERVAL_S
+            existing_next = _num_or_none(row.get("nextPollAt"))
+            row["nextPollAt"] = (
+                floor if existing_next is None else max(existing_next, floor)
+            )
+
+        self._mutate(identities, [num], apply)
+        return True
+
     def set_poll_plan(
         self,
         plans: dict[str, tuple[float | None, float | None]],
@@ -1450,11 +1561,27 @@ def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def _pruned_attempts(row: dict, now: float) -> list[float]:
+    """The row's ``attempts`` ledger, filtered to timestamps still inside
+    ``ATTEMPT_WINDOW_S``. A row with no ledger (written before this change,
+    or never fetched) reads as empty rather than refusing it."""
+    ledger = row.get("attempts")
+    if not isinstance(ledger, list):
+        return []
+    cutoff = now - ATTEMPT_WINDOW_S
+    return [t for t in ledger if isinstance(t, (int, float)) and t > cutoff]
+
+
 def _row_eligible(
     row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes)."""
+    # The hourly attempt cap binds in every mode, forced or scheduled: a row
+    # that already spent its budget this trailing hour is ineligible however
+    # due or stale it looks.
+    if len(_pruned_attempts(row, now)) >= ATTEMPTS_PER_HOUR_MAX:
+        return False
     # A suspected race stays eligible ON PURPOSE: the strike blocks the fetch,
     # and only a fetch can succeed, so vetoing here is what made one
     # `invalid_grant` permanent. Backoff below still paces the single retry.

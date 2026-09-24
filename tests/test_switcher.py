@@ -1927,6 +1927,36 @@ class TestUsageFetchStamps:
         assert stamps["2"] is None
 
 
+class TestRecordUsageHeaders:
+    """The pin-facing entry point: a slot number + reply headers, no
+    identity of its own to pass in."""
+
+    def test_slot_number_alone_resolves_identity_and_records(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        headers = {"anthropic-ratelimit-unified-5h-utilization": "0.3"}
+        assert switcher.record_usage_headers("1", headers) is True
+
+        entry = UsageStore(switcher.backup_dir / "cache").entries(
+            {"1": ("account1@example.com", "")}
+        )["1"]
+        assert entry.last_good["five_hour"]["pct"] == pytest.approx(30.0)
+
+    def test_unknown_slot_records_nothing(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        headers = {"anthropic-ratelimit-unified-5h-utilization": "0.3"}
+        assert switcher.record_usage_headers("9", headers) is False
+
+
 @pytest.fixture
 def _ex_reads_what_the_plain_reader_returns(monkeypatch):
     """Keep the two backup-read seams agreeing for tests that patch one.

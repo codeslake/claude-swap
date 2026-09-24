@@ -11,7 +11,7 @@ import shutil
 import threading
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -1885,6 +1885,23 @@ class ClaudeAccountSwitcher:
             num: entry.fetched_at
             for num, entry in self._usage_store.entries(identities).items()
         }
+
+    def record_usage_headers(self, num: str, headers: Mapping[str, str]) -> bool:
+        """Public entry point for the pin: record a 5h/7d usage reading
+        straight off a ``/v1/messages`` reply's own rate-limit headers for
+        slot ``num`` — no fetch, no credential access, just this slot's
+        roster identity resolved from disk. See
+        ``UsageStore.record_header_reading`` for the header names, the
+        utilization scale, and the throttle contract (the pin calls this at
+        most once per 30s per slot). Returns False, recording nothing, for
+        an unknown slot or a reply carrying no 5h utilization header.
+        """
+        data = self._get_sequence_data() or {}
+        info = data.get("accounts", {}).get(num)
+        if info is None:
+            return False
+        identity = (info.get("email", ""), info.get("organizationUuid", "") or "")
+        return self._usage_store.record_header_reading(num, {num: identity}, headers)
 
     def set_poll_policy_inputs(
         self, threshold: float, models: tuple[str, ...]

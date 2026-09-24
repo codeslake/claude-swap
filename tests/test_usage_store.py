@@ -8,7 +8,7 @@ import logging
 import pytest
 
 from claude_swap import oauth, usage_store
-from claude_swap.poll_policy import POST_429_MIN_INTERVAL_S
+from claude_swap.poll_policy import CANDIDATE_MAX_INTERVAL_S, POST_429_MIN_INTERVAL_S
 from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
@@ -1301,6 +1301,116 @@ class TestReserve:
         store.record({"2": FetchRecord(usage=USAGE)}, IDENT)
         other = {"2": ("new@x.com", "org-9")}
         assert set(store.reserve(["2"], other, respect_plans=True)) == {"2"}
+
+
+class TestAttemptLedger:
+    """The hourly attempt cap: refuses reserve() outright, in every caller
+    mode, once a row already holds ATTEMPTS_PER_HOUR_MAX attempts inside
+    the trailing ATTEMPT_WINDOW_S — independent of backoff/plan state."""
+
+    def _seed(self, store, num, **fields):
+        store.path.parent.mkdir(parents=True, exist_ok=True)
+        rows = {}
+        if store.path.exists():
+            rows = json.loads(store.path.read_text(encoding="utf-8")).get(
+                "accounts", {}
+            )
+        row = {"email": IDENT[num][0], "organizationUuid": IDENT[num][1]}
+        row.update(fields)
+        rows[num] = row
+        store.path.write_text(
+            json.dumps({"schemaVersion": 2, "accounts": rows}), encoding="utf-8"
+        )
+
+    def test_at_cap_blocks_reserve_in_both_modes(self, store, clock):
+        now = clock.now
+        self._seed(
+            store,
+            "1",
+            fetchedAt=now - SERVE_TTL_S - 1,  # stale
+            nextPollAt=now - 1,  # poll-due
+            attempts=[now - i * 10 for i in range(usage_store.ATTEMPTS_PER_HOUR_MAX)],
+        )
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+
+    def test_an_aged_out_attempt_frees_a_slot_and_is_recorded(self, store, clock):
+        now = clock.now
+        window = usage_store.ATTEMPT_WINDOW_S
+        attempts = [now - window - 1] + [
+            now - i * 10 for i in range(usage_store.ATTEMPTS_PER_HOUR_MAX - 1)
+        ]
+        self._seed(
+            store,
+            "1",
+            fetchedAt=now - SERVE_TTL_S - 1,
+            nextPollAt=now - 1,
+            attempts=attempts,
+        )
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+        recorded = json.loads(store.path.read_text(encoding="utf-8"))["accounts"][
+            "1"
+        ]["attempts"]
+        assert now in recorded
+        assert all(t > now - window for t in recorded)  # the stale one is pruned
+
+
+class TestHeaderReading:
+    """record_header_reading: a reply's own rate-limit headers, no fetch."""
+
+    def test_records_a_reading_without_disturbing_attempts_or_other_windows(
+        self, store, clock
+    ):
+        # A prior real fetch left a per-model (scoped) window, a far-future
+        # AIMD-backed-off plan, and its own lastAttemptAt.
+        scoped = [{"name": "seven_day_opus", "pct": 33.0}]
+        store.record({"1": FetchRecord(usage={**USAGE, "scoped": scoped})}, IDENT)
+        last_attempt = clock.now
+        far_future = clock.now + 1200.0
+        store.set_poll_plan({"1": (far_future, 1200.0)}, IDENT)
+        clock.advance(60)
+
+        five_reset_ts = clock.now + 1800.0
+        seven_reset_ts = clock.now + 3600.0
+        headers = {
+            usage_store.USAGE_HEADER_5H_PCT: "0.42",
+            usage_store.USAGE_HEADER_5H_RESET: str(five_reset_ts),
+            usage_store.USAGE_HEADER_7D_PCT: "0.1",
+            usage_store.USAGE_HEADER_7D_RESET: str(seven_reset_ts),
+        }
+        assert store.record_header_reading("1", IDENT, headers) is True
+
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good["five_hour"]["pct"] == pytest.approx(42.0)
+        assert entry.last_good["seven_day"]["pct"] == pytest.approx(10.0)
+        assert usage_store.parse_reset_ts(
+            entry.last_good["five_hour"]["resets_at"]
+        ) == pytest.approx(five_reset_ts)
+        assert entry.last_good["scoped"] == scoped  # per-model window untouched
+        assert entry.fetched_at == clock.now
+        assert entry.age_s == 0.0
+        assert entry.last_attempt_at == pytest.approx(last_attempt)  # not an attempt
+        assert entry.next_poll_at == pytest.approx(far_future)  # not pulled earlier
+
+    def test_no_5h_header_records_nothing(self, store, clock):
+        assert store.record_header_reading("1", IDENT, {"x": "1"}) is False
+        assert store.entries(IDENT)["1"] == UsageEntry()
+
+    def test_floors_next_poll_at_candidate_max_interval_when_unset(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)  # no plan set
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        store.record_header_reading("1", IDENT, headers)
+        entry = store.entries(IDENT)["1"]
+        assert entry.next_poll_at == pytest.approx(clock.now + CANDIDATE_MAX_INTERVAL_S)
+
+    def test_does_not_join_the_attempt_ledger(self, store, clock):
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        store.record_header_reading("1", IDENT, headers)
+        store.record_header_reading("1", IDENT, headers)
+        row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["1"]
+        assert "attempts" not in row
 
 
 class TestLast429Marker:
