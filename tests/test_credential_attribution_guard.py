@@ -486,6 +486,11 @@ CROSS_PR_WRITE_SITES: dict[tuple[str, str], int] = {
 # an override could silently absorb an unreviewed second write; addition cannot.
 CROSS_PR_WRITE_SITE_DELTAS: dict[tuple[str, str], int] = {
     ("switcher.py", "_fetch_active_usage"): 1,
+    # T1125: the in-memory `_unpersisted` fast path, a second write
+    # inside the same function EXPECTED_WRITE_SITE_ROSTER already
+    # reviews once (the on-disk stash scan) -- keyed here, not
+    # there, so the count above stays #210's own branch exactly.
+    ("switcher.py", "_adopt_stashed_successor"): 1,
 }
 
 # The union below (`{**EXPECTED_WRITE_SITE_ROSTER, **CROSS_PR_WRITE_SITES}`) lets a

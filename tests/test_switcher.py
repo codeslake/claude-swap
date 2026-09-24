@@ -4203,7 +4203,9 @@ class TestActiveAccountRefresh:
 
         assert result.sentinel is None
         assert result.usage == {"five_hour": {"pct": 3}}
-        write_backup.assert_called_once_with("1", "test@example.com", self._REFRESHED)
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED, attributed=True,
+        )
         write_live.assert_called_once_with(self._REFRESHED)
         assert switcher.list_unclaimed_credentials() == {}
 
@@ -4232,8 +4234,8 @@ class TestActiveAccountRefresh:
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
         mock_refresh.assert_not_called()
-        write_backup.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED
+        write_backup.assert_called_once_with(  # in-memory fast path
+            "1", "test@example.com", self._REFRESHED, attributed=True,
         )
         write_live.assert_called_once_with(self._REFRESHED)
         mock_fetch.assert_called_once_with(
@@ -4274,8 +4276,8 @@ class TestActiveAccountRefresh:
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
         mock_refresh.assert_not_called()
-        write_backup.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED
+        write_backup.assert_called_once_with(  # on-disk stash scan
+            "1", "test@example.com", self._REFRESHED, attributed=True,
         )
         write_live.assert_called_once_with(self._REFRESHED)
         mock_fetch.assert_called_once_with(

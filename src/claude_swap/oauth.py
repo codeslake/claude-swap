@@ -238,6 +238,10 @@ ERROR_NOTES = {
         "this slot's stored grant is confirmed another account's — a switch "
         "restores the slot's own backup"
     ),
+    "stash-write-failed": (
+        "this slot's in-memory successor could not be written back — fix "
+        "the storage failure, then retry"
+    ),
 }
 
 

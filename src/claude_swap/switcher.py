@@ -4356,7 +4356,14 @@ class ClaudeAccountSwitcher:
         pending = self._unpersisted.get(account_num)
         if pending is not None and pending[0] == cur_fp:
             try:
-                self._write_account_credentials(account_num, email, pending[1])
+                # attributed=True: `pending[0]` (checked above) matches
+                # the slot's CURRENT stored fingerprint -- a CAS proving
+                # `pending[1]` is this slot's own pending successor, not
+                # another account's, the same reasoning the on-disk
+                # stash write below attests.
+                self._write_account_credentials(
+                    account_num, email, pending[1], attributed=True,
+                )
             except Exception:
                 # A WRITE failure, not a read one: the successor is sitting
                 # right here in memory, readable. Its own exception type so
