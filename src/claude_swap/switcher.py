@@ -7025,11 +7025,14 @@ class ClaudeAccountSwitcher:
         Its stored plan was computed while it was an idle candidate and may
         wait up to CANDIDATE_MAX_INTERVAL_S — too slow for the account whose
         usage is about to move. The deadline anchors on the last measurement
-        (an already-old one comes due immediately, a never-measured account
-        is left plan-less so nothing blocks its first fetch), and the next
-        poll is only ever pulled earlier, never pushed later. Best-effort by
-        contract: the switch this rides on has already committed, so a cache
-        hiccup here must not surface as a switch failure."""
+        (an already-old one comes due after POST_SWITCH_REPLAN_DEFER_S, not
+        immediately — that window gives the pin's own header throttle a
+        chance to land a free reading and push the real poll out on its own,
+        a never-measured account is left plan-less so nothing blocks its
+        first fetch), and the next poll is only ever pulled earlier, never
+        pushed later. Best-effort by contract: the switch this rides on has
+        already committed, so a cache hiccup here must not surface as a
+        switch failure."""
         try:
             identities = {number: (email, org_uuid or "")}
             now = self._usage_store.clock()
@@ -7037,7 +7040,10 @@ class ClaudeAccountSwitcher:
             entry = self._usage_store.entries(identities).get(number)
             if entry is None or entry.fetched_at is None:
                 return
-            next_poll = max(now, entry.fetched_at + poll_policy.MIN_INTERVAL_S)
+            next_poll = max(
+                now + poll_policy.POST_SWITCH_REPLAN_DEFER_S,
+                entry.fetched_at + poll_policy.MIN_INTERVAL_S,
+            )
             if entry.next_poll_at is not None and entry.next_poll_at <= next_poll:
                 return
             self._usage_store.set_poll_plan(

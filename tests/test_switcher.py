@@ -1836,7 +1836,10 @@ class TestListAccountsUsage:
         switcher._replan_new_active("2", "b@x.com", "")
         assert store.entries(ident2)["2"].next_poll_at is None
 
-        # An already-old measurement comes due immediately, not 180s from now.
+        # An already-old measurement is deferred by the header-throttle
+        # window (POST_SWITCH_REPLAN_DEFER_S), not pulled all the way to now:
+        # an immediate fetch would race a free header reading that lands
+        # within that window and pushes the real poll out on its own.
         old_store = UsageStore(
             switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 400
         )
@@ -1846,7 +1849,9 @@ class TestListAccountsUsage:
         store.set_poll_plan({"2": (time_mod.time() + 600.0, 600.0)}, ident2)
         switcher._replan_new_active("2", "b@x.com", "")
         entry = store.entries(ident2)["2"]
-        assert entry.next_poll_at <= time_mod.time() + 1
+        deferred = time_mod.time() + poll_policy.POST_SWITCH_REPLAN_DEFER_S
+        assert entry.next_poll_at <= deferred + 1
+        assert entry.next_poll_at >= deferred - 1
 
     def test_replan_new_active_failure_is_logged_not_raised(
         self, temp_home: Path, mock_claude_config: Path, caplog
