@@ -2964,9 +2964,9 @@ class ClaudeAccountSwitcher:
                 # attributed=True: the CAS just above (`pending[0] ==
                 # cur_fp`) matched this successor's own consumed generation
                 # against `current` (the slot's backup, or -- from the
-                # live-keyed caller -- a live credential that caller already
-                # proved is this slot's own) under the lock -- that is this
-                # call site's own independent attribution.
+                # live-keyed caller -- the live credential) under the lock
+                # -- the match itself is the proof, no verdict needed: a
+                # verdict here could only refuse, never license the adopt.
                 self._write_account_credentials(
                     account_num, email, pending[1], attributed=True
                 )

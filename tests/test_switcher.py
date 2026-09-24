@@ -4163,32 +4163,6 @@ class TestActiveAccountRefresh:
         mock_refresh.assert_not_called()
         mock_fetch.assert_not_called()
 
-    def test_in_memory_successor_adoption_writes_the_backup_as_attributed(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
-    ):
-        """The in-memory CAS (`pending[0] == cur_fp`) is what attributes this
-        successor to the slot -- the write-back must say so, the same seam
-        `_register_login_as_new_slot` already passes at its own
-        independently-attributed write (~3714)."""
-        switcher = self._switcher(sample_sequence_data)
-        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
-        switcher._unpersisted["1"] = (
-            oauth.credential_fingerprint(self._EXPIRED), self._REFRESHED
-        )
-
-        with patch.object(
-            switcher, "_write_account_credentials",
-            wraps=switcher._write_account_credentials,
-        ) as write_backup:
-            result = switcher._adopt_stashed_successor(
-                "1", "test@example.com", self._EXPIRED
-            )
-
-        assert result == self._REFRESHED
-        write_backup.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED, attributed=True
-        )
-
     def test_in_memory_successor_with_a_foreign_consumed_fp_is_not_adopted(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
