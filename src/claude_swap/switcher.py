@@ -2950,7 +2950,13 @@ class ClaudeAccountSwitcher:
         pending = self._unpersisted.get(account_num)
         if pending is not None and pending[0] == cur_fp:
             try:
-                self._write_account_credentials(account_num, email, pending[1])
+                # attributed=True: the CAS just above (`pending[0] ==
+                # cur_fp`) matched this successor's own consumed generation
+                # against the slot's CURRENT backup under the lock -- that
+                # is this call site's own independent attribution.
+                self._write_account_credentials(
+                    account_num, email, pending[1], attributed=True
+                )
             except Exception:
                 # A WRITE failure, not a read one: the successor is sitting
                 # right here in memory, readable. Its own exception type so
@@ -5268,6 +5274,17 @@ class ClaudeAccountSwitcher:
                             and adopted_oauth.get("accessToken")
                             and adopted_oauth.get("refreshToken")
                         )
+                    elif (
+                        oauth.credential_fingerprint(locked_backup) != backup_fp
+                    ):
+                        # The scan adopted nothing, but the backup moved
+                        # under the lock: `backup`/`backup_fp` below this
+                        # point are still the STALE pre-lock read. Restoring
+                        # or POSTing from them would race the writer that
+                        # moved it -- the same drift `_resync_rotated_backup`
+                        # refuses to persist. Defer to the next pass rather
+                        # than act on a copy the slot has already moved past.
+                        return _defer(force_refresh)
                     elif live_oauth is not None and (
                         oauth.credential_fingerprint(live) == backup_fp
                     ):
@@ -5339,7 +5356,7 @@ class ClaudeAccountSwitcher:
                         # another actor is mutating the store; defer.
                         return _defer(force_refresh)
                     input_oauth = oauth.extract_oauth_data(refresh_input)
-                    if restore_source is not None or (
+                    if (
                         refresh_input == backup
                         and backup_usable
                         and not force_refresh
@@ -5351,8 +5368,7 @@ class ClaudeAccountSwitcher:
                         # The backup already holds a live, non-expired
                         # credential (a prior locked refresh persisted it but
                         # the live write failed, stranding the live store on
-                        # the consumed generation) — or a stashed successor
-                        # was just adopted above. Restore it — no POST, no
+                        # the consumed generation). Restore it — no POST, no
                         # generation consumed.
                         restore_source = refresh_input
                         working = refresh_input
@@ -5636,11 +5652,17 @@ class ClaudeAccountSwitcher:
                 },
             )
         except Exception:
+            # Both persists and this stash write are spent -- the same
+            # both-fail shape `_consume_backup_grant_locked` hits (~2803-
+            # 2806). Keep it in process memory so a later pass in THIS
+            # process still adopts it via `_adopt_stashed_successor`,
+            # rather than the generation being lost outright.
+            self._unpersisted[account_num] = (consumed_fp, creds)
             self._logger.error(
                 "Account %s's active-refresh successor could not be "
-                "stashed either; it survives only for this pass. Fix the "
-                "storage failure, then re-login and `cswap add` if the "
-                "slot strikes.", account_num, exc_info=True,
+                "stashed to disk either; kept in memory for this process "
+                "only. Fix the storage failure, then re-login and `cswap "
+                "add` if the slot strikes.", account_num, exc_info=True,
             )
         except BaseException:
             self._logger.error(
