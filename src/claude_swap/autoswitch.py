@@ -3117,10 +3117,23 @@ class AutoSwitchEngine:
         # is the intended cadence for a row fed by free readings, not a stuck
         # defer, so the `next_poll_at - now <= POST_SWITCH_REPLAN_DEFER_S`
         # check below keeps this scoped to a plan still inside the post-switch
-        # window instead of firing on every header-fed active slot (T1231). A
-        # widened post-429 interval (necessarily above the active ceiling) is
-        # deliberate and excluded here exactly as it is from
-        # `stale_candidate_plan` above.
+        # window instead of firing on every header-fed active slot (T1231).
+        # The trade, stated outright: outside this window (`next_poll_at -
+        # now > POST_SWITCH_REPLAN_DEFER_S`), a header-fed reading can decide
+        # for the active slot until `nextPollAt` (`lastAttemptAt +
+        # CANDIDATE_MAX_INTERVAL_S`, i.e. up to ~600s since the last real
+        # endpoint attempt) — but only once 300s+ has passed with no fresh
+        # header reading on that slot: with a request at least every 30s (the
+        # pin's own per-slot header throttle), `fetchedAt` stays under ~60s
+        # old, and a pin 429 still marks the slot walled out-of-band
+        # regardless (`UsageStore.mark_at_limit`, independent of this poll
+        # cadence). The same `next_poll_at - now <= POST_SWITCH_REPLAN_DEFER_S`
+        # scoping also matches a header-fed row in its last 30s, pulling it
+        # forward by at most that much — harmless. A widened post-429
+        # interval (necessarily above the active ceiling) is NOT excluded
+        # here: `stale_candidate_plan` above matches any `poll_interval_s >
+        # ACTIVE_MAX_INTERVAL_S`, so a post-429 plan on the active is forced
+        # through once its reading is 300s old (pre-existing behavior).
         stale_active_plan = (
             active_pre is not None
             and active_pre.age_s is not None
