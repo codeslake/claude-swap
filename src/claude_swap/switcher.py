@@ -907,23 +907,20 @@ class ClaudeAccountSwitcher:
     def _read_account_credentials(self, account_num: str, email: str) -> str:
         return self._store._read_account_credentials(account_num, email)
 
-    def _read_account_credentials_direct(self, account_num: str, email: str) -> str:
-        return self._store._read_account_credentials_direct(account_num, email)
-
     def _log_ignored_degraded_login(
         self, account_num: str, email: str, creds: str
     ) -> None:
         """`_log_detected_login` for the "would have resynced but degraded"
         case, only when ``creds`` actually differs from the slot's own
         backup -- the steady state gets no line every pass. Reads the
-        backup via `_read_account_credentials_direct`, never
+        backup via `_read_backup_uncached`, never
         `_read_account_credentials`: a degraded active read already means
         the Keychain may be failing, and this comparison is diagnostic
         only, so it must not flip the Keychain capability cache on behalf
         of a check nothing else needed. Unattributed either way: the
         config slot's email/uuid is not this credential's own.
         """
-        backup = self._read_account_credentials_direct(account_num, email)
+        backup = self._store._read_backup_uncached(account_num, email)
         if oauth.credential_fingerprint(creds) != oauth.credential_fingerprint(backup):
             self._store._log_detected_login(
                 creds, slot=None, outcome="ignored: degraded read",

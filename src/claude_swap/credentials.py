@@ -1713,7 +1713,7 @@ class CredentialStore:
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
         return ""
 
-    def _read_account_credentials_direct(self, account_num: str, email: str) -> str:
+    def _read_backup_uncached(self, account_num: str, email: str) -> str:
         """Best-effort backup read that never touches the Keychain capability
         cache. ``""`` on any absence, corruption or Keychain failure.
 
