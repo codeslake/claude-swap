@@ -653,6 +653,41 @@ class ClaudeAccountSwitcher:
             warning(msg)
         return salvage
 
+    def _write_oauth_account_to_live_config(
+        self,
+        config_path: Path,
+        oauth_section: dict,
+        fallback_config_data: dict,
+        *,
+        emit_output: bool,
+        warnings_out: list[str],
+    ) -> None:
+        """Splice ``oauthAccount`` into the live ``~/.claude.json``,
+        preserving every other key -- local settings, projects, anything the
+        pin needs -- rather than replacing the file. Shared by both
+        ``_perform_switch`` activation branches and the T1313 keep-active-
+        account restore, so "preserve the rest of the file" has one
+        implementation instead of a third that can drift from the other two.
+
+        Falls back to the full stored config only when no live config exists
+        to splice into. ``_read_json`` answers ``None`` for ABSENT and for
+        TORN alike, so an unreadable (not merely missing) file is salvaged
+        aside first -- best-effort -- rather than silently discarded before
+        the fallback write replaces it.
+        """
+        existing_config = (
+            self._read_json(config_path) if config_path.exists() else None
+        )
+        if existing_config is not None:
+            # `is not None`, not truthiness: a valid but empty `{}` is
+            # readable and loses nothing by being spliced.
+            existing_config["oauthAccount"] = oauth_section
+            self._write_json(config_path, existing_config)
+        else:
+            if config_path.exists():
+                self._salvage_unreadable(config_path, emit_output, warnings_out)
+            self._write_json(config_path, fallback_config_data)
+
     def _write_json(self, path: Path, data: dict) -> None:
         """Write JSON file with validation."""
         content = json.dumps(data, indent=2)
@@ -3707,6 +3742,94 @@ class ClaudeAccountSwitcher:
                 return num
         return None
 
+    def _restore_active_credential_after_login_write(
+        self, written_slot: str, written_fp: str
+    ) -> str:
+        """T1313: after a login was just written into ``written_slot``'s
+        backup, keep the roster's ACTIVE account live in the store rather
+        than leave the just-written login there.
+
+        A ``/login`` for a managed slot is enrolment, never a switch --
+        every other site in this adopt chain already keeps
+        ``activeAccountNumber``, the disabled flag and the pin selection
+        untouched on this path (``fc3f288b`` and siblings). This closes the
+        one piece those sites leave open: the live STORE itself, which a
+        bare write into a non-active slot otherwise leaves pointed at that
+        slot's login until an unrelated switch happens to correct it.
+
+        MUST be called with :attr:`lock_file` and
+        :func:`claude_locks.claude_credentials_lock` ALREADY held by the
+        caller, and never acquires either itself -- composing into an
+        existing locked write, rather than re-entering the (non-reentrant)
+        :class:`locking.FileLock`. No probe, no refresh, no grant consumed.
+
+        ``written_slot`` already the active slot (N == A: a login into the
+        active account) keeps today's behaviour exactly -- nothing to
+        restore. Otherwise best-effort: any refusal just leaves the live
+        store on the login that was just written, the same as before this
+        existed. Returns the login-line outcome suffix.
+        """
+        data = self._get_sequence_data() or {}
+        active_num = data.get("activeAccountNumber")
+        if active_num is None or str(active_num) == str(written_slot):
+            return ""
+        active_num = str(active_num)
+        acc = (data.get("accounts") or {}).get(active_num) or {}
+        active_email = (acc.get("email") or "").strip()
+        if not active_email:
+            return (
+                f"; live left on {written_slot}: active slot {active_num} "
+                "has no email on record"
+            )
+        backup, unreadable = self._read_account_credentials_ex(
+            active_num, active_email
+        )
+        if unreadable:
+            return (
+                f"; live left on {written_slot}: active slot {active_num}'s "
+                "backup could not be read"
+            )
+        backup_oauth = oauth.extract_oauth_data(backup) if backup else None
+        if not (
+            backup_oauth
+            and backup_oauth.get("accessToken")
+            and backup_oauth.get("refreshToken")
+        ):
+            return (
+                f"; live left on {written_slot}: active slot {active_num} "
+                "has no usable backup"
+            )
+        if self._slot_token_dead(active_num, active_email):
+            return (
+                f"; live left on {written_slot}: active slot {active_num} "
+                "is quarantined"
+            )
+        # Never overwrite bytes no slot holds: only restore while the live
+        # store still carries what THIS write just put there.
+        live = self._read_credentials()
+        if not live or oauth.credential_fingerprint(live) != written_fp:
+            return (
+                f"; live left on {written_slot}: the live store moved on "
+                "before it could be restored"
+            )
+        self._write_credentials(backup)
+        try:
+            active_config_data = json.loads(
+                self._target_config(data, active_num, active_email)
+            )
+        except (SwitchError, TypeError, ValueError):
+            active_config_data = None
+        if active_config_data and active_config_data.get("oauthAccount"):
+            # The switch path's own writer, never a new one -- preserves
+            # every other key in the live config (local settings, projects,
+            # anything the pin needs) instead of replacing the file.
+            self._write_oauth_account_to_live_config(
+                self._get_claude_config_path(),
+                active_config_data["oauthAccount"], active_config_data,
+                emit_output=False, warnings_out=[],
+            )
+        return f"; live kept on active slot {active_num}"
+
     def _register_login_as_new_slot(
         self, data: dict, creds: str, resolved: dict
     ) -> bool:
@@ -3724,12 +3847,19 @@ class ClaudeAccountSwitcher:
         email = (resolved.get("email") or "").strip()
         uuid = resolved.get("uuid") or ""
         if not email or not uuid:
+            self._store._log_detected_login(
+                creds, slot=None, outcome="ignored: partial profile",
+            )
             return True
         live = self._read_credentials()
         if not live or (
             oauth.credential_fingerprint(live)
             != oauth.credential_fingerprint(creds)
         ):
+            self._store._log_detected_login(
+                creds, slot=None, outcome="ignored: live moved on",
+                email=email, uuid=uuid,
+            )
             return True
         num = str(self._get_next_account_number())
         # attributed=True: `creds` was just matched against `live` (the
@@ -3778,6 +3908,18 @@ class ClaudeAccountSwitcher:
                 "rebuilds one and `export` skips the slot until then: %s",
                 num, e,
             )
+        # T1313: a bare login just enrolled a NEW slot, but the live STORE
+        # now holds that slot's bytes even though the roster's active
+        # account never moved -- restore it (see the helper's docstring for
+        # the invariant this closes). Called under the SAME lock
+        # `_adopt_login_into_slot` (our only caller) already holds.
+        suffix = self._restore_active_credential_after_login_write(
+            num, oauth.credential_fingerprint(creds) or ""
+        )
+        self._store._log_detected_login(
+            creds, slot=num, outcome=f"registered as slot {num}{suffix}",
+            email=email, uuid=uuid,
+        )
         self._logger.info(
             "Registered a login as Account-%s (%s): no slot owned it, so it "
             "was given one. The active account is unchanged.", num, email,
@@ -3802,7 +3944,12 @@ class ClaudeAccountSwitcher:
         # would otherwise be overwritten by a guard that had already passed.
         # A LockError from the acquire propagates to `_resync_rotated_backup`,
         # which returns without popping the memo — so contention retries.
-        with FileLock(self.lock_file):
+        # `claude_credentials_lock` too: T1313's active-account restore below
+        # writes the live store and needs it held, and composing it into this
+        # SAME `with` (rather than a nested one) is what lets that restore
+        # call `_restore_active_credential_after_login_write` without
+        # re-entering either lock.
+        with FileLock(self.lock_file), claude_credentials_lock():
             # RE-DERIVED HERE, not trusted from the caller's pre-lock scan.
             # `swap_accounts` and `move_account` hold this lock and
             # `remove_account` holds none, so the roster can move while the
@@ -3814,15 +3961,29 @@ class ClaudeAccountSwitcher:
             if not owner:
                 return self._register_login_as_new_slot(data, creds, resolved)
             if owner == account_num:
+                self._store._log_detected_login(
+                    creds, slot=owner,
+                    outcome="ignored: resolves to this slot already",
+                    email=resolved.get("email"), uuid=resolved.get("uuid"),
+                )
                 return True  # nobody here to adopt into
             acc = (data.get("accounts") or {}).get(owner) or {}
             owner_email = (acc.get("email") or "").strip()
             if not owner_email:
+                self._store._log_detected_login(
+                    creds, slot=owner,
+                    outcome="ignored: owner slot has no email on record",
+                    email=resolved.get("email"), uuid=resolved.get("uuid"),
+                )
                 return True  # nothing keys the write; a retry changes nothing
             stored, unreadable = self._read_account_credentials_ex(
                 owner, owner_email
             )
             if unreadable:
+                self._store._log_detected_login(
+                    creds, slot=owner, outcome="refused: owner backup unreadable",
+                    email=owner_email, uuid=resolved.get("uuid"),
+                )
                 return False  # a read that FAILED is not an empty slot
             if stored and (
                 oauth.credential_fingerprint(stored)
@@ -3833,6 +3994,10 @@ class ClaudeAccountSwitcher:
                 # the fleet onto ``owner`` -- only `cswap switch`/`add_account`
                 # are, and writing this slot's own bytes into the CONFIG's
                 # slot is exactly how a cross-wire gets created.
+                self._store._log_detected_login(
+                    creds, slot=owner, outcome="ignored: already stored",
+                    email=owner_email, uuid=resolved.get("uuid"),
+                )
                 return True
             # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE, the rule
             # `_adopt_into_dead_slot` applies at a switch: `_refresh_expiry`
@@ -3844,6 +4009,10 @@ class ClaudeAccountSwitcher:
             stored_at, live_at = _refresh_expiry(stored), _refresh_expiry(creds)
             if stored and not self._slot_token_dead(owner, owner_email):
                 if not newer_login(live_at, stored_at):
+                    self._store._log_detected_login(
+                        creds, slot=owner, outcome="refused: healthy slot kept",
+                        email=owner_email, uuid=resolved.get("uuid"),
+                    )
                     return False  # its own credential may yet be condemned
             elif newer_login(stored_at, live_at):
                 self._logger.info(
@@ -3851,6 +4020,11 @@ class ClaudeAccountSwitcher:
                     "account but its refresh lifetime ends earlier than the "
                     "stored one, so the stored credential was kept.",
                     owner, owner_email,
+                )
+                self._store._log_detected_login(
+                    creds, slot=owner,
+                    outcome="ignored: stored generation is newer",
+                    email=owner_email, uuid=resolved.get("uuid"),
                 )
                 return True
             # attributed=True: `owner` came from `_slot_owning_resolved_identity`
@@ -3880,6 +4054,15 @@ class ClaudeAccountSwitcher:
                 )
             # Never moves `activeAccountNumber` here either -- see the
             # comment on the identical-bytes branch above.
+            # T1313: keep the roster's active account live in the store --
+            # see the helper's docstring for the invariant this closes.
+            suffix = self._restore_active_credential_after_login_write(
+                owner, oauth.credential_fingerprint(creds) or ""
+            )
+            self._store._log_detected_login(
+                creds, slot=owner, outcome=f"adopted into slot {owner}{suffix}",
+                email=owner_email, uuid=resolved.get("uuid"),
+            )
         self._logger.info(
             "Adopted a login into Account-%s (%s): the live credential "
             "resolves to that account, so it was stored there rather than "
@@ -4361,7 +4544,7 @@ class ClaudeAccountSwitcher:
 
             self._write_account_credentials(account_num, current_email, current_creds)
             self._store._sync_active_credentials_file_to_adopted_login(
-                current_creds, slot=account_num,
+                current_creds, slot=account_num, email=current_email,
             )
             self._write_account_config(account_num, current_email, current_config)
             self._usage_store.clear_dead_token(
@@ -4507,7 +4690,7 @@ class ClaudeAccountSwitcher:
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
         self._store._sync_active_credentials_file_to_adopted_login(
-            current_creds, slot=account_num,
+            current_creds, slot=account_num, email=current_email,
         )
         self._write_account_config(account_num, current_email, current_config)
         self._usage_store.clear_dead_token(
@@ -4993,6 +5176,19 @@ class ClaudeAccountSwitcher:
                     if not self._active_read_degraded:
                         self._resync_rotated_backup(
                             account_num, email, org_uuid, creds
+                        )
+                    elif oauth.credential_fingerprint(
+                        creds
+                    ) != oauth.credential_fingerprint(
+                        self._read_account_credentials(account_num, email)
+                    ):
+                        # Would have resynced, but the read is degraded (see
+                        # the comment above) -- still a detected login, just
+                        # one the write side must not act on yet.
+                        self._store._log_detected_login(
+                            creds, slot=None, outcome="ignored: degraded read",
+                            email=email,
+                            uuid=self.account_identity(account_num).get("uuid"),
                         )
                     if self._probe_verdicts and self._probe_verdicts.get(
                         self._lineage_key(
@@ -5790,6 +5986,7 @@ class ClaudeAccountSwitcher:
         moved, oracle unreachable) just leaves the backup stale — the
         recovery branch consumes nothing it cannot attribute. Never raises.
         """
+        own_uuid = self.account_identity(account_num).get("uuid")
         try:
             creds_oauth = oauth.extract_oauth_data(creds)
             if not (
@@ -5797,6 +5994,10 @@ class ClaudeAccountSwitcher:
                 and creds_oauth.get("accessToken")
                 and creds_oauth.get("refreshToken")
             ):
+                self._store._log_detected_login(
+                    creds, slot=None, outcome="refused: incomplete token pair",
+                    email=email, uuid=own_uuid,
+                )
                 return  # never seed a backup with a partial token pair
             backup = self._read_account_credentials(account_num, email)
             if backup and (
@@ -5809,7 +6010,8 @@ class ClaudeAccountSwitcher:
                 # not a request to move the fleet onto this slot; only
                 # `cswap switch`/`add_account` are. `current_account_number()`
                 # already reads the live identity directly and needs no
-                # help from this bookkeeping field.
+                # help from this bookkeeping field. NOT A LOGIN: no line --
+                # this is the steady state, not a detected login.
                 return
             fp = oauth.credential_fingerprint(creds) or ""
             lineage = self._lineage_key(account_num, email, fp)
@@ -5822,10 +6024,19 @@ class ClaudeAccountSwitcher:
                 # to make one attempt the only one. The owner is memoized with
                 # the verdict so this costs no probe.
                 profile = self._resolved_owners.get(lineage)
-                if profile and self._adopt_login_into_slot(
+                settled = profile and self._adopt_login_into_slot(
                     account_num, creds, profile
-                ):
+                )
+                if settled:
                     self._resolved_owners.pop(lineage, None)
+                else:
+                    # Unsettled: the adopt (if attempted) logged its own
+                    # refusal already; this is the retry-pending state itself.
+                    self._store._log_detected_login(
+                        creds, slot=None, outcome="ignored: foreign lineage retry",
+                        email=(profile or {}).get("email"),
+                        uuid=(profile or {}).get("uuid"),
+                    )
                 return
             if verdict is not True:
                 now = self._usage_store.clock()
@@ -5834,6 +6045,10 @@ class ClaudeAccountSwitcher:
                     # Still cooling down from the last unresolved probe on
                     # this exact lineage -- skip the network call rather
                     # than repeat it every collect pass.
+                    self._store._log_detected_login(
+                        creds, slot=None, outcome="ignored: cooldown",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 resolved = oauth.fetch_oauth_profile(
                     oauth.extract_access_token(creds) or ""
@@ -5844,6 +6059,10 @@ class ClaudeAccountSwitcher:
                         "Ownership probe for account %s's drifted live "
                         "credential failed; resync skipped this pass.",
                         account_num,
+                    )
+                    self._store._log_detected_login(
+                        creds, slot=None, outcome="refused: probe failed",
+                        email=email, uuid=own_uuid,
                     )
                     return
                 match = self._resolved_matches_slot_identity(
@@ -5857,6 +6076,11 @@ class ClaudeAccountSwitcher:
                         "resync skipped this pass.",
                         account_num,
                     )
+                    self._store._log_detected_login(
+                        creds, slot=None,
+                        outcome="refused: ownership unverifiable",
+                        email=resolved.get("email"), uuid=resolved.get("uuid"),
+                    )
                     return
                 # Key built AFTER the match: an email-path affirmation just
                 # backfilled the slot uuid, and the verdict must live under
@@ -5869,10 +6093,19 @@ class ClaudeAccountSwitcher:
                     # bytes; the adopt stores them in that account's slot, or
                     # gives the account a slot when none owns it.
                     self._resolved_owners[lineage] = resolved
-                    if self._adopt_login_into_slot(
+                    settled = self._adopt_login_into_slot(
                         account_num, creds, resolved
-                    ):
+                    )
+                    if settled:
                         self._resolved_owners.pop(lineage, None)
+                    else:
+                        # Adopt logged its own refusal; this names the state
+                        # the lineage is left in.
+                        self._store._log_detected_login(
+                            creds, slot=None,
+                            outcome="ignored: foreign lineage retry",
+                            email=resolved.get("email"), uuid=resolved.get("uuid"),
+                        )
                     return
             with (
                 FileLock(self.lock_file),
@@ -5881,6 +6114,10 @@ class ClaudeAccountSwitcher:
                 # Identity re-check under the lock: a switch/login landing in
                 # the gap means the live store is no longer this account's.
                 if not self._live_identity_matches(email, org_uuid):
+                    self._store._log_detected_login(
+                        creds, slot=None, outcome="refused: identity moved",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 # Verdict re-check under the lock: slot mutations hold this
                 # FileLock, so rebuilding the key revalidates that the slot
@@ -5888,6 +6125,10 @@ class ClaudeAccountSwitcher:
                 if not self._probe_verdicts.get(
                     self._lineage_key(account_num, email, fp)
                 ):
+                    self._store._log_detected_login(
+                        creds, slot=None, outcome="refused: verdict stale",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 # Re-read live under the lock and require it to still carry
                 # the served (and oracle-attributed) credential's lineage
@@ -5896,6 +6137,10 @@ class ClaudeAccountSwitcher:
                 # if the access token moved since the probe.
                 live = self._read_credentials()
                 if not live:
+                    self._store._log_detected_login(
+                        creds, slot=None, outcome="refused: live vanished",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 live_oauth = oauth.extract_oauth_data(live)
                 if not (
@@ -5905,6 +6150,10 @@ class ClaudeAccountSwitcher:
                     and oauth.credential_fingerprint(live)
                     == oauth.credential_fingerprint(creds)
                 ):
+                    self._store._log_detected_login(
+                        creds, slot=None, outcome="refused: live moved",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 # Re-read the BACKUP too, under the same lock: the pre-lock
                 # read above can be stale by now (the oracle probe is a
@@ -5922,23 +6171,46 @@ class ClaudeAccountSwitcher:
                 if oauth.credential_fingerprint(
                     backup_now
                 ) != oauth.credential_fingerprint(backup):
+                    self._store._log_detected_login(
+                        creds, slot=None, outcome="refused: backup moved",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 backup_exp = (
                     oauth.extract_oauth_data(backup_now) or {}
                 ).get("expiresAt") or 0
                 live_exp = live_oauth.get("expiresAt") or 0
                 if backup_exp > live_exp:
+                    self._store._log_detected_login(
+                        creds, slot=None,
+                        outcome="refused: backup already newer",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 self._write_account_credentials(account_num, email, live)
                 self._store._sync_active_credentials_file_to_adopted_login(
-                    live, slot=account_num,
+                    live, slot=account_num, email=email,
                 )
                 self._logger.info(
                     "Resynced account %s's backup to the rotated live "
                     "credential (rotation completed outside a collect pass).",
                     account_num,
                 )
+                # T1313: keep the roster's active account live in the store
+                # -- see the helper's docstring for the invariant this closes.
+                suffix = self._restore_active_credential_after_login_write(
+                    account_num, oauth.credential_fingerprint(live) or ""
+                )
+                self._store._log_detected_login(
+                    live, slot=account_num,
+                    outcome=f"adopted into slot {account_num}{suffix}",
+                    email=email, uuid=own_uuid,
+                )
         except LockError:
+            self._store._log_detected_login(
+                creds, slot=None, outcome="refused: lock contention",
+                email=email, uuid=own_uuid,
+            )
             return  # holder is mid-operation; the next pass retries
         except Exception:
             self._logger.warning(
@@ -6340,6 +6612,17 @@ class ClaudeAccountSwitcher:
                 # a pre-check here would just repeat that no-op check at the
                 # cost of a second backup read on every pass.
                 self._resync_rotated_backup(num, info[1], info[3], info[5])
+            elif active_oauth and oauth.credential_fingerprint(
+                info[5]
+            ) != oauth.credential_fingerprint(
+                self._read_account_credentials(num, info[1])
+            ):
+                # Same "would have resynced but degraded" case as
+                # `_fetch_active_usage`'s success branch.
+                self._store._log_detected_login(
+                    info[5], slot=None, outcome="ignored: degraded read",
+                    email=info[1], uuid=self.account_identity(num).get("uuid"),
+                )
 
         if claims:
             pre = entries
@@ -9649,45 +9932,13 @@ class ClaudeAccountSwitcher:
                     )
                     creds_written = True
 
-                    # Mirror the normal switch path: preserve existing local
-                    # settings/projects when ~/.claude.json already exists, only
-                    # swapping in oauthAccount. Fall back to the full imported
-                    # config when no usable local config exists.
-                    # `_read_json` answers None for ABSENT and for TORN alike,
-                    # so a torn ~/.claude.json fell to the else branch and the
-                    # 1-key backup config was written over the user's whole
-                    # file — measured through the public `switch_to`:
-                    # `switched: True` returned with `projects`, `mcpServers`
-                    # and `userID` gone.
-                    #
-                    # Back it up before replacing it, rather than refusing.
-                    # Upstream REPLACES a malformed config here on purpose
-                    # (`test_clean_switch_fallback_when_local_config_malformed`
-                    # — a machine being seeded by import, where the leftover
-                    # file is noise), and nothing in scope separates that from
-                    # a working install whose config just tore: measured, both
-                    # reach this line with `current_account` set and
-                    # `_get_current_account()` None. So keep upstream's
-                    # behaviour and stop it being LOSSY: the bytes survive next
-                    # to the config, named, and the switch still lands.
-                    existing_config = (
-                        self._read_json(config_path) if config_path.exists() else None
+                    # See _write_oauth_account_to_live_config: preserves
+                    # local settings/projects/pin state, only swapping in
+                    # oauthAccount (mirrors the normal switch path below).
+                    self._write_oauth_account_to_live_config(
+                        config_path, target_oauth, target_config_data,
+                        emit_output=emit_output, warnings_out=warnings_out,
                     )
-                    if existing_config is not None:
-                        # `is not None`, not truthiness. A VALID but empty `{}`
-                        # is readable and loses nothing by being spliced; the
-                        # falsy form sent it down the salvage branch and told
-                        # the user it "could not be parsed", which is the same
-                        # ""-vs-None conflation this branch exists to separate.
-                        existing_config["oauthAccount"] = target_oauth
-                        self._write_json(config_path, existing_config)
-                    else:
-                        if config_path.exists():
-                            salvage = self._salvage_unreadable(
-                                config_path, emit_output, warnings_out
-                            )
-                            del salvage
-                        self._write_json(config_path, target_config_data)
                     config_written = True
 
                     data["activeAccountNumber"] = int(target_account)
@@ -9955,24 +10206,12 @@ class ClaudeAccountSwitcher:
                 if not oauth_section:
                     raise SwitchError("Invalid oauthAccount in backup")
 
-                # `is not None`, not truthiness — same conflation the direct-
-                # activation branch above (:6148-6165) already guards
-                # against. A torn ~/.claude.json reads as None here too;
-                # `current_config_data["oauthAccount"] = ...` on that None
-                # raised `'NoneType' object does not support item
-                # assignment` with no salvage copy, losing the user's torn
-                # config for good. Absent/unreadable both fall to the same
-                # salvage-then-replace the direct-activation branch uses.
-                current_config_data = self._read_json(config_path)
-                if current_config_data is not None:
-                    current_config_data["oauthAccount"] = oauth_section
-                    self._write_json(config_path, current_config_data)
-                else:
-                    if config_path.exists():
-                        self._salvage_unreadable(
-                            config_path, emit_output, warnings_out
-                        )
-                    self._write_json(config_path, target_config_data)
+                # See _write_oauth_account_to_live_config, shared with the
+                # direct-activation branch above.
+                self._write_oauth_account_to_live_config(
+                    config_path, oauth_section, target_config_data,
+                    emit_output=emit_output, warnings_out=warnings_out,
+                )
                 transaction.record_step("config_written")
                 self._logger.info("Updated config file")
 

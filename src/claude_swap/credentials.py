@@ -21,6 +21,7 @@ import base64
 import json
 import logging
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -28,7 +29,7 @@ import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, oauth
 from claude_swap.exceptions import (
     ClaudeSwitchError,
     CredentialError,
@@ -36,7 +37,7 @@ from claude_swap.exceptions import (
     CredentialWriteError,
 )
 from claude_swap.fsutil import replace_with_retry
-from claude_swap.models import Platform
+from claude_swap.models import Platform, get_timestamp
 from claude_swap.paths import (
     get_claude_config_home,
     get_credentials_path,
@@ -380,6 +381,13 @@ class CredentialStore:
         # flag above can stand in for it.
         self._residual_verdict: bool | None = None
         self._last_active_credentials_backend: str | None = None
+        # T1312's audit trail: one INFO "login:" line per (fingerprint,
+        # outcome) the collect/resync path sees, so a masked login is never
+        # silent again. Bounded so the 3s TUI tick's repeats of an unchanged
+        # verdict can't grow this without limit; a full clear rather than an
+        # LRU eviction, since this is a dedup window, not a correctness
+        # record — losing it early only costs one repeated log line.
+        self._login_line_seen: set[tuple[str, str]] = set()
 
     def _kc_call(self, fn, *args):
         """Run a ``macos_keychain`` wrapper call, learning Keychain usability.
@@ -578,6 +586,19 @@ class CredentialStore:
                 return None, True
         return None, False
 
+    def _active_oauth_keychain_mdat(self) -> "float | None":
+        """``mdat`` of whichever service :meth:`_read_active_oauth_keychain`
+        just served, for the file/Keychain write-time comparison in
+        :meth:`_fresher_plaintext_login`. Non-raising; same try-order as the
+        value read, so it asks the same item.
+        """
+        account = macos_keychain.keychain_account_name()
+        for service in _active_oauth_keychain_services():
+            mdat = macos_keychain.item_modified_at(service, account)
+            if mdat is not None:
+                return mdat
+        return None
+
     def _read_one_oauth_keychain(self, service: str) -> tuple[str | None, bool]:
         """Read one OAuth Keychain item with a bounded retry.
 
@@ -609,37 +630,59 @@ class CredentialStore:
         return None, True
 
     def _fresher_plaintext_login(
-        self, keychain_value: str, *, same_lineage_only: bool = False,
+        self,
+        keychain_value: str,
+        *,
+        same_lineage_only: bool = False,
+        kc_mdat: "float | None" = None,
     ) -> "str | None":
         """The plaintext file's credential when it is a NEWER login, else None.
 
-        Compared on ``refreshTokenExpiresAt``, which only a fresh login moves.
-        A stamp later by more than the lineage jitter is a newer login. Within
-        that jitter the two stamps name the SAME login, and ``expiresAt`` (which
-        moves forward on every rotation) tells which is the newer generation of
-        it. Any read or parse failure answers None: this decides which of two
+        Two arms. The cross-lineage arm (a DIFFERENT login, skipped when
+        ``same_lineage_only``) asks which STORE WAS WRITTEN LAST: the file's
+        mtime vs the Keychain item's ``mdat`` (``kc_mdat``, the caller's
+        job to supply — this method has no service/account to query it
+        with). ``refreshTokenExpiresAt`` is NOT this arm's test: the server
+        re-mints it per-account from that account's own token TTL, so it is
+        not ordered across two DIFFERENT logins (measured: a login at
+        00:55:59 carried an earlier stamp than one made at 00:54:28). File
+        wins only when its mtime (floored to seconds) is strictly later than
+        ``kc_mdat``; ``kc_mdat is None`` is no evidence, so the Keychain
+        keeps it, same as an unreadable file.
+
+        The same-lineage arm (within the jitter window) is unchanged: two
+        stamps that name the SAME login are ordered by ``expiresAt``, which
+        moves forward on every rotation — the newer GENERATION of it.
+
+        Any read or parse failure answers None: this decides which of two
         readable credentials to serve, and an unreadable one is not a claim.
 
         ``same_lineage_only`` restricts the verdict to the within-jitter arm —
         a later GENERATION of the same login — and never answers on a later
-        ``refreshTokenExpiresAt`` that names a DIFFERENT login. A caller that
-        means "is the file a newer generation of what I'm about to write"
-        must not read "the file holds someone else's later login" as that.
+        write that names a DIFFERENT login. A caller that means "is the file
+        a newer generation of what I'm about to write" must not read "the
+        file holds someone else's later login" as that.
         """
         try:
             cred_file = get_credentials_path()
             if not cred_file.exists():
                 return None
             text = cred_file.read_text(encoding="utf-8")
+            file_mtime = cred_file.stat().st_mtime
         except Exception:      # noqa: BLE001 — the Keychain value still stands
             return None
         if not text.strip():
             return None
 
+        if (
+            not same_lineage_only
+            and kc_mdat is not None
+            and int(file_mtime) > int(kc_mdat)
+        ):
+            return text
+
         kc_at = _credential_stamp(keychain_value, "refreshTokenExpiresAt")
         file_at = _credential_stamp(text, "refreshTokenExpiresAt")
-        if not same_lineage_only and newer_login(file_at, kc_at):
-            return text
         if (
             kc_at is not None
             and file_at is not None
@@ -715,7 +758,9 @@ class CredentialStore:
                 # refresh of the SAME lineage, to within seconds of jitter, so
                 # only a stamp later by more than that jitter is a newer
                 # login. Undated is no evidence and keeps the Keychain.
-                fresher = self._fresher_plaintext_login(val)
+                fresher = self._fresher_plaintext_login(
+                    val, kc_mdat=self._active_oauth_keychain_mdat()
+                )
                 if fresher is not None:
                     return ActiveCredentials(fresher, False)
                 return ActiveCredentials(val, False)
@@ -1185,11 +1230,70 @@ class CredentialStore:
                 "a running session may not hot-reload until restart"
             )
 
+    # Cap on `_log_detected_login`'s dedup set. Generous for a single
+    # long-lived TUI/daemon process (a handful of accounts, a handful of
+    # outcomes each) -- never expected to fill under ordinary use.
+    _LOGIN_LINE_DEDUP_MAX = 512
+
+    def _log_detected_login(
+        self,
+        creds: str,
+        *,
+        slot: "str | None",
+        outcome: str,
+        email: "str | None" = None,
+        uuid: "str | None" = None,
+    ) -> None:
+        """One INFO line per (fingerprint, outcome) for every login the
+        collect/resync/adopt path sees, whatever the outcome (the owner's
+        order: T1312 was a login the chain reasoned about correctly at every
+        step and never once wrote down, so nothing outside a debugger could
+        see why it was masked).
+
+        Lives on the store (not the switcher) so this stash path -- a leaf
+        collaborator that must never call a switcher method -- can log
+        through the SAME helper the switcher's own adopt/resync callers use,
+        rather than a second, drifting implementation.
+
+        Never called for the NO-DRIFT return (the live credential already
+        matches the matched slot's own backup): that is the steady state,
+        not a login, and logging it every collect pass would drown the
+        outcomes that matter under noise.
+
+        Deduplicates on (fingerprint, outcome) so the TUI's 3s tick does not
+        repeat an unchanged verdict; the set is capped by a full clear, not
+        an LRU eviction -- this is a debug trail, not a correctness record,
+        so losing it early only costs one repeated line.
+        """
+        fp = (oauth.credential_fingerprint(creds) or "unknown")[:8]
+        key = (fp, outcome)
+        if key in self._login_line_seen:
+            return
+        if len(self._login_line_seen) >= self._LOGIN_LINE_DEDUP_MAX:
+            self._login_line_seen.clear()
+        self._login_line_seen.add(key)
+        self._host._logger.info(
+            "login: utc=%s host=%s email=%s uuid=%s fp=%s slot=%s outcome=%s",
+            get_timestamp(),
+            socket.gethostname().split(".")[0],
+            email or "unknown",
+            uuid or "unknown",
+            fp,
+            slot or "none",
+            outcome,
+        )
+
     def _sync_active_credentials_file_to_adopted_login(
-        self, credentials: str, slot: str,
+        self, credentials: str, slot: str, email: str = "",
     ) -> None:
         """After an ``add_account`` adopt, bring an existing plaintext file to
         the adopted generation.
+
+        ``email`` (added for T1312's stash-dedup check below) is best-effort:
+        every real caller has it in hand from the same write this syncs
+        after, but an old call site cannot be made to raise over a debug
+        line -- an empty string just skips that one check, same as an
+        unreadable backup/.prev would.
 
         macOS only: ``add_account`` reads the credential from the Keychain
         and stores it into a slot backup — never into ``.credentials.json``.
@@ -1251,7 +1355,6 @@ class CredentialStore:
                 credentials, same_lineage_only=True
             ) is not None:
                 return
-            from claude_swap import oauth
             current = get_credentials_path().read_text(encoding="utf-8")
             if oauth.extract_oauth_data(current) == oauth.extract_oauth_data(credentials):
                 return
@@ -1280,6 +1383,23 @@ class CredentialStore:
                     )
             except Exception:
                 different_lineage = False  # unparseable: no lineage to preserve
+            if different_lineage and email:
+                current_fp = oauth.credential_fingerprint(current)
+                already_held = current_fp is not None and current_fp in (
+                    oauth.credential_fingerprint(credentials),
+                    oauth.credential_fingerprint(
+                        self._read_previous_backup(slot, email)
+                    ),
+                )
+                if already_held:
+                    # A copy of these exact bytes already exists (the slot's
+                    # own current backup, or its retained .prev generation) --
+                    # stashing them again would only duplicate that copy.
+                    self._log_detected_login(
+                        current, slot=slot,
+                        outcome=f"ignored: displaced copy already held by slot {slot}",
+                    )
+                    different_lineage = False
             if different_lineage:
                 try:
                     self._write_unclaimed_credential(

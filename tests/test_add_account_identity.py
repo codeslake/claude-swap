@@ -1065,6 +1065,76 @@ def test_resync_stashes_a_different_login_the_file_alone_held_before_overwriting
     )
 
 
+def test_resync_does_not_re_stash_a_file_login_the_prev_generation_already_holds(
+    temp_home: Path, mock_claude_config: Path, monkeypatch, caplog,
+):
+    """T1312: the file's displaced login can be a copy ``_write_account_credentials``'s
+    own ``.prev`` retention JUST created (the account's own just-superseded
+    generation, which the file happened to still be holding) -- a copy of it
+    already exists durably, so stashing it a second time into the unclaimed
+    store is a needless duplicate, not the "only copy anywhere" the stash
+    exists to preserve.
+    """
+    import logging
+
+    s = ClaudeAccountSwitcher()
+    s.platform = Platform.MACOS
+    s._setup_directories()
+    s._init_sequence_file()
+    cfg = s._get_claude_config_path()
+    cfg.write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "ax@example.com", "organizationUuid": "",
+        "accountUuid": "u-ax"}}), encoding="utf-8")
+    seq = s._get_sequence_data()
+    seq["accounts"]["1"] = {
+        "email": "ax@example.com", "uuid": "u-ax", "organizationUuid": ""}
+    seq["sequence"] = [1]
+    seq["activeAccountNumber"] = 1
+    s._write_json(s.sequence_file, seq)
+
+    old_backup = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-old-backup", "refreshToken": "rt-OLD-lineage",
+        "expiresAt": 99999999999000, "refreshTokenExpiresAt": 1_000}})
+    s._write_account_credentials("1", "ax@example.com", old_backup)
+
+    kc_new = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-KC-N-PLUS-1", "refreshToken": "rt-NEW",
+        "expiresAt": 99999999999000 + 3_600_000,
+        "refreshTokenExpiresAt": 50_000}})
+
+    # The plaintext file is holding EXACTLY the slot's own current backup --
+    # the very generation this write is about to rotate into `.prev`.
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    cred_file.write_text(old_backup, encoding="utf-8")
+
+    monkeypatch.setattr(s, "_read_credentials", lambda: kc_new)
+
+    before = set(s._store._list_unclaimed_credentials())
+    with caplog.at_level(logging.INFO, logger="claude-swap"):
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-ax", "email": "ax@example.com",
+                                 "organizationUuid": ""}):
+            s._resync_rotated_backup("1", "ax@example.com", "", kc_new)
+
+    assert cred_file.read_text(encoding="utf-8") == kc_new, (
+        "the plaintext file did not receive the rotated Keychain generation"
+    )
+    assert json.loads(
+        s._store._read_previous_backup("1", "ax@example.com")
+    )["claudeAiOauth"]["refreshToken"] == "rt-OLD-lineage", (
+        "premise: the file's login is the generation .prev now holds"
+    )
+    after = set(s._store._list_unclaimed_credentials())
+    assert after == before, (
+        "DEFECT: a login already retained as .prev was stashed again"
+    )
+    assert any(
+        r.getMessage().startswith("login:")
+        and "ignored: displaced copy already held by slot 1" in r.getMessage()
+        for r in caplog.records
+    ), "the dedup skip did not log its outcome"
+
+
 def test_resync_writes_through_a_same_lineage_older_generation_with_no_stash(
     temp_home: Path, mock_claude_config: Path, monkeypatch,
 ):
