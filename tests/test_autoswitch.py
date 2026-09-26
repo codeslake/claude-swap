@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -48,6 +49,7 @@ from claude_swap.autoswitch import (
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import SERVE_TTL_S, STALE_OK_S, FetchRecord, UsageEntry
+from claude_swap.paths import get_credentials_path
 from claude_swap.usage_store import (
     USAGE_HEADER_5H_PCT,
     FetchRecord,
@@ -56,7 +58,11 @@ from claude_swap.usage_store import (
 )
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import (
+    LOGIN_RESTORE_RECHECK_MARGIN_S,
+    LOGIN_RESTORE_SETTLE_FLOOR_S,
+    ClaudeAccountSwitcher,
+)
 
 
 class FakeClock:
@@ -19176,3 +19182,200 @@ class TestDynamicNeverWalls0010:
         assert consume_first > cap, (
             f"{consume_first}s — `consume-first` must keep its own sleep"
         )
+
+
+class TestT1313SettleWiring:
+    """`_settle_login_restore` wired into the engine (T1313 call sites b/c):
+    a login for a different managed slot (N=2) than the roster's active
+    account (A=1) must hold the tick at NO_ACTION -- and, once N's own
+    backup already holds it, `tick()` itself is the collect pass that puts
+    A back live."""
+
+    def _seed_settle_candidate(
+        self, h: EngineHarness, *, age_s: float = 10.0,
+    ) -> str:
+        h.seed(1, "a@example.com", expires_at=99_999_999_999_999)
+        h.seed(2, "b@example.com")
+        h.set_active(1)
+        login = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999}})
+        # N's (slot 2) own backup already holds the login -- the shape a
+        # prior collect pass leaves. Attributed: this is slot 2's own
+        # (b@example.com's) login, not a foreign identity.
+        h.switcher._write_account_credentials(
+            "2", "b@example.com", login, attributed=True,
+        )
+        h.switcher._write_credentials(login)
+        (h.temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com",
+                              "accountUuid": "uuid-2"},
+        }))
+        path = get_credentials_path()
+        now = time.time()
+        os.utime(path, (now - age_s, now - age_s))
+        return login
+
+    def test_tick_performs_nothing_and_restores_a_past_the_floor(
+        self, temp_home: Path,
+    ):
+        h = EngineHarness(temp_home)
+        self._seed_settle_candidate(h, age_s=10.0)
+        with patch.object(h.engine, "_perform") as perform:
+            outcome = h.engine.tick()
+        perform.assert_not_called()
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.switcher._get_sequence_data()["activeAccountNumber"] == 1
+        active_backup = h.switcher._read_account_credentials("1", "a@example.com")
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            active_backup
+        ), "the tick's own settle-first call never restored A"
+
+    def test_tick_waits_under_the_floor_and_touches_nothing(
+        self, temp_home: Path,
+    ):
+        h = EngineHarness(temp_home)
+        login = self._seed_settle_candidate(
+            h, age_s=LOGIN_RESTORE_SETTLE_FLOOR_S - 1,
+        )
+        outcome = h.engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "an under-floor settle must never touch the live store"
+        delay = h.engine._next_delay(outcome)
+        assert 0 < delay <= (
+            LOGIN_RESTORE_SETTLE_FLOOR_S + LOGIN_RESTORE_RECHECK_MARGIN_S
+        ), (
+            "a WAITING settle must recheck at the settle floor, not merely "
+            "sooner than the ordinary cadence"
+        )
+
+    def test_tick_bails_when_the_collect_pass_itself_moves_the_identity(
+        self, temp_home: Path, monkeypatch,
+    ):
+        """The collect pass's own `_resync_rotated_backup` no-drift return
+        (call site a) can settle a login mid-pass. Everything gathered by
+        that pass is keyed on the `current` read before it ran, so a tick
+        that finds the identity moved underneath it must decide nothing
+        from that stale snapshot."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "z@example.com")
+        h.set_active(1)  # D == A at tick start: the top-of-tick settle is a no-op
+        # A live login for slot 1 -- without it `current_account_number()`
+        # is None and the tick bails before ever reaching its collect pass,
+        # which would make this test pass whether or not the fix is there.
+        h.make_live("a@example.com", 1)
+
+        collected = {"ran": False}
+
+        def _collect_moves_identity(current, *args, **kwargs):
+            collected["ran"] = True
+            h.switcher._write_credentials(json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2", "refreshToken": "rt-2",
+                "expiresAt": 99_999_999_999_999}}))
+            (h.temp_home / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": "z@example.com",
+                                  "accountUuid": "uuid-2"},
+            }))
+            return {}, {}, {}
+
+        monkeypatch.setattr(
+            h.engine, "_collect_scheduled_usage", _collect_moves_identity
+        )
+        with patch.object(h.engine, "_perform") as perform:
+            outcome = h.engine.tick()
+        assert collected["ran"], (
+            "the tick never reached its collect pass -- this test cannot fail"
+        )
+        perform.assert_not_called()
+        assert outcome is TickOutcome.NO_ACTION
+
+    def test_tick_bails_when_the_collects_own_adopt_settles_mid_pass(
+        self, temp_home: Path, monkeypatch,
+    ):
+        """Call site (b): the collect pass's own resync can write N's backup
+        mid-pass while `current_account_number()` never moves at all -- the
+        live identity was already N's for the whole tick. The drift check
+        alone (`current_account_number() != current`) cannot see this
+        settle through; only a second `_settle_login_restore()` call, after
+        the collect, catches it."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com", expires_at=99_999_999_999_999)
+        h.seed(2, "z@example.com")  # N's own backup is stale: "rt-2"
+        h.set_active(1)  # A = 1
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["disabled"] = True
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        login = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-2", "refreshToken": "rt-live-2",
+            "expiresAt": 99_999_999_999_999}})
+        h.switcher._write_credentials(login)
+        (h.temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "z@example.com",
+                              "accountUuid": "uuid-2"},
+        }))
+        path = get_credentials_path()
+        now = time.time()
+        os.utime(path, (now - 10.0, now - 10.0))  # past the settle floor
+
+        collected = {"ran": False}
+
+        def _collect_adopts(current, *args, **kwargs):
+            # The shape a real resync leaves: N's own backup now holds the
+            # live login it was missing at tick start. Attributed: this is
+            # slot 2's own (z@example.com's) login.
+            collected["ran"] = True
+            h.switcher._write_account_credentials(
+                "2", "z@example.com", login, attributed=True,
+            )
+            return {}, {}, {}
+
+        monkeypatch.setattr(h.engine, "_collect_scheduled_usage", _collect_adopts)
+        with patch.object(h.engine, "_perform") as perform:
+            outcome = h.engine.tick()
+        assert collected["ran"], (
+            "the tick never reached its collect pass -- this test cannot fail"
+        )
+        perform.assert_not_called()
+        assert outcome is TickOutcome.NO_ACTION
+        active_backup = h.switcher._read_account_credentials("1", "a@example.com")
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            active_backup
+        ), "the second settle call (after the collect) never restored A"
+
+    def test_tick_never_performs_while_a_consume_lock_is_held(
+        self, temp_home: Path,
+    ):
+        """A TRANSIENT settle refusal (T1313) -- someone else holds A's own
+        `.consume-{A}.lock` -- must hold the tick at NO_ACTION, never fall
+        through to an ordinary candidate search that could switch away from
+        a disabled N."""
+        from claude_swap.locking import FileLock
+
+        h = EngineHarness(temp_home)
+        self._seed_settle_candidate(h, age_s=10.0)  # A = 1, N = 2
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["disabled"] = True
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        held_lock = FileLock(h.switcher.credentials_dir / ".consume-1.lock")
+        assert held_lock.acquire(timeout=0)
+        try:
+            with patch.object(h.engine, "_perform") as perform:
+                outcome = h.engine.tick()
+        finally:
+            held_lock.release()
+        perform.assert_not_called()
+        assert outcome is TickOutcome.NO_ACTION
+        delay = h.engine._next_delay(outcome)
+        # A TRANSIENT WAITING is well past the settle floor already, so
+        # arming on `write_time + floor + margin` (already behind `now`)
+        # would spin `_next_delay` at its own 0.1s floor instead of
+        # actually waiting out the margin.
+        assert LOGIN_RESTORE_RECHECK_MARGIN_S / 2 < delay <= (
+            LOGIN_RESTORE_RECHECK_MARGIN_S
+        ), "a transient WAITING must not spin at the 0.1s floor"

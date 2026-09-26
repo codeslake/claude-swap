@@ -249,15 +249,13 @@ def test_item_modified_at_parses_a_captured_attribute_block():
     assert "-w" not in args, "the mdat read must be attribute-only, no -w"
 
 
-def test_item_modified_at_none_on_absent_item():
+@pytest.mark.parametrize("returncode, stdout", [
+    (44, ""),                    # absent item (rc-44)
+    (0, "attributes:\n"),        # no "mdat" attribute in the output
+])
+def test_item_modified_at_none_when_unavailable(returncode, stdout):
     with patch("claude_swap.macos_keychain.subprocess.run") as run:
-        run.return_value = _completed(44)
-        assert macos_keychain.item_modified_at("svc", "acct") is None
-
-
-def test_item_modified_at_none_on_unparseable_output():
-    with patch("claude_swap.macos_keychain.subprocess.run") as run:
-        run.return_value = _completed(0, stdout="attributes:\n")
+        run.return_value = _completed(returncode, stdout=stdout)
         assert macos_keychain.item_modified_at("svc", "acct") is None
 
 

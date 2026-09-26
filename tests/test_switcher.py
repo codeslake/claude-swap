@@ -40,7 +40,9 @@ from claude_swap.settings import AutoSwitchSettings, save_settings
 from claude_swap.credentials import ActiveCredentials, CredentialStore
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
+    LOGIN_RESTORE_SETTLE_FLOOR_S,
     ClaudeAccountSwitcher,
+    LoginRestoreOutcome,
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
@@ -21913,25 +21915,27 @@ class TestActiveSlotStrikeParity:
             s._fetch_active_usage("2", "b@example.com", fresh)
         resync.assert_not_called()
 
+    @pytest.mark.parametrize("differs_from_backup", [True, False])
     def test_degraded_read_logs_ignored_only_when_it_differs_from_the_backup(
         self, temp_home: Path, mock_claude_config: Path,
-        sample_sequence_data: dict, caplog
+        sample_sequence_data: dict, caplog, differs_from_backup: bool,
     ):
         """T1312 [m]: the "ignored: degraded read" line must not fire every
         pass -- only when the live credential actually differs from the
-        slot's own backup."""
+        slot's own backup; the steady state (live already matches it) is
+        not a detected login and must produce no line."""
         import logging
         from claude_swap.oauth import UsageOutcome
         sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
         s = ClaudeAccountSwitcher()
         s._setup_directories()
         s._write_json(s.sequence_file, sample_sequence_data)
-        backup = json.dumps({
-            "claudeAiOauth": {"accessToken": "sk-backup", "refreshToken": "rt-backup",
-                              "expiresAt": 9999999999000}})
         live = json.dumps({
             "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live",
                               "expiresAt": 9999999999000}})
+        backup = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-backup", "refreshToken": "rt-backup",
+                              "expiresAt": 9999999999000}}) if differs_from_backup else live
         s._write_account_credentials("2", "b@example.com", backup)
         s._record_active_verdict(ActiveCredentials("", False, True))
         with patch(
@@ -21943,36 +21947,11 @@ class TestActiveSlotStrikeParity:
             r.getMessage() for r in caplog.records
             if "ignored: degraded read" in r.getMessage()
         ]
-        assert len(lines) == 1, f"expected one line, got {lines}"
-        assert "email=unknown" in lines[0]
-
-    def test_degraded_read_logs_nothing_when_live_equals_the_backup(
-        self, temp_home: Path, mock_claude_config: Path,
-        sample_sequence_data: dict, caplog
-    ):
-        """T1312 [m]: the steady state (live already matches the slot's own
-        backup) is not a detected login and must produce no line."""
-        import logging
-        from claude_swap.oauth import UsageOutcome
-        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        s._write_json(s.sequence_file, sample_sequence_data)
-        live = json.dumps({
-            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live",
-                              "expiresAt": 9999999999000}})
-        s._write_account_credentials("2", "b@example.com", live)
-        s._record_active_verdict(ActiveCredentials("", False, True))
-        with patch(
-            "claude_swap.oauth.try_fetch_usage_for_account",
-            return_value=UsageOutcome({"five_hour": {"utilization": 10}}),
-        ), caplog.at_level(logging.INFO, logger="claude-swap"):
-            s._fetch_active_usage("2", "b@example.com", live)
-        lines = [
-            r.getMessage() for r in caplog.records
-            if "ignored: degraded read" in r.getMessage()
-        ]
-        assert lines == [], f"expected no line in the steady state, got {lines}"
+        if differs_from_backup:
+            assert len(lines) == 1, f"expected one line, got {lines}"
+            assert "email=unknown" in lines[0]
+        else:
+            assert lines == [], f"expected no line in the steady state, got {lines}"
 
     def test_active_strike_healed_by_absent_backup_not_unreadable(
         self, temp_home: Path, mock_claude_config: Path,
@@ -24412,6 +24391,388 @@ class TestALoginLandsInItsOwnSlot:
         assert s._get_sequence_data()["activeAccountNumber"] == 2
 
 
+class TestT1313LoginRestore:
+    """A ``/login`` for a DIFFERENT managed slot (N) is enrolment, never a
+    switch -- the sibling class already pins that for ``activeAccountNumber``.
+    This closes the axis that invariant leaves open: the live STORE and
+    ``~/.claude.json`` must not keep serving N's login once N's own backup
+    already holds it, while the roster's active slot (A) sits right there,
+    healthy and unquarantined.
+
+    Slot 2 (``b@example.com``) is A, the roster's active slot. Slot 1
+    (``c@example.com``) is N, whose own ``/login`` just landed on the live
+    store.
+    """
+
+    def _setup(self, sample_sequence_data, temp_home, *, n_disabled: bool = False):
+        accs = sample_sequence_data["accounts"]
+        accs["2"].update(email="b@example.com", uuid="u-2", organizationUuid="o-2")
+        accs["1"].update(email="c@example.com", uuid="u-1", organizationUuid="o-1",
+                          disabled=n_disabled)
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        active_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2", "refreshToken": "rt-2",
+            "expiresAt": 99_999_999_999_999}})
+        s._write_account_credentials("2", "b@example.com", active_backup)
+        s._write_account_config("2", "b@example.com", json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com",
+                              "accountUuid": "u-2", "organizationUuid": "o-2"},
+        }))
+        # A real `/login` rewrites BOTH the credential store AND
+        # `~/.claude.json`'s `oauthAccount` -- not the credential alone.
+        login = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999}})
+        s._write_credentials(login)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "c@example.com",
+                              "accountUuid": "u-1", "organizationUuid": "o-1"},
+        }))
+        return s, login, active_backup
+
+    @staticmethod
+    def _make_settled_candidate(s, login: str, *, age_s: float = 10.0) -> None:
+        """The shape a prior collect pass leaves: N's OWN backup already
+        holds the login, and the live store's write is ``age_s`` old."""
+        s._write_account_credentials("1", "c@example.com", login)
+        path = get_credentials_path()
+        now = time.time()
+        os.utime(path, (now - age_s, now - age_s))
+
+    @pytest.mark.parametrize("n_disabled", [False, True])
+    def test_settle_restores_the_active_account_past_the_floor(
+        self, temp_home: Path, sample_sequence_data: dict, n_disabled: bool,
+    ):
+        s, login, active_backup = self._setup(
+            sample_sequence_data, temp_home, n_disabled=n_disabled,
+        )
+        self._make_settled_candidate(s, login)
+        with patch.object(s, "_replan_new_active") as replan, \
+             patch.object(s._store, "_log_detected_login") as log_line:
+            outcome = s._settle_login_restore()
+        assert outcome is LoginRestoreOutcome.RESTORED
+        # A just went live -- its poll plan, computed while it sat idle,
+        # must be pulled to the active floor the same way an ordinary
+        # switch's own activation does (`_perform_switch`).
+        replan.assert_called_once_with("2", "b@example.com", "o-2")
+        # `slot` names the login this record is ABOUT (N, whose `/login`
+        # this is), never the account the outcome text names (A).
+        restored_calls = [
+            c for c in log_line.call_args_list
+            if c.kwargs.get("outcome", "").startswith("restored:")
+        ]
+        assert len(restored_calls) == 1
+        assert restored_calls[0].kwargs["slot"] == "1"
+
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            active_backup
+        ), "DEFECT: live was left serving N's login instead of A's own"
+        live_config = json.loads((temp_home / ".claude.json").read_text())
+        assert live_config["oauthAccount"]["emailAddress"] == "b@example.com"
+        data = s._get_sequence_data()
+        assert data["activeAccountNumber"] == 2, "the active pointer moved"
+        assert data["accounts"]["1"].get("disabled", False) == n_disabled, (
+            "N's disabled flag changed"
+        )
+        assert json.loads(s._read_account_credentials(
+            "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live", (
+            "N's own backup must still hold its login"
+        )
+
+    def test_settle_waits_under_the_settle_floor(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Claude Code's own ``/login`` writes the credential and
+        ``~/.claude.json`` non-atomically -- a settle attempted the moment
+        the write is first observed may still be racing the rest of it."""
+        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login, age_s=LOGIN_RESTORE_SETTLE_FLOOR_S - 1)
+        outcome = s._settle_login_restore()
+        assert outcome is LoginRestoreOutcome.WAITING
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "an under-floor settle must never touch the live store"
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_a_login_into_the_active_account_itself_is_not_a_candidate(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """N == A keeps today's behaviour: nothing to restore, since the
+        live login already IS the roster's active account."""
+        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        # Re-point the live login (and its own backup) at A itself.
+        # Attributed: this is slot 2's own (b@example.com's) login.
+        s._write_account_credentials("2", "b@example.com", login, attributed=True)
+        s._write_credentials(login)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com",
+                              "accountUuid": "u-2", "organizationUuid": "o-2"},
+        }))
+        outcome = s._settle_login_restore()
+        assert outcome is LoginRestoreOutcome.NONE
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        )
+
+    @pytest.mark.parametrize("condition", [
+        "quarantined", "inside_margin", "non_finite", "consume_locked",
+        "consume_locked_past_bound", "settled_meanwhile", "engine_quarantined",
+        "engine_quarantined_stale", "engine_quarantined_read_fails",
+        "write_time_unreadable", "write_time_future",
+        "d_backup_changed_meanwhile", "d_backup_unreadable", "backup_unreadable",
+    ])
+    def test_a_refused_restore_never_writes_over_live(
+        self, temp_home: Path, sample_sequence_data: dict,
+        condition: str, monkeypatch,
+    ):
+        from claude_swap.locking import FileLock
+
+        s, login, active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(
+            s, login,
+            # Past `LOGIN_RESTORE_TRANSIENT_BOUND_S`, so the held consume
+            # lock reads as a refusal that has recurred too long, not one
+            # still worth a WAITING recheck.
+            age_s=70.0 if condition == "consume_locked_past_bound" else 10.0,
+        )
+        held_lock = None
+        if condition == "quarantined":
+            monkeypatch.setattr(s, "_slot_token_dead", lambda num, email: num == "2")
+        elif condition == "engine_quarantined":
+            # The auto-switch engine's own ledger, not `_slot_token_dead`'s
+            # (a different quarantine, e.g. an `identity-conflict` strike),
+            # bound to A's OWN current backup fingerprint -- a stale entry
+            # (T1313) must not block a restore forever.
+            state_path = s.backup_dir / "autoswitch_state.json"
+            state_path.write_text(json.dumps({"quarantine": {"2": {
+                "refreshTokenFingerprint": oauth.credential_fingerprint(
+                    active_backup
+                ),
+            }}}))
+        elif condition == "engine_quarantined_stale":
+            # Control: the entry names a fingerprint that is NOT A's
+            # current backup at all (not merely unreadable) -- the
+            # quarantine check must answer False and the restore must go
+            # ahead, same as when no quarantine file exists.
+            state_path = s.backup_dir / "autoswitch_state.json"
+            state_path.write_text(json.dumps({"quarantine": {"2": {
+                "refreshTokenFingerprint": "not-a-real-fingerprint",
+            }}}))
+        elif condition == "engine_quarantined_read_fails":
+            # T1313: the entry matches A's backup exactly as already read
+            # under the lock a few lines up -- but the OLD
+            # `_engine_quarantined` re-read that same backup itself
+            # (unlocked, via the plain reader) and that second read
+            # fails, returning "". The fix takes the locked read's own
+            # fingerprint as an argument instead, so this failure must
+            # never make the check answer "not quarantined".
+            state_path = s.backup_dir / "autoswitch_state.json"
+            state_path.write_text(json.dumps({"quarantine": {"2": {
+                "refreshTokenFingerprint": oauth.credential_fingerprint(
+                    active_backup
+                ),
+            }}}))
+            real_read = s._read_account_credentials
+
+            def _failing_read(num, email):
+                if (num, email) == ("2", "b@example.com"):
+                    return ""
+                return real_read(num, email)
+
+            monkeypatch.setattr(s, "_read_account_credentials", _failing_read)
+        elif condition == "write_time_unreadable":
+            monkeypatch.setattr(s, "_live_write_time", lambda: None)
+        elif condition == "write_time_future":
+            future = time.time() + 10.0
+            monkeypatch.setattr(s, "_live_write_time", lambda: future)
+        elif condition in (
+            "d_backup_changed_meanwhile", "d_backup_unreadable", "backup_unreadable",
+        ):
+            # The re-check under the lock, patched at one (num, email) pair:
+            # a genuine mismatch (read succeeds, differs) for N's own backup
+            # is "no longer matches" (permanent); a read that FAILS, for
+            # either N's or A's own backup, is transient (T1313).
+            real_ex = s._read_account_credentials_ex
+            match, result = {
+                "d_backup_changed_meanwhile": (("1", "c@example.com"), ("", False)),
+                "d_backup_unreadable": (("1", "c@example.com"), ("", True)),
+                "backup_unreadable": (("2", "b@example.com"), ("", True)),
+            }[condition]
+
+            def _patched_ex(num, email):
+                if (num, email) == match:
+                    return result
+                return real_ex(num, email)
+
+            monkeypatch.setattr(s, "_read_account_credentials_ex", _patched_ex)
+        elif condition == "inside_margin":
+            s._write_account_credentials("2", "b@example.com", json.dumps({
+                "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
+                                  "expiresAt": 1}}))
+        elif condition == "non_finite":
+            s._write_account_credentials("2", "b@example.com", json.dumps({
+                "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
+                                  "expiresAt": float("nan")}}))
+        elif condition in ("consume_locked", "consume_locked_past_bound"):
+            held_lock = FileLock(s.credentials_dir / ".consume-2.lock")
+            assert held_lock.acquire(timeout=0)
+        elif condition == "settled_meanwhile":
+            # Something else (a second settle, a manual switch to N) already
+            # caught up between the pre-lock candidate check and the lock --
+            # simulated by moving the roster's own active pointer the moment
+            # it is re-read UNDER the lock.
+            real_get = s._get_sequence_data
+            calls = {"n": 0}
+
+            def _racy_get():
+                calls["n"] += 1
+                data = real_get()
+                if calls["n"] >= 2 and data is not None:
+                    data["activeAccountNumber"] = 1
+                return data
+
+            monkeypatch.setattr(s, "_get_sequence_data", _racy_get)
+        try:
+            outcome = s._settle_login_restore()
+        finally:
+            if held_lock is not None:
+                held_lock.release()
+        # The three TRANSIENT refusals (T1313) answer WAITING within the
+        # bound; "engine_quarantined_stale" is the positive control --
+        # a quarantine entry that plainly does not name A's backup must
+        # not block a legitimate restore; everything else, including the
+        # SAME refusal past the bound, answers NONE like it always has.
+        expected = (
+            LoginRestoreOutcome.RESTORED
+            if condition == "engine_quarantined_stale"
+            else LoginRestoreOutcome.WAITING
+            if condition in (
+                "consume_locked", "d_backup_unreadable", "backup_unreadable",
+            )
+            else LoginRestoreOutcome.NONE
+        )
+        assert outcome is expected, condition
+        live_now = s._read_credentials()
+        if condition == "engine_quarantined_stale":
+            assert (
+                oauth.credential_fingerprint(live_now)
+                == oauth.credential_fingerprint(active_backup)
+            ), f"a stale quarantine entry ({condition}) must not block a restore"
+        else:
+            assert (
+                oauth.credential_fingerprint(live_now)
+                == oauth.credential_fingerprint(login)
+            ), f"a refused restore ({condition}) must leave live on N's login"
+
+    def test_settle_keeps_a_live_mcpOAuth_key(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """The restore must carry the live credential's machine-shared
+        ``mcpOAuth`` forward, same as an ordinary switch's activation
+        does -- never silently drop it with A's stale stored snapshot."""
+        s, login, active_backup = self._setup(sample_sequence_data, temp_home)
+        live_with_mcp = json.dumps({
+            **json.loads(login),
+            "mcpOAuth": {"server": {"refreshToken": "keep-me"}},
+        })
+        s._write_credentials(live_with_mcp)
+        self._make_settled_candidate(s, live_with_mcp)
+        outcome = s._settle_login_restore()
+        assert outcome is LoginRestoreOutcome.RESTORED
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            active_backup
+        )
+        assert json.loads(live_now).get("mcpOAuth") == {
+            "server": {"refreshToken": "keep-me"}
+        }
+
+    def test_the_resync_no_drift_return_triggers_the_settle(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Call site (a): once N's own backup adopts the login, the very
+        next collect pass through ``_resync_rotated_backup`` lands on the
+        no-drift return -- which must trigger the settle rather than
+        silently leaving live on N forever."""
+        s, login, active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login)
+        s._resync_rotated_backup("1", "c@example.com", "o-1", login)
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            active_backup
+        ), "the no-drift return never called the settle"
+
+    def test_switch_reports_the_restore_and_switches_nothing(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Call site (d): the pin's 429 handler calls ``switch()`` about
+        the account a `/login` just displaced -- once that login is
+        settled back onto A, there is nothing left to switch away from."""
+        s, login, active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login)
+        with patch.object(s, "_perform_switch") as perform:
+            result = s.switch(strategy="best", json_output=True)
+        perform.assert_not_called()
+        assert result["switched"] is False
+        assert result["reason"] == "login-restored"
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            active_backup
+        )
+
+    def test_switch_does_not_settle_when_a_is_walled(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """When the CALLER's own `exclude` already walls A (the pin's 429
+        handler, about A itself), restoring exactly the account it is
+        trying to leave would undo the reason it called at all -- settle
+        must not even run, and the normal candidate search takes over."""
+        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login)
+        usage = {"1": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 0.0}}}
+        with patch.object(s, "_settle_login_restore") as settle, \
+             patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="best", json_output=True, exclude=["2"])
+        settle.assert_not_called()
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "a walled A must never be restored onto live"
+
+    def test_live_write_time_takes_the_later_of_mdat_and_the_file(
+        self, temp_home: Path,
+    ):
+        """A `/login`'s two writes (Keychain, plaintext fallback) can each
+        lag the other -- the settle floor must wait out BOTH, so this reads
+        the LATER of the two, never one alone (T1313)."""
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        # The plaintext file directly -- what a Keychain-blind read would
+        # have served, per `_live_write_time`'s own docstring -- rather than
+        # `_write_credentials`, which on MACOS would route to a real
+        # Keychain this sandbox does not have.
+        get_credentials_path().write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "sk", "refreshToken": "rt"}}))
+        os.utime(get_credentials_path(), (1_000_000.0, 1_000_000.0))
+        with patch.object(
+            s._store, "_active_oauth_keychain_mdat", return_value=2_000_000.0,
+        ):
+            assert s._live_write_time() == 2_000_000.0, "mdat is later"
+        with patch.object(
+            s._store, "_active_oauth_keychain_mdat", return_value=500_000.0,
+        ):
+            assert s._live_write_time() == 1_000_000.0, "the file is later"
+
+
 class TestLoginLineHelper:
     """`_log_detected_login`: every detected login gets exactly one INFO
     ``login:`` line per (fingerprint, outcome), whatever the outcome, so a
@@ -24424,16 +24785,15 @@ class TestLoginLineHelper:
         "refreshToken": "sk-ant-ort01-SECRET-REFRESH-VALUE",
         "expiresAt": 1}})
 
-    @pytest.mark.parametrize("outcome", [
-        "adopted into slot 1",
-        "registered as slot 3",
-        "ignored: displaced copy already held by slot 2",
-        "refused: healthy slot kept",
-        "ignored: already stored",
-    ])
     def test_one_line_per_fp_outcome_across_two_passes(
-        self, temp_home: Path, caplog, outcome: str,
+        self, temp_home: Path, caplog,
     ):
+        # The dedup key is (fingerprint, outcome) -- any outcome string
+        # exercises the same mechanism, so one representative literal
+        # covers it; the other outcome-producing paths get their OWN
+        # coverage from `test_the_adopted_outcome_line_is_driven_by_the_
+        # real_adopt_path` below.
+        outcome = "adopted into slot 1"
         import logging
 
         s = ClaudeAccountSwitcher()
@@ -24475,7 +24835,10 @@ class TestLoginLineHelper:
         or ``"sha256-full:<hex>"``. Slicing THAT string to 8 characters
         (the field's old implementation) took mostly the prefix's own
         letters, not the digest. The displayed ``fp=`` field must be 8 hex
-        characters of the digest itself."""
+        characters of the digest itself -- and the dedup set (folded in
+        here) must remember the FULL fingerprint, not that displayed
+        slice, or two unrelated credentials sharing a slice could wrongly
+        suppress each other's line."""
         import logging
         import re
 
@@ -24499,19 +24862,6 @@ class TestLoginLineHelper:
         )
         assert not fp_field.startswith("sha256"), (
             "the fp field still carries the fingerprint's prefix"
-        )
-
-    def test_dedup_keys_on_the_full_fingerprint_not_the_displayed_slice(
-        self, temp_home: Path,
-    ):
-        """T1312 [C]: the dedup set must remember the FULL fingerprint, not
-        the 8-character slice shown in the log line -- two unrelated
-        credentials could otherwise share a displayed slice and wrongly
-        suppress each other's line."""
-        s = ClaudeAccountSwitcher()
-        full_fp = oauth.credential_fingerprint(self._CREDS)
-        s._store._log_detected_login(
-            self._CREDS, slot="1", outcome="adopted into slot 1",
         )
         assert (full_fp, "adopted into slot 1") in s._store._login_line_seen
 

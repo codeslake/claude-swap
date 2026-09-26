@@ -5,8 +5,10 @@ from __future__ import annotations
 import dataclasses
 import errno
 import hashlib
+import enum
 import json
 import logging
+import math
 import os
 import secrets
 import re
@@ -128,6 +130,34 @@ _FETCH_STAGGER_S = 0.25
 # serve TTL the data is current by design (that is the polling cadence), so
 # an age note there would be permanent noise.
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
+
+# T1313: minimum age of the live store's own write before
+# `_settle_login_restore` will act on it. Claude Code's `/login` writes the
+# credential and `~/.claude.json` non-atomically, so a settle attempted right
+# after the write is first observed may still be racing the rest of it.
+LOGIN_RESTORE_SETTLE_FLOOR_S = 5.0
+# Small margin added on top of the floor when scheduling the next recheck
+# after a WAITING verdict, so the recheck lands just past the floor rather
+# than racing it again.
+LOGIN_RESTORE_RECHECK_MARGIN_S = 1.0
+# T1313: how long a TRANSIENT refusal (someone else's `.consume-*.lock`,
+# a backup read that failed this instant, contention on the settle's own
+# lock) may keep answering WAITING before it answers NONE instead, same as
+# every other refusal. Unbounded, a refusal that keeps recurring on N would
+# park the engine in front of it forever.
+LOGIN_RESTORE_TRANSIENT_BOUND_S = 60.0
+# Clock-skew allowance for a live write time read in the future. Past this,
+# "in the future" is itself the answer -- nothing here would make it move
+# backward, so waiting for it would never clear.
+LOGIN_RESTORE_CLOCK_SKEW_S = 5.0
+
+
+class LoginRestoreOutcome(enum.Enum):
+    """Tri-state result of :meth:`ClaudeAccountSwitcher._settle_login_restore`."""
+
+    RESTORED = "restored"
+    WAITING = "waiting"
+    NONE = "none"
 
 
 def _pace_marker(window: dict, fetched_at: float | None) -> str:
@@ -921,6 +951,40 @@ class ClaudeAccountSwitcher:
         if emit_output:
             warning(msg)
         return salvage
+
+    def _write_oauth_account_to_live_config(
+        self,
+        config_path: Path,
+        oauth_section: dict,
+        fallback_config_data: dict,
+        *,
+        emit_output: bool,
+        warnings_out: list[str],
+    ) -> None:
+        """Splice ``oauthAccount`` into the live ``~/.claude.json``,
+        preserving every other key -- local settings, projects, anything the
+        pin needs -- rather than replacing the file. Used by
+        :meth:`_settle_login_restore`; :meth:`_perform_switch` still carries
+        its own, separate splice.
+
+        Falls back to the full stored config only when no live config exists
+        to splice into. ``_read_json`` answers ``None`` for ABSENT and for
+        TORN alike, so an unreadable (not merely missing) file is salvaged
+        aside first -- best-effort -- rather than silently discarded before
+        the fallback write replaces it.
+        """
+        existing_config = (
+            self._read_json(config_path) if config_path.exists() else None
+        )
+        if existing_config is not None:
+            # `is not None`, not truthiness: a valid but empty `{}` is
+            # readable and loses nothing by being spliced.
+            existing_config["oauthAccount"] = oauth_section
+            self._write_json(config_path, existing_config)
+        else:
+            if config_path.exists():
+                self._salvage_unreadable(config_path, emit_output, warnings_out)
+            self._write_json(config_path, fallback_config_data)
 
     def _write_json(self, path: Path, data: dict) -> None:
         """Write JSON atomically: 0600 temp, read-back check, rename publish.
@@ -7927,6 +7991,20 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 # already reads the live identity directly and needs no
                 # help from this bookkeeping field. NOT A LOGIN: no line --
                 # this is the steady state, not a detected login.
+                #
+                # T1313: this IS the shape a non-active `/login` settles
+                # into once its own slot's backup has adopted it -- cheap
+                # gate (one roster read, no Keychain/network call) before
+                # the stateless settle below re-derives and re-verifies
+                # everything on its own.
+                roster_active = (self._get_sequence_data() or {}).get(
+                    "activeAccountNumber"
+                )
+                if (
+                    roster_active is not None
+                    and str(roster_active) != str(account_num)
+                ):
+                    self._settle_login_restore()
                 return
             # Read only past the no-drift return: the identity lookup is
             # wasted on either early return above (a partial token pair, or
@@ -8155,6 +8233,330 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 "newer-generation check still guards the next expiry.",
                 account_num, exc_info=True,
             )
+
+    def _live_write_time(self) -> "float | None":
+        """When the live credential store was last written, best-effort.
+
+        macOS: the LATER of the served OAuth Keychain item's ``mdat`` and the
+        plaintext file's mtime -- a `/login` there can update either one
+        first, and taking only one risks reading the floor as already past
+        while the other write is still landing. Every other platform: the
+        plaintext file's mtime -- there is no Keychain.
+
+        ``None`` only when neither is readable: an unknown write time is not
+        evidence the settle floor has passed, never a stand-in for "old
+        enough".
+        """
+        mdat = (
+            self._store._active_oauth_keychain_mdat()
+            if self.platform == Platform.MACOS else None
+        )
+        try:
+            file_mtime = get_credentials_path().stat().st_mtime
+        except OSError:
+            file_mtime = None
+        if mdat is None:
+            return file_mtime
+        if file_mtime is None:
+            return mdat
+        return max(mdat, file_mtime)
+
+    def _engine_quarantined(self, num: str, fingerprint: str | None) -> bool:
+        """Is slot ``num`` in the auto-switch engine's own quarantine ledger
+        right now (its ``autoswitch_state.json``, e.g. an
+        ``identity-conflict`` entry -- see ``AutoSwitchEngine._quarantine``)?
+
+        Read directly off disk, best-effort like every other settle
+        precondition: this file is the engine's own (``.autoswitch_state.lock``
+        guards its writes), and the settle never opens that lock, only reads
+        past it.
+
+        ``fingerprint`` is the caller's OWN fingerprint of ``num``'s backup,
+        from a read already done under :attr:`lock_file` -- never re-read
+        here. A second, unlocked read of that same backup can FAIL and
+        return ``""``, whose fingerprint is ``None`` and mismatches every
+        real entry, so the caller's genuinely quarantined backup would read
+        as "not quarantined" on nothing but that read's bad luck (T1313).
+        An unreadable backup never reaches this call at all: the locked
+        read that produced ``fingerprint`` already turned that case into a
+        transient refusal before this is checked.
+
+        Counted only while the entry's own ``refreshTokenFingerprint`` still
+        matches ``num``'s current backup -- the same comparison
+        ``AutoSwitchEngine._release_recovered_quarantines`` uses to decide a
+        quarantine is stale. That release only runs from an engine tick, so
+        in manual mode (no engine running) a login already replaced there
+        would otherwise refuse every restore forever with nothing left to
+        lift it. ``fingerprintUnknown`` (the generation was never learned)
+        still counts, same as the release leaves it bound rather than
+        cleared.
+        """
+        try:
+            raw = json.loads(
+                (self.backup_dir / "autoswitch_state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        quarantine = raw.get("quarantine") if isinstance(raw, dict) else None
+        entry = quarantine.get(num) if isinstance(quarantine, dict) else None
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("fingerprintUnknown"):
+            return True
+        return fingerprint == entry.get("refreshTokenFingerprint")
+
+    def _settle_login_restore(self) -> LoginRestoreOutcome:
+        """Put the live store back on the roster's active account A after a
+        ``/login`` of a different managed slot N landed on it and N's own
+        backup already holds that login (T1313).
+
+        Disk-derived and stateless: every call re-derives the candidate from
+        the roster and the live store, so nothing here is lost between
+        calls and nothing needs to be dropped when it stops applying.
+        Called from the collect path (:meth:`_resync_rotated_backup`'s
+        no-drift return), the auto engine's tick (before ``current`` is read
+        and again, directly after its collect pass, since that pass can
+        settle a login itself without moving ``current_account_number()``
+        at all) and :meth:`switch`. Never raises.
+
+        Candidate: the live read is not degraded, the roster names an
+        active account A, the derived active slot D differs from A, and the
+        live fingerprint already matches D's own backup -- the login is
+        already safely stored, so nothing is lost by overwriting live.
+
+        Settle floor: :data:`LOGIN_RESTORE_SETTLE_FLOOR_S` since the live
+        store was last written (:meth:`_live_write_time`) -- Claude Code's
+        own ``/login`` writes the credential and ``~/.claude.json`` non-
+        atomically, so acting immediately risks racing the rest of that
+        write. An unreadable write time answers NONE, not WAITING: nothing
+        here would ever make it readable, so WAITING for it would never
+        clear. A write time in the future (beyond
+        :data:`LOGIN_RESTORE_CLOCK_SKEW_S`) answers NONE the same way.
+
+        Restore: re-verified under :attr:`lock_file` (roster still names A,
+        live still carries D's fingerprint, and D's own backup -- re-read
+        under the lock -- still matches too), then A's backup must be a
+        complete OAuth pair, unquarantined, with a finite numeric
+        ``expiresAt`` outside Claude Code's refresh margin, and a non-
+        blocking ``.consume-{A}.lock`` must succeed -- each a condition that
+        can change, so a refusal here is not remembered, only re-derived on
+        the next call. Activation reuses the switch path's own pieces
+        (:meth:`_target_config`, :meth:`_prepare_credentials_for_activation`,
+        :meth:`_write_oauth_account_to_live_config`) and rolls back the same
+        way. No probe, refresh, grant, roster write or disabled-flag write.
+        """
+        active = self._read_active_credentials()
+        live = active.value
+        if active.degraded or not live or looks_like_api_key(live):
+            return LoginRestoreOutcome.NONE
+        live_fp = oauth.credential_fingerprint(live)
+        if not live_fp:
+            return LoginRestoreOutcome.NONE
+        data = self._get_sequence_data() or {}
+        roster_active = data.get("activeAccountNumber")
+        if roster_active is None:
+            return LoginRestoreOutcome.NONE
+        a_num = str(roster_active)
+        identity = self._live_login_identity()
+        if identity is None:
+            return LoginRestoreOutcome.NONE
+        d_email, d_org = identity
+        d_num = self._find_account_slot(data, d_email, d_org)
+        if d_num is None or d_num == a_num:
+            return LoginRestoreOutcome.NONE
+        d_backup = self._read_account_credentials(d_num, d_email)
+        if live_fp != oauth.credential_fingerprint(d_backup):
+            return LoginRestoreOutcome.NONE  # D's own backup doesn't hold this yet
+
+        def _left(reason: str) -> LoginRestoreOutcome:
+            self._store._log_detected_login(
+                live, slot=d_num, outcome=f"live left on {d_num}: {reason}",
+            )
+            return LoginRestoreOutcome.NONE
+
+        def _transient(reason: str) -> LoginRestoreOutcome:
+            """A refusal that can clear on its own shortly (someone else's
+            lock, a backup read that failed this instant): WAITING lets the
+            next call re-derive it, bounded by
+            :data:`LOGIN_RESTORE_TRANSIENT_BOUND_S` so a refusal that keeps
+            recurring on N cannot hold the engine in front of it forever."""
+            if (time.time() - write_time) >= LOGIN_RESTORE_TRANSIENT_BOUND_S:
+                return _left(reason)
+            self._store._log_detected_login(
+                live, slot=d_num, outcome=f"waiting: {reason}",
+            )
+            return LoginRestoreOutcome.WAITING
+
+        write_time = self._live_write_time()
+        if write_time is None:
+            # Unreadable, not merely unknown-and-recent: WAITING here would
+            # never clear on its own (nothing marks it readable later), and
+            # every call site treats WAITING as "hold, recheck soon" -- so an
+            # unreadable clock would park the engine in front of this account
+            # forever instead of leaving it for the next call to re-derive.
+            return _left("write time unreadable")
+        # Real wall time, not `self._usage_store.clock()`: `write_time` is a
+        # real filesystem mtime (or Keychain `mdat`), and only a clock the
+        # OS itself advances can be compared against it.
+        now = time.time()
+        if write_time - now > LOGIN_RESTORE_CLOCK_SKEW_S:
+            # In the future by more than clock skew: nothing here would ever
+            # make it move backward, so WAITING for it would never clear,
+            # same reasoning as an unreadable write time above.
+            return _left("write time in the future")
+        if (now - write_time) < LOGIN_RESTORE_SETTLE_FLOOR_S:
+            self._store._log_detected_login(
+                live, slot=d_num, outcome="waiting: settle floor",
+            )
+            return LoginRestoreOutcome.WAITING
+
+        try:
+            with FileLock(self.lock_file):
+                data = self._get_sequence_data() or {}
+                roster_active = data.get("activeAccountNumber")
+                if roster_active is None or str(roster_active) == d_num:
+                    return LoginRestoreOutcome.NONE  # settled on its own meanwhile
+                a_num = str(roster_active)
+                a_account = (data.get("accounts") or {}).get(a_num) or {}
+                a_email = a_account.get("email", "")
+                if not a_email:
+                    return _left("no email on record for the active slot")
+                live_now = self._read_credentials()
+                if (
+                    live_now is None
+                    or oauth.credential_fingerprint(live_now) != live_fp
+                ):
+                    return LoginRestoreOutcome.NONE  # moved on since the read above
+                # T1313: re-verify D's OWN backup still holds this exact
+                # login, under the lock too. The unlocked read above is what
+                # made this a CANDIDATE at all, and it is stale the moment
+                # anything else (a second settle, a fresh `/login` racing
+                # this one) could have run between it and here -- writing
+                # over live on that stale premise would drop a login nothing
+                # else has a copy of.
+                d_backup_now, d_unreadable = self._read_account_credentials_ex(
+                    d_num, d_email
+                )
+                if d_unreadable:
+                    return _transient("its backup is unreadable right now")
+                if oauth.credential_fingerprint(d_backup_now) != live_fp:
+                    return _left("its own backup no longer matches")
+                backup, unreadable = self._read_account_credentials_ex(
+                    a_num, a_email
+                )
+                if unreadable:
+                    return _transient("its backup is unreadable right now")
+                backup_oauth = oauth.extract_oauth_data(backup) if backup else None
+                if not (
+                    backup_oauth
+                    and backup_oauth.get("accessToken")
+                    and backup_oauth.get("refreshToken")
+                ):
+                    return _left("no usable stored login")
+                if (
+                    self._slot_token_dead(a_num, a_email)
+                    or self._engine_quarantined(
+                        a_num, oauth.credential_fingerprint(backup)
+                    )
+                ):
+                    return _left("quarantined")
+                expires_at = backup_oauth.get("expiresAt")
+                if not isinstance(expires_at, (int, float)) or (
+                    isinstance(expires_at, float) and not math.isfinite(expires_at)
+                ):
+                    return _left("no numeric expiresAt")
+                if oauth.is_oauth_token_expired(expires_at):
+                    return _left("inside the refresh margin")
+                consume_lock = FileLock(
+                    self.credentials_dir / f".consume-{a_num}.lock"
+                )
+                if not consume_lock.acquire(timeout=0):
+                    return _transient("a consume is in flight")
+                try:
+                    with claude_credentials_lock(), claude_config_lock():
+                        live_now = self._read_credentials()
+                        if (
+                            live_now is None
+                            or oauth.credential_fingerprint(live_now) != live_fp
+                        ):
+                            return LoginRestoreOutcome.NONE
+                        target_config_data = json.loads(
+                            self._target_config(data, a_num, a_email)
+                        )
+                        target_oauth = target_config_data.get("oauthAccount")
+                        if not target_oauth:
+                            return _left("no oauthAccount in the stored config")
+                        # THE IDENTITY FILE NAMES THE PIN WHILE ONE IS SET, the
+                        # same reason switch()'s own splice keeps it there: a
+                        # pinned host's Remote Control bridge is keyed on this
+                        # field, and writing A's raw identity over it here would
+                        # tear that bridge down the way a bare switch used to
+                        # before that splice existed (Rule 0).
+                        from claude_swap import pin as _pin
+
+                        pin_oauth = _pin.identity_for_config(self)
+                        config_path = self._get_claude_config_path()
+                        rollback_config_text = (
+                            config_path.read_text(encoding="utf-8")
+                            if config_path.exists() else None
+                        )
+                        creds_written = False
+                        try:
+                            self._write_credentials(
+                                self._prepare_credentials_for_activation(
+                                    backup, live_now
+                                )
+                            )
+                            creds_written = True
+                            self._write_oauth_account_to_live_config(
+                                config_path, pin_oauth or target_oauth,
+                                dict(target_config_data, oauthAccount=pin_oauth)
+                                if pin_oauth else target_config_data,
+                                emit_output=False, warnings_out=[],
+                            )
+                        except Exception:
+                            if creds_written:
+                                try:
+                                    self._write_credentials(live_now)
+                                except Exception as e:
+                                    self._logger.error(
+                                        "Failed to roll back a login-restore's "
+                                        f"credentials: {e}"
+                                    )
+                            if rollback_config_text is not None:
+                                try:
+                                    config_path.write_text(
+                                        rollback_config_text, encoding="utf-8"
+                                    )
+                                except Exception as e:
+                                    self._logger.error(
+                                        "Failed to roll back a login-restore's "
+                                        f"config: {e}"
+                                    )
+                            raise
+                finally:
+                    consume_lock.release()
+        except LockError:
+            return _transient("lock contention")
+        except Exception as e:
+            self._logger.warning(
+                "Restoring the active account after a non-active login "
+                "raised: %s", e, exc_info=True,
+            )
+            return _left("an internal error")
+        self._logger.info(
+            "Restored the live login to account %s after a /login of a "
+            "different managed slot landed on it.", a_num,
+        )
+        # `slot` names the login this record is ABOUT, same as every other
+        # call in this method (d_num) -- the outcome text is what names A.
+        self._store._log_detected_login(
+            live, slot=d_num, outcome=f"restored: live back on slot {a_num}",
+        )
+        self._replan_new_active(a_num, a_email, a_account.get("organizationUuid", ""))
+        return LoginRestoreOutcome.RESTORED
 
     def _static_usage_sentinel(
         self, account_info: tuple[int, str, str, str, bool, str, str]
@@ -10007,6 +10409,44 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
 
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
+
+        # T1313: settle first. A caller here (notably the pin's 429 handler,
+        # about the account a `/login` just displaced) is asking "should the
+        # fleet move off the account now live" -- but when that live login
+        # is a different managed slot's own, already safely in its backup,
+        # the answer is to put the roster's active account back, not to rank
+        # a switch away from a login that was never a switch target.
+        #
+        # UNLESS the roster's active account A is itself one of THIS call's
+        # own `exclude` -- the caller already knows A is walled (the pin's
+        # 429 handler, about A itself), so restoring exactly the account it
+        # is trying to leave would undo the reason it called at all. Read
+        # before calling settle, not after: settle's own write is not one to
+        # trigger and then ignore.
+        roster_active_before_settle = (
+            self._get_sequence_data() or {}
+        ).get("activeAccountNumber")
+        if (
+            roster_active_before_settle is None
+            or str(roster_active_before_settle) not in excluded_slots
+        ) and self._settle_login_restore() is LoginRestoreOutcome.RESTORED:
+            data = self._get_sequence_data() or {}
+            a_num = data.get("activeAccountNumber")
+            a_email = (
+                (data.get("accounts") or {}).get(str(a_num)) or {}
+            ).get("email", "")
+            to_ref = account_ref(int(a_num), a_email) if a_num is not None else None
+            message = (
+                f"A /login of a different managed account was restored back "
+                f"to Account-{a_num} ({a_email}); nothing else was switched."
+            )
+            if json_output:
+                return self._switch_noop(
+                    strategy=strategy_label, reason="login-restored",
+                    message=message, to_ref=to_ref,
+                )
+            print(dimmed(message))
+            return None
 
         # THE LIVE LOGIN. This decides which slot is being switched AWAY
         # from; the identity file names the PIN after a rotation, so reading
