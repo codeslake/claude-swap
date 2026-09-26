@@ -6386,10 +6386,19 @@ class ClaudeAccountSwitcher:
             recurring on N cannot hold the engine in front of it forever.
             ``write_time is None`` is not "unbounded transient": nothing
             here would ever make an unreadable clock readable, so this
-            answers NONE the same as that check does further down."""
-            if write_time is None or (
-                time.time() - write_time
-            ) >= LOGIN_RESTORE_TRANSIENT_BOUND_S:
+            answers NONE the same as that check does further down. Nor is
+            a ``write_time`` more than :data:`LOGIN_RESTORE_CLOCK_SKEW_S`
+            in the future: ``time.time() - write_time`` is then negative
+            and would never reach the bound above, and nothing here would
+            ever make it move backward either -- called from BEFORE the
+            module's own future-write-time check further down, so this
+            bound must answer the same NONE that check does, on its own."""
+            if write_time is None:
+                return _left(reason)
+            now = time.time()
+            if (now - write_time) >= LOGIN_RESTORE_TRANSIENT_BOUND_S or (
+                write_time - now > LOGIN_RESTORE_CLOCK_SKEW_S
+            ):
                 return _left(reason)
             self._store._log_detected_login(
                 live, slot=d_num, outcome=f"waiting: {reason}",

@@ -1568,9 +1568,16 @@ class AutoSwitchEngine:
         call sites (T1313) -- before ``current`` is read, and again after the
         collect pass, whose own resync can settle a login mid-pass without
         moving ``current_account_number()`` at all (see the second call
-        site's comment)."""
+        site's comment) -- and by ``_next_delay``'s own recheck (T1313
+        correctness-pass item 5), once the ordinary cadence is computed.
+
+        A suppressed WAITING (``self.dry_run``) is never armed: the write
+        stays suppressed for as long as this engine runs, so nothing here
+        would ever clear it sooner, and arming it would spin every tick at
+        the 1s recheck margin instead of the ordinary cadence for no gain.
+        """
         settle = self.switcher._settle_login_restore()
-        if settle is LoginRestoreOutcome.WAITING:
+        if settle is LoginRestoreOutcome.WAITING and not self.dry_run:
             # Real wall time, not `self.clock()`: the floor is measured
             # against a real filesystem mtime (or Keychain `mdat`), which
             # only the OS's own clock can be compared against -- `self.clock`
@@ -3657,7 +3664,16 @@ class AutoSwitchEngine:
         schedule. ``_switch_in_flight`` closes that: the release waits on the
         switch rather than on the state lock, which ``_perform`` already holds
         and which callers reach through this method.
+
+        Clears the switcher's write suppression too (T1313 correctness-pass
+        item 4 sets it every tick, but nothing else ever clears it): a
+        stopped engine ticks no more, so left True it would make every
+        later ``_settle_login_restore()`` call on this same switcher --
+        a manual collect, or a freshly promoted LIVE engine, since the
+        switcher outlives any one engine -- answer WAITING forever instead
+        of performing the write.
         """
+        self.switcher._suppress_login_restore_write = False
         self._stop.set()
         self._wake.set()
         with self._stop_lock:
@@ -3778,7 +3794,23 @@ class AutoSwitchEngine:
         # no signal reaching `_settle_wait_until` above -- that check ran
         # BEFORE this call. Recheck now that the delay is computed, and cap
         # it the same way an already-armed wait would.
-        if self._settle_or_arm_wait() is LoginRestoreOutcome.WAITING:
+        #
+        # Stop-gated, same reason `_respect_poll_plan` guards itself just
+        # above (see its own docstring): `run_loop` calls this on the
+        # tick's own thread AFTER `tick()` has returned, so a `stop()`
+        # landing in that gap may already have handed LIVE to a successor
+        # by the time this recheck runs -- performing the write here would
+        # do it for an engine that no longer holds LIVE.
+        if self._stop.is_set():
+            return delay
+        # A suppressed WAITING leaves `_settle_wait_until` unarmed (see
+        # `_settle_or_arm_wait`'s own docstring) -- guard on it too, not
+        # just the outcome, or this falls back to the ordinary cadence
+        # already computed above instead of a `None` arithmetic error.
+        if (
+            self._settle_or_arm_wait() is LoginRestoreOutcome.WAITING
+            and self._settle_wait_until is not None
+        ):
             delay = min(delay, max(self._settle_wait_until - time.time(), 0.1))
         return delay
 
@@ -3931,6 +3963,11 @@ class AutoSwitchEngine:
             if not self._stop.is_set():
                 reason = "consumer gone" if self._consumer_gone else "unhandled error"
                 self._release_live()
+                # This path exits without ever calling `stop()` (its own
+                # clearing is conditioned on `not self._stop.is_set()`
+                # above), so the write suppression left by this engine's
+                # last tick needs clearing here too.
+                self.switcher._suppress_login_restore_write = False
                 self._emit(
                     ErrorEvent(message=f"engine stopped: {reason}", transient=False)
                 )

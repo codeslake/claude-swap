@@ -20912,6 +20912,7 @@ class TestT1313LoginRestore:
         "write_time_unreadable", "write_time_future",
         "d_backup_changed_meanwhile", "d_backup_unreadable", "backup_unreadable",
         "d_backup_unreadable_before_lock", "write_suppressed",
+        "d_backup_unreadable_write_time_future",
     ])
     def test_a_refused_restore_never_writes_over_live(
         self, temp_home: Path, sample_sequence_data: dict,
@@ -21012,6 +21013,24 @@ class TestT1313LoginRestore:
                 return real_ex(num, email)
 
             monkeypatch.setattr(s, "_read_account_credentials_ex", _patched_ex)
+        elif condition == "d_backup_unreadable_write_time_future":
+            # `_transient`'s own bound compares `time.time() - write_time`,
+            # which is NEGATIVE for a write time in the future -- so this
+            # never trips the bound, and `_transient` (reached here from
+            # the UNLOCKED candidacy read, ahead of the module's own
+            # future-write-time check further down) would WAIT forever
+            # instead of answering NONE the same way "write_time_future"
+            # already does for the read that succeeds.
+            future = time.time() + 3600.0
+            monkeypatch.setattr(s, "_live_write_time", lambda: future)
+            real_ex = s._read_account_credentials_ex
+
+            def _unreadable_ex(num, email):
+                if (num, email) == ("1", "c@example.com"):
+                    return "", True
+                return real_ex(num, email)
+
+            monkeypatch.setattr(s, "_read_account_credentials_ex", _unreadable_ex)
         elif condition == "d_backup_unreadable_before_lock":
             # T1313 (correctness-pass item 1): the UNLOCKED candidacy check
             # -- before `write_time` is even computed -- used the plain
