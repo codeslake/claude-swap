@@ -54,7 +54,7 @@ from claude_swap.poll_policy import (
     binding_pct,
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
-from claude_swap.switcher import _PENDING_RESTORE_MIN_AGE_S, ClaudeAccountSwitcher
+from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -1577,16 +1577,6 @@ class AutoSwitchEngine:
             else {}
         )
 
-        # T1312: settle any restore a PRIOR tick's collect queued BEFORE
-        # reading `current` for THIS tick -- otherwise a `/login` into a
-        # disabled slot races the restore: `current` would read as the
-        # still-displaced login, the disabled-active trigger below would
-        # fire, and `_perform` would land on whichever slot ranks top --
-        # not necessarily the account the restore is about to put back.
-        # Mirrors the collect pass's own call (`usage_entries_by_account` ->
-        # `_process_pending_active_restores`), so this is a no-op when
-        # nothing is queued.
-        self.switcher._process_pending_active_restores()
         # Read once, ahead of the trace block below, which needs THIS
         # tick's value to tell a switched-away account from the one the
         # last tick's offset/carry were baselined against.
@@ -1688,21 +1678,6 @@ class AutoSwitchEngine:
                 },
             )
         )
-
-        # T1312: the collect just ran and may itself have QUEUED a restore
-        # for a login it just saw (never applied one -- that is a LATER
-        # tick's job, same as the settle-first call above). `current` above
-        # is what this tick would act on, and either condition means it can
-        # no longer be trusted: a queued restore says the live identity is
-        # about to be corrected out from under it, and a changed identity
-        # says it already was. Bail rather than `_perform` onto the wrong
-        # account; a later tick's settle-first call corrects it.
-        if (
-            self.switcher._pending_active_restores
-            or self.switcher.current_account_number() != current
-        ):
-            self._emit(NoSwitchEvent(reason="pending-restore"))
-            return TickOutcome.NO_ACTION
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
@@ -2003,17 +1978,6 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
-            # T1312 item 5: this re-collect runs `_process_pending_active_
-            # restores` too (the same call the tick's own settle-first call
-            # above makes), so it can just as easily queue -- or settle -- a
-            # restore as the FIRST collect did. Repeat the bail: `_perform`ing
-            # on `current` below would still be wrong for either reason.
-            if (
-                self.switcher._pending_active_restores
-                or self.switcher.current_account_number() != current
-            ):
-                self._emit(NoSwitchEvent(reason="pending-restore"))
-                return TickOutcome.NO_ACTION
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
@@ -3696,17 +3660,6 @@ class AutoSwitchEngine:
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
-        if self.switcher._pending_active_restores:
-            # T1312 item 1: a pending restore's NO_ACTION used to sleep the
-            # full jittered `interval` (54-66s at the 60s default) — past
-            # `_PENDING_RESTORE_MAX_AGE_S`'s 60s ceiling by enough that the
-            # settle-first call on the NEXT tick found the entry already
-            # too old and dropped it unattempted, never restoring the
-            # account the login displaced. Wake at the min-age floor (plus
-            # a small margin for the collect pass itself) instead, capped
-            # at `interval` so this never LENGTHENS an already-short
-            # cadence.
-            return min(_PENDING_RESTORE_MIN_AGE_S + 1.0, interval)
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:
                 delay = self._sleep_until_ts - self.clock()
