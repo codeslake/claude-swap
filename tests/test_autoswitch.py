@@ -13453,14 +13453,57 @@ class TestT1313SettleWiring:
         now = time.time()
         os.utime(path, (now - 10.0, now - 10.0))  # past the settle floor
 
+        collected = {"ran": False}
+
         def _collect_adopts(current, *args, **kwargs):
             # The shape a real resync leaves: N's own backup now holds the
             # live login it was missing at tick start.
+            collected["ran"] = True
             h.switcher._write_account_credentials("2", "z@example.com", login)
             return {}, {}, {}
 
         monkeypatch.setattr(h.engine, "_collect_scheduled_usage", _collect_adopts)
         with patch.object(h.engine, "_perform") as perform:
             outcome = h.engine.tick()
+        assert collected["ran"], (
+            "the tick never reached its collect pass -- this test cannot fail"
+        )
         perform.assert_not_called()
         assert outcome is TickOutcome.NO_ACTION
+        active_backup = h.switcher._read_account_credentials("1", "a@example.com")
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            active_backup
+        ), "the second settle call (after the collect) never restored A"
+
+    def test_tick_never_performs_while_a_consume_lock_is_held(
+        self, temp_home: Path,
+    ):
+        """A TRANSIENT settle refusal (T1313) -- someone else holds A's own
+        `.consume-{A}.lock` -- must hold the tick at NO_ACTION, never fall
+        through to an ordinary candidate search that could switch away from
+        a disabled N."""
+        from claude_swap.locking import FileLock
+
+        h = EngineHarness(temp_home)
+        self._seed_settle_candidate(h, age_s=10.0)  # A = 1, N = 2
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["disabled"] = True
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        held_lock = FileLock(h.switcher.credentials_dir / ".consume-1.lock")
+        assert held_lock.acquire(timeout=0)
+        try:
+            with patch.object(h.engine, "_perform") as perform:
+                outcome = h.engine.tick()
+        finally:
+            held_lock.release()
+        perform.assert_not_called()
+        assert outcome is TickOutcome.NO_ACTION
+        delay = h.engine._next_delay(outcome)
+        # A TRANSIENT WAITING is well past the settle floor already, so
+        # arming on `write_time + floor + margin` (already behind `now`)
+        # would spin `_next_delay` at its own 0.1s floor instead of
+        # actually waiting out the margin.
+        assert LOGIN_RESTORE_RECHECK_MARGIN_S / 2 < delay <= (
+            LOGIN_RESTORE_RECHECK_MARGIN_S
+        ), "a transient WAITING must not spin at the 0.1s floor"

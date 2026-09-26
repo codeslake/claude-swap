@@ -20904,8 +20904,9 @@ class TestT1313LoginRestore:
 
     @pytest.mark.parametrize("condition", [
         "quarantined", "inside_margin", "non_finite", "consume_locked",
-        "settled_meanwhile", "engine_quarantined", "write_time_unreadable",
-        "d_backup_changed_meanwhile",
+        "consume_locked_past_bound", "settled_meanwhile", "engine_quarantined",
+        "write_time_unreadable", "write_time_future",
+        "d_backup_changed_meanwhile", "d_backup_unreadable", "backup_unreadable",
     ])
     def test_a_refused_restore_never_writes_over_live(
         self, temp_home: Path, sample_sequence_data: dict,
@@ -20913,33 +20914,53 @@ class TestT1313LoginRestore:
     ):
         from claude_swap.locking import FileLock
 
-        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
-        self._make_settled_candidate(s, login)
+        s, login, active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(
+            s, login,
+            # Past `LOGIN_RESTORE_TRANSIENT_BOUND_S`, so the held consume
+            # lock reads as a refusal that has recurred too long, not one
+            # still worth a WAITING recheck.
+            age_s=70.0 if condition == "consume_locked_past_bound" else 10.0,
+        )
         held_lock = None
         if condition == "quarantined":
             monkeypatch.setattr(s, "_slot_token_dead", lambda num, email: num == "2")
         elif condition == "engine_quarantined":
             # The auto-switch engine's own ledger, not `_slot_token_dead`'s
-            # (a different quarantine, e.g. an `identity-conflict` strike).
+            # (a different quarantine, e.g. an `identity-conflict` strike),
+            # bound to A's OWN current backup fingerprint -- a stale entry
+            # (T1313) must not block a restore forever.
             state_path = s.backup_dir / "autoswitch_state.json"
-            state_path.write_text(json.dumps({"quarantine": {"2": {}}}))
+            state_path.write_text(json.dumps({"quarantine": {"2": {
+                "refreshTokenFingerprint": oauth.credential_fingerprint(
+                    active_backup
+                ),
+            }}}))
         elif condition == "write_time_unreadable":
             monkeypatch.setattr(s, "_live_write_time", lambda: None)
-        elif condition == "d_backup_changed_meanwhile":
-            # N's OWN backup no longer matches live by the time the lock is
-            # held -- the unlocked read that made this a candidate is stale
-            # the moment anything else could have run between it and here.
-            real_read = s._read_account_credentials
-            calls = {"n": 0}
+        elif condition == "write_time_future":
+            future = time.time() + 10.0
+            monkeypatch.setattr(s, "_live_write_time", lambda: future)
+        elif condition in (
+            "d_backup_changed_meanwhile", "d_backup_unreadable", "backup_unreadable",
+        ):
+            # The re-check under the lock, patched at one (num, email) pair:
+            # a genuine mismatch (read succeeds, differs) for N's own backup
+            # is "no longer matches" (permanent); a read that FAILS, for
+            # either N's or A's own backup, is transient (T1313).
+            real_ex = s._read_account_credentials_ex
+            match, result = {
+                "d_backup_changed_meanwhile": (("1", "c@example.com"), ("", False)),
+                "d_backup_unreadable": (("1", "c@example.com"), ("", True)),
+                "backup_unreadable": (("2", "b@example.com"), ("", True)),
+            }[condition]
 
-            def _racy_read(num, email):
-                if num == "1" and email == "c@example.com":
-                    calls["n"] += 1
-                    if calls["n"] >= 2:
-                        return None
-                return real_read(num, email)
+            def _patched_ex(num, email):
+                if (num, email) == match:
+                    return result
+                return real_ex(num, email)
 
-            monkeypatch.setattr(s, "_read_account_credentials", _racy_read)
+            monkeypatch.setattr(s, "_read_account_credentials_ex", _patched_ex)
         elif condition == "inside_margin":
             s._write_account_credentials("2", "b@example.com", json.dumps({
                 "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
@@ -20948,7 +20969,7 @@ class TestT1313LoginRestore:
             s._write_account_credentials("2", "b@example.com", json.dumps({
                 "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
                                   "expiresAt": float("nan")}}))
-        elif condition == "consume_locked":
+        elif condition in ("consume_locked", "consume_locked_past_bound"):
             held_lock = FileLock(s.credentials_dir / ".consume-2.lock")
             assert held_lock.acquire(timeout=0)
         elif condition == "settled_meanwhile":
@@ -20972,7 +20993,17 @@ class TestT1313LoginRestore:
         finally:
             if held_lock is not None:
                 held_lock.release()
-        assert outcome is LoginRestoreOutcome.NONE, condition
+        # The three TRANSIENT refusals (T1313) answer WAITING within the
+        # bound; everything else, including the SAME refusal past the
+        # bound, answers NONE like it always has.
+        expected = (
+            LoginRestoreOutcome.WAITING
+            if condition in (
+                "consume_locked", "d_backup_unreadable", "backup_unreadable",
+            )
+            else LoginRestoreOutcome.NONE
+        )
+        assert outcome is expected, condition
         live_now = s._read_credentials()
         assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
             login

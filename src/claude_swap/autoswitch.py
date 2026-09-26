@@ -1575,11 +1575,23 @@ class AutoSwitchEngine:
             # only the OS's own clock can be compared against -- `self.clock`
             # is a test/cooldown seam that need not track it.
             write_time = self.switcher._live_write_time()
-            self._settle_wait_until = (
-                (write_time if write_time is not None else time.time())
-                + LOGIN_RESTORE_SETTLE_FLOOR_S
-                + LOGIN_RESTORE_RECHECK_MARGIN_S
-            )
+            now = time.time()
+            if write_time is not None and (now - write_time) < (
+                LOGIN_RESTORE_SETTLE_FLOOR_S
+            ):
+                self._settle_wait_until = (
+                    write_time
+                    + LOGIN_RESTORE_SETTLE_FLOOR_S
+                    + LOGIN_RESTORE_RECHECK_MARGIN_S
+                )
+            else:
+                # Past the floor already, so this WAITING is one of the
+                # TRANSIENT refusals (a lock held elsewhere, a backup read
+                # that failed this instant) -- `write_time + floor + margin`
+                # is already behind `now`, and arming on it would make
+                # `_next_delay` spin at its own 0.1s floor instead of
+                # actually waiting out the margin.
+                self._settle_wait_until = now + LOGIN_RESTORE_RECHECK_MARGIN_S
         return settle
 
     def _tick_inner(self) -> TickOutcome:

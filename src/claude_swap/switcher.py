@@ -133,6 +133,16 @@ LOGIN_RESTORE_SETTLE_FLOOR_S = 5.0
 # after a WAITING verdict, so the recheck lands just past the floor rather
 # than racing it again.
 LOGIN_RESTORE_RECHECK_MARGIN_S = 1.0
+# T1313: how long a TRANSIENT refusal (someone else's `.consume-*.lock`,
+# a backup read that failed this instant, contention on the settle's own
+# lock) may keep answering WAITING before it answers NONE instead, same as
+# every other refusal. Unbounded, a refusal that keeps recurring on N would
+# park the engine in front of it forever.
+LOGIN_RESTORE_TRANSIENT_BOUND_S = 60.0
+# Clock-skew allowance for a live write time read in the future. Past this,
+# "in the future" is itself the answer -- nothing here would make it move
+# backward, so waiting for it would never clear.
+LOGIN_RESTORE_CLOCK_SKEW_S = 5.0
 
 
 class LoginRestoreOutcome(enum.Enum):
@@ -6211,7 +6221,7 @@ class ClaudeAccountSwitcher:
             return mdat
         return max(mdat, file_mtime)
 
-    def _engine_quarantined(self, num: str) -> bool:
+    def _engine_quarantined(self, num: str, email: str) -> bool:
         """Is slot ``num`` in the auto-switch engine's own quarantine ledger
         right now (its ``autoswitch_state.json``, e.g. an
         ``identity-conflict`` entry -- see ``AutoSwitchEngine._quarantine``)?
@@ -6220,6 +6230,16 @@ class ClaudeAccountSwitcher:
         precondition: this file is the engine's own (``.autoswitch_state.lock``
         guards its writes), and the settle never opens that lock, only reads
         past it.
+
+        Counted only while the entry's own ``refreshTokenFingerprint`` still
+        matches ``num``'s current backup -- the same comparison
+        ``AutoSwitchEngine._release_recovered_quarantines`` uses to decide a
+        quarantine is stale. That release only runs from an engine tick, so
+        in manual mode (no engine running) a login already replaced there
+        would otherwise refuse every restore forever with nothing left to
+        lift it. ``fingerprintUnknown`` (the generation was never learned)
+        still counts, same as the release leaves it bound rather than
+        cleared.
         """
         try:
             raw = json.loads(
@@ -6230,7 +6250,14 @@ class ClaudeAccountSwitcher:
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return False
         quarantine = raw.get("quarantine") if isinstance(raw, dict) else None
-        return isinstance(quarantine, dict) and num in quarantine
+        entry = quarantine.get(num) if isinstance(quarantine, dict) else None
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("fingerprintUnknown"):
+            return True
+        backup = self._read_account_credentials(num, email)
+        fingerprint = oauth.credential_fingerprint(backup) if backup else None
+        return fingerprint == entry.get("refreshTokenFingerprint")
 
     def _settle_login_restore(self) -> LoginRestoreOutcome:
         """Put the live store back on the roster's active account A after a
@@ -6241,9 +6268,10 @@ class ClaudeAccountSwitcher:
         the roster and the live store, so nothing here is lost between
         calls and nothing needs to be dropped when it stops applying.
         Called from the collect path (:meth:`_resync_rotated_backup`'s
-        no-drift return), the auto engine's tick (before and, via its own
-        identity recheck, after the collect passes) and :meth:`switch`.
-        Never raises.
+        no-drift return), the auto engine's tick (before ``current`` is read
+        and again, directly after its collect pass, since that pass can
+        settle a login itself without moving ``current_account_number()``
+        at all) and :meth:`switch`. Never raises.
 
         Candidate: the live read is not degraded, the roster names an
         active account A, the derived active slot D differs from A, and the
@@ -6256,10 +6284,12 @@ class ClaudeAccountSwitcher:
         atomically, so acting immediately risks racing the rest of that
         write. An unreadable write time answers NONE, not WAITING: nothing
         here would ever make it readable, so WAITING for it would never
-        clear.
+        clear. A write time in the future (beyond
+        :data:`LOGIN_RESTORE_CLOCK_SKEW_S`) answers NONE the same way.
 
         Restore: re-verified under :attr:`lock_file` (roster still names A,
-        live still carries D's fingerprint), then A's backup must be a
+        live still carries D's fingerprint, and D's own backup -- re-read
+        under the lock -- still matches too), then A's backup must be a
         complete OAuth pair, unquarantined, with a finite numeric
         ``expiresAt`` outside Claude Code's refresh margin, and a non-
         blocking ``.consume-{A}.lock`` must succeed -- each a condition that
@@ -6298,6 +6328,19 @@ class ClaudeAccountSwitcher:
             )
             return LoginRestoreOutcome.NONE
 
+        def _transient(reason: str) -> LoginRestoreOutcome:
+            """A refusal that can clear on its own shortly (someone else's
+            lock, a backup read that failed this instant): WAITING lets the
+            next call re-derive it, bounded by
+            :data:`LOGIN_RESTORE_TRANSIENT_BOUND_S` so a refusal that keeps
+            recurring on N cannot hold the engine in front of it forever."""
+            if (time.time() - write_time) >= LOGIN_RESTORE_TRANSIENT_BOUND_S:
+                return _left(reason)
+            self._store._log_detected_login(
+                live, slot=d_num, outcome=f"waiting: {reason}",
+            )
+            return LoginRestoreOutcome.WAITING
+
         write_time = self._live_write_time()
         if write_time is None:
             # Unreadable, not merely unknown-and-recent: WAITING here would
@@ -6310,6 +6353,11 @@ class ClaudeAccountSwitcher:
         # real filesystem mtime (or Keychain `mdat`), and only a clock the
         # OS itself advances can be compared against it.
         now = time.time()
+        if write_time - now > LOGIN_RESTORE_CLOCK_SKEW_S:
+            # In the future by more than clock skew: nothing here would ever
+            # make it move backward, so WAITING for it would never clear,
+            # same reasoning as an unreadable write time above.
+            return _left("write time in the future")
         if (now - write_time) < LOGIN_RESTORE_SETTLE_FLOOR_S:
             self._store._log_detected_login(
                 live, slot=d_num, outcome="waiting: settle floor",
@@ -6340,14 +6388,18 @@ class ClaudeAccountSwitcher:
                 # this one) could have run between it and here -- writing
                 # over live on that stale premise would drop a login nothing
                 # else has a copy of.
-                d_backup_now = self._read_account_credentials(d_num, d_email)
+                d_backup_now, d_unreadable = self._read_account_credentials_ex(
+                    d_num, d_email
+                )
+                if d_unreadable:
+                    return _transient("its backup is unreadable right now")
                 if oauth.credential_fingerprint(d_backup_now) != live_fp:
                     return _left("its own backup no longer matches")
                 backup, unreadable = self._read_account_credentials_ex(
                     a_num, a_email
                 )
                 if unreadable:
-                    return _left("its backup is unreadable right now")
+                    return _transient("its backup is unreadable right now")
                 backup_oauth = oauth.extract_oauth_data(backup) if backup else None
                 if not (
                     backup_oauth
@@ -6357,7 +6409,7 @@ class ClaudeAccountSwitcher:
                     return _left("no usable stored login")
                 if (
                     self._slot_token_dead(a_num, a_email)
-                    or self._engine_quarantined(a_num)
+                    or self._engine_quarantined(a_num, a_email)
                 ):
                     return _left("quarantined")
                 expires_at = backup_oauth.get("expiresAt")
@@ -6371,7 +6423,7 @@ class ClaudeAccountSwitcher:
                     self.credentials_dir / f".consume-{a_num}.lock"
                 )
                 if not consume_lock.acquire(timeout=0):
-                    return _left("a consume is in flight")
+                    return _transient("a consume is in flight")
                 try:
                     with claude_credentials_lock(), claude_config_lock():
                         live_now = self._read_credentials()
@@ -6426,7 +6478,7 @@ class ClaudeAccountSwitcher:
                 finally:
                     consume_lock.release()
         except LockError:
-            return _left("lock contention")
+            return _transient("lock contention")
         except Exception as e:
             self._logger.warning(
                 "Restoring the active account after a non-active login "
