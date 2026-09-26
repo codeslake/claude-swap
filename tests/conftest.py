@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -503,6 +504,7 @@ class _KeychainStore:
 
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], str] = {}
+        self.mtimes: dict[tuple[str, str], float] = {}
 
     # Mirrors the ``macos_keychain`` (security CLI) contract.
     def get_password(self, service: str, account: str) -> str | None:
@@ -513,9 +515,18 @@ class _KeychainStore:
 
     def set_password(self, service: str, account: str, password: str) -> None:
         self.data[(service, account)] = password
+        self.mtimes[(service, account)] = time.time()
 
     def delete_password(self, service: str, account: str) -> None:
         self.data.pop((service, account), None)  # absent = no-op (rc 44)
+        self.mtimes.pop((service, account), None)
+
+    def item_modified_at(self, service: str, account: str) -> float | None:
+        """Fake ``macos_keychain.item_modified_at``: the fake store's own
+        write time, or ``None`` for an item never set here (mirrors the
+        real ``security`` wrapper's "absent/unparseable is no evidence").
+        """
+        return self.mtimes.get((service, account))
 
 
 def _make_fake_keyring() -> types.ModuleType:
@@ -618,7 +629,9 @@ def block_real_keychain(request, monkeypatch):
     """Safety net: no test may touch the real macOS Keychain.
 
     Replaces the ``security``-CLI wrapper (``claude_swap.macos_keychain``) with an
-    in-memory fake and injects a fake ``keyring`` module (for the lazy
+    in-memory fake -- including ``item_modified_at``, or a test exercising the
+    mtime-vs-``mdat`` freshness arbitration would shell out to the real
+    ``security`` for it -- and injects a fake ``keyring`` module (for the lazy
     ``import keyring`` paths in purge/migrations). Tests marked
     ``@pytest.mark.no_keychain_fake`` opt out — either because they mock
     ``subprocess`` themselves (the wrapper's own unit tests) or because they run
@@ -634,6 +647,7 @@ def block_real_keychain(request, monkeypatch):
     monkeypatch.setattr(_macos_keychain, "item_exists", store.item_exists)
     monkeypatch.setattr(_macos_keychain, "set_password", store.set_password)
     monkeypatch.setattr(_macos_keychain, "delete_password", store.delete_password)
+    monkeypatch.setattr(_macos_keychain, "item_modified_at", store.item_modified_at)
     monkeypatch.setitem(sys.modules, "keyring", _make_fake_keyring())
     yield store
 

@@ -1638,6 +1638,25 @@ class ClaudeAccountSwitcher:
     def _read_account_credentials(self, account_num: str, email: str) -> str:
         return self._store._read_account_credentials(account_num, email)
 
+    def _log_ignored_degraded_login(
+        self, account_num: str, email: str, creds: str
+    ) -> None:
+        """`_log_detected_login` for the "would have resynced but degraded"
+        case, only when ``creds`` actually differs from the slot's own
+        backup -- the steady state gets no line every pass. Reads the
+        backup via `_read_backup_uncached`, never
+        `_read_account_credentials`: a degraded active read already means
+        the Keychain may be failing, and this comparison is diagnostic
+        only, so it must not flip the Keychain capability cache on behalf
+        of a check nothing else needed. Unattributed either way: the
+        config slot's email/uuid is not this credential's own.
+        """
+        backup = self._store._read_backup_uncached(account_num, email)
+        if oauth.credential_fingerprint(creds) != oauth.credential_fingerprint(backup):
+            self._store._log_detected_login(
+                creds, slot=None, outcome="ignored: degraded read",
+            )
+
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str,
         *, attributed: bool = False,
@@ -5382,12 +5401,20 @@ class ClaudeAccountSwitcher:
         email = (resolved.get("email") or "").strip()
         uuid = resolved.get("uuid") or ""
         if not email or not uuid:
+            self._store._log_detected_login(
+                creds, slot=None, outcome="ignored: partial profile",
+                email=email or None, uuid=uuid or None,
+            )
             return True
         live = self._read_credentials()
         if not live or (
             oauth.credential_fingerprint(live)
             != oauth.credential_fingerprint(creds)
         ):
+            self._store._log_detected_login(
+                creds, slot=None, outcome="ignored: live moved on",
+                email=email, uuid=uuid,
+            )
             return True
         num = str(self._get_next_account_number())
         # attributed=True: `creds` was just matched against `live` (the
@@ -5436,6 +5463,10 @@ class ClaudeAccountSwitcher:
                 "rebuilds one and `export` skips the slot until then: %s",
                 num, e,
             )
+        self._store._log_detected_login(
+            creds, slot=num, outcome=f"registered as slot {num}",
+            email=email, uuid=uuid,
+        )
         self._logger.info(
             "Registered a login as Account-%s (%s): no slot owned it, so it "
             "was given one. The active account is unchanged.", num, email,
@@ -5472,15 +5503,29 @@ class ClaudeAccountSwitcher:
             if not owner:
                 return self._register_login_as_new_slot(data, creds, resolved)
             if owner == account_num:
+                self._store._log_detected_login(
+                    creds, slot=owner,
+                    outcome="ignored: resolves to this slot already",
+                    email=resolved.get("email"), uuid=resolved.get("uuid"),
+                )
                 return True  # nobody here to adopt into
             acc = (data.get("accounts") or {}).get(owner) or {}
             owner_email = (acc.get("email") or "").strip()
             if not owner_email:
+                self._store._log_detected_login(
+                    creds, slot=owner,
+                    outcome="ignored: owner slot has no email on record",
+                    email=resolved.get("email"), uuid=resolved.get("uuid"),
+                )
                 return True  # nothing keys the write; a retry changes nothing
             stored, unreadable = self._read_account_credentials_ex(
                 owner, owner_email
             )
             if unreadable:
+                self._store._log_detected_login(
+                    creds, slot=owner, outcome="refused: owner backup unreadable",
+                    email=owner_email, uuid=resolved.get("uuid"),
+                )
                 return False  # a read that FAILED is not an empty slot
             if stored and (
                 oauth.credential_fingerprint(stored)
@@ -5491,6 +5536,10 @@ class ClaudeAccountSwitcher:
                 # the fleet onto ``owner`` -- only `cswap switch`/`add_account`
                 # are, and writing this slot's own bytes into the CONFIG's
                 # slot is exactly how a cross-wire gets created.
+                self._store._log_detected_login(
+                    creds, slot=owner, outcome="ignored: already stored",
+                    email=owner_email, uuid=resolved.get("uuid"),
+                )
                 return True
             # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE, the rule
             # `_adopt_into_dead_slot` applies at a switch: `_refresh_expiry`
@@ -5502,6 +5551,10 @@ class ClaudeAccountSwitcher:
             stored_at, live_at = _refresh_expiry(stored), _refresh_expiry(creds)
             if stored and not self._slot_token_dead(owner, owner_email):
                 if not newer_login(live_at, stored_at):
+                    self._store._log_detected_login(
+                        creds, slot=owner, outcome="refused: healthy slot kept",
+                        email=owner_email, uuid=resolved.get("uuid"),
+                    )
                     return False  # its own credential may yet be condemned
             elif newer_login(stored_at, live_at):
                 self._logger.info(
@@ -5509,6 +5562,11 @@ class ClaudeAccountSwitcher:
                     "account but its refresh lifetime ends earlier than the "
                     "stored one, so the stored credential was kept.",
                     owner, owner_email,
+                )
+                self._store._log_detected_login(
+                    creds, slot=owner,
+                    outcome="ignored: stored generation is newer",
+                    email=owner_email, uuid=resolved.get("uuid"),
                 )
                 return True
             # attributed=True: `owner` came from `_slot_owning_resolved_identity`
@@ -5538,6 +5596,10 @@ class ClaudeAccountSwitcher:
                 )
             # Never moves `activeAccountNumber` here either -- see the
             # comment on the identical-bytes branch above.
+            self._store._log_detected_login(
+                creds, slot=owner, outcome=f"adopted into slot {owner}",
+                email=owner_email, uuid=resolved.get("uuid"),
+            )
         self._logger.info(
             "Adopted a login into Account-%s (%s): the live credential "
             "resolves to that account, so it was stored there rather than "
@@ -6205,7 +6267,7 @@ class ClaudeAccountSwitcher:
                 account_num, current_email, current_creds, attributed=True
             )
             self._store._sync_active_credentials_file_to_adopted_login(
-                current_creds, slot=account_num,
+                current_creds, slot=account_num, email=current_email,
             )
             # UN-SPLICE IT, like the archive in `_perform_switch`. This
             # is the same kind of write — a live config kept as a slot's
@@ -6377,7 +6439,7 @@ class ClaudeAccountSwitcher:
             account_num, current_email, current_creds, attributed=True
         )
         self._store._sync_active_credentials_file_to_adopted_login(
-            current_creds, slot=account_num,
+            current_creds, slot=account_num, email=current_email,
         )
         # NO UN-SPLICE HERE, AND IT NEEDS NONE. This slot's roster row is
         # written just below, so `_config_naming_slot` would find nothing
@@ -6971,6 +7033,10 @@ class ClaudeAccountSwitcher:
                         self._resync_rotated_backup(
                             account_num, email, org_uuid, creds
                         )
+                    else:
+                        # Would have resynced, but the read is degraded (see
+                        # the comment above) -- see `_log_ignored_degraded_login`.
+                        self._log_ignored_degraded_login(account_num, email, creds)
 
                     def _confirmed_foreign() -> bool:
                         # Same shape as `_consume_backup_grant_locked`'s
@@ -7825,6 +7891,14 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         moved, oracle unreachable) just leaves the backup stale — the
         recovery branch consumes nothing it cannot attribute. Never raises.
         """
+        # T1312: whether ownership of `creds` as `account_num`'s own login
+        # was ever settled (a fresh oracle match, or a memoized verdict) --
+        # set right before the locked block below, which is unreachable any
+        # other way. `except` below reads it so a raise BEFORE that point
+        # (still pre-probe) does not attribute `creds` to `account_num`'s
+        # email/uuid the same way the pre-probe branches above already
+        # refuse to.
+        established = False
         try:
             creds_oauth = oauth.extract_oauth_data(creds)
             if not (
@@ -7832,6 +7906,13 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 and creds_oauth.get("accessToken")
                 and creds_oauth.get("refreshToken")
             ):
+                # Pre-probe: nothing yet says these bytes are even
+                # ``account_num``'s own -- email/uuid unknown rather than
+                # the config slot's, which would misattribute an identity
+                # that has not been established.
+                self._store._log_detected_login(
+                    creds, slot=None, outcome="refused: incomplete token pair",
+                )
                 return  # never seed a backup with a partial token pair
             backup = self._read_account_credentials(account_num, email)
             if backup and (
@@ -7844,8 +7925,13 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 # not a request to move the fleet onto this slot; only
                 # `cswap switch`/`add_account` are. `current_account_number()`
                 # already reads the live identity directly and needs no
-                # help from this bookkeeping field.
+                # help from this bookkeeping field. NOT A LOGIN: no line --
+                # this is the steady state, not a detected login.
                 return
+            # Read only past the no-drift return: the identity lookup is
+            # wasted on either early return above (a partial token pair, or
+            # the steady state), which together are the common case.
+            own_uuid = self.account_identity(account_num).get("uuid")
             fp = oauth.credential_fingerprint(creds) or ""
             lineage = self._lineage_key(account_num, email, fp)
             verdict = self._probe_verdicts.get(lineage)
@@ -7857,10 +7943,19 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 # to make one attempt the only one. The owner is memoized with
                 # the verdict so this costs no probe.
                 profile = self._resolved_owners.get(lineage)
-                if profile and self._adopt_login_into_slot(
+                settled = profile and self._adopt_login_into_slot(
                     account_num, creds, profile
-                ):
+                )
+                if settled:
                     self._resolved_owners.pop(lineage, None)
+                else:
+                    # Unsettled: the adopt (if attempted) logged its own
+                    # refusal already; this is the retry-pending state itself.
+                    self._store._log_detected_login(
+                        creds, slot=None, outcome="ignored: foreign lineage retry",
+                        email=(profile or {}).get("email"),
+                        uuid=(profile or {}).get("uuid"),
+                    )
                 return
             if verdict is not True:
                 now = self._usage_store.clock()
@@ -7868,7 +7963,12 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 if retry_at is not None and now < retry_at:
                     # Still cooling down from the last unresolved probe on
                     # this exact lineage -- skip the network call rather
-                    # than repeat it every collect pass.
+                    # than repeat it every collect pass. Pre-probe: whose
+                    # login this is has not been settled, so email/uuid
+                    # stay unknown rather than the config slot's.
+                    self._store._log_detected_login(
+                        creds, slot=None, outcome="ignored: cooldown",
+                    )
                     return
                 resolved = oauth.fetch_oauth_profile(
                     oauth.extract_access_token(creds) or ""
@@ -7879,6 +7979,11 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                         "Ownership probe for account %s's drifted live "
                         "credential failed; resync skipped this pass.",
                         account_num,
+                    )
+                    # Pre-probe (the probe is what just failed): unknown,
+                    # not the config slot's -- ownership was never confirmed.
+                    self._store._log_detected_login(
+                        creds, slot=None, outcome="refused: probe failed",
                     )
                     return
                 match = self._resolved_matches_slot_identity(
@@ -7892,6 +7997,11 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                         "resync skipped this pass.",
                         account_num,
                     )
+                    self._store._log_detected_login(
+                        creds, slot=None,
+                        outcome="refused: ownership unverifiable",
+                        email=resolved.get("email"), uuid=resolved.get("uuid"),
+                    )
                     return
                 # Key built AFTER the match: an email-path affirmation just
                 # backfilled the slot uuid, and the verdict must live under
@@ -7904,18 +8014,36 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                     # bytes; the adopt stores them in that account's slot, or
                     # gives the account a slot when none owns it.
                     self._resolved_owners[lineage] = resolved
-                    if self._adopt_login_into_slot(
+                    settled = self._adopt_login_into_slot(
                         account_num, creds, resolved
-                    ):
+                    )
+                    if settled:
                         self._resolved_owners.pop(lineage, None)
+                    else:
+                        # Adopt logged its own refusal; this names the state
+                        # the lineage is left in.
+                        self._store._log_detected_login(
+                            creds, slot=None,
+                            outcome="ignored: foreign lineage retry",
+                            email=resolved.get("email"), uuid=resolved.get("uuid"),
+                        )
                     return
+            established = True
             with (
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):
+                # Every refusal below logs `slot=account_num`, not `None`:
+                # `match` is True by construction to have reached this
+                # block, so ownership is already settled -- these are
+                # refusals of ITS OWN rotation, not of an unattributed one.
                 # Identity re-check under the lock: a switch/login landing in
                 # the gap means the live store is no longer this account's.
                 if not self._live_identity_matches(email, org_uuid):
+                    self._store._log_detected_login(
+                        creds, slot=account_num, outcome="refused: identity moved",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 # Verdict re-check under the lock: slot mutations hold this
                 # FileLock, so rebuilding the key revalidates that the slot
@@ -7923,6 +8051,10 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 if not self._probe_verdicts.get(
                     self._lineage_key(account_num, email, fp)
                 ):
+                    self._store._log_detected_login(
+                        creds, slot=account_num, outcome="refused: verdict stale",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 # Re-read live under the lock and require it to still carry
                 # the served (and oracle-attributed) credential's lineage
@@ -7931,6 +8063,10 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 # if the access token moved since the probe.
                 live = self._read_credentials()
                 if not live:
+                    self._store._log_detected_login(
+                        creds, slot=account_num, outcome="refused: live vanished",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 live_oauth = oauth.extract_oauth_data(live)
                 if not (
@@ -7940,6 +8076,10 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                     and oauth.credential_fingerprint(live)
                     == oauth.credential_fingerprint(creds)
                 ):
+                    self._store._log_detected_login(
+                        creds, slot=account_num, outcome="refused: live moved",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 # attributed=True: the oracle above (`_resolved_matches_slot_identity`)
                 # already positively verified this lineage belongs to
@@ -7960,27 +8100,56 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 if oauth.credential_fingerprint(
                     backup_now
                 ) != oauth.credential_fingerprint(backup):
+                    self._store._log_detected_login(
+                        creds, slot=account_num, outcome="refused: backup moved",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 backup_exp = (
                     oauth.extract_oauth_data(backup_now) or {}
                 ).get("expiresAt") or 0
                 live_exp = live_oauth.get("expiresAt") or 0
                 if backup_exp > live_exp:
+                    self._store._log_detected_login(
+                        creds, slot=account_num,
+                        outcome="refused: backup already newer",
+                        email=email, uuid=own_uuid,
+                    )
                     return
                 self._write_account_credentials(
                     account_num, email, live, attributed=True
                 )
                 self._store._sync_active_credentials_file_to_adopted_login(
-                    live, slot=account_num,
+                    live, slot=account_num, email=email,
                 )
                 self._logger.info(
                     "Resynced account %s's backup to the rotated live "
                     "credential (rotation completed outside a collect pass).",
                     account_num,
                 )
+                self._store._log_detected_login(
+                    live, slot=account_num,
+                    outcome=f"adopted into slot {account_num}",
+                    email=email, uuid=own_uuid,
+                )
         except LockError:
+            # T1312: pre-probe (not `established`), attribution is a guess --
+            # `slot`/`email`/`uuid` stay unknown, same as every other
+            # pre-probe refusal above.
+            self._store._log_detected_login(
+                creds, slot=account_num if established else None,
+                outcome="refused: lock contention",
+                email=email if established else None,
+                uuid=own_uuid if established else None,
+            )
             return  # holder is mid-operation; the next pass retries
         except Exception:
+            self._store._log_detected_login(
+                creds, slot=account_num if established else None,
+                outcome="refused: resync failed",
+                email=email if established else None,
+                uuid=own_uuid if established else None,
+            )
             self._logger.warning(
                 "Backup resync for account %s failed; the recovery branch's "
                 "newer-generation check still guards the next expiry.",
@@ -8380,6 +8549,11 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 # a pre-check here would just repeat that no-op check at the
                 # cost of a second backup read on every pass.
                 self._resync_rotated_backup(num, info[1], info[3], info[5])
+            elif active_oauth:
+                # Same "would have resynced but degraded" case as
+                # `_fetch_active_usage`'s success branch -- see
+                # `_log_ignored_degraded_login`.
+                self._log_ignored_degraded_login(num, info[1], info[5])
 
         if claims:
             pre = entries

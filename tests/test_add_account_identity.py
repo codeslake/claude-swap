@@ -16,11 +16,14 @@ token is this") and is used by the autoswitch identity oracle. add_account
 does not call it.
 """
 import json
+import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.exceptions import ConfigError, ValidationError
@@ -768,6 +771,96 @@ def test_adopting_a_keychain_login_syncs_the_stale_plaintext_file(
     )
 
 
+def test_sync_stamps_the_mirror_file_to_the_keychains_own_mdat(
+    temp_home: Path, mock_claude_config: Path, monkeypatch,
+):
+    """T1312 [m]: the mirror's own mtime must not outrun the Keychain item
+    it just copied -- left at "now" (write time), a ``/login`` landing
+    mid-sync can still carry an mdat EARLIER than this write finishes,
+    which would make the mirror look like the fresher login to
+    ``_fresher_plaintext_login``'s cross-lineage arm and mask the new one.
+    Stamped to the Keychain's own current mdat instead."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    s.platform = Platform.MACOS
+
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    cred_file.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-old", "refreshToken": "rt-old",
+        "expiresAt": 1}}), encoding="utf-8")
+    # Backdate the file's PRE-sync mtime so the write under test is the
+    # only thing that can move it forward.
+    old_mtime = time.time() - 3600
+    os.utime(cred_file, (old_mtime, old_mtime))
+
+    keychain_mdat = time.time() - 120  # older than "now", newer than the file
+    monkeypatch.setattr(
+        macos_keychain, "item_modified_at",
+        lambda service, account: keychain_mdat,
+    )
+    new_login = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-new", "refreshToken": "rt-new",
+        "expiresAt": 99999999999000}})
+
+    s._store._sync_active_credentials_file_to_adopted_login(
+        new_login, slot="3", email="ax@example.com",
+    )
+
+    assert cred_file.read_text(encoding="utf-8") == new_login
+    assert cred_file.stat().st_mtime == pytest.approx(keychain_mdat, abs=1), (
+        "the mirror's mtime was left at write time (now) instead of the "
+        "Keychain item's own mdat"
+    )
+
+
+def test_sync_leaves_the_mirror_mtime_alone_when_the_write_fails(
+    temp_home: Path, mock_claude_config: Path, monkeypatch,
+):
+    """T1312 [m]: the re-read guard before the mtime stamp. If the mirror
+    write failed (``_refresh_stale_credentials_file`` swallows the
+    exception) or the file was replaced by another writer before this
+    re-reads it, the bytes on disk no longer equal what was just written --
+    stamping the Keychain's mdat onto them would misdate a write this call
+    never made (or a different login's own write)."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    s.platform = Platform.MACOS
+
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    old_login = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-old", "refreshToken": "rt-old",
+        "expiresAt": 1}})
+    cred_file.write_text(old_login, encoding="utf-8")
+    old_mtime = time.time() - 3600
+    os.utime(cred_file, (old_mtime, old_mtime))
+
+    monkeypatch.setattr(
+        macos_keychain, "item_modified_at",
+        lambda service, account: time.time() - 120,
+    )
+
+    def _failing_write(credentials):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        s._store, "_write_active_credentials_file", _failing_write,
+    )
+    new_login = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-new", "refreshToken": "rt-new",
+        "expiresAt": 99999999999000}})
+
+    s._store._sync_active_credentials_file_to_adopted_login(
+        new_login, slot="3", email="ax@example.com",
+    )
+
+    assert cred_file.read_text(encoding="utf-8") == old_login, (
+        "the failed write's swallowed exception should leave the file's "
+        "previous bytes standing"
+    )
+    assert cred_file.stat().st_mtime == pytest.approx(old_mtime, abs=1), (
+        "the mtime was stamped to the Keychain's mdat even though the "
+        "write never landed"
+    )
+
+
 def test_sync_skips_when_secure_storage_profile_diverges_from_config_dir(
     temp_home: Path, mock_claude_config: Path, monkeypatch,
 ):
@@ -1066,6 +1159,76 @@ def test_resync_stashes_a_different_login_the_file_alone_held_before_overwriting
     assert any("rt-B-FILE-ONLY" in b for b in bodies), (
         "DEFECT: the resync overwrote login L's only copy without stashing it"
     )
+
+
+def test_resync_does_not_re_stash_a_file_login_the_prev_generation_already_holds(
+    temp_home: Path, mock_claude_config: Path, monkeypatch, caplog,
+):
+    """T1312: the file's displaced login can be a copy ``_write_account_credentials``'s
+    own ``.prev`` retention JUST created (the account's own just-superseded
+    generation, which the file happened to still be holding) -- a copy of it
+    already exists durably, so stashing it a second time into the unclaimed
+    store is a needless duplicate, not the "only copy anywhere" the stash
+    exists to preserve.
+    """
+    import logging
+
+    s = ClaudeAccountSwitcher()
+    s.platform = Platform.MACOS
+    s._setup_directories()
+    s._init_sequence_file()
+    cfg = s._get_claude_config_path()
+    cfg.write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "ax@example.com", "organizationUuid": "",
+        "accountUuid": "u-ax"}}), encoding="utf-8")
+    seq = s._get_sequence_data()
+    seq["accounts"]["1"] = {
+        "email": "ax@example.com", "uuid": "u-ax", "organizationUuid": ""}
+    seq["sequence"] = [1]
+    seq["activeAccountNumber"] = 1
+    s._write_json(s.sequence_file, seq)
+
+    old_backup = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-old-backup", "refreshToken": "rt-OLD-lineage",
+        "expiresAt": 99999999999000, "refreshTokenExpiresAt": 1_000}})
+    s._write_account_credentials("1", "ax@example.com", old_backup)
+
+    kc_new = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-KC-N-PLUS-1", "refreshToken": "rt-NEW",
+        "expiresAt": 99999999999000 + 3_600_000,
+        "refreshTokenExpiresAt": 50_000}})
+
+    # The plaintext file is holding EXACTLY the slot's own current backup --
+    # the very generation this write is about to rotate into `.prev`.
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    cred_file.write_text(old_backup, encoding="utf-8")
+
+    monkeypatch.setattr(s, "_read_credentials", lambda: kc_new)
+
+    before = set(s._store._list_unclaimed_credentials())
+    with caplog.at_level(logging.INFO, logger="claude-swap"):
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-ax", "email": "ax@example.com",
+                                 "organizationUuid": ""}):
+            s._resync_rotated_backup("1", "ax@example.com", "", kc_new)
+
+    assert cred_file.read_text(encoding="utf-8") == kc_new, (
+        "the plaintext file did not receive the rotated Keychain generation"
+    )
+    assert json.loads(
+        s._store._read_previous_backup("1", "ax@example.com")
+    )["claudeAiOauth"]["refreshToken"] == "rt-OLD-lineage", (
+        "premise: the file's login is the generation .prev now holds"
+    )
+    after = set(s._store._list_unclaimed_credentials())
+    assert after == before, (
+        "DEFECT: a login already retained as .prev was stashed again"
+    )
+    assert any(
+        r.getMessage().startswith("login:")
+        and "ignored: displaced copy already held by slot 1" in r.getMessage()
+        for r in caplog.records
+    ), "the dedup skip did not log its outcome"
 
 
 def test_resync_writes_through_a_same_lineage_older_generation_with_no_stash(
