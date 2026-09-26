@@ -13335,8 +13335,11 @@ class TestT1313SettleWiring:
             "accessToken": "sk-live", "refreshToken": "rt-live",
             "expiresAt": 99_999_999_999_999}})
         # N's (slot 2) own backup already holds the login -- the shape a
-        # prior collect pass leaves.
-        h.switcher._write_account_credentials("2", "b@example.com", login)
+        # prior collect pass leaves. Attributed: this is slot 2's own
+        # (b@example.com's) login, not a foreign identity.
+        h.switcher._write_account_credentials(
+            "2", "b@example.com", login, attributed=True,
+        )
         h.switcher._write_credentials(login)
         (h.temp_home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "b@example.com",
@@ -13457,9 +13460,12 @@ class TestT1313SettleWiring:
 
         def _collect_adopts(current, *args, **kwargs):
             # The shape a real resync leaves: N's own backup now holds the
-            # live login it was missing at tick start.
+            # live login it was missing at tick start. Attributed: this is
+            # slot 2's own (z@example.com's) login.
             collected["ran"] = True
-            h.switcher._write_account_credentials("2", "z@example.com", login)
+            h.switcher._write_account_credentials(
+                "2", "z@example.com", login, attributed=True,
+            )
             return {}, {}, {}
 
         monkeypatch.setattr(h.engine, "_collect_scheduled_usage", _collect_adopts)

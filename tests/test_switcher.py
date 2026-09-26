@@ -20889,7 +20889,8 @@ class TestT1313LoginRestore:
         live login already IS the roster's active account."""
         s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
         # Re-point the live login (and its own backup) at A itself.
-        s._write_account_credentials("2", "b@example.com", login)
+        # Attributed: this is slot 2's own (b@example.com's) login.
+        s._write_account_credentials("2", "b@example.com", login, attributed=True)
         s._write_credentials(login)
         (temp_home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "b@example.com",
