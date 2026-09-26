@@ -44,7 +44,11 @@ from claude_swap.usage_store import (
 )
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
-from claude_swap.switcher import LOGIN_RESTORE_SETTLE_FLOOR_S, ClaudeAccountSwitcher
+from claude_swap.switcher import (
+    LOGIN_RESTORE_RECHECK_MARGIN_S,
+    LOGIN_RESTORE_SETTLE_FLOOR_S,
+    ClaudeAccountSwitcher,
+)
 
 
 class FakeClock:
@@ -13373,8 +13377,11 @@ class TestT1313SettleWiring:
             login
         ), "an under-floor settle must never touch the live store"
         delay = h.engine._next_delay(outcome)
-        assert 0 < delay < h.settings.interval_seconds, (
-            "a WAITING settle must recheck sooner than the ordinary cadence"
+        assert 0 < delay <= (
+            LOGIN_RESTORE_SETTLE_FLOOR_S + LOGIN_RESTORE_RECHECK_MARGIN_S
+        ), (
+            "a WAITING settle must recheck at the settle floor, not merely "
+            "sooner than the ordinary cadence"
         )
 
     def test_tick_bails_when_the_collect_pass_itself_moves_the_identity(
@@ -13389,8 +13396,15 @@ class TestT1313SettleWiring:
         h.seed(1, "a@example.com")
         h.seed(2, "z@example.com")
         h.set_active(1)  # D == A at tick start: the top-of-tick settle is a no-op
+        # A live login for slot 1 -- without it `current_account_number()`
+        # is None and the tick bails before ever reaching its collect pass,
+        # which would make this test pass whether or not the fix is there.
+        h.make_live("a@example.com", 1)
+
+        collected = {"ran": False}
 
         def _collect_moves_identity(current, *args, **kwargs):
+            collected["ran"] = True
             h.switcher._write_credentials(json.dumps({"claudeAiOauth": {
                 "accessToken": "sk-2", "refreshToken": "rt-2",
                 "expiresAt": 99_999_999_999_999}}))
@@ -13403,6 +13417,49 @@ class TestT1313SettleWiring:
         monkeypatch.setattr(
             h.engine, "_collect_scheduled_usage", _collect_moves_identity
         )
+        with patch.object(h.engine, "_perform") as perform:
+            outcome = h.engine.tick()
+        assert collected["ran"], (
+            "the tick never reached its collect pass -- this test cannot fail"
+        )
+        perform.assert_not_called()
+        assert outcome is TickOutcome.NO_ACTION
+
+    def test_tick_bails_when_the_collects_own_adopt_settles_mid_pass(
+        self, temp_home: Path, monkeypatch,
+    ):
+        """Call site (b): the collect pass's own resync can write N's backup
+        mid-pass while `current_account_number()` never moves at all -- the
+        live identity was already N's for the whole tick. The drift check
+        alone (`current_account_number() != current`) cannot see this
+        settle through; only a second `_settle_login_restore()` call, after
+        the collect, catches it."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com", expires_at=99_999_999_999_999)
+        h.seed(2, "z@example.com")  # N's own backup is stale: "rt-2"
+        h.set_active(1)  # A = 1
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["disabled"] = True
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        login = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-2", "refreshToken": "rt-live-2",
+            "expiresAt": 99_999_999_999_999}})
+        h.switcher._write_credentials(login)
+        (h.temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "z@example.com",
+                              "accountUuid": "uuid-2"},
+        }))
+        path = get_credentials_path()
+        now = time.time()
+        os.utime(path, (now - 10.0, now - 10.0))  # past the settle floor
+
+        def _collect_adopts(current, *args, **kwargs):
+            # The shape a real resync leaves: N's own backup now holds the
+            # live login it was missing at tick start.
+            h.switcher._write_account_credentials("2", "z@example.com", login)
+            return {}, {}, {}
+
+        monkeypatch.setattr(h.engine, "_collect_scheduled_usage", _collect_adopts)
         with patch.object(h.engine, "_perform") as perform:
             outcome = h.engine.tick()
         perform.assert_not_called()

@@ -684,9 +684,9 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Splice ``oauthAccount`` into the live ``~/.claude.json``,
         preserving every other key -- local settings, projects, anything the
-        pin needs -- rather than replacing the file. Shared by
-        :meth:`_settle_login_restore`, so "preserve the rest of the file" has
-        one implementation.
+        pin needs -- rather than replacing the file. Used by
+        :meth:`_settle_login_restore`; :meth:`_perform_switch` still carries
+        its own, separate splice.
 
         Falls back to the full stored config only when no live config exists
         to splice into. ``_read_json`` answers ``None`` for ABSENT and for
@@ -6187,23 +6187,50 @@ class ClaudeAccountSwitcher:
     def _live_write_time(self) -> "float | None":
         """When the live credential store was last written, best-effort.
 
-        macOS: the served OAuth Keychain item's ``mdat`` when readable, else
-        the plaintext file's mtime (the file is what a Keychain-blind read
-        would have served, so it is the right fallback clock too). Every
-        other platform: the plaintext file's mtime -- there is no Keychain.
+        macOS: the LATER of the served OAuth Keychain item's ``mdat`` and the
+        plaintext file's mtime -- a `/login` there can update either one
+        first, and taking only one risks reading the floor as already past
+        while the other write is still landing. Every other platform: the
+        plaintext file's mtime -- there is no Keychain.
 
-        ``None`` when neither is readable: an unknown write time is not
+        ``None`` only when neither is readable: an unknown write time is not
         evidence the settle floor has passed, never a stand-in for "old
         enough".
         """
-        if self.platform == Platform.MACOS:
-            mdat = self._store._active_oauth_keychain_mdat()
-            if mdat is not None:
-                return mdat
+        mdat = (
+            self._store._active_oauth_keychain_mdat()
+            if self.platform == Platform.MACOS else None
+        )
         try:
-            return get_credentials_path().stat().st_mtime
+            file_mtime = get_credentials_path().stat().st_mtime
         except OSError:
-            return None
+            file_mtime = None
+        if mdat is None:
+            return file_mtime
+        if file_mtime is None:
+            return mdat
+        return max(mdat, file_mtime)
+
+    def _engine_quarantined(self, num: str) -> bool:
+        """Is slot ``num`` in the auto-switch engine's own quarantine ledger
+        right now (its ``autoswitch_state.json``, e.g. an
+        ``identity-conflict`` entry -- see ``AutoSwitchEngine._quarantine``)?
+
+        Read directly off disk, best-effort like every other settle
+        precondition: this file is the engine's own (``.autoswitch_state.lock``
+        guards its writes), and the settle never opens that lock, only reads
+        past it.
+        """
+        try:
+            raw = json.loads(
+                (self.backup_dir / "autoswitch_state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        quarantine = raw.get("quarantine") if isinstance(raw, dict) else None
+        return isinstance(quarantine, dict) and num in quarantine
 
     def _settle_login_restore(self) -> LoginRestoreOutcome:
         """Put the live store back on the roster's active account A after a
@@ -6227,8 +6254,9 @@ class ClaudeAccountSwitcher:
         store was last written (:meth:`_live_write_time`) -- Claude Code's
         own ``/login`` writes the credential and ``~/.claude.json`` non-
         atomically, so acting immediately risks racing the rest of that
-        write. An unreadable write time is treated the same as one inside
-        the floor: not yet safe to act on.
+        write. An unreadable write time answers NONE, not WAITING: nothing
+        here would ever make it readable, so WAITING for it would never
+        clear.
 
         Restore: re-verified under :attr:`lock_file` (roster still names A,
         live still carries D's fingerprint), then A's backup must be a
@@ -6264,22 +6292,29 @@ class ClaudeAccountSwitcher:
         if live_fp != oauth.credential_fingerprint(d_backup):
             return LoginRestoreOutcome.NONE  # D's own backup doesn't hold this yet
 
-        write_time = self._live_write_time()
-        # Real wall time, not `self._usage_store.clock()`: `write_time` is a
-        # real filesystem mtime (or Keychain `mdat`), and only a clock the
-        # OS itself advances can be compared against it.
-        now = time.time()
-        if write_time is None or (now - write_time) < LOGIN_RESTORE_SETTLE_FLOOR_S:
-            self._store._log_detected_login(
-                live, slot=d_num, outcome="waiting: settle floor",
-            )
-            return LoginRestoreOutcome.WAITING
-
         def _left(reason: str) -> LoginRestoreOutcome:
             self._store._log_detected_login(
                 live, slot=d_num, outcome=f"live left on {d_num}: {reason}",
             )
             return LoginRestoreOutcome.NONE
+
+        write_time = self._live_write_time()
+        if write_time is None:
+            # Unreadable, not merely unknown-and-recent: WAITING here would
+            # never clear on its own (nothing marks it readable later), and
+            # every call site treats WAITING as "hold, recheck soon" -- so an
+            # unreadable clock would park the engine in front of this account
+            # forever instead of leaving it for the next call to re-derive.
+            return _left("write time unreadable")
+        # Real wall time, not `self._usage_store.clock()`: `write_time` is a
+        # real filesystem mtime (or Keychain `mdat`), and only a clock the
+        # OS itself advances can be compared against it.
+        now = time.time()
+        if (now - write_time) < LOGIN_RESTORE_SETTLE_FLOOR_S:
+            self._store._log_detected_login(
+                live, slot=d_num, outcome="waiting: settle floor",
+            )
+            return LoginRestoreOutcome.WAITING
 
         try:
             with FileLock(self.lock_file):
@@ -6298,6 +6333,16 @@ class ClaudeAccountSwitcher:
                     or oauth.credential_fingerprint(live_now) != live_fp
                 ):
                     return LoginRestoreOutcome.NONE  # moved on since the read above
+                # T1313: re-verify D's OWN backup still holds this exact
+                # login, under the lock too. The unlocked read above is what
+                # made this a CANDIDATE at all, and it is stale the moment
+                # anything else (a second settle, a fresh `/login` racing
+                # this one) could have run between it and here -- writing
+                # over live on that stale premise would drop a login nothing
+                # else has a copy of.
+                d_backup_now = self._read_account_credentials(d_num, d_email)
+                if oauth.credential_fingerprint(d_backup_now) != live_fp:
+                    return _left("its own backup no longer matches")
                 backup, unreadable = self._read_account_credentials_ex(
                     a_num, a_email
                 )
@@ -6310,7 +6355,10 @@ class ClaudeAccountSwitcher:
                     and backup_oauth.get("refreshToken")
                 ):
                     return _left("no usable stored login")
-                if self._slot_token_dead(a_num, a_email):
+                if (
+                    self._slot_token_dead(a_num, a_email)
+                    or self._engine_quarantined(a_num)
+                ):
                     return _left("quarantined")
                 expires_at = backup_oauth.get("expiresAt")
                 if not isinstance(expires_at, (int, float)) or (
@@ -6389,9 +6437,12 @@ class ClaudeAccountSwitcher:
             "Restored the live login to account %s after a /login of a "
             "different managed slot landed on it.", a_num,
         )
+        # `slot` names the login this record is ABOUT, same as every other
+        # call in this method (d_num) -- the outcome text is what names A.
         self._store._log_detected_login(
-            live, slot=a_num, outcome=f"restored: live back on slot {a_num}",
+            live, slot=d_num, outcome=f"restored: live back on slot {a_num}",
         )
+        self._replan_new_active(a_num, a_email, a_account.get("organizationUuid", ""))
         return LoginRestoreOutcome.RESTORED
 
     def _static_usage_sentinel(
@@ -8219,7 +8270,20 @@ class ClaudeAccountSwitcher:
         # is a different managed slot's own, already safely in its backup,
         # the answer is to put the roster's active account back, not to rank
         # a switch away from a login that was never a switch target.
-        if self._settle_login_restore() is LoginRestoreOutcome.RESTORED:
+        #
+        # UNLESS the roster's active account A is itself one of THIS call's
+        # own `exclude` -- the caller already knows A is walled (the pin's
+        # 429 handler, about A itself), so restoring exactly the account it
+        # is trying to leave would undo the reason it called at all. Read
+        # before calling settle, not after: settle's own write is not one to
+        # trigger and then ignore.
+        roster_active_before_settle = (
+            self._get_sequence_data() or {}
+        ).get("activeAccountNumber")
+        if (
+            roster_active_before_settle is None
+            or str(roster_active_before_settle) not in excluded_slots
+        ) and self._settle_login_restore() is LoginRestoreOutcome.RESTORED:
             data = self._get_sequence_data() or {}
             a_num = data.get("activeAccountNumber")
             a_email = (

@@ -1561,6 +1561,27 @@ class AutoSwitchEngine:
             self._tick_in_flight.set()
             self._tick_thread_id = None
 
+    def _settle_or_arm_wait(self) -> LoginRestoreOutcome:
+        """Call ``_settle_login_restore()`` and, on WAITING, arm the recheck
+        delay ``_next_delay`` reads. Shared by both of ``_tick_inner``'s own
+        call sites (T1313) -- before ``current`` is read, and again after the
+        collect pass, whose own resync can settle a login mid-pass without
+        moving ``current_account_number()`` at all (see the second call
+        site's comment)."""
+        settle = self.switcher._settle_login_restore()
+        if settle is LoginRestoreOutcome.WAITING:
+            # Real wall time, not `self.clock()`: the floor is measured
+            # against a real filesystem mtime (or Keychain `mdat`), which
+            # only the OS's own clock can be compared against -- `self.clock`
+            # is a test/cooldown seam that need not track it.
+            write_time = self.switcher._live_write_time()
+            self._settle_wait_until = (
+                (write_time if write_time is not None else time.time())
+                + LOGIN_RESTORE_SETTLE_FLOOR_S
+                + LOGIN_RESTORE_RECHECK_MARGIN_S
+            )
+        return settle
+
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
@@ -1594,19 +1615,9 @@ class AutoSwitchEngine:
         # Code's own `/login` write is non-atomic); either way this tick
         # decides nothing from a `current` that is about to change or that
         # cannot yet be acted on.
-        settle = self.switcher._settle_login_restore()
-        if settle is LoginRestoreOutcome.WAITING:
-            # Real wall time, not `self.clock()`: the floor is measured
-            # against a real filesystem mtime (or Keychain `mdat`), which
-            # only the OS's own clock can be compared against -- `self.clock`
-            # is a test/cooldown seam that need not track it.
-            write_time = self.switcher._live_write_time()
-            self._settle_wait_until = (
-                (write_time if write_time is not None else time.time())
-                + LOGIN_RESTORE_SETTLE_FLOOR_S
-                + LOGIN_RESTORE_RECHECK_MARGIN_S
-            )
-        if settle in (LoginRestoreOutcome.RESTORED, LoginRestoreOutcome.WAITING):
+        if self._settle_or_arm_wait() in (
+            LoginRestoreOutcome.RESTORED, LoginRestoreOutcome.WAITING,
+        ):
             return TickOutcome.NO_ACTION
 
         # Read once, ahead of the trace block below, which needs THIS
@@ -1698,6 +1709,15 @@ class AutoSwitchEngine:
         # an account that is no longer live, so this tick decides nothing
         # from it.
         if self.switcher.current_account_number() != current:
+            return TickOutcome.NO_ACTION
+        # T1313: the collect's own adopt can ALSO leave `current` unchanged
+        # -- the live identity was already D's for the whole tick, and the
+        # adopt only just gave D's backup the fingerprint the settle above
+        # needed. The drift check above catches a MOVED identity, never a
+        # freshly SETTLED one, so it is re-checked here rather than trusted.
+        if self._settle_or_arm_wait() in (
+            LoginRestoreOutcome.RESTORED, LoginRestoreOutcome.WAITING,
+        ):
             return TickOutcome.NO_ACTION
         self._emit(
             PollEvent(
@@ -3720,8 +3740,10 @@ class AutoSwitchEngine:
             # store's own write hasn't passed yet) -- recheck just past it
             # rather than on the ordinary cadence, which could be minutes.
             # Real wall time again, matching how `_settle_wait_until` itself
-            # was computed.
-            return max(self._settle_wait_until - time.time(), 0.1)
+            # was computed. Capped at `interval`: a write time read as
+            # FUTURE (clock skew, a bad mtime) must not sleep the engine
+            # past its own ordinary cadence either.
+            return min(max(self._settle_wait_until - time.time(), 0.1), interval)
         # ±10% jitter so multiple machines don't synchronize their API hits.
         return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
 

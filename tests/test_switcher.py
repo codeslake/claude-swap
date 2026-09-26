@@ -20833,8 +20833,22 @@ class TestT1313LoginRestore:
             sample_sequence_data, temp_home, n_disabled=n_disabled,
         )
         self._make_settled_candidate(s, login)
-        outcome = s._settle_login_restore()
+        with patch.object(s, "_replan_new_active") as replan, \
+             patch.object(s._store, "_log_detected_login") as log_line:
+            outcome = s._settle_login_restore()
         assert outcome is LoginRestoreOutcome.RESTORED
+        # A just went live -- its poll plan, computed while it sat idle,
+        # must be pulled to the active floor the same way an ordinary
+        # switch's own activation does (`_perform_switch`).
+        replan.assert_called_once_with("2", "b@example.com", "o-2")
+        # `slot` names the login this record is ABOUT (N, whose `/login`
+        # this is), never the account the outcome text names (A).
+        restored_calls = [
+            c for c in log_line.call_args_list
+            if c.kwargs.get("outcome", "").startswith("restored:")
+        ]
+        assert len(restored_calls) == 1
+        assert restored_calls[0].kwargs["slot"] == "1"
 
         live_now = s._read_credentials()
         assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
@@ -20890,7 +20904,8 @@ class TestT1313LoginRestore:
 
     @pytest.mark.parametrize("condition", [
         "quarantined", "inside_margin", "non_finite", "consume_locked",
-        "settled_meanwhile",
+        "settled_meanwhile", "engine_quarantined", "write_time_unreadable",
+        "d_backup_changed_meanwhile",
     ])
     def test_a_refused_restore_never_writes_over_live(
         self, temp_home: Path, sample_sequence_data: dict,
@@ -20903,6 +20918,28 @@ class TestT1313LoginRestore:
         held_lock = None
         if condition == "quarantined":
             monkeypatch.setattr(s, "_slot_token_dead", lambda num, email: num == "2")
+        elif condition == "engine_quarantined":
+            # The auto-switch engine's own ledger, not `_slot_token_dead`'s
+            # (a different quarantine, e.g. an `identity-conflict` strike).
+            state_path = s.backup_dir / "autoswitch_state.json"
+            state_path.write_text(json.dumps({"quarantine": {"2": {}}}))
+        elif condition == "write_time_unreadable":
+            monkeypatch.setattr(s, "_live_write_time", lambda: None)
+        elif condition == "d_backup_changed_meanwhile":
+            # N's OWN backup no longer matches live by the time the lock is
+            # held -- the unlocked read that made this a candidate is stale
+            # the moment anything else could have run between it and here.
+            real_read = s._read_account_credentials
+            calls = {"n": 0}
+
+            def _racy_read(num, email):
+                if num == "1" and email == "c@example.com":
+                    calls["n"] += 1
+                    if calls["n"] >= 2:
+                        return None
+                return real_read(num, email)
+
+            monkeypatch.setattr(s, "_read_account_credentials", _racy_read)
         elif condition == "inside_margin":
             s._write_account_credentials("2", "b@example.com", json.dumps({
                 "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
@@ -20996,6 +21033,51 @@ class TestT1313LoginRestore:
         assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
             active_backup
         )
+
+    def test_switch_does_not_settle_when_a_is_walled(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """When the CALLER's own `exclude` already walls A (the pin's 429
+        handler, about A itself), restoring exactly the account it is
+        trying to leave would undo the reason it called at all -- settle
+        must not even run, and the normal candidate search takes over."""
+        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login)
+        usage = {"1": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 0.0}}}
+        with patch.object(s, "_settle_login_restore") as settle, \
+             patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="best", json_output=True, exclude=["2"])
+        settle.assert_not_called()
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "a walled A must never be restored onto live"
+
+    def test_live_write_time_takes_the_later_of_mdat_and_the_file(
+        self, temp_home: Path,
+    ):
+        """A `/login`'s two writes (Keychain, plaintext fallback) can each
+        lag the other -- the settle floor must wait out BOTH, so this reads
+        the LATER of the two, never one alone (T1313)."""
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        # The plaintext file directly -- what a Keychain-blind read would
+        # have served, per `_live_write_time`'s own docstring -- rather than
+        # `_write_credentials`, which on MACOS would route to a real
+        # Keychain this sandbox does not have.
+        get_credentials_path().write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "sk", "refreshToken": "rt"}}))
+        os.utime(get_credentials_path(), (1_000_000.0, 1_000_000.0))
+        with patch.object(
+            s._store, "_active_oauth_keychain_mdat", return_value=2_000_000.0,
+        ):
+            assert s._live_write_time() == 2_000_000.0, "mdat is later"
+        with patch.object(
+            s._store, "_active_oauth_keychain_mdat", return_value=500_000.0,
+        ):
+            assert s._live_write_time() == 1_000_000.0, "the file is later"
 
 
 class TestLoginLineHelper:
