@@ -1577,6 +1577,16 @@ class AutoSwitchEngine:
             else {}
         )
 
+        # T1312: settle any restore a PRIOR tick's collect queued BEFORE
+        # reading `current` for THIS tick -- otherwise a `/login` into a
+        # disabled slot races the restore: `current` would read as the
+        # still-displaced login, the disabled-active trigger below would
+        # fire, and `_perform` would land on whichever slot ranks top --
+        # not necessarily the account the restore is about to put back.
+        # Mirrors the collect pass's own call (`usage_entries_by_account` ->
+        # `_process_pending_active_restores`), so this is a no-op when
+        # nothing is queued.
+        self.switcher._process_pending_active_restores()
         # Read once, ahead of the trace block below, which needs THIS
         # tick's value to tell a switched-away account from the one the
         # last tick's offset/carry were baselined against.
@@ -1678,6 +1688,21 @@ class AutoSwitchEngine:
                 },
             )
         )
+
+        # T1312: the collect just ran and may itself have QUEUED a restore
+        # for a login it just saw (never applied one -- that is a LATER
+        # tick's job, same as the settle-first call above). `current` above
+        # is what this tick would act on, and either condition means it can
+        # no longer be trusted: a queued restore says the live identity is
+        # about to be corrected out from under it, and a changed identity
+        # says it already was. Bail rather than `_perform` onto the wrong
+        # account; a later tick's settle-first call corrects it.
+        if (
+            self.switcher._pending_active_restores
+            or self.switcher.current_account_number() != current
+        ):
+            self._emit(NoSwitchEvent(reason="pending-restore"))
+            return TickOutcome.NO_ACTION
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)

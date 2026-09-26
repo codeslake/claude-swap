@@ -374,6 +374,15 @@ def _refresh_expiry(blob: str) -> "float | None":
 #: would freeze the display for 10s PER SLOT against a concurrent switch.
 _ADOPT_LOCK_WAIT_S = 0.5
 
+#: T1312: a pending active-account restore (`_record_pending_active_restore`)
+#: is never attempted before it is this old -- CC's own `/login` writes the
+#: credential and `~/.claude.json` non-atomically, so the pass that just
+#: observed the write may still be racing the rest of it -- and is dropped
+#: once it is this old, so a restore that can never settle does not hold the
+#: engine at NO_ACTION indefinitely.
+_PENDING_RESTORE_MIN_AGE_S = 5.0
+_PENDING_RESTORE_MAX_AGE_S = 60.0
+
 
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
@@ -485,7 +494,11 @@ class ClaudeAccountSwitcher:
         # (dropped in that case). In-memory only: a desync already standing
         # before this process started is never recorded, since the only way
         # into this dict is a write THIS process just observed.
-        self._pending_active_restores: dict[str, str] = {}
+        # T1312: value is (written_slot, recorded_at) -- the timestamp gates
+        # both the minimum age below which a restore is never attempted (the
+        # non-atomic `/login` write may still be racing) and the maximum age
+        # past which the entry is dropped rather than held forever.
+        self._pending_active_restores: dict[str, tuple[str, float]] = {}
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -3794,12 +3807,20 @@ class ClaudeAccountSwitcher:
         if pre_write_backup:
             pre_at = _refresh_expiry(pre_write_backup)
             new_at = _refresh_expiry(written_creds)
+            if pre_at is None or new_at is None:
+                # T1312: undated on either side is "no evidence" either way
+                # (`newer_login` already answers False both ways for it) --
+                # never queue on a guess, but say so, since silently doing
+                # nothing here left this exact case unwritten before.
+                return f"; lineage undated; live left on {written_slot}"
             if not (newer_login(new_at, pre_at) or newer_login(pre_at, new_at)):
                 return ""  # same lineage: an ordinary rotation
         fp = oauth.credential_fingerprint(written_creds)
         if not fp:
             return ""
-        self._pending_active_restores[fp] = str(written_slot)
+        self._pending_active_restores[fp] = (
+            str(written_slot), self._usage_store.clock(),
+        )
         return f"; active slot {active} restore queued"
 
     def _process_pending_active_restores(self) -> None:
@@ -3814,14 +3835,51 @@ class ClaudeAccountSwitcher:
         past the fingerprint the entry named -- that write is superseded
         (something else already changed the live store) and there is
         nothing left for this entry to correct.
+
+        T1312: an entry younger than :data:`_PENDING_RESTORE_MIN_AGE_S` is
+        skipped outright -- CC's own `/login` writes the credential and
+        `~/.claude.json` non-atomically, so the pass that just observed it
+        may still be racing the rest of it. One older than
+        :data:`_PENDING_RESTORE_MAX_AGE_S` is dropped here, unconditionally,
+        so a restore that can never settle does not hold the engine at
+        NO_ACTION forever.
         """
-        for fp, written_slot in list(self._pending_active_restores.items()):
+        now = self._usage_store.clock()
+        for fp, (written_slot, recorded_at) in list(
+            self._pending_active_restores.items()
+        ):
+            age = now - recorded_at
+            if age >= _PENDING_RESTORE_MAX_AGE_S:
+                self._pending_active_restores.pop(fp, None)
+                self._store._log_detected_login(
+                    None, slot=None, fp=fp,
+                    outcome=(
+                        f"live left on {written_slot}: restore never "
+                        f"settled within {int(_PENDING_RESTORE_MAX_AGE_S)}s"
+                    ),
+                )
+                continue
+            if age < _PENDING_RESTORE_MIN_AGE_S:
+                continue  # still racing /login's non-atomic write
             if self._try_restore_pending_active(fp, written_slot):
                 self._pending_active_restores.pop(fp, None)
 
     def _try_restore_pending_active(self, fp: str, written_slot: str) -> bool:
-        """One pending entry. True: done (restored, or stale) -- drop it.
-        False: keep it queued for a later pass.
+        """One pending entry. True: done (restored, stale, or permanently
+        refused) -- drop it. False: keep it queued for a later pass.
+
+        T1312: the cheap checks below (the active slot's own backup being
+        usable, unquarantined, OAuth, dated and outside CC's refresh margin,
+        and the roster still naming an active account distinct from
+        ``written_slot``) run under cswap's OWN account lock alone, before
+        CC's credential and config locks are ever taken -- a refusal here
+        never needed them. Each is PERMANENT: none of them heals itself by
+        retrying, so failing one drops the entry (logged once, so a masked
+        restore is never silent again -- the same reasoning
+        :meth:`_record_pending_active_restore`'s docstring gives). Only lock
+        contention, an unreadable backup, and any other exception are
+        TRANSIENT -- conditions that change -- so those keep the entry
+        queued, bounded by :data:`_PENDING_RESTORE_MAX_AGE_S` in the caller.
 
         Lock order matches the switch path (:meth:`_perform_switch`):
         cswap's own account lock, then Claude Code's credential lock, then
@@ -3831,12 +3889,14 @@ class ClaudeAccountSwitcher:
         way it does -- no probe, no refresh, no grant, no roster write, no
         disabled-flag change.
         """
+        def _drop(reason: str) -> None:
+            self._store._log_detected_login(
+                None, slot=None, fp=fp,
+                outcome=f"live left on {written_slot}: {reason}",
+            )
+
         try:
-            with (
-                FileLock(self.lock_file),
-                claude_credentials_lock(),
-                claude_config_lock(),
-            ):
+            with FileLock(self.lock_file):
                 live = self._read_credentials()
                 if live is None:
                     return False  # unreadable this pass; retry later
@@ -3844,81 +3904,111 @@ class ClaudeAccountSwitcher:
                     return True  # moved on: this entry is stale
                 data = self._get_sequence_data() or {}
                 active = data.get("activeAccountNumber")
-                if active is None or str(active) == str(written_slot):
-                    return False  # nothing (yet, or any more) to restore to
+                if active is None:
+                    _drop("no active account")
+                    return True
+                if str(active) == str(written_slot):
+                    _drop("the roster's active account already matches")
+                    return True
                 active_num = str(active)
                 acc = (data.get("accounts") or {}).get(active_num) or {}
                 active_email = (acc.get("email") or "").strip()
                 if not active_email:
-                    return False
+                    _drop("no email on record")
+                    return True
                 backup, unreadable = self._read_account_credentials_ex(
                     active_num, active_email
                 )
                 if unreadable:
-                    return False
+                    return False  # transient: cannot read the backup yet
                 backup_oauth = oauth.extract_oauth_data(backup) if backup else None
+                if not backup_oauth:
+                    _drop("not OAuth" if backup else "no usable backup")
+                    return True
                 if not (
-                    backup_oauth
-                    and backup_oauth.get("accessToken")
+                    backup_oauth.get("accessToken")
                     and backup_oauth.get("refreshToken")
                 ):
-                    return False
+                    _drop("no usable backup")
+                    return True
                 if self._slot_token_dead(active_num, active_email):
-                    return False
+                    _drop("quarantined")
+                    return True
                 # A no-network proof that no rotation of the active
                 # account was missed while its live bytes sat elsewhere: a
                 # missed rotation leaves the predecessor near expiry.
-                if oauth.is_oauth_token_expired(backup_oauth.get("expiresAt")):
-                    return False
+                # T1312: an ``expiresAt`` that isn't numeric is not evidence
+                # of an unexpired token -- `is_oauth_token_expired` answers
+                # False for it (unknown is not expired), which used to let
+                # a token nobody can date through this gate.
+                expires_at = backup_oauth.get("expiresAt")
+                if not isinstance(expires_at, (int, float)):
+                    _drop("no numeric expiresAt")
+                    return True
+                if oauth.is_oauth_token_expired(expires_at):
+                    _drop("inside the refresh margin")
+                    return True
                 consume_lock = FileLock(
                     self.credentials_dir / f".consume-{active_num}.lock"
                 )
                 if not consume_lock.acquire(timeout=0):
                     return False  # a consume is in flight; retry later
                 try:
-                    target_config_data = json.loads(
-                        self._target_config(data, active_num, active_email)
-                    )
-                    target_oauth = target_config_data.get("oauthAccount")
-                    if not target_oauth:
-                        return False
-                    config_path = self._get_claude_config_path()
-                    rollback_config_text = (
-                        config_path.read_text(encoding="utf-8")
-                        if config_path.exists() else None
-                    )
-                    creds_written = False
-                    try:
-                        self._write_credentials(
-                            self._prepare_credentials_for_activation(
-                                backup, live
-                            )
+                    with (
+                        claude_credentials_lock(),
+                        claude_config_lock(),
+                    ):
+                        # Re-verify under CC's own locks: the cheap checks
+                        # above ran without them, so a switch or another
+                        # login could have landed in the gap.
+                        live = self._read_credentials()
+                        if not live or (
+                            oauth.credential_fingerprint(live) != fp
+                        ):
+                            return True  # moved on since the cheap checks
+                        target_config_data = json.loads(
+                            self._target_config(data, active_num, active_email)
                         )
-                        creds_written = True
-                        self._write_oauth_account_to_live_config(
-                            config_path, target_oauth, target_config_data,
-                            emit_output=False, warnings_out=[],
+                        target_oauth = target_config_data.get("oauthAccount")
+                        if not target_oauth:
+                            return False
+                        config_path = self._get_claude_config_path()
+                        rollback_config_text = (
+                            config_path.read_text(encoding="utf-8")
+                            if config_path.exists() else None
                         )
-                    except Exception:
-                        def _rollback(action, what: str) -> None:
-                            try:
-                                action()
-                            except Exception as e:
-                                self._logger.error(
-                                    "Failed to roll back a pending "
-                                    f"active-account restore's {what}: {e}"
+                        creds_written = False
+                        try:
+                            self._write_credentials(
+                                self._prepare_credentials_for_activation(
+                                    backup, live
                                 )
-                        if creds_written:
-                            _rollback(lambda: self._write_credentials(live),
-                                      "credentials")
-                        if rollback_config_text is not None:
-                            _rollback(
-                                lambda: config_path.write_text(
-                                    rollback_config_text, encoding="utf-8"
-                                ),
-                                "config",
                             )
-                        raise
+                            creds_written = True
+                            self._write_oauth_account_to_live_config(
+                                config_path, target_oauth, target_config_data,
+                                emit_output=False, warnings_out=[],
+                            )
+                        except Exception:
+                            def _rollback(action, what: str) -> None:
+                                try:
+                                    action()
+                                except Exception as e:
+                                    self._logger.error(
+                                        "Failed to roll back a pending "
+                                        f"active-account restore's {what}: {e}"
+                                    )
+                            if creds_written:
+                                _rollback(lambda: self._write_credentials(live),
+                                          "credentials")
+                            if rollback_config_text is not None:
+                                _rollback(
+                                    lambda: config_path.write_text(
+                                        rollback_config_text, encoding="utf-8"
+                                    ),
+                                    "config",
+                                )
+                            raise
                 finally:
                     consume_lock.release()
             self._logger.info(
@@ -3927,11 +4017,20 @@ class ClaudeAccountSwitcher:
                 active_num, written_slot,
             )
             return True
-        except (
-            LockError, SwitchError, CredentialReadError, OSError,
-            TypeError, ValueError,
-        ):
-            return False  # transient / unreadable: retry on a later pass
+        except Exception as e:
+            # T1312: broadened from a narrow type tuple to every exception --
+            # a collect pass must never raise over a pending restore, and an
+            # untyped failure kept queued forever without a line saying why
+            # is what left this masked before.
+            self._store._log_detected_login(
+                None, slot=None, fp=fp,
+                outcome=f"pending restore into slot {written_slot}'s place raised",
+            )
+            self._logger.warning(
+                "A pending active-account restore raised while attempting "
+                "it (kept queued for a later pass): %s", e, exc_info=True,
+            )
+            return False  # transient: retry on a later pass
 
     def _register_login_as_new_slot(
         self, data: dict, creds: str, resolved: dict
@@ -6091,6 +6190,14 @@ class ClaudeAccountSwitcher:
         recovery branch consumes nothing it cannot attribute. Never raises.
         """
         own_uuid = self.account_identity(account_num).get("uuid")
+        # T1312: whether ownership of `creds` as `account_num`'s own login
+        # was ever settled (a fresh oracle match, or a memoized verdict) --
+        # set right before the locked block below, which is unreachable any
+        # other way. `except` below reads it so a raise BEFORE that point
+        # (still pre-probe) does not attribute `creds` to `account_num`'s
+        # email/uuid the same way the pre-probe branches above already
+        # refuse to.
+        established = False
         try:
             creds_oauth = oauth.extract_oauth_data(creds)
             if not (
@@ -6216,6 +6323,7 @@ class ClaudeAccountSwitcher:
                             email=resolved.get("email"), uuid=resolved.get("uuid"),
                         )
                     return
+            established = True
             with (
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
@@ -6322,15 +6430,22 @@ class ClaudeAccountSwitcher:
                     email=email, uuid=own_uuid,
                 )
         except LockError:
+            # T1312: pre-probe (not `established`), attribution is a guess --
+            # `slot`/`email`/`uuid` stay unknown, same as every other
+            # pre-probe refusal above.
             self._store._log_detected_login(
-                creds, slot=None, outcome="refused: lock contention",
-                email=email, uuid=own_uuid,
+                creds, slot=account_num if established else None,
+                outcome="refused: lock contention",
+                email=email if established else None,
+                uuid=own_uuid if established else None,
             )
             return  # holder is mid-operation; the next pass retries
         except Exception:
             self._store._log_detected_login(
-                creds, slot=None, outcome="refused: resync failed",
-                email=email, uuid=own_uuid,
+                creds, slot=account_num if established else None,
+                outcome="refused: resync failed",
+                email=email if established else None,
+                uuid=own_uuid if established else None,
             )
             self._logger.warning(
                 "Backup resync for account %s failed; the recovery branch's "

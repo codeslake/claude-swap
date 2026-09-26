@@ -1267,12 +1267,13 @@ class CredentialStore:
 
     def _log_detected_login(
         self,
-        creds: str,
+        creds: "str | None",
         *,
         slot: "str | None",
         outcome: str,
         email: "str | None" = None,
         uuid: "str | None" = None,
+        fp: "str | None" = None,
     ) -> None:
         """One INFO line per (fingerprint, outcome) for every login the
         collect/resync/adopt path sees, whatever the outcome (the owner's
@@ -1294,6 +1295,12 @@ class CredentialStore:
         repeat an unchanged verdict; the set is capped by a full clear, not
         an LRU eviction -- this is a debug trail, not a correctness record,
         so losing it early only costs one repeated line.
+
+        ``fp``, not ``creds``: a caller that only ever kept the fingerprint
+        (the pending-active-restore queue keys on it, never the bytes) has
+        no other way to log through this helper. Takes precedence over
+        recomputing from ``creds`` when both are given, though no caller
+        does that.
         """
         # `credential_fingerprint` returns "sha256:<hex>" or
         # "sha256-full:<hex>" -- deduping (and, before this fix, displaying)
@@ -1303,7 +1310,7 @@ class CredentialStore:
         # only the digest's own first 8 hex chars (split(":", 1) is prefix-
         # agnostic: both prefix shapes end in exactly one colon before the
         # digest).
-        full_fp = oauth.credential_fingerprint(creds) or "unknown"
+        full_fp = fp or (creds and oauth.credential_fingerprint(creds)) or "unknown"
         key = (full_fp, outcome)
         if key in self._login_line_seen:
             return
@@ -1449,10 +1456,14 @@ class CredentialStore:
                             "fingerprint": oauth.credential_fingerprint(current),
                         },
                     )
+                    # T1312: `slot`/`email` name the login that DISPLACED
+                    # `current`, never `current`'s own owner -- its identity
+                    # was never established, only its lineage compared, so
+                    # attributing it to `slot` would misattribute a login
+                    # this path never resolved.
                     self._log_detected_login(
-                        current, slot=slot,
+                        current, slot=None,
                         outcome=f"stashed: displaced by slot {slot}'s adopted login",
-                        email=email,
                     )
                 except (ClaudeSwitchError, OSError, TypeError, AttributeError) as e:
                     self._host._logger.warning(
@@ -1460,9 +1471,8 @@ class CredentialStore:
                         f"to the adopted one ({e}); the file was left as is"
                     )
                     self._log_detected_login(
-                        current, slot=slot,
+                        current, slot=None,
                         outcome="refused: could not stash displaced login",
-                        email=email,
                     )
                     return  # failed stash is not a license to overwrite: leave the file
         self._refresh_stale_credentials_file(credentials)

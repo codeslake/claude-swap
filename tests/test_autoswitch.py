@@ -2609,6 +2609,107 @@ class TestABareLoginHealsItsSlotThroughTheEngineTick:
         )
 
 
+class TestAPendingRestoreHoldsTheEngineAtNoAction:
+    """T1312: the owner's case -- a `/login` into a DISABLED slot (N) fired
+    ``disabled-active`` and ``_perform``ed the top-ranked candidate, which
+    need not be the roster's own active account (A), racing the T1313
+    restore that was about to put the live store back on A regardless.
+
+    ``_tick_inner`` read ``current`` (the live LABEL) once, before the
+    collect pass that both detects the login and queues (never applies)
+    its restore -- so the tick that RECORDS the restore must never act on
+    that stale ``current``, whatever trigger it would otherwise read as.
+    """
+
+    def test_the_recording_tick_never_switches_and_the_next_one_restores_a(
+        self, temp_home, monkeypatch,
+    ):
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = EngineHarness(temp_home, strategy="best")  # no consume-first chasing
+        # A's own backup needs a fresh, numeric `expiresAt` -- the restore
+        # gate (item 5) requires one, same as the switch path's own dead-
+        # token check.
+        h.seed(1, "a@example.com", expires_at=99_999_999_999_999)  # A
+        h.seed(2, "n@example.com")   # N: disabled, about to receive a bare /login
+        h.seed(3, "p@example.com")   # ranked ABOVE A when disabled-active fires
+        data = h.switcher._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        data["accounts"]["2"]["disabled"] = True
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+        a_backup = h.switcher._read_account_credentials("1", "a@example.com")
+
+        # N's stored backup needs its own dated lineage stamp -- undated on
+        # either side (`seed()` writes none) reads as "no evidence" and
+        # queues no restore at all (item 6), which is not what this test is
+        # about.
+        h.switcher._write_account_credentials("2", "n@example.com", json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-2-old", "refreshToken": "rt-2-old",
+                                "refreshTokenExpiresAt": 1_000_000}}
+        ), attributed=True)
+
+        # A bare /login as N's OWN roster identity -- no cswap add/switch --
+        # while the roster's active account is still A. A LATER
+        # `refreshTokenExpiresAt` than the stored backup's, so this reads as
+        # a genuinely new login rather than an ordinary same-lineage
+        # rotation.
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live",
+                               "refreshTokenExpiresAt": 2_000_000},
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "n@example.com", "accountUuid": "uuid-2"},
+        }))
+
+        def recording_fetch(num, email, creds, is_active=False, **kwargs):
+            # A well below its limit, slot 3 with even more headroom: if
+            # `disabled-active` reached candidate selection this tick, slot
+            # 3 would win. Neither is NEAR its limit -- this tick's Phase B
+            # escalation fetch persists both readings into the usage store
+            # regardless of the decision my fix skips, and a near-limit
+            # value for A would leak into the next tick's serve-TTL window.
+            pct = 50.0 if num == "1" else 0.0
+            return oauth.UsageOutcome({"five_hour": {"pct": pct}})
+
+        with (
+            patch("claude_swap.oauth.try_fetch_usage_for_account",
+                  side_effect=recording_fetch),
+            patch("claude_swap.oauth.fetch_oauth_profile",
+                  return_value={"uuid": "uuid-2", "email": "n@example.com",
+                                "organizationUuid": ""}),
+        ):
+            outcome = h.engine.tick()
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert "switch" not in h.kinds(), (
+            "the recording tick must never `_perform` on the stale "
+            "`current` it read before the collect queued a restore"
+        )
+        assert h.switcher._pending_active_restores, "premise: a restore was queued"
+        assert h.active_number() == 1, "the roster's active pointer must not move"
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) != oauth.credential_fingerprint(
+            a_backup
+        ), "premise: the restore has not been applied on this same tick either"
+
+        # The NEXT tick: past the 5s age floor, and nobody near their limit,
+        # so nothing but the settled restore can move the live store.
+        h.clock.advance(10)
+
+        def settled_fetch(num, email, creds, is_active=False, **kwargs):
+            return oauth.UsageOutcome({"five_hour": {"pct": 0.0}})
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   side_effect=settled_fetch):
+            h.engine.tick()
+
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            a_backup
+        ), "live must be back on A once the next tick settles the restore"
+        assert h.active_number() == 1
+
+
 class TestABareLoginToAnUnownedIdentityGetsItsOwnSlotThroughTheEngineTick:
     """The `_register_login_as_new_slot` sibling of the healing class above:
     the oracle resolves the live login to an identity NO slot owns at all

@@ -20543,6 +20543,42 @@ class TestALoginLandsInItsOwnSlot:
         oracle.assert_not_called()          # same lineage: nothing to attribute
         assert s._get_sequence_data()["activeAccountNumber"] == 2
 
+    def test_a_same_lineage_rotation_of_a_non_active_slot_records_nothing(
+        self, temp_home: Path,
+        sample_sequence_data: dict,
+    ):
+        """T1312 item 8(c): slot 1's OWN refresh token rotated (a routine
+        server-side re-mint, jitter apart -- not a new login) while slot 2
+        is active. `_record_pending_active_restore` must recognise the
+        jitter and queue nothing, same as the identical-bytes case above --
+        no `/login` ever asked for a restore here."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        old = self._blob("rt-1-old", refresh_expires_at=1_000_000)
+        new = self._blob("rt-1-new", refresh_expires_at=1_000_000 + 2_000)
+        s._write_account_credentials("1", "c@example.com", old)
+        s._write_credentials(new)
+        # The live config must itself show slot 1's identity -- the resync's
+        # own under-lock TOCTOU check (`_live_identity_matches`) refuses
+        # otherwise, and the generic `mock_claude_config` fixture carries an
+        # unrelated one.
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "c@example.com",
+                              "accountUuid": "u-1", "organizationUuid": "o-1"},
+        }))
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-1", "email": "c@example.com",
+                                 "organizationUuid": "o-1"}):
+            s._resync_rotated_backup("1", "c@example.com", "o-1", new)
+        assert json.loads(s._read_account_credentials(
+            "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-1-new", (
+            "premise: the rotation was still resynced to the backup"
+        )
+        assert not s._pending_active_restores, (
+            "an ordinary same-lineage rotation must never queue a restore"
+        )
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
     def test_CONTROL_the_roster_does_not_follow_bytes_the_live_store_no_longer_holds(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
@@ -20774,7 +20810,13 @@ class TestT1313KeepsTheActiveAccountLive:
             "oauthAccount": {"emailAddress": "b@example.com",
                               "accountUuid": "u-2", "organizationUuid": "o-2"},
         }))
-        return s, login, active_backup
+        # T1312: a pending restore is never attempted under a 5s age floor
+        # -- a controllable clock lets a test that records-then-processes
+        # in the same call advance past it deliberately, same as the real
+        # gap between two collect passes would.
+        clock = [1_700_000_000.0]
+        s._usage_store.clock = lambda: clock[0]
+        return s, login, active_backup, clock
 
     def _assert_active_slot_untouched(
         self, s, temp_home, active_backup, *, n_disabled: bool,
@@ -20815,7 +20857,7 @@ class TestT1313KeepsTheActiveAccountLive:
         """The manual collect path: `_fetch_active_usage`'s own resync call
         queues a restore; a LATER pass (`_process_pending_active_restores`)
         is the one that applies it."""
-        s, login, active_backup = self._setup(
+        s, login, active_backup, clock = self._setup(
             sample_sequence_data, temp_home, n_disabled=n_disabled,
         )
         with patch("claude_swap.oauth.fetch_oauth_profile",
@@ -20829,6 +20871,7 @@ class TestT1313KeepsTheActiveAccountLive:
         )
         self._assert_restore_queued_not_yet_applied(s, login)
 
+        clock[0] += 10  # past the 5s age floor: this is now "a later pass"
         s._process_pending_active_restores()
         self._assert_active_slot_untouched(
             s, temp_home, active_backup, n_disabled=n_disabled,
@@ -20842,7 +20885,7 @@ class TestT1313KeepsTheActiveAccountLive:
         """The same resync, reached through the autoswitch engine's own
         collect surface rather than called directly. One collect pass
         queues the restore; the NEXT one applies it -- never the same call."""
-        s, login, active_backup = self._setup(
+        s, login, active_backup, clock = self._setup(
             sample_sequence_data, temp_home, n_disabled=n_disabled,
         )
         with patch("claude_swap.oauth.fetch_oauth_profile",
@@ -20856,6 +20899,7 @@ class TestT1313KeepsTheActiveAccountLive:
             )
             self._assert_restore_queued_not_yet_applied(s, login)
 
+            clock[0] += 10  # past the 5s age floor: this is now "the NEXT one"
             s.usage_entries_by_account(fetch=set())
 
         self._assert_active_slot_untouched(
@@ -20871,7 +20915,7 @@ class TestT1313KeepsTheActiveAccountLive:
         Code ``/login`` faithfully: it rewrites BOTH the credential store
         AND ``~/.claude.json``'s ``oauthAccount`` (identity), not the
         credential alone."""
-        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        s, login, _active_backup, _clock = self._setup(sample_sequence_data, temp_home)
         (temp_home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "b@example.com",
                               "accountUuid": "u-2", "organizationUuid": "o-2"},
@@ -20897,10 +20941,22 @@ class TestT1313KeepsTheActiveAccountLive:
 
 
 class TestPendingActiveRestoreRefusals:
-    """`_try_restore_pending_active`'s proceed-conditions, unit-level: every
-    refusal keeps the entry queued for a later pass, except a live store
-    that has moved past the fingerprint the entry named (dropped -- there
-    is nothing left for the entry to correct)."""
+    """`_try_restore_pending_active`'s proceed-conditions, unit-level.
+
+    T1312: a refusal is either TRANSIENT (age floor, consume-lock
+    contention, lock contention, an unreadable backup, any other
+    exception) -- keeps the entry queued, retried on a later pass -- or
+    PERMANENT (the active backup unusable/quarantined/not-OAuth/no-email,
+    its access token dated but inside CC's refresh margin or not dated at
+    all, or the roster no longer naming an active account distinct from
+    the slot the login landed in) -- drops the entry, since none of those
+    heal themselves by retrying. A live store that has moved past the
+    fingerprint the entry named is dropped too: superseded, nothing left
+    to correct.
+    """
+
+    #: Recorded well past the 5s minimum age floor, well under the 60s max.
+    _RECORDED_AGE_S = 10.0
 
     def _setup(self, sample_sequence_data, temp_home):
         accs = sample_sequence_data["accounts"]
@@ -20927,48 +20983,105 @@ class TestPendingActiveRestoreRefusals:
                               "accountUuid": "u-2", "organizationUuid": "o-2"},
         }))
         fp = oauth.credential_fingerprint(login)
-        s._pending_active_restores[fp] = "1"
+        s._pending_active_restores[fp] = (
+            "1", s._usage_store.clock() - self._RECORDED_AGE_S,
+        )
         return s, login, active_backup, fp
 
     def test_a_live_store_that_moved_on_drops_the_entry(
         self, temp_home: Path, sample_sequence_data: dict,
     ):
         s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
-        s._write_credentials(json.dumps({"claudeAiOauth": {
+        other = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-other", "refreshToken": "rt-other",
-            "expiresAt": 1}}))
+            "expiresAt": 1}})
+        s._write_credentials(other)
         s._process_pending_active_restores()
         assert not s._pending_active_restores, (
             "a stale entry (live moved since it was recorded) must be dropped"
         )
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            other
+        ), "a superseded entry must never touch a live store it no longer names"
 
-    def test_a_quarantined_active_slot_keeps_the_entry_queued(
+    @pytest.mark.parametrize("age_s", [0.0, 4.9])
+    def test_an_entry_under_the_age_floor_keeps_queued_and_untried(
+        self, temp_home: Path, sample_sequence_data: dict, age_s: float,
+    ):
+        """CC's `/login` writes the credential and `~/.claude.json`
+        non-atomically -- an entry recorded moments ago may still be
+        racing the rest of that write, so it must not even be attempted."""
+        s, login, active_backup, fp = self._setup(sample_sequence_data, temp_home)
+        s._pending_active_restores[fp] = (
+            "1", s._usage_store.clock() - age_s,
+        )
+        s._process_pending_active_restores()
+        assert fp in s._pending_active_restores, "an under-age entry must be skipped"
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "an untried entry must never touch the live store"
+
+    def test_an_entry_past_the_max_age_is_dropped(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+    ):
+        """A restore that can never settle (its target permanently
+        unhealthy, say) must not hold the engine at NO_ACTION forever."""
+        s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
+        monkeypatch.setattr(s, "_slot_token_dead", lambda num, email: num == "2")
+        s._pending_active_restores[fp] = ("1", s._usage_store.clock() - 61.0)
+        s._process_pending_active_restores()
+        assert not s._pending_active_restores, (
+            "an entry older than the max age must be dropped, not retried forever"
+        )
+
+    def test_a_quarantined_active_slot_drops_the_entry(
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
     ):
         s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
         monkeypatch.setattr(s, "_slot_token_dead", lambda num, email: num == "2")
         s._process_pending_active_restores()
-        assert fp in s._pending_active_restores, (
-            "a quarantined active account must not be activated; retry later"
+        assert not s._pending_active_restores, (
+            "a quarantined active account never heals by retrying; drop it"
         )
         live_now = s._read_credentials()
         assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
             login
         ), "the live store must be untouched while the active slot is quarantined"
 
-    def test_an_active_backup_near_its_refresh_margin_keeps_the_entry_queued(
+    def test_an_active_backup_near_its_refresh_margin_drops_the_entry(
         self, temp_home: Path, sample_sequence_data: dict,
     ):
         """A no-network proof that no rotation of the active account was
         missed while its live bytes sat displaced: a missed rotation
-        leaves the predecessor near expiry."""
+        leaves the predecessor near expiry. Near-expiry does not heal by
+        retrying either -- it is dropped the same as any other permanent
+        refusal."""
         s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
         s._write_account_credentials("2", "b@example.com", json.dumps({
             "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
                               "expiresAt": 1}}))
         s._process_pending_active_restores()
-        assert fp in s._pending_active_restores, (
-            "a near-expiry backup must not be activated; retry later"
+        assert not s._pending_active_restores, (
+            "a near-expiry backup never heals by retrying; drop it"
+        )
+
+    @pytest.mark.parametrize("expires_at", [None, "not-a-number", float("nan")])
+    def test_an_active_backup_with_no_numeric_expires_at_drops_the_entry(
+        self, temp_home: Path, sample_sequence_data: dict, expires_at,
+    ):
+        """T1312: `is_oauth_token_expired` answers False (not expired) for
+        anything non-numeric -- unknown is not expired -- which used to let
+        a backup nobody can date through this gate. A numeric `expiresAt`
+        is required outright."""
+        s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
+        s._write_account_credentials("2", "b@example.com", json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
+                              "expiresAt": expires_at}}))
+        s._process_pending_active_restores()
+        assert not s._pending_active_restores, (
+            "an undated access token must not be treated as fresh"
         )
 
     def test_a_held_consume_lock_keeps_the_entry_queued(
@@ -20988,19 +21101,55 @@ class TestPendingActiveRestoreRefusals:
         finally:
             held.release()
 
+    def test_an_exception_keeps_the_entry_queued(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+    ):
+        """T1312: item 3 -- a collect pass never raises over a pending
+        restore, whatever the exception, and the entry stays queued
+        (bounded by the max-age drop) rather than being lost."""
+        s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
+        monkeypatch.setattr(
+            s, "_slot_token_dead",
+            lambda num, email: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        s._process_pending_active_restores()
+        assert fp in s._pending_active_restores, (
+            "an exception must keep the entry queued, not drop or raise it"
+        )
+
     def test_CONTROL_a_healthy_active_slot_is_restored_and_dropped(
         self, temp_home: Path, sample_sequence_data: dict,
     ):
         """Positive control: with none of the above refusals in play, the
         entry IS restored and dropped -- proving the refusal tests above
-        are exercising a real gate, not a setup that never restores."""
+        are exercising a real gate, not a setup that never restores.
+
+        T1312 item 8(b)/(d): a real ``/login`` rewrites ``~/.claude.json``'s
+        ``oauthAccount`` too, not only the credential -- so the config here
+        is set to N (not left on A, as most of the other setups leave it)
+        before the restore runs, with an ``mcpOAuth`` key alongside it, and
+        both the identity and that key must survive the restore.
+        """
         s, login, active_backup, fp = self._setup(sample_sequence_data, temp_home)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "c@example.com",
+                              "accountUuid": "u-1", "organizationUuid": "o-1"},
+            "mcpOAuth": {"server": {"refreshToken": "keep-me"}},
+        }))
         s._process_pending_active_restores()
         live_now = s._read_credentials()
         assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
             active_backup
         )
         assert not s._pending_active_restores
+        live_config = json.loads((temp_home / ".claude.json").read_text())
+        assert live_config["oauthAccount"]["emailAddress"] == "b@example.com", (
+            "the restore must rewrite the live config's identity back to A, "
+            "not only the credential store"
+        )
+        assert live_config["mcpOAuth"] == {"server": {"refreshToken": "keep-me"}}, (
+            "the restore must preserve every other live-config key"
+        )
 
 
 class TestLoginLineHelper:
