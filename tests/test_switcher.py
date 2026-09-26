@@ -18295,6 +18295,67 @@ class TestActiveSlotStrikeParity:
             s._fetch_active_usage("2", "b@example.com", fresh)
         resync.assert_not_called()
 
+    def test_degraded_read_logs_ignored_only_when_it_differs_from_the_backup(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, caplog
+    ):
+        """T1312 [m]: the "ignored: degraded read" line must not fire every
+        pass -- only when the live credential actually differs from the
+        slot's own backup."""
+        import logging
+        from claude_swap.oauth import UsageOutcome
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        backup = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-backup", "refreshToken": "rt-backup",
+                              "expiresAt": 9999999999000}})
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live",
+                              "expiresAt": 9999999999000}})
+        s._write_account_credentials("2", "b@example.com", backup)
+        s._record_active_verdict(ActiveCredentials("", False, True))
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=UsageOutcome({"five_hour": {"utilization": 10}}),
+        ), caplog.at_level(logging.INFO, logger="claude-swap"):
+            s._fetch_active_usage("2", "b@example.com", live)
+        lines = [
+            r.getMessage() for r in caplog.records
+            if "ignored: degraded read" in r.getMessage()
+        ]
+        assert len(lines) == 1, f"expected one line, got {lines}"
+        assert "email=unknown" in lines[0]
+
+    def test_degraded_read_logs_nothing_when_live_equals_the_backup(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, caplog
+    ):
+        """T1312 [m]: the steady state (live already matches the slot's own
+        backup) is not a detected login and must produce no line."""
+        import logging
+        from claude_swap.oauth import UsageOutcome
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live",
+                              "expiresAt": 9999999999000}})
+        s._write_account_credentials("2", "b@example.com", live)
+        s._record_active_verdict(ActiveCredentials("", False, True))
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=UsageOutcome({"five_hour": {"utilization": 10}}),
+        ), caplog.at_level(logging.INFO, logger="claude-swap"):
+            s._fetch_active_usage("2", "b@example.com", live)
+        lines = [
+            r.getMessage() for r in caplog.records
+            if "ignored: degraded read" in r.getMessage()
+        ]
+        assert lines == [], f"expected no line in the steady state, got {lines}"
+
     def test_active_strike_healed_by_absent_backup_not_unreadable(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict

@@ -463,19 +463,19 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
 
     def test_CONTROL_a_newer_KEYCHAIN_still_wins(self, tmp_path, monkeypatch):
         """The other direction, and the ordinary one: CC writes rotations to
-        the Keychain on macOS, so a stale file must not win. ``kc_mdat`` is
-        a REAL value, older than the file's own mtime -- mtime evidence
-        ALONE would hand the file the win, so this only passes because the
-        file's stamp is confidently the OLDER generation (a spent refresh
-        token), which the mtime arm must never override."""
+        the Keychain on macOS, so a stale file must not win. T1312: the
+        direction of the stamp gap is not evidence either way -- both stamps
+        are dated and more than the jitter apart, so mtime vs ``kc_mdat``
+        decides. ``kc_mdat`` is LATER than the file's own mtime here (the
+        Keychain really was written last), which is the right reason the
+        Keychain wins."""
         kc = self._creds("keychain-login", 9_000)
         fl = self._creds("file-old", 1_000)
         got = self._store(
-            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
+            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() + 3600,
         )._read_active_credentials()
         assert got.value == kc, (
-            "a stale file, confidently the OLDER generation by its own "
-            "stamp, won on mtime evidence alone"
+            "a file mtime-older than the Keychain's write still won"
         )
 
     def test_CONTROL_equal_lifetimes_keep_the_keychain(self, tmp_path, monkeypatch):
@@ -596,11 +596,11 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
         older, far outside the same-lineage jitter, so it must never reach
         the ``expiresAt`` tiebreak at all. A later ``expiresAt`` on that
         stale login (e.g. a long-lived token minted at the time) must not
-        let it win over the Keychain's current login. ``kc_mdat`` is a
-        REAL value, older than the file's own mtime: mtime evidence alone
-        would hand the file the win, so this only passes because the
-        file's stamp is confidently the OLDER generation, which the mtime
-        arm must never override."""
+        let it win over the Keychain's current login. T1312: the stamp gap's
+        DIRECTION is not evidence -- both stamps are dated and a year apart,
+        so mtime vs ``kc_mdat`` decides. ``kc_mdat`` is LATER than the
+        file's own mtime here (the Keychain really was written last), which
+        is the right reason the Keychain wins."""
         kc_refresh = 1_790_380_487_015
         kc_exp = 1_788_399_592_015
         fl_refresh = kc_refresh - 31_536_000_000  # 365 days earlier
@@ -614,11 +614,35 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
             "expiresAt": fl_exp,
             "refreshTokenExpiresAt": fl_refresh}})
         got = self._store(
-            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
+            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() + 3600,
         )._read_active_credentials()
         assert got.value == kc, (
             "a year-older login in the file won because its expiresAt was "
             "later, even though it is nowhere near the same-lineage jitter"
+        )
+
+    def test_a_fresh_login_in_the_FILE_with_an_EARLIER_stamp_still_wins(
+        self, tmp_path, monkeypatch
+    ):
+        """T1312 [C], the bug this round closes: stamps are not ordered
+        ACROSS accounts (a later login can carry an earlier
+        ``refreshTokenExpiresAt``; each account's own token TTL sets it
+        independently). A fresh login written to the FILE only (a failed
+        Keychain write) whose stamp happens to be EARLIER than the
+        Keychain's current login must still be served on mtime evidence --
+        the old code's direction gate (file wins only when ITS stamp is
+        later) silently kept the Keychain here instead. ``kc_mdat`` is an
+        hour old; the file's mtime is "now" (just written), so mtime
+        evidence says the file was written last."""
+        kc = self._creds("keychain-login", 9_000)  # LATER stamp
+        fl = self._creds("file-fresh-login", 1_000)  # EARLIER stamp
+        got = self._store(
+            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
+        )._read_active_credentials()
+        assert got.value == fl, (
+            "the file's fresh login lost to the Keychain solely because its "
+            "refreshTokenExpiresAt was earlier -- that stamp does not order "
+            "two different logins, only a later WRITE (mtime vs kc_mdat) does"
         )
 
     def test_a_strict_tie_between_file_mtime_and_keychain_mdat_keeps_the_keychain(

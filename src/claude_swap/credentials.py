@@ -677,13 +677,13 @@ class CredentialStore:
         strictly later than ``kc_mdat``; ``kc_mdat is None`` is no evidence,
         so the Keychain keeps it, same as an unreadable file.
 
-        Reached only when the file's OWN stamp is CONFIDENTLY LATER than the
-        Keychain's (later by more than the jitter) -- never merely "not
-        within the jitter". An UNDATED side (either stamp missing) or a file
-        stamp that is confidently EARLIER cannot be told apart from a later
-        write of an OLDER generation of the SAME login (a spent refresh
-        token copied in after its lineage's last dated write): mtime alone
-        must not hand that file the win, so both keep the Keychain.
+        Reached whenever BOTH stamps are present and more than the jitter
+        apart, in EITHER direction: the stamps are not ordered ACROSS
+        accounts (a later login can carry an earlier
+        ``refreshTokenExpiresAt`` -- each account's own token TTL sets it
+        independently), so which side is later says nothing about which
+        STORE was written last -- only mtime vs ``kc_mdat`` does. An UNDATED
+        side (either stamp missing) is no evidence and keeps the Keychain.
 
         Any read or parse failure answers None: this decides which of two
         readable credentials to serve, and an unreadable one is not a claim.
@@ -719,12 +719,12 @@ class CredentialStore:
                 return text
             return None
 
-        file_confidently_later = (
+        stamps_confidently_apart = (
             kc_at is not None
             and file_at is not None
-            and file_at - kc_at > LINEAGE_STAMP_JITTER_MS
+            and abs(file_at - kc_at) > LINEAGE_STAMP_JITTER_MS
         )
-        if same_lineage_only or kc_mdat is None or not file_confidently_later:
+        if same_lineage_only or kc_mdat is None or not stamps_confidently_apart:
             return None
         resolved_mdat = kc_mdat()
         if resolved_mdat is not None and int(file_mtime) > int(resolved_mdat):
@@ -795,10 +795,10 @@ class CredentialStore:
                 # refresh of the SAME lineage, to within seconds of jitter --
                 # but it does NOT order two DIFFERENT logins (each account's
                 # own token TTL sets it independently), so only a STORE
-                # write (`kc_mdat` vs the file's mtime) orders those, and
-                # only once the file's own stamp is confidently later.
-                # Undated, or confidently earlier, is no evidence and keeps
-                # the Keychain either way.
+                # write (`kc_mdat` vs the file's mtime) orders those, once
+                # both stamps are dated and more than the jitter apart in
+                # EITHER direction. Undated on either side is no evidence and
+                # keeps the Keychain either way.
                 #
                 # The mdat lookup shells out to `security` again; resolved
                 # lazily by `_fresher_plaintext_login` itself, only when it
@@ -1711,6 +1711,40 @@ class CredentialStore:
                 if failed is not None:
                     failed.append(True)
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
+        return ""
+
+    def _read_account_credentials_direct(self, account_num: str, email: str) -> str:
+        """Best-effort backup read that never touches the Keychain capability
+        cache. ``""`` on any absence, corruption or Keychain failure.
+
+        Same backends and ``.enc``-wins order as
+        :meth:`_read_account_credentials`, but the Keychain fallback calls
+        ``macos_keychain.get_password`` directly rather than through
+        ``_kc_call`` -- for a caller that only wants to compare the live
+        credential against this slot's backup to decide whether to LOG,
+        never to serve or write anything, so a Keychain failure here must
+        not flip ``_keychain_usable_cache``/``_keychain_op_failed`` on
+        behalf of a check nothing else needed.
+        """
+        enc_file = self._backup_enc_path(account_num, email)
+        try:
+            encoded = enc_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            encoded = ""
+        if encoded:
+            try:
+                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+            except Exception:
+                decoded = ""
+            if decoded:
+                return decoded
+        if self._host.platform == Platform.MACOS:
+            try:
+                return macos_keychain.get_password(
+                    SECURITY_SERVICE, self._backup_username(account_num, email),
+                ) or ""
+            except macos_keychain.KEYCHAIN_ERRORS:
+                return ""
         return ""
 
     def _read_account_credentials_ex(

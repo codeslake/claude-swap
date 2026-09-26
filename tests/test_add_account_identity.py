@@ -809,6 +809,55 @@ def test_sync_stamps_the_mirror_file_to_the_keychains_own_mdat(
     )
 
 
+def test_sync_leaves_the_mirror_mtime_alone_when_the_write_fails(
+    temp_home: Path, mock_claude_config: Path, monkeypatch,
+):
+    """T1312 [m]: the re-read guard before the mtime stamp. If the mirror
+    write failed (``_refresh_stale_credentials_file`` swallows the
+    exception) or the file was replaced by another writer before this
+    re-reads it, the bytes on disk no longer equal what was just written --
+    stamping the Keychain's mdat onto them would misdate a write this call
+    never made (or a different login's own write)."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    s.platform = Platform.MACOS
+
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    old_login = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-old", "refreshToken": "rt-old",
+        "expiresAt": 1}})
+    cred_file.write_text(old_login, encoding="utf-8")
+    old_mtime = time.time() - 3600
+    os.utime(cred_file, (old_mtime, old_mtime))
+
+    monkeypatch.setattr(
+        macos_keychain, "item_modified_at",
+        lambda service, account: time.time() - 120,
+    )
+
+    def _failing_write(credentials):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        s._store, "_write_active_credentials_file", _failing_write,
+    )
+    new_login = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-new", "refreshToken": "rt-new",
+        "expiresAt": 99999999999000}})
+
+    s._store._sync_active_credentials_file_to_adopted_login(
+        new_login, slot="3", email="ax@example.com",
+    )
+
+    assert cred_file.read_text(encoding="utf-8") == old_login, (
+        "the failed write's swallowed exception should leave the file's "
+        "previous bytes standing"
+    )
+    assert cred_file.stat().st_mtime == pytest.approx(old_mtime, abs=1), (
+        "the mtime was stamped to the Keychain's mdat even though the "
+        "write never landed"
+    )
+
+
 def test_sync_skips_when_secure_storage_profile_diverges_from_config_dir(
     temp_home: Path, mock_claude_config: Path, monkeypatch,
 ):
