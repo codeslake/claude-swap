@@ -6221,7 +6221,7 @@ class ClaudeAccountSwitcher:
             return mdat
         return max(mdat, file_mtime)
 
-    def _engine_quarantined(self, num: str, email: str) -> bool:
+    def _engine_quarantined(self, num: str, fingerprint: str | None) -> bool:
         """Is slot ``num`` in the auto-switch engine's own quarantine ledger
         right now (its ``autoswitch_state.json``, e.g. an
         ``identity-conflict`` entry -- see ``AutoSwitchEngine._quarantine``)?
@@ -6230,6 +6230,16 @@ class ClaudeAccountSwitcher:
         precondition: this file is the engine's own (``.autoswitch_state.lock``
         guards its writes), and the settle never opens that lock, only reads
         past it.
+
+        ``fingerprint`` is the caller's OWN fingerprint of ``num``'s backup,
+        from a read already done under :attr:`lock_file` -- never re-read
+        here. A second, unlocked read of that same backup can FAIL and
+        return ``""``, whose fingerprint is ``None`` and mismatches every
+        real entry, so the caller's genuinely quarantined backup would read
+        as "not quarantined" on nothing but that read's bad luck (T1313).
+        An unreadable backup never reaches this call at all: the locked
+        read that produced ``fingerprint`` already turned that case into a
+        transient refusal before this is checked.
 
         Counted only while the entry's own ``refreshTokenFingerprint`` still
         matches ``num``'s current backup -- the same comparison
@@ -6255,8 +6265,6 @@ class ClaudeAccountSwitcher:
             return False
         if entry.get("fingerprintUnknown"):
             return True
-        backup = self._read_account_credentials(num, email)
-        fingerprint = oauth.credential_fingerprint(backup) if backup else None
         return fingerprint == entry.get("refreshTokenFingerprint")
 
     def _settle_login_restore(self) -> LoginRestoreOutcome:
@@ -6409,7 +6417,9 @@ class ClaudeAccountSwitcher:
                     return _left("no usable stored login")
                 if (
                     self._slot_token_dead(a_num, a_email)
-                    or self._engine_quarantined(a_num, a_email)
+                    or self._engine_quarantined(
+                        a_num, oauth.credential_fingerprint(backup)
+                    )
                 ):
                     return _left("quarantined")
                 expires_at = backup_oauth.get("expiresAt")

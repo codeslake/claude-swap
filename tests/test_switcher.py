@@ -20905,6 +20905,7 @@ class TestT1313LoginRestore:
     @pytest.mark.parametrize("condition", [
         "quarantined", "inside_margin", "non_finite", "consume_locked",
         "consume_locked_past_bound", "settled_meanwhile", "engine_quarantined",
+        "engine_quarantined_stale", "engine_quarantined_read_fails",
         "write_time_unreadable", "write_time_future",
         "d_backup_changed_meanwhile", "d_backup_unreadable", "backup_unreadable",
     ])
@@ -20936,6 +20937,37 @@ class TestT1313LoginRestore:
                     active_backup
                 ),
             }}}))
+        elif condition == "engine_quarantined_stale":
+            # Control: the entry names a fingerprint that is NOT A's
+            # current backup at all (not merely unreadable) -- the
+            # quarantine check must answer False and the restore must go
+            # ahead, same as when no quarantine file exists.
+            state_path = s.backup_dir / "autoswitch_state.json"
+            state_path.write_text(json.dumps({"quarantine": {"2": {
+                "refreshTokenFingerprint": "not-a-real-fingerprint",
+            }}}))
+        elif condition == "engine_quarantined_read_fails":
+            # T1313: the entry matches A's backup exactly as already read
+            # under the lock a few lines up -- but the OLD
+            # `_engine_quarantined` re-read that same backup itself
+            # (unlocked, via the plain reader) and that second read
+            # fails, returning "". The fix takes the locked read's own
+            # fingerprint as an argument instead, so this failure must
+            # never make the check answer "not quarantined".
+            state_path = s.backup_dir / "autoswitch_state.json"
+            state_path.write_text(json.dumps({"quarantine": {"2": {
+                "refreshTokenFingerprint": oauth.credential_fingerprint(
+                    active_backup
+                ),
+            }}}))
+            real_read = s._read_account_credentials
+
+            def _failing_read(num, email):
+                if (num, email) == ("2", "b@example.com"):
+                    return ""
+                return real_read(num, email)
+
+            monkeypatch.setattr(s, "_read_account_credentials", _failing_read)
         elif condition == "write_time_unreadable":
             monkeypatch.setattr(s, "_live_write_time", lambda: None)
         elif condition == "write_time_future":
@@ -20994,10 +21026,14 @@ class TestT1313LoginRestore:
             if held_lock is not None:
                 held_lock.release()
         # The three TRANSIENT refusals (T1313) answer WAITING within the
-        # bound; everything else, including the SAME refusal past the
-        # bound, answers NONE like it always has.
+        # bound; "engine_quarantined_stale" is the positive control --
+        # a quarantine entry that plainly does not name A's backup must
+        # not block a legitimate restore; everything else, including the
+        # SAME refusal past the bound, answers NONE like it always has.
         expected = (
-            LoginRestoreOutcome.WAITING
+            LoginRestoreOutcome.RESTORED
+            if condition == "engine_quarantined_stale"
+            else LoginRestoreOutcome.WAITING
             if condition in (
                 "consume_locked", "d_backup_unreadable", "backup_unreadable",
             )
@@ -21005,9 +21041,16 @@ class TestT1313LoginRestore:
         )
         assert outcome is expected, condition
         live_now = s._read_credentials()
-        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
-            login
-        ), f"a refused restore ({condition}) must leave live on N's login"
+        if condition == "engine_quarantined_stale":
+            assert (
+                oauth.credential_fingerprint(live_now)
+                == oauth.credential_fingerprint(active_backup)
+            ), f"a stale quarantine entry ({condition}) must not block a restore"
+        else:
+            assert (
+                oauth.credential_fingerprint(live_now)
+                == oauth.credential_fingerprint(login)
+            ), f"a refused restore ({condition}) must leave live on N's login"
 
     def test_settle_keeps_a_live_mcpOAuth_key(
         self, temp_home: Path, sample_sequence_data: dict,
