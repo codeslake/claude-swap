@@ -42,7 +42,7 @@ from claude_swap.usage_store import (
 )
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import _PENDING_RESTORE_MAX_AGE_S, ClaudeAccountSwitcher
 
 
 class FakeClock:
@@ -2709,6 +2709,82 @@ class TestAPendingRestoreHoldsTheEngineAtNoAction:
         ), "live must be back on A once the next tick settles the restore"
         assert h.active_number() == 1
 
+    def test_next_delay_wakes_before_the_settle_window_closes(
+        self, temp_home, monkeypatch,
+    ):
+        """T1312 item 1: `_next_delay` used to ignore a pending restore and
+        sleep the FULL jittered ``interval_seconds`` (54-66s at the 60s
+        default) — past `_PENDING_RESTORE_MAX_AGE_S`'s 60s ceiling by
+        enough that the settle-first call on the next tick found the entry
+        already too old and dropped it unattempted, never restoring A;
+        ``--once`` exits with it. Advances the fake clock by whatever
+        `_next_delay` itself returns for THIS tick's outcome (not a
+        hand-picked figure), so reverting the fix — back to the plain
+        jittered interval — turns this red.
+        """
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        # Pin the +-10% jitter to its top end: pre-fix, `_next_delay` would
+        # then sleep the full 66s (past the 60s max-age ceiling) -- this
+        # test must not depend on which way an unseeded draw happened to
+        # fall.
+        monkeypatch.setattr(autoswitch.random, "random", lambda: 1.0)
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com", expires_at=99_999_999_999_999)  # A
+        h.seed(2, "n@example.com")   # N: disabled, about to receive a /login
+        h.seed(3, "p@example.com")
+        data = h.switcher._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        data["accounts"]["2"]["disabled"] = True
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+        a_backup = h.switcher._read_account_credentials("1", "a@example.com")
+
+        h.switcher._write_account_credentials("2", "n@example.com", json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-2-old", "refreshToken": "rt-2-old",
+                                "refreshTokenExpiresAt": 1_000_000}}
+        ), attributed=True)
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live",
+                               "refreshTokenExpiresAt": 2_000_000},
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "n@example.com", "accountUuid": "uuid-2"},
+        }))
+
+        def fetch(num, email, creds, is_active=False, **kwargs):
+            return oauth.UsageOutcome({"five_hour": {"pct": 0.0}})
+
+        with (
+            patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=fetch),
+            patch("claude_swap.oauth.fetch_oauth_profile",
+                  return_value={"uuid": "uuid-2", "email": "n@example.com",
+                                "organizationUuid": ""}),
+        ):
+            outcome = h.engine.tick()
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.switcher._pending_active_restores, "premise: a restore was queued"
+
+        delay = h.engine._next_delay(outcome)
+        assert delay < _PENDING_RESTORE_MAX_AGE_S, (
+            f"a {delay}s sleep leaves no room for the settle-first call "
+            f"before the {_PENDING_RESTORE_MAX_AGE_S}s max-age drop"
+        )
+        h.clock.advance(delay)
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=fetch):
+            h.engine.tick()
+
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            a_backup
+        ), (
+            "the loop's own sleep must leave enough of the settle window "
+            "that the next tick restores A instead of dropping the entry "
+            "unattempted"
+        )
+
 
 class TestABareLoginToAnUnownedIdentityGetsItsOwnSlotThroughTheEngineTick:
     """The `_register_login_as_new_slot` sibling of the healing class above:
@@ -5292,6 +5368,53 @@ class TestConsumeFirstStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
         assert {"1", "2", "3"} in fetch_sets
+
+    def test_a_login_race_during_the_phase_two_refetch_bails_instead_of_switching(
+        self, temp_home,
+    ):
+        """T1312 item 5: the phase-2 refetch calls `usage_entries_by_account`
+        too, which runs `_process_pending_active_restores` -- the same call
+        the tick's own settle-first call makes before the FIRST collect, so
+        it can just as easily queue a NEW restore mid-tick (a `/login`
+        landing between the provisional decision and this refetch). The
+        bail the first collect earns must repeat here: fresh data
+        confirming the provisional pick is not license to `_perform` on
+        `current` once a restore is queued out from under it.
+        """
+        h = self._harness(temp_home)
+        view = {
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        fetch_sets: list[set] = []
+
+        def collect(fetch=None, **_kwargs):
+            requested = set(fetch or ())
+            fetch_sets.append(requested)
+            if requested == {"1", "2", "3"}:
+                # A login raced in between phase 1 and this refetch.
+                h.switcher._pending_active_restores["fake-fp"] = (
+                    "3", h.clock.now,
+                )
+            return {
+                num: _entry_for(value, h.clock.now)
+                for num, value in view.items()
+            }
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=collect
+        ):
+            outcome = h.engine.tick()
+
+        assert outcome is TickOutcome.NO_ACTION, (
+            "a restore queued mid-tick by the phase-2 refetch must bail, "
+            "not `_perform` on the stale `current`"
+        )
+        assert h.active_number() == 1
+        assert {"1", "2", "3"} in fetch_sets, "premise: the refetch did happen"
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["pending-restore"]
 
     def test_two_phase_refetch_reranks_to_fresh_best(self, temp_home):
         # Phase 2 is a full re-rank, not a yes/no check on the provisional

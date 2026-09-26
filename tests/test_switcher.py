@@ -20989,14 +20989,17 @@ class TestPendingActiveRestoreRefusals:
         return s, login, active_backup, fp
 
     def test_a_live_store_that_moved_on_drops_the_entry(
-        self, temp_home: Path, sample_sequence_data: dict,
+        self, temp_home: Path, sample_sequence_data: dict, caplog,
     ):
+        import logging
+
         s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
         other = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-other", "refreshToken": "rt-other",
             "expiresAt": 1}})
         s._write_credentials(other)
-        s._process_pending_active_restores()
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            s._process_pending_active_restores()
         assert not s._pending_active_restores, (
             "a stale entry (live moved since it was recorded) must be dropped"
         )
@@ -21004,6 +21007,14 @@ class TestPendingActiveRestoreRefusals:
         assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
             other
         ), "a superseded entry must never touch a live store it no longer names"
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("login:")
+        ]
+        assert any("dropped: live moved on" in line for line in lines), (
+            f"T1312 item 2: a superseded restore must go through "
+            f"_log_detected_login too, not vanish silently: {lines}"
+        )
 
     @pytest.mark.parametrize("age_s", [0.0, 4.9])
     def test_an_entry_under_the_age_floor_keeps_queued_and_untried(
@@ -21024,17 +21035,36 @@ class TestPendingActiveRestoreRefusals:
         ), "an untried entry must never touch the live store"
 
     def test_an_entry_past_the_max_age_is_dropped(
-        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+        self, temp_home: Path, sample_sequence_data: dict,
     ):
-        """A restore that can never settle (its target permanently
-        unhealthy, say) must not hold the engine at NO_ACTION forever."""
+        """A restore that can never settle must not hold the engine at
+        NO_ACTION forever.
+
+        T1312 item 3: the refusal held here must be TRANSIENT (a held
+        consume lock), not a permanent one (a quarantined A) -- a
+        quarantined A drops the entry on its own merits, whatever the age,
+        so that setup never actually exercised the max-age gate: this
+        exact test would still pass with the age check deleted outright.
+        A transient refusal only ever KEEPS the entry queued on its own, so
+        the drop this test asserts can only be the max-age gate's.
+        """
+        from claude_swap.locking import FileLock
+
         s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
-        monkeypatch.setattr(s, "_slot_token_dead", lambda num, email: num == "2")
         s._pending_active_restores[fp] = ("1", s._usage_store.clock() - 61.0)
-        s._process_pending_active_restores()
+        held = FileLock(s.credentials_dir / ".consume-2.lock")
+        assert held.acquire(timeout=0)
+        try:
+            s._process_pending_active_restores()
+        finally:
+            held.release()
         assert not s._pending_active_restores, (
             "an entry older than the max age must be dropped, not retried forever"
         )
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "a max-age drop must never touch the live store either"
 
     def test_a_quarantined_active_slot_drops_the_entry(
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
@@ -21066,6 +21096,10 @@ class TestPendingActiveRestoreRefusals:
         assert not s._pending_active_restores, (
             "a near-expiry backup never heals by retrying; drop it"
         )
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "a near-expiry backup must never actually be activated"
 
     @pytest.mark.parametrize("expires_at", [None, "not-a-number", float("nan")])
     def test_an_active_backup_with_no_numeric_expires_at_drops_the_entry(
@@ -21074,7 +21108,15 @@ class TestPendingActiveRestoreRefusals:
         """T1312: `is_oauth_token_expired` answers False (not expired) for
         anything non-numeric -- unknown is not expired -- which used to let
         a backup nobody can date through this gate. A numeric `expiresAt`
-        is required outright."""
+        is required outright.
+
+        T1312 item 3: a NaN passes `isinstance(x, float)`, so without
+        `math.isfinite` here it slipped past this gate AND
+        `is_oauth_token_expired` (which excludes it from "expired" the same
+        way) and the restore went through -- `not pending_active_restores`
+        alone cannot tell a genuine drop from a completed restore; only the
+        live store, still on the login, can.
+        """
         s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
         s._write_account_credentials("2", "b@example.com", json.dumps({
             "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
@@ -21083,20 +21125,35 @@ class TestPendingActiveRestoreRefusals:
         assert not s._pending_active_restores, (
             "an undated access token must not be treated as fresh"
         )
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "an undated backup must never actually be activated"
 
     def test_a_held_consume_lock_keeps_the_entry_queued(
-        self, temp_home: Path, sample_sequence_data: dict,
+        self, temp_home: Path, sample_sequence_data: dict, caplog,
     ):
+        import logging
+
         from claude_swap.locking import FileLock
 
         s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
         held = FileLock(s.credentials_dir / ".consume-2.lock")
         assert held.acquire(timeout=0)
         try:
-            s._process_pending_active_restores()
+            with caplog.at_level(logging.INFO, logger="claude-swap"):
+                s._process_pending_active_restores()
             assert fp in s._pending_active_restores, (
                 "a consume in flight for the active slot must retry later, "
                 "not race its own POST"
+            )
+            lines = [
+                r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("login:")
+            ]
+            assert any("kept: consume in flight" in line for line in lines), (
+                f"T1312 item 2: a transient keep must go through "
+                f"_log_detected_login too, not vanish silently: {lines}"
             )
         finally:
             held.release()
@@ -21118,7 +21175,7 @@ class TestPendingActiveRestoreRefusals:
         )
 
     def test_CONTROL_a_healthy_active_slot_is_restored_and_dropped(
-        self, temp_home: Path, sample_sequence_data: dict,
+        self, temp_home: Path, sample_sequence_data: dict, caplog,
     ):
         """Positive control: with none of the above refusals in play, the
         entry IS restored and dropped -- proving the refusal tests above
@@ -21127,16 +21184,32 @@ class TestPendingActiveRestoreRefusals:
         T1312 item 8(b)/(d): a real ``/login`` rewrites ``~/.claude.json``'s
         ``oauthAccount`` too, not only the credential -- so the config here
         is set to N (not left on A, as most of the other setups leave it)
-        before the restore runs, with an ``mcpOAuth`` key alongside it, and
-        both the identity and that key must survive the restore.
+        before the restore runs, and the identity must survive the restore.
+
+        T1312 item 4: the live credential's machine-shared ``mcpOAuth``
+        (the ``SHARED_CREDENTIAL_KEYS`` allowlist) lives in the CREDENTIAL
+        blob ``_read_credentials()`` returns, not the config -- checking it
+        there (as an earlier version of this test did) passed even with the
+        merge reverted to the raw backup, since nothing here touches
+        unrelated config keys either way.
+
+        T1312 item 2: the success outcome must go through
+        ``_log_detected_login`` too, same as every other restore outcome.
         """
+        import logging
+
         s, login, active_backup, fp = self._setup(sample_sequence_data, temp_home)
+        live_with_mcp = json.dumps({
+            **json.loads(login),
+            "mcpOAuth": {"server": {"refreshToken": "keep-me"}},
+        })
+        s._write_credentials(live_with_mcp)
         (temp_home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "c@example.com",
                               "accountUuid": "u-1", "organizationUuid": "o-1"},
-            "mcpOAuth": {"server": {"refreshToken": "keep-me"}},
         }))
-        s._process_pending_active_restores()
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            s._process_pending_active_restores()
         live_now = s._read_credentials()
         assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
             active_backup
@@ -21147,8 +21220,20 @@ class TestPendingActiveRestoreRefusals:
             "the restore must rewrite the live config's identity back to A, "
             "not only the credential store"
         )
-        assert live_config["mcpOAuth"] == {"server": {"refreshToken": "keep-me"}}, (
-            "the restore must preserve every other live-config key"
+        assert json.loads(live_now).get("mcpOAuth") == {
+            "server": {"refreshToken": "keep-me"}
+        }, (
+            "the restore must carry the live credential's machine-shared "
+            "mcpOAuth forward in the CREDENTIAL blob, not silently drop it "
+            "with the backup's stale snapshot"
+        )
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("login:")
+        ]
+        assert any("restored: live back on slot 2" in line for line in lines), (
+            f"T1312 item 2: a successful restore must go through "
+            f"_log_detected_login too, not a separate plain log line: {lines}"
         )
 
 

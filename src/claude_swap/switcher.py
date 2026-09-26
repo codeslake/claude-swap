@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -3854,8 +3855,9 @@ class ClaudeAccountSwitcher:
                 self._store._log_detected_login(
                     None, slot=None, fp=fp,
                     outcome=(
-                        f"live left on {written_slot}: restore never "
-                        f"settled within {int(_PENDING_RESTORE_MAX_AGE_S)}s"
+                        f"dropped: never settled within "
+                        f"{int(_PENDING_RESTORE_MAX_AGE_S)}s (live left on "
+                        f"{written_slot})"
                     ),
                 )
                 continue
@@ -3892,15 +3894,27 @@ class ClaudeAccountSwitcher:
         def _drop(reason: str) -> None:
             self._store._log_detected_login(
                 None, slot=None, fp=fp,
-                outcome=f"live left on {written_slot}: {reason}",
+                outcome=f"dropped: {reason} (live left on {written_slot})",
+            )
+
+        def _keep(reason: str) -> None:
+            self._store._log_detected_login(
+                None, slot=None, fp=fp, outcome=f"kept: {reason}",
+            )
+
+        def _moved_on() -> None:
+            self._store._log_detected_login(
+                None, slot=None, fp=fp, outcome="dropped: live moved on",
             )
 
         try:
             with FileLock(self.lock_file):
                 live = self._read_credentials()
                 if live is None:
+                    _keep("live credentials unreadable")
                     return False  # unreadable this pass; retry later
                 if not live or oauth.credential_fingerprint(live) != fp:
+                    _moved_on()
                     return True  # moved on: this entry is stale
                 data = self._get_sequence_data() or {}
                 active = data.get("activeAccountNumber")
@@ -3920,6 +3934,7 @@ class ClaudeAccountSwitcher:
                     active_num, active_email
                 )
                 if unreadable:
+                    _keep("backup unreadable")
                     return False  # transient: cannot read the backup yet
                 backup_oauth = oauth.extract_oauth_data(backup) if backup else None
                 if not backup_oauth:
@@ -3940,9 +3955,16 @@ class ClaudeAccountSwitcher:
                 # T1312: an ``expiresAt`` that isn't numeric is not evidence
                 # of an unexpired token -- `is_oauth_token_expired` answers
                 # False for it (unknown is not expired), which used to let
-                # a token nobody can date through this gate.
+                # a token nobody can date through this gate. A non-finite
+                # float (NaN, +-inf) passes `isinstance(..., float)` too --
+                # `is_oauth_token_expired` already excludes it from "expired"
+                # the same way, so without `math.isfinite` here a NaN
+                # `expiresAt` cleared this gate AND the next one and let the
+                # restore through undated.
                 expires_at = backup_oauth.get("expiresAt")
-                if not isinstance(expires_at, (int, float)):
+                if not isinstance(expires_at, (int, float)) or (
+                    isinstance(expires_at, float) and not math.isfinite(expires_at)
+                ):
                     _drop("no numeric expiresAt")
                     return True
                 if oauth.is_oauth_token_expired(expires_at):
@@ -3952,6 +3974,7 @@ class ClaudeAccountSwitcher:
                     self.credentials_dir / f".consume-{active_num}.lock"
                 )
                 if not consume_lock.acquire(timeout=0):
+                    _keep("consume in flight")
                     return False  # a consume is in flight; retry later
                 try:
                     with (
@@ -3965,12 +3988,14 @@ class ClaudeAccountSwitcher:
                         if not live or (
                             oauth.credential_fingerprint(live) != fp
                         ):
+                            _moved_on()
                             return True  # moved on since the cheap checks
                         target_config_data = json.loads(
                             self._target_config(data, active_num, active_email)
                         )
                         target_oauth = target_config_data.get("oauthAccount")
                         if not target_oauth:
+                            _keep("no oauthAccount in target config")
                             return False
                         config_path = self._get_claude_config_path()
                         rollback_config_text = (
@@ -4011,10 +4036,9 @@ class ClaudeAccountSwitcher:
                             raise
                 finally:
                     consume_lock.release()
-            self._logger.info(
-                "Restored the live store to active Account-%s after a "
-                "login had displaced it into slot %s.",
-                active_num, written_slot,
+            self._store._log_detected_login(
+                None, slot=None, fp=fp,
+                outcome=f"restored: live back on slot {active_num}",
             )
             return True
         except Exception as e:
@@ -4024,7 +4048,10 @@ class ClaudeAccountSwitcher:
             # is what left this masked before.
             self._store._log_detected_login(
                 None, slot=None, fp=fp,
-                outcome=f"pending restore into slot {written_slot}'s place raised",
+                outcome=(
+                    f"kept: pending restore into slot {written_slot}'s "
+                    f"place raised"
+                ),
             )
             self._logger.warning(
                 "A pending active-account restore raised while attempting "
