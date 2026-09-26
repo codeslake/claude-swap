@@ -20796,11 +20796,25 @@ class TestT1313KeepsTheActiveAccountLive:
             "the live config's identity did not follow the restored credential"
         )
 
+    def _assert_restore_queued_not_yet_applied(self, s, login):
+        """The redesigned T1313: the pass that RECORDED the foreign write
+        must never be the one that restores it (CC's own ``/login`` writes
+        the credential and ``~/.claude.json`` non-atomically)."""
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "the recording pass already restored the active slot -- too early"
+        assert len(s._pending_active_restores) == 1, (
+            "the write did not queue a pending restore"
+        )
+
     @pytest.mark.parametrize("n_disabled", [False, True])
     def test_manual_collect_path(
         self, temp_home: Path, sample_sequence_data: dict, n_disabled: bool,
     ):
-        """The manual collect path: `_fetch_active_usage`'s own resync call."""
+        """The manual collect path: `_fetch_active_usage`'s own resync call
+        queues a restore; a LATER pass (`_process_pending_active_restores`)
+        is the one that applies it."""
         s, login, active_backup = self._setup(
             sample_sequence_data, temp_home, n_disabled=n_disabled,
         )
@@ -20813,27 +20827,39 @@ class TestT1313KeepsTheActiveAccountLive:
             "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live", (
             "premise: the login still lands in its real owner's slot"
         )
+        self._assert_restore_queued_not_yet_applied(s, login)
+
+        s._process_pending_active_restores()
         self._assert_active_slot_untouched(
             s, temp_home, active_backup, n_disabled=n_disabled,
         )
+        assert not s._pending_active_restores, "the entry was not dropped"
 
+    @pytest.mark.parametrize("n_disabled", [False, True])
     def test_autoswitch_engine_usage_entries_by_account_path(
-        self, temp_home: Path, sample_sequence_data: dict,
+        self, temp_home: Path, sample_sequence_data: dict, n_disabled: bool,
     ):
         """The same resync, reached through the autoswitch engine's own
-        collect surface rather than called directly."""
-        s, login, active_backup = self._setup(sample_sequence_data, temp_home)
+        collect surface rather than called directly. One collect pass
+        queues the restore; the NEXT one applies it -- never the same call."""
+        s, login, active_backup = self._setup(
+            sample_sequence_data, temp_home, n_disabled=n_disabled,
+        )
         with patch("claude_swap.oauth.fetch_oauth_profile",
                    return_value={"uuid": "u-1", "email": "c@example.com",
                                  "organizationUuid": "o-1"}):
             s.usage_entries_by_account(fetch=set())
 
-        assert json.loads(s._read_account_credentials(
-            "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live", (
-            "premise: the login still lands in its real owner's slot"
-        )
+            assert json.loads(s._read_account_credentials(
+                "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live", (
+                "premise: the login still lands in its real owner's slot"
+            )
+            self._assert_restore_queued_not_yet_applied(s, login)
+
+            s.usage_entries_by_account(fetch=set())
+
         self._assert_active_slot_untouched(
-            s, temp_home, active_backup, n_disabled=False,
+            s, temp_home, active_backup, n_disabled=n_disabled,
         )
 
     def test_n_equals_a_updates_the_backup_and_leaves_live_alone(
@@ -20841,8 +20867,15 @@ class TestT1313KeepsTheActiveAccountLive:
     ):
         """A login into the ACTIVE account itself (N == A) keeps today's
         behaviour exactly: the backup is resynced to it, and the live store
-        -- already this same login -- is left as is."""
+        -- already this same login -- is left as is. Models a real Claude
+        Code ``/login`` faithfully: it rewrites BOTH the credential store
+        AND ``~/.claude.json``'s ``oauthAccount`` (identity), not the
+        credential alone."""
         s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com",
+                              "accountUuid": "u-2", "organizationUuid": "o-2"},
+        }))
         with patch("claude_swap.oauth.fetch_oauth_profile",
                    return_value={"uuid": "u-2", "email": "b@example.com",
                                  "organizationUuid": "o-2"}):
@@ -20857,6 +20890,117 @@ class TestT1313KeepsTheActiveAccountLive:
             login
         ), "N == A must leave the live store on the login, unchanged"
         assert s._get_sequence_data()["activeAccountNumber"] == 2
+        live_config = json.loads((temp_home / ".claude.json").read_text())
+        assert live_config["oauthAccount"]["emailAddress"] == "b@example.com", (
+            "N == A must leave the re-logged-in identity in the live config"
+        )
+
+
+class TestPendingActiveRestoreRefusals:
+    """`_try_restore_pending_active`'s proceed-conditions, unit-level: every
+    refusal keeps the entry queued for a later pass, except a live store
+    that has moved past the fingerprint the entry named (dropped -- there
+    is nothing left for the entry to correct)."""
+
+    def _setup(self, sample_sequence_data, temp_home):
+        accs = sample_sequence_data["accounts"]
+        accs["2"].update(email="b@example.com", uuid="u-2", organizationUuid="o-2")
+        accs["1"].update(email="c@example.com", uuid="u-1", organizationUuid="o-1")
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        active_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2", "refreshToken": "rt-2",
+            "expiresAt": 99_999_999_999_999}})
+        s._write_account_credentials("2", "b@example.com", active_backup)
+        s._write_account_config("2", "b@example.com", json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com",
+                              "accountUuid": "u-2", "organizationUuid": "o-2"},
+        }))
+        login = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999}})
+        s._write_credentials(login)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com",
+                              "accountUuid": "u-2", "organizationUuid": "o-2"},
+        }))
+        fp = oauth.credential_fingerprint(login)
+        s._pending_active_restores[fp] = "1"
+        return s, login, active_backup, fp
+
+    def test_a_live_store_that_moved_on_drops_the_entry(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
+        s._write_credentials(json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-other", "refreshToken": "rt-other",
+            "expiresAt": 1}}))
+        s._process_pending_active_restores()
+        assert not s._pending_active_restores, (
+            "a stale entry (live moved since it was recorded) must be dropped"
+        )
+
+    def test_a_quarantined_active_slot_keeps_the_entry_queued(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+    ):
+        s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
+        monkeypatch.setattr(s, "_slot_token_dead", lambda num, email: num == "2")
+        s._process_pending_active_restores()
+        assert fp in s._pending_active_restores, (
+            "a quarantined active account must not be activated; retry later"
+        )
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "the live store must be untouched while the active slot is quarantined"
+
+    def test_an_active_backup_near_its_refresh_margin_keeps_the_entry_queued(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """A no-network proof that no rotation of the active account was
+        missed while its live bytes sat displaced: a missed rotation
+        leaves the predecessor near expiry."""
+        s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
+        s._write_account_credentials("2", "b@example.com", json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
+                              "expiresAt": 1}}))
+        s._process_pending_active_restores()
+        assert fp in s._pending_active_restores, (
+            "a near-expiry backup must not be activated; retry later"
+        )
+
+    def test_a_held_consume_lock_keeps_the_entry_queued(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        from claude_swap.locking import FileLock
+
+        s, login, _active_backup, fp = self._setup(sample_sequence_data, temp_home)
+        held = FileLock(s.credentials_dir / ".consume-2.lock")
+        assert held.acquire(timeout=0)
+        try:
+            s._process_pending_active_restores()
+            assert fp in s._pending_active_restores, (
+                "a consume in flight for the active slot must retry later, "
+                "not race its own POST"
+            )
+        finally:
+            held.release()
+
+    def test_CONTROL_a_healthy_active_slot_is_restored_and_dropped(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Positive control: with none of the above refusals in play, the
+        entry IS restored and dropped -- proving the refusal tests above
+        are exercising a real gate, not a setup that never restores."""
+        s, login, active_backup, fp = self._setup(sample_sequence_data, temp_home)
+        s._process_pending_active_restores()
+        live_now = s._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            active_backup
+        )
+        assert not s._pending_active_restores
 
 
 class TestLoginLineHelper:
@@ -20874,7 +21018,7 @@ class TestLoginLineHelper:
     @pytest.mark.parametrize("outcome", [
         "adopted into slot 1",
         "registered as slot 3",
-        "stashed: displaced copy already held by slot 2",
+        "ignored: displaced copy already held by slot 2",
         "refused: healthy slot kept",
         "ignored: already stored",
     ])
@@ -20915,6 +21059,104 @@ class TestLoginLineHelper:
         ]
         assert len(lines) == 2, f"expected two distinct lines, got {lines}"
 
+    def test_fp_field_is_the_digest_not_the_prefixed_string(
+        self, temp_home: Path, caplog,
+    ):
+        """T1312 [C]: ``credential_fingerprint`` returns ``"sha256:<hex>"``
+        or ``"sha256-full:<hex>"``. Slicing THAT string to 8 characters
+        (the field's old implementation) took mostly the prefix's own
+        letters, not the digest. The displayed ``fp=`` field must be 8 hex
+        characters of the digest itself."""
+        import logging
+        import re
+
+        s = ClaudeAccountSwitcher()
+        full_fp = oauth.credential_fingerprint(self._CREDS)
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            s._store._log_detected_login(
+                self._CREDS, slot="1", outcome="adopted into slot 1",
+            )
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("login:")
+        ]
+        assert len(lines) == 1
+        match = re.search(r"fp=(\S+)", lines[0])
+        assert match is not None, lines[0]
+        fp_field = match.group(1)
+        assert fp_field == full_fp.split(":", 1)[-1][:8], (
+            f"fp field {fp_field!r} is not the digest's own first 8 hex "
+            f"characters of {full_fp!r}"
+        )
+        assert not fp_field.startswith("sha256"), (
+            "the fp field still carries the fingerprint's prefix"
+        )
+
+    def test_dedup_keys_on_the_full_fingerprint_not_the_displayed_slice(
+        self, temp_home: Path,
+    ):
+        """T1312 [C]: the dedup set must remember the FULL fingerprint, not
+        the 8-character slice shown in the log line -- two unrelated
+        credentials could otherwise share a displayed slice and wrongly
+        suppress each other's line."""
+        s = ClaudeAccountSwitcher()
+        full_fp = oauth.credential_fingerprint(self._CREDS)
+        s._store._log_detected_login(
+            self._CREDS, slot="1", outcome="adopted into slot 1",
+        )
+        assert (full_fp, "adopted into slot 1") in s._store._login_line_seen
+
+    def test_the_adopted_outcome_line_is_driven_by_the_real_adopt_path(
+        self, temp_home: Path, sample_sequence_data: dict, caplog,
+    ):
+        """T1312 [I]: the tests above feed literal outcome strings straight
+        to the helper -- proving the dedup mechanism, never that the adopt
+        chain actually PRODUCES that text. Drive two real outcomes (a
+        healthy slot's own newer login, then the same bytes seen again)
+        through `_adopt_login_into_slot` and read the emitted lines back."""
+        import logging
+
+        accs = sample_sequence_data["accounts"]
+        accs["1"].update(email="owner@example.com", uuid="u-1",
+                          organizationUuid="o-1")
+        sample_sequence_data["activeAccountNumber"] = None
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        stale = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-old", "refreshToken": "rt-old",
+            "expiresAt": 1, "refreshTokenExpiresAt": 1_000}})
+        s._write_account_credentials("1", "owner@example.com", stale)
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-new", "refreshToken": "rt-new",
+            "expiresAt": 1, "refreshTokenExpiresAt": 1_000_000}})
+        profile = {"uuid": "u-1", "email": "owner@example.com",
+                   "organizationUuid": "o-1"}
+
+        # `account_num="2"`, not the resolved owner: exercises the actual
+        # adopt-into-a-DIFFERENT-slot logic (the "already this slot" branch
+        # short-circuits when the caller's own slot already matches).
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            settled = s._adopt_login_into_slot("2", fresh, profile)
+        assert settled is True
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("login:")
+        ]
+        assert len(lines) == 1, lines
+        assert "outcome=adopted into slot 1" in lines[0], lines[0]
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            settled_again = s._adopt_login_into_slot("2", fresh, profile)
+        assert settled_again is True
+        lines_again = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("login:")
+        ]
+        assert len(lines_again) == 1, lines_again
+        assert "outcome=ignored: already stored" in lines_again[0], lines_again[0]
+
     def test_the_no_drift_return_never_logs(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict, caplog,
@@ -20935,6 +21177,34 @@ class TestLoginLineHelper:
         assert not any(
             r.getMessage().startswith("login:") for r in caplog.records
         ), "the no-drift return logged a line"
+
+    def test_an_unexpected_failure_still_logs_a_login_line(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, caplog, monkeypatch,
+    ):
+        """T1312 [I]: the generic ``except Exception`` used to leave a
+        detected login silently unlogged -- exactly the failure mode this
+        whole logging chain exists to close."""
+        import logging
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-a", "refreshToken": "rt-a", "expiresAt": 1}})
+
+        def _boom(*a, **k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(s, "_read_account_credentials", _boom)
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            s._resync_rotated_backup("1", "account1@example.com", "", creds)
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("login:")
+        ]
+        assert len(lines) == 1, lines
+        assert "outcome=refused: resync failed" in lines[0]
 
 
 class TestCrossLineageFreshnessIsWriteTimeNotRefreshLifetime:

@@ -16,11 +16,14 @@ token is this") and is used by the autoswitch identity oracle. add_account
 does not call it.
 """
 import json
+import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.exceptions import ConfigError, ValidationError
@@ -762,6 +765,47 @@ def test_adopting_a_keychain_login_syncs_the_stale_plaintext_file(
     ]
     assert any("rt-login-a" in c for c in stashed), (
         "DEFECT: login A's only copy was overwritten with nothing stashed"
+    )
+
+
+def test_sync_stamps_the_mirror_file_to_the_keychains_own_mdat(
+    temp_home: Path, mock_claude_config: Path, monkeypatch,
+):
+    """T1312 [m]: the mirror's own mtime must not outrun the Keychain item
+    it just copied -- left at "now" (write time), a ``/login`` landing
+    mid-sync can still carry an mdat EARLIER than this write finishes,
+    which would make the mirror look like the fresher login to
+    ``_fresher_plaintext_login``'s cross-lineage arm and mask the new one.
+    Stamped to the Keychain's own current mdat instead."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    s.platform = Platform.MACOS
+
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    cred_file.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-old", "refreshToken": "rt-old",
+        "expiresAt": 1}}), encoding="utf-8")
+    # Backdate the file's PRE-sync mtime so the write under test is the
+    # only thing that can move it forward.
+    old_mtime = time.time() - 3600
+    os.utime(cred_file, (old_mtime, old_mtime))
+
+    keychain_mdat = time.time() - 120  # older than "now", newer than the file
+    monkeypatch.setattr(
+        macos_keychain, "item_modified_at",
+        lambda service, account: keychain_mdat,
+    )
+    new_login = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-new", "refreshToken": "rt-new",
+        "expiresAt": 99999999999000}})
+
+    s._store._sync_active_credentials_file_to_adopted_login(
+        new_login, slot="3", email="ax@example.com",
+    )
+
+    assert cred_file.read_text(encoding="utf-8") == new_login
+    assert cred_file.stat().st_mtime == pytest.approx(keychain_mdat, abs=1), (
+        "the mirror's mtime was left at write time (now) instead of the "
+        "Keychain item's own mdat"
     )
 
 

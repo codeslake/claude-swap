@@ -562,7 +562,7 @@ class CredentialStore:
         """
         return self._read_active_credentials().value
 
-    def _read_active_oauth_keychain(self) -> tuple[str | None, bool]:
+    def _read_active_oauth_keychain(self) -> tuple[str | None, bool, "str | None"]:
         """Read the active profile's OAuth Keychain item(s).
 
         Reads the item(s) :func:`_active_oauth_keychain_services` resolves for
@@ -570,9 +570,14 @@ class CredentialStore:
         explicit-``CLAUDE_CONFIG_DIR``-names-the-default-profile case yields
         more than one; see that function for why.
 
-        Returns ``(value, failed)`` exactly as before: ``value`` is the
-        credential string, or ``None`` when every item was absent (rc-44) or the
+        Returns ``(value, failed, service)``: ``value`` is the credential
+        string, or ``None`` when every item was absent (rc-44) or the
         Keychain was unreadable. ``failed`` is True only for unreadable.
+        ``service`` names exactly which item ``value`` came from (``None``
+        when nothing was found) — the caller's job to hand back to
+        :meth:`_active_oauth_keychain_mdat`, since a second, independent scan
+        of this same try-order could land on a different service than the
+        one that actually served ``value``.
 
         An unreadable Keychain stops the walk. It is a property of the Keychain,
         not of the item, so a second service name cannot fare better — and
@@ -581,20 +586,28 @@ class CredentialStore:
         for service in _active_oauth_keychain_services():
             value, failed = self._read_one_oauth_keychain(service)
             if value:
-                return value, False
+                return value, False, service
             if failed:
-                return None, True
-        return None, False
+                return None, True, None
+        return None, False, None
 
-    def _active_oauth_keychain_mdat(self) -> "float | None":
-        """``mdat`` of whichever service :meth:`_read_active_oauth_keychain`
-        just served, for the file/Keychain write-time comparison in
-        :meth:`_fresher_plaintext_login`. Non-raising; same try-order as the
-        value read, so it asks the same item.
+    def _active_oauth_keychain_mdat(self, service: "str | None" = None) -> "float | None":
+        """``mdat`` of an active-profile OAuth Keychain item, for the
+        file/Keychain write-time comparison in :meth:`_fresher_plaintext_login`.
+        Non-raising.
+
+        ``service`` pins the lookup to the exact item a prior
+        :meth:`_read_active_oauth_keychain` call served its value from —
+        required whenever such a value is in hand, since re-scanning the
+        try-order independently could stop at a different item than the one
+        that produced it. With none given, scans the try-order itself and
+        returns the first hit (there is no prior read to pin to).
         """
         account = macos_keychain.keychain_account_name()
-        for service in _active_oauth_keychain_services():
-            mdat = macos_keychain.item_modified_at(service, account)
+        if service is not None:
+            return macos_keychain.item_modified_at(service, account)
+        for svc in _active_oauth_keychain_services():
+            mdat = macos_keychain.item_modified_at(svc, account)
             if mdat is not None:
                 return mdat
         return None
@@ -638,21 +651,30 @@ class CredentialStore:
     ) -> "str | None":
         """The plaintext file's credential when it is a NEWER login, else None.
 
-        Two arms. The cross-lineage arm (a DIFFERENT login, skipped when
-        ``same_lineage_only``) asks which STORE WAS WRITTEN LAST: the file's
-        mtime vs the Keychain item's ``mdat`` (``kc_mdat``, the caller's
-        job to supply — this method has no service/account to query it
-        with). ``refreshTokenExpiresAt`` is NOT this arm's test: the server
+        The stamps decide which arm applies, so they are read FIRST: a pair
+        within the jitter window is the SAME lineage whatever the mtimes
+        say, and only the same-lineage arm may answer for it.
+
+        The same-lineage arm (within the jitter window) orders two stamps
+        naming the SAME login by ``expiresAt``, which moves forward on every
+        rotation — the newer GENERATION of it. mtime plays no part here: a
+        file copied or touched after the write it holds can carry a later
+        mtime than a Keychain item that was in fact written after it, and
+        letting mtime override ``expiresAt`` for a same-lineage pair would
+        serve that stale generation as if it were fresher.
+
+        The cross-lineage arm (a DIFFERENT login, skipped when
+        ``same_lineage_only``, and reached only when the pair is NOT
+        same-lineage) asks which STORE WAS WRITTEN LAST: the file's mtime vs
+        the Keychain item's ``mdat`` (``kc_mdat``, the caller's job to supply
+        — this method has no service/account to query it with).
+        ``refreshTokenExpiresAt`` is NOT this arm's test: the server
         re-mints it per-account from that account's own token TTL, so it is
         not ordered across two DIFFERENT logins (measured: a login at
         00:55:59 carried an earlier stamp than one made at 00:54:28). File
         wins only when its mtime (floored to seconds) is strictly later than
         ``kc_mdat``; ``kc_mdat is None`` is no evidence, so the Keychain
         keeps it, same as an unreadable file.
-
-        The same-lineage arm (within the jitter window) is unchanged: two
-        stamps that name the SAME login are ordered by ``expiresAt``, which
-        moves forward on every rotation — the newer GENERATION of it.
 
         Any read or parse failure answers None: this decides which of two
         readable credentials to serve, and an unreadable one is not a claim.
@@ -674,24 +696,26 @@ class CredentialStore:
         if not text.strip():
             return None
 
+        kc_at = _credential_stamp(keychain_value, "refreshTokenExpiresAt")
+        file_at = _credential_stamp(text, "refreshTokenExpiresAt")
+        same_lineage = (
+            kc_at is not None
+            and file_at is not None
+            and abs(file_at - kc_at) <= LINEAGE_STAMP_JITTER_MS
+        )
+        if same_lineage:
+            kc_exp = _credential_stamp(keychain_value, "expiresAt")
+            file_exp = _credential_stamp(text, "expiresAt")
+            if kc_exp is not None and file_exp is not None and file_exp > kc_exp:
+                return text
+            return None
+
         if (
             not same_lineage_only
             and kc_mdat is not None
             and int(file_mtime) > int(kc_mdat)
         ):
             return text
-
-        kc_at = _credential_stamp(keychain_value, "refreshTokenExpiresAt")
-        file_at = _credential_stamp(text, "refreshTokenExpiresAt")
-        if (
-            kc_at is not None
-            and file_at is not None
-            and abs(file_at - kc_at) <= LINEAGE_STAMP_JITTER_MS
-        ):
-            kc_exp = _credential_stamp(keychain_value, "expiresAt")
-            file_exp = _credential_stamp(text, "expiresAt")
-            if kc_exp is not None and file_exp is not None and file_exp > kc_exp:
-                return text
         return None
 
     def _read_active_credentials(self) -> ActiveCredentials:
@@ -736,7 +760,7 @@ class CredentialStore:
         # derivation (pinned against its source) and the delete, session-read
         # and capture paths already depend on it.
         if self._use_keychain():
-            val, keychain_failed = self._read_active_oauth_keychain()
+            val, keychain_failed, kc_service = self._read_active_oauth_keychain()
             # THIS read's own verdict, kept so a later success on some OTHER
             # item cannot erase it. Sticky until this read succeeds again,
             # which is what makes it self-heal without being erasable.
@@ -758,9 +782,15 @@ class CredentialStore:
                 # refresh of the SAME lineage, to within seconds of jitter, so
                 # only a stamp later by more than that jitter is a newer
                 # login. Undated is no evidence and keeps the Keychain.
-                fresher = self._fresher_plaintext_login(
-                    val, kc_mdat=self._active_oauth_keychain_mdat()
-                )
+                #
+                # The mdat lookup shells out to `security` again; skip it
+                # when there is no plaintext file to compare against, since
+                # `_fresher_plaintext_login` would just answer None anyway.
+                fresher = None
+                if get_credentials_path().exists():
+                    fresher = self._fresher_plaintext_login(
+                        val, kc_mdat=self._active_oauth_keychain_mdat(kc_service)
+                    )
                 if fresher is not None:
                     return ActiveCredentials(fresher, False)
                 return ActiveCredentials(val, False)
@@ -1265,8 +1295,16 @@ class CredentialStore:
         an LRU eviction -- this is a debug trail, not a correctness record,
         so losing it early only costs one repeated line.
         """
-        fp = (oauth.credential_fingerprint(creds) or "unknown")[:8]
-        key = (fp, outcome)
+        # `credential_fingerprint` returns "sha256:<hex>" or
+        # "sha256-full:<hex>" -- deduping (and, before this fix, displaying)
+        # on the first 8 characters of THAT string sliced off the prefix,
+        # not the digest, so two unrelated logins both starting "sha256:"
+        # collided into one dedup key. Dedupe on the full value; display
+        # only the digest's own first 8 hex chars (split(":", 1) is prefix-
+        # agnostic: both prefix shapes end in exactly one colon before the
+        # digest).
+        full_fp = oauth.credential_fingerprint(creds) or "unknown"
+        key = (full_fp, outcome)
         if key in self._login_line_seen:
             return
         if len(self._login_line_seen) >= self._LOGIN_LINE_DEDUP_MAX:
@@ -1278,7 +1316,7 @@ class CredentialStore:
             socket.gethostname().split(".")[0],
             email or "unknown",
             uuid or "unknown",
-            fp,
+            full_fp.split(":", 1)[-1][:8],
             slot or "none",
             outcome,
         )
@@ -1398,6 +1436,7 @@ class CredentialStore:
                     self._log_detected_login(
                         current, slot=slot,
                         outcome=f"ignored: displaced copy already held by slot {slot}",
+                        email=email,
                     )
                     different_lineage = False
             if different_lineage:
@@ -1410,13 +1449,38 @@ class CredentialStore:
                             "fingerprint": oauth.credential_fingerprint(current),
                         },
                     )
+                    self._log_detected_login(
+                        current, slot=slot,
+                        outcome=f"stashed: displaced by slot {slot}'s adopted login",
+                        email=email,
+                    )
                 except (ClaudeSwitchError, OSError, TypeError, AttributeError) as e:
                     self._host._logger.warning(
                         f"Could not stash the plaintext file's login before syncing it "
                         f"to the adopted one ({e}); the file was left as is"
                     )
+                    self._log_detected_login(
+                        current, slot=slot,
+                        outcome="refused: could not stash displaced login",
+                        email=email,
+                    )
                     return  # failed stash is not a license to overwrite: leave the file
         self._refresh_stale_credentials_file(credentials)
+        # The mirror's own mtime must not outrun the Keychain item it just
+        # copied: left at "now", a /login landing mid-sync writes a Keychain
+        # item whose mdat can still be EARLIER than this write finishes,
+        # which would make the mirror look like the fresher login to
+        # `_fresher_plaintext_login`'s cross-lineage arm and mask the new one
+        # forever. Stamped to the Keychain's own current mdat instead,
+        # read fresh (not the pre-sync value): best-effort, an unreadable
+        # mdat or a failed utime just leaves "now" standing, same as before
+        # this existed.
+        mdat = self._active_oauth_keychain_mdat()
+        if mdat is not None:
+            try:
+                os.utime(get_credentials_path(), (mdat, mdat))
+            except OSError:
+                pass
 
     def _uses_file_backup_backend(self) -> bool:
         """Whether per-account backup *writes* go to files vs. the Keychain.

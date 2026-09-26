@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
@@ -535,6 +536,36 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
             "held the later generation of the same login"
         )
 
+    def test_a_same_lineage_pair_is_never_decided_by_mtime_vs_mdat(
+        self, tmp_path, monkeypatch
+    ):
+        """T1312 regression: the mtime-vs-``mdat`` (cross-lineage) rule must
+        never even be CONSULTED for a same-lineage pair, whatever the
+        mtimes say. The file here is written by this very test (so its
+        mtime is "now", far later than the stale ``kc_mdat`` below) and
+        would win under the old ordering, which checked mtime/mdat BEFORE
+        classifying the pair as same- or cross-lineage. But it is the OLDER
+        generation of the SAME login (earlier access-token ``expiresAt``),
+        so the same-lineage arm's own tiebreak must keep the Keychain."""
+        kc_refresh = 1_790_380_487_015
+        fl_refresh = kc_refresh + 300  # within LINEAGE_STAMP_JITTER_MS
+        kc = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-newer-gen", "refreshToken": "rt-newer-gen",
+            "expiresAt": 2_000_000_000_000,
+            "refreshTokenExpiresAt": kc_refresh}})
+        fl = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-older-gen", "refreshToken": "rt-older-gen",
+            "expiresAt": 1_000_000_000_000,
+            "refreshTokenExpiresAt": fl_refresh}})
+        got = self._store(
+            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
+        )._read_active_credentials()
+        assert got.value == kc, (
+            "a stale mtime-newer file from the SAME lineage's older "
+            "generation won by the mtime/mdat rule, masking the Keychain's "
+            "current generation"
+        )
+
     def test_a_year_older_file_login_cannot_win_on_a_later_expiresAt(
         self, tmp_path, monkeypatch
     ):
@@ -576,6 +607,44 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
             "DEFECT: a corrupt plaintext file crashed the read instead of "
             "just losing the freshness comparison"
         )
+
+
+class TestMdatLookupIsPinnedToTheServingService:
+    """T1312 [m]: ``_active_oauth_keychain_mdat`` must read the ``mdat`` of
+    the EXACT service ``_read_active_oauth_keychain`` served its value
+    from -- a second, independent scan of the same try-order could stop at
+    a different service than the one that produced the value."""
+
+    def test_the_mdat_lookup_never_wanders_to_a_different_service(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(
+            "claude_swap.credentials._active_oauth_keychain_services",
+            lambda: ["svc-a", "svc-b"],
+        )
+        store = CredentialStore(_Host(tmp_path / "backups"))
+
+        monkeypatch.setattr(
+            macos_keychain, "get_password",
+            lambda service, account: "kc-value" if service == "svc-a" else None,
+        )
+        monkeypatch.setattr(
+            macos_keychain, "item_modified_at",
+            # Only svc-b (which never served the value) has an mdat here --
+            # a naive re-scan would wrongly attribute it to svc-a's value.
+            lambda service, account: 1_000_000.0 if service == "svc-b" else None,
+        )
+
+        val, failed, kc_service = store._read_active_oauth_keychain()
+        assert (val, failed, kc_service) == ("kc-value", False, "svc-a")
+        assert store._active_oauth_keychain_mdat(kc_service) is None, (
+            "the mdat lookup wandered to svc-b, which never served the value"
+        )
+        # CONTROL: an unpinned (scanning) lookup DOES find svc-b's mdat --
+        # proving pinning, not an unreachable fake, is what the assertion
+        # above depends on.
+        assert store._active_oauth_keychain_mdat(None) == 1_000_000.0
 
 
 class TestTheLineageJitterToleranceIsPublic:
