@@ -13513,3 +13513,72 @@ class TestT1313SettleWiring:
         assert LOGIN_RESTORE_RECHECK_MARGIN_S / 2 < delay <= (
             LOGIN_RESTORE_RECHECK_MARGIN_S
         ), "a transient WAITING must not spin at the 0.1s floor"
+
+    def test_tick_write_suppressed_for_a_dry_run_engine(
+        self, temp_home: Path,
+    ):
+        """(correctness-pass item 4) A dry-run engine (a demoted one forces
+        `dry_run` True the same way) must never let its own settle calls
+        write the live store, even for a fully valid, past-floor candidate
+        -- it stays pending on disk for the live engine or a manual
+        collect instead."""
+        h = EngineHarness(temp_home)
+        h.engine.dry_run = True
+        login = self._seed_settle_candidate(h, age_s=10.0)
+        with patch.object(h.engine, "_perform") as perform:
+            outcome = h.engine.tick()
+        perform.assert_not_called()
+        assert outcome is TickOutcome.NO_ACTION
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "a dry-run tick must never perform the settle's write"
+        assert h.switcher._get_sequence_data()["activeAccountNumber"] == 1, (
+            "the active pointer must not move either"
+        )
+
+    def test_next_delay_rechecks_after_the_polls_own_collect_queues_a_settle(
+        self, temp_home: Path, monkeypatch,
+    ):
+        """(correctness-pass item 5) `_next_delay` checks `_settle_wait_until`
+        BEFORE calling `_respect_poll_plan` -- but `_respect_poll_plan`'s own
+        collect (`usage_entries_by_account`, whose `_collect_usage_entries`
+        runs `_resync_rotated_backup`'s no-drift adopt) can itself make a
+        restore pending ON DISK, with no signal reaching `_settle_wait_until`
+        set before that call ran. A recheck after the delay is computed must
+        still catch the fresh candidate and cap the sleep near the settle
+        floor, not hand back the ordinary cadence."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com", expires_at=99_999_999_999_999)
+        h.seed(2, "z@example.com")  # N's own backup starts stale ("rt-2")
+        h.set_active(1)  # A = 1
+        login = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999}})
+        h.switcher._write_credentials(login)  # fresh write: under the floor
+        (h.temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "z@example.com",
+                              "accountUuid": "uuid-2"},
+        }))
+
+        def _collect_adopts(fetch=None, *, scheduled=False):
+            # The shape `_resync_rotated_backup`'s no-drift return leaves:
+            # N's own backup adopts the live login mid-collect. Attributed:
+            # this is slot 2's own (z@example.com's) login.
+            h.switcher._write_account_credentials(
+                "2", "z@example.com", login, attributed=True,
+            )
+            return {}
+
+        monkeypatch.setattr(h.switcher, "usage_entries_by_account", _collect_adopts)
+        h.engine._settle_wait_until = None
+        delay = h.engine._next_delay(TickOutcome.NO_ACTION)
+        assert delay <= LOGIN_RESTORE_SETTLE_FLOOR_S + LOGIN_RESTORE_RECHECK_MARGIN_S, (
+            "a settle candidate that appeared inside `_respect_poll_plan`'s "
+            "own collect must cap the sleep near the settle floor, not the "
+            "ordinary cadence"
+        )
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "computing a delay must never itself perform the restore"

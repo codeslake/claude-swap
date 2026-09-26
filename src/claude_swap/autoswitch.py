@@ -1247,13 +1247,14 @@ class AutoSwitchEngine:
                 # `--add-account --slot N`, and that rewrites this stamp.
                 # Without the check the bind takes the replacement as the
                 # quarantine's OWN generation, every later compare matches,
-                # and the slot stays barred with nothing said. Strictly
-                # after, so an add in the same second as the quarantine --
-                # a slot that conflicted the moment it was added -- is not
-                # read as a recovery. Both stamps are fixed-width UTC ISO.
-                added = roster.get(number, {}).get("added", "")
-                at = entry.get("at", "")
-                if added and at and added > at:
+                # and the slot stays barred with nothing said.
+                # THE ONE PREDICATE, shared with `_engine_quarantined` (the
+                # settle, which uses it with no engine ticking at all) --
+                # see `_fingerprint_unknown_recovered`'s own docstring
+                # (T1313).
+                if self.switcher._fingerprint_unknown_recovered(
+                    number, entry.get("at", "")
+                ):
                     to_release.append(
                         (number, email_now, "credentials-replaced")
                     )
@@ -1599,6 +1600,13 @@ class AutoSwitchEngine:
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         self._settle_wait_until = None
+        # T1313 (correctness-pass item 4): a demoted engine forces
+        # `dry_run` True the same way an explicit one does, so this one
+        # flag covers both -- every settle call this tick and every one
+        # `_resync_rotated_backup`'s own collect-path call makes must
+        # refuse to write, the same way every OTHER mutation below is
+        # gated on `dry_run`.
+        self.switcher._suppress_login_restore_write = self.dry_run
         if self._stop.is_set():
             # BEFORE the mutators, not among them. `stop()` releases the LIVE
             # lock synchronously and no caller joins the worker, so the
@@ -3748,16 +3756,31 @@ class AutoSwitchEngine:
             # resumes one slow tick after they do.
             return max(interval, NO_RESET_FALLBACK_S)
         elif outcome is TickOutcome.NO_ACTION and self._settle_wait_until is not None:
-            # T1313: the last settle said WAITING (the floor since the live
-            # store's own write hasn't passed yet) -- recheck just past it
-            # rather than on the ordinary cadence, which could be minutes.
-            # Real wall time again, matching how `_settle_wait_until` itself
-            # was computed. Capped at `interval`: a write time read as
-            # FUTURE (clock skew, a bad mtime) must not sleep the engine
-            # past its own ordinary cadence either.
+            # T1313: the last settle said WAITING -- either the floor since
+            # the live store's own write hasn't passed yet (armed at
+            # write_time + floor + margin), or one of the TRANSIENT
+            # refusals past the floor already (a lock held elsewhere, a
+            # backup read that failed this instant), which re-arm at
+            # now + margin instead so this recheck lands just past the
+            # margin rather than racing the floor a second time. Either
+            # way: recheck just past it rather than on the ordinary
+            # cadence, which could be minutes. Real wall time again,
+            # matching how `_settle_wait_until` itself was computed. Capped
+            # at `interval`: a write time read as FUTURE (clock skew, a bad
+            # mtime) must not sleep the engine past its own ordinary
+            # cadence either.
             return min(max(self._settle_wait_until - time.time(), 0.1), interval)
         # ±10% jitter so multiple machines don't synchronize their API hits.
-        return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+        delay = self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+        # T1313 (correctness-pass item 5): `_respect_poll_plan`'s own
+        # collect (`usage_entries_by_account` -> `_resync_rotated_backup`'s
+        # no-drift adopt) can itself make a restore pending ON DISK, with
+        # no signal reaching `_settle_wait_until` above -- that check ran
+        # BEFORE this call. Recheck now that the delay is computed, and cap
+        # it the same way an already-armed wait would.
+        if self._settle_or_arm_wait() is LoginRestoreOutcome.WAITING:
+            delay = min(delay, max(self._settle_wait_until - time.time(), 0.1))
+        return delay
 
     def _respect_poll_plan(self, delay: float) -> float:
         """Shorten a normal-cadence sleep to the store's own next-poll time.
