@@ -5037,18 +5037,16 @@ class ClaudeAccountSwitcher:
                         self._resync_rotated_backup(
                             account_num, email, org_uuid, creds
                         )
-                    elif oauth.credential_fingerprint(
-                        creds
-                    ) != oauth.credential_fingerprint(
-                        self._read_account_credentials(account_num, email)
-                    ):
+                    else:
                         # Would have resynced, but the read is degraded (see
                         # the comment above) -- still a detected login, just
-                        # one the write side must not act on yet.
+                        # one the write side must not act on yet. Unattributed:
+                        # the config slot's email/uuid is not this credential's
+                        # own, and telling drift from the steady state would
+                        # only cost a second backup read to decide whether to
+                        # log -- not otherwise needed.
                         self._store._log_detected_login(
                             creds, slot=None, outcome="ignored: degraded read",
-                            email=email,
-                            uuid=self.account_identity(account_num).get("uuid"),
                         )
                     if self._probe_verdicts and self._probe_verdicts.get(
                         self._lineage_key(
@@ -5846,7 +5844,6 @@ class ClaudeAccountSwitcher:
         moved, oracle unreachable) just leaves the backup stale — the
         recovery branch consumes nothing it cannot attribute. Never raises.
         """
-        own_uuid = self.account_identity(account_num).get("uuid")
         # T1312: whether ownership of `creds` as `account_num`'s own login
         # was ever settled (a fresh oracle match, or a memoized verdict) --
         # set right before the locked block below, which is unreachable any
@@ -5884,6 +5881,10 @@ class ClaudeAccountSwitcher:
                 # help from this bookkeeping field. NOT A LOGIN: no line --
                 # this is the steady state, not a detected login.
                 return
+            # Read only past the no-drift return: the identity lookup is
+            # wasted on either early return above (a partial token pair, or
+            # the steady state), which together are the common case.
+            own_uuid = self.account_identity(account_num).get("uuid")
             fp = oauth.credential_fingerprint(creds) or ""
             lineage = self._lineage_key(account_num, email, fp)
             verdict = self._probe_verdicts.get(lineage)
@@ -6496,16 +6497,13 @@ class ClaudeAccountSwitcher:
                 # a pre-check here would just repeat that no-op check at the
                 # cost of a second backup read on every pass.
                 self._resync_rotated_backup(num, info[1], info[3], info[5])
-            elif active_oauth and oauth.credential_fingerprint(
-                info[5]
-            ) != oauth.credential_fingerprint(
-                self._read_account_credentials(num, info[1])
-            ):
+            elif active_oauth:
                 # Same "would have resynced but degraded" case as
-                # `_fetch_active_usage`'s success branch.
+                # `_fetch_active_usage`'s success branch: unattributed,
+                # and no second backup read spent only to decide whether
+                # to log.
                 self._store._log_detected_login(
                     info[5], slot=None, outcome="ignored: degraded read",
-                    email=info[1], uuid=self.account_identity(num).get("uuid"),
                 )
 
         if claims:

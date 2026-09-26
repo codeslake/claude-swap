@@ -386,10 +386,16 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
     Claude Code to the file while later Keychain READS keep succeeding with the
     older item.
 
-    `refreshTokenExpiresAt` IS the comparison, and `expiresAt` is not: a
-    refresh moves the access token on every poll and does not extend the
-    refresh lifetime, so comparing access expiry would flip backends on
-    ordinary rotation. Only a fresh login mints a later refresh lifetime.
+    A later WRITE (the Keychain item's `mdat` vs the file's mtime) is the
+    comparison for two DIFFERENT logins, not `refreshTokenExpiresAt`: the
+    server re-mints that stamp per-account from its own token TTL, so it
+    does not order two different logins. It still gates which pairs the
+    write-time comparison may decide for the file: only when the file's
+    own stamp is confidently later than the Keychain's (undated, or
+    confidently earlier -- a stale generation copied in later -- keep the
+    Keychain whatever the mtimes say). `expiresAt` is a different arm
+    entirely, ordering two GENERATIONS of the SAME login within a jitter
+    window.
     """
 
     @staticmethod
@@ -457,11 +463,20 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
 
     def test_CONTROL_a_newer_KEYCHAIN_still_wins(self, tmp_path, monkeypatch):
         """The other direction, and the ordinary one: CC writes rotations to
-        the Keychain on macOS, so a stale file must not win."""
+        the Keychain on macOS, so a stale file must not win. ``kc_mdat`` is
+        a REAL value, older than the file's own mtime -- mtime evidence
+        ALONE would hand the file the win, so this only passes because the
+        file's stamp is confidently the OLDER generation (a spent refresh
+        token), which the mtime arm must never override."""
         kc = self._creds("keychain-login", 9_000)
         fl = self._creds("file-old", 1_000)
-        got = self._store(tmp_path, monkeypatch, kc, fl)._read_active_credentials()
-        assert got.value == kc
+        got = self._store(
+            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
+        )._read_active_credentials()
+        assert got.value == kc, (
+            "a stale file, confidently the OLDER generation by its own "
+            "stamp, won on mtime evidence alone"
+        )
 
     def test_CONTROL_equal_lifetimes_keep_the_keychain(self, tmp_path, monkeypatch):
         """Same generation in both — the steady state on a healthy host. No
@@ -472,13 +487,21 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
 
     def test_CONTROL_an_undated_file_cannot_win(self, tmp_path, monkeypatch):
         """No `refreshTokenExpiresAt` is no evidence of a newer login. A row
-        that could win on absence would hand the older bytes the decision."""
+        that could win on absence would hand the older bytes the decision.
+        ``kc_mdat`` is a REAL value, older than the file's own mtime: mtime
+        evidence alone would hand the file the win, so this only passes
+        because an UNDATED pair must never reach the mtime arm at all."""
         kc = self._creds("keychain", 1_000)
         fl = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-undated", "refreshToken": "rt-undated",
             "expiresAt": 9999999999000}})
-        got = self._store(tmp_path, monkeypatch, kc, fl)._read_active_credentials()
-        assert got.value == kc
+        got = self._store(
+            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
+        )._read_active_credentials()
+        assert got.value == kc, (
+            "an undated file won on mtime evidence alone, with no stamp to "
+            "say it is even a later generation of anything"
+        )
 
     def test_CONTROL_an_empty_keychain_still_falls_back(self, tmp_path, monkeypatch):
         """The original fallback must survive: nothing in the Keychain means
@@ -573,7 +596,11 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
         older, far outside the same-lineage jitter, so it must never reach
         the ``expiresAt`` tiebreak at all. A later ``expiresAt`` on that
         stale login (e.g. a long-lived token minted at the time) must not
-        let it win over the Keychain's current login."""
+        let it win over the Keychain's current login. ``kc_mdat`` is a
+        REAL value, older than the file's own mtime: mtime evidence alone
+        would hand the file the win, so this only passes because the
+        file's stamp is confidently the OLDER generation, which the mtime
+        arm must never override."""
         kc_refresh = 1_790_380_487_015
         kc_exp = 1_788_399_592_015
         fl_refresh = kc_refresh - 31_536_000_000  # 365 days earlier
@@ -586,10 +613,32 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
             "accessToken": "sk-file", "refreshToken": "rt-file",
             "expiresAt": fl_exp,
             "refreshTokenExpiresAt": fl_refresh}})
-        got = self._store(tmp_path, monkeypatch, kc, fl)._read_active_credentials()
+        got = self._store(
+            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
+        )._read_active_credentials()
         assert got.value == kc, (
             "a year-older login in the file won because its expiresAt was "
             "later, even though it is nowhere near the same-lineage jitter"
+        )
+
+    def test_a_strict_tie_between_file_mtime_and_keychain_mdat_keeps_the_keychain(
+        self, tmp_path, monkeypatch
+    ):
+        """The file wins only when its mtime is STRICTLY later than
+        ``kc_mdat`` -- an exact tie (both floored to the same second) must
+        not flip the verdict to the file."""
+        kc = self._creds("keychain", 1_000)
+        fl = self._creds("file-newer-generation", 9_000)
+        store = self._store(tmp_path, monkeypatch, kc, fl, kc_mdat=None)
+        file_mtime = (tmp_path / ".claude" / ".credentials.json").stat().st_mtime
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.item_modified_at",
+            lambda service, account: file_mtime,
+        )
+        got = store._read_active_credentials()
+        assert got.value == kc, (
+            "an exact tie between the file's mtime and the Keychain's mdat "
+            "let the file win -- only a STRICTLY later mtime may"
         )
 
     def test_a_corrupt_plaintext_file_does_not_crash_the_read(
