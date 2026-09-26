@@ -430,11 +430,24 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
             (d / ".credentials.json").write_text(fl, encoding="utf-8")
         return CredentialStore(_Host(tmp_path / "backups"))
 
-    def test_a_newer_login_in_the_FILE_wins(self, tmp_path, monkeypatch):
-        """THE MEASURED CASE: the file holds the login just made, so its
-        write is later than the Keychain item's last modification."""
-        kc = self._creds("keychain-old", 1_000)
-        fl = self._creds("file-login", 9_000)
+    @pytest.mark.parametrize("kc_refresh, fl_refresh", [
+        # THE MEASURED CASE: the file holds the login just made, whose
+        # stamp is also later.
+        (1_000, 9_000),
+        # T1312 [C]: stamps are not ordered ACROSS accounts (a later login
+        # can carry an EARLIER `refreshTokenExpiresAt`), so the file must
+        # still win on mtime evidence alone even with the earlier stamp --
+        # the old code's direction gate (file wins only when ITS stamp is
+        # later) silently kept the Keychain here instead.
+        (9_000, 1_000),
+    ])
+    def test_a_newer_login_in_the_FILE_wins(
+        self, tmp_path, monkeypatch, kc_refresh, fl_refresh,
+    ):
+        """The file's write is later than the Keychain item's last
+        modification, so it wins whatever the two stamps say."""
+        kc = self._creds("keychain-old", kc_refresh)
+        fl = self._creds("file-login", fl_refresh)
         got = self._store(
             tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
         )._read_active_credentials()
@@ -461,21 +474,40 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
             "file win — that ordering is not valid across different logins"
         )
 
-    def test_CONTROL_a_newer_KEYCHAIN_still_wins(self, tmp_path, monkeypatch):
-        """The other direction, and the ordinary one: CC writes rotations to
-        the Keychain on macOS, so a stale file must not win. T1312: the
-        direction of the stamp gap is not evidence either way -- both stamps
-        are dated and more than the jitter apart, so mtime vs ``kc_mdat``
-        decides. ``kc_mdat`` is LATER than the file's own mtime here (the
+    @pytest.mark.parametrize("kc_exp, kc_refresh, fl_exp, fl_refresh", [
+        # THE ORDINARY CASE: same expiresAt on both sides, refresh stamps
+        # only a few thousand ms apart.
+        (9_999_999_999_000, 9_000, 9_999_999_999_000, 1_000),
+        # T1312: a YEAR-older file login (refreshTokenExpiresAt far outside
+        # the same-lineage jitter) must not win even when its expiresAt is
+        # LATER than the Keychain's -- that stamp does not order two
+        # different logins, and this gap is nowhere near the same-lineage
+        # tiebreak either.
+        (1_788_399_592_015, 1_790_380_487_015,
+         1_788_399_592_015 + 3_600_000, 1_790_380_487_015 - 31_536_000_000),
+    ])
+    def test_CONTROL_a_newer_KEYCHAIN_still_wins(
+        self, tmp_path, monkeypatch, kc_exp, kc_refresh, fl_exp, fl_refresh,
+    ):
+        """CC writes rotations to the Keychain on macOS, so a stale file
+        must not win. T1312: the direction of the stamp gap is not
+        evidence either way -- both stamps are dated and outside the
+        jitter, so mtime vs ``kc_mdat`` decides, whatever ``expiresAt``
+        says. ``kc_mdat`` is LATER than the file's own mtime here (the
         Keychain really was written last), which is the right reason the
         Keychain wins."""
-        kc = self._creds("keychain-login", 9_000)
-        fl = self._creds("file-old", 1_000)
+        kc = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-keychain", "refreshToken": "rt-keychain",
+            "expiresAt": kc_exp, "refreshTokenExpiresAt": kc_refresh}})
+        fl = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-file", "refreshToken": "rt-file",
+            "expiresAt": fl_exp, "refreshTokenExpiresAt": fl_refresh}})
         got = self._store(
             tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() + 3600,
         )._read_active_credentials()
         assert got.value == kc, (
-            "a file mtime-older than the Keychain's write still won"
+            "a file mtime-older than the Keychain's write still won, "
+            "whatever its stamp or expiresAt said"
         )
 
     def test_CONTROL_equal_lifetimes_keep_the_keychain(self, tmp_path, monkeypatch):
@@ -587,62 +619,6 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
             "a stale mtime-newer file from the SAME lineage's older "
             "generation won by the mtime/mdat rule, masking the Keychain's "
             "current generation"
-        )
-
-    def test_a_year_older_file_login_cannot_win_on_a_later_expiresAt(
-        self, tmp_path, monkeypatch
-    ):
-        """The file's stamp is not a few hundred ms off — it is a YEAR
-        older, far outside the same-lineage jitter, so it must never reach
-        the ``expiresAt`` tiebreak at all. A later ``expiresAt`` on that
-        stale login (e.g. a long-lived token minted at the time) must not
-        let it win over the Keychain's current login. T1312: the stamp gap's
-        DIRECTION is not evidence -- both stamps are dated and a year apart,
-        so mtime vs ``kc_mdat`` decides. ``kc_mdat`` is LATER than the
-        file's own mtime here (the Keychain really was written last), which
-        is the right reason the Keychain wins."""
-        kc_refresh = 1_790_380_487_015
-        kc_exp = 1_788_399_592_015
-        fl_refresh = kc_refresh - 31_536_000_000  # 365 days earlier
-        fl_exp = kc_exp + 3_600_000  # 1 hour later than the Keychain's
-        kc = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-keychain", "refreshToken": "rt-keychain",
-            "expiresAt": kc_exp,
-            "refreshTokenExpiresAt": kc_refresh}})
-        fl = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-file", "refreshToken": "rt-file",
-            "expiresAt": fl_exp,
-            "refreshTokenExpiresAt": fl_refresh}})
-        got = self._store(
-            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() + 3600,
-        )._read_active_credentials()
-        assert got.value == kc, (
-            "a year-older login in the file won because its expiresAt was "
-            "later, even though it is nowhere near the same-lineage jitter"
-        )
-
-    def test_a_fresh_login_in_the_FILE_with_an_EARLIER_stamp_still_wins(
-        self, tmp_path, monkeypatch
-    ):
-        """T1312 [C], the bug this round closes: stamps are not ordered
-        ACROSS accounts (a later login can carry an earlier
-        ``refreshTokenExpiresAt``; each account's own token TTL sets it
-        independently). A fresh login written to the FILE only (a failed
-        Keychain write) whose stamp happens to be EARLIER than the
-        Keychain's current login must still be served on mtime evidence --
-        the old code's direction gate (file wins only when ITS stamp is
-        later) silently kept the Keychain here instead. ``kc_mdat`` is an
-        hour old; the file's mtime is "now" (just written), so mtime
-        evidence says the file was written last."""
-        kc = self._creds("keychain-login", 9_000)  # LATER stamp
-        fl = self._creds("file-fresh-login", 1_000)  # EARLIER stamp
-        got = self._store(
-            tmp_path, monkeypatch, kc, fl, kc_mdat=time.time() - 3600,
-        )._read_active_credentials()
-        assert got.value == fl, (
-            "the file's fresh login lost to the Keychain solely because its "
-            "refreshTokenExpiresAt was earlier -- that stamp does not order "
-            "two different logins, only a later WRITE (mtime vs kc_mdat) does"
         )
 
     def test_a_strict_tie_between_file_mtime_and_keychain_mdat_keeps_the_keychain(

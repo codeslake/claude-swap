@@ -54,7 +54,12 @@ from claude_swap.poll_policy import (
     binding_pct,
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import (
+    LOGIN_RESTORE_RECHECK_MARGIN_S,
+    LOGIN_RESTORE_SETTLE_FLOOR_S,
+    ClaudeAccountSwitcher,
+    LoginRestoreOutcome,
+)
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -1003,6 +1008,10 @@ class AutoSwitchEngine:
         # longer than the normal interval.
         self._sleep_until_ts: float | None = None
         self._blocked_wait_long = False
+        # T1313: per-tick, set when `_settle_login_restore` answered WAITING
+        # this tick -- the settle floor hasn't passed yet, so the next tick
+        # should land just past it rather than on the ordinary cadence.
+        self._settle_wait_until: float | None = None
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -1556,6 +1565,7 @@ class AutoSwitchEngine:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
+        self._settle_wait_until = None
         if self._stop.is_set():
             # BEFORE the mutators, not among them. `stop()` releases the LIVE
             # lock synchronously and no caller joins the worker, so the
@@ -1576,6 +1586,28 @@ class AutoSwitchEngine:
             if isinstance(state.get("quarantine"), dict)
             else {}
         )
+
+        # T1313: settle before `current` is read -- a live login can be a
+        # different managed slot's own (already safely in its backup) while
+        # the roster still names another account active. RESTORED puts the
+        # roster's account back and WAITING means it's too soon to (Claude
+        # Code's own `/login` write is non-atomic); either way this tick
+        # decides nothing from a `current` that is about to change or that
+        # cannot yet be acted on.
+        settle = self.switcher._settle_login_restore()
+        if settle is LoginRestoreOutcome.WAITING:
+            # Real wall time, not `self.clock()`: the floor is measured
+            # against a real filesystem mtime (or Keychain `mdat`), which
+            # only the OS's own clock can be compared against -- `self.clock`
+            # is a test/cooldown seam that need not track it.
+            write_time = self.switcher._live_write_time()
+            self._settle_wait_until = (
+                (write_time if write_time is not None else time.time())
+                + LOGIN_RESTORE_SETTLE_FLOOR_S
+                + LOGIN_RESTORE_RECHECK_MARGIN_S
+            )
+        if settle in (LoginRestoreOutcome.RESTORED, LoginRestoreOutcome.WAITING):
+            return TickOutcome.NO_ACTION
 
         # Read once, ahead of the trace block below, which needs THIS
         # tick's value to tell a switched-away account from the one the
@@ -1659,6 +1691,14 @@ class AutoSwitchEngine:
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold, overloaded=is_overloaded
         )
+        # T1313: the collect pass above can itself settle a login restore
+        # (`_resync_rotated_backup`'s no-drift return) mid-pass -- if the
+        # live identity moved out from under `current` while collecting,
+        # everything gathered above (`headroom`, `active_ref`) is keyed on
+        # an account that is no longer live, so this tick decides nothing
+        # from it.
+        if self.switcher.current_account_number() != current:
+            return TickOutcome.NO_ACTION
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -3675,6 +3715,13 @@ class AutoSwitchEngine:
             # until the user comes back, so crawl. Worst case protection
             # resumes one slow tick after they do.
             return max(interval, NO_RESET_FALLBACK_S)
+        elif outcome is TickOutcome.NO_ACTION and self._settle_wait_until is not None:
+            # T1313: the last settle said WAITING (the floor since the live
+            # store's own write hasn't passed yet) -- recheck just past it
+            # rather than on the ordinary cadence, which could be minutes.
+            # Real wall time again, matching how `_settle_wait_until` itself
+            # was computed.
+            return max(self._settle_wait_until - time.time(), 0.1)
         # ±10% jitter so multiple machines don't synchronize their API hits.
         return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
 
