@@ -8253,7 +8253,7 @@ class ClaudeAccountSwitcher:
                 # session whose persisted bridge owner no longer matches the
                 # config just written; the package's daemon carries those
                 # pointers on noticing the move, but only while it is running.
-                _pin.carry_live_pointers()
+                _pin.carry_live_pointers(self)
 
                 if force_activate and current_identity is not None:
                     self._logger.info(
@@ -8613,7 +8613,7 @@ class ClaudeAccountSwitcher:
             # plain switch and every auto rotation), so leaving it out here
             # left every live session vetoed until the daemon noticed the
             # config move on its own.
-            _pin.carry_live_pointers()
+            _pin.carry_live_pointers(self)
 
         # Lock released. Safe to do network I/O and let persist callbacks
         # re-acquire the lock from inside list_accounts(). All of this is
