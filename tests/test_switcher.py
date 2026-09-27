@@ -24611,6 +24611,116 @@ class TestT1313LoginRestore:
             "still carry the pin's identity, not A's own stored config"
         )
 
+    def test_a_settle_carries_the_pins_pointers_on_success_only(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+    ):
+        """T1467. `switch()`'s own activation calls `_pin.carry_live_
+        pointers(self)` right after its live write, under the same
+        locks (switcher.py ~12662, ~13050), so a live Remote Control
+        bridge notices the move -- the settle's own activation never
+        did. Fakes the pin function with a side_effect that records
+        its argument, the sibling switch-path test's own shape
+        (`test_ordinary_switch_carries_live_pointers_too`), and
+        asserts it fires exactly once with the switcher `s` itself --
+        a bare `MagicMock` accepts any arity and would still pass
+        against a no-argument call, which #210's real `carry_live_
+        pointers(switcher)` signature (bbabfb68) does not accept
+        (T1469, correctness pass [I]).
+        """
+        from claude_swap import pin as _pin
+
+        carried = []
+        monkeypatch.setattr(
+            _pin, "carry_live_pointers", lambda sw: carried.append(sw)
+        )
+        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login)
+        with patch.object(s, "_replan_new_active"), \
+             patch.object(s._store, "_log_detected_login"):
+            outcome = s._settle_login_restore()
+        assert outcome is LoginRestoreOutcome.RESTORED
+        assert carried == [s], (
+            "a RESTORED settle must carry the pin's live pointers "
+            "with the switcher itself, the same way switch()'s own "
+            "activation does after its live write"
+        )
+
+        carried.clear()
+        s2, login2, _active_backup2 = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s2, login2)
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(s2, "_write_json", _boom)
+        with patch.object(s2, "_replan_new_active"), \
+             patch.object(s2._store, "_log_detected_login"):
+            outcome = s2._settle_login_restore()
+        assert outcome is LoginRestoreOutcome.NONE
+        assert carried == [], (
+            "a settle whose own write never landed must not carry "
+            "pointers for a login that never went live"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="RLIMIT_FSIZE is the one fault that fails the write AND "
+               "the rollback; `resource` is POSIX-only, and no Windows "
+               "API gives the same single-fault shape",
+    )
+    def test_a_settle_rollback_does_not_truncate_the_config_it_cannot_rewrite(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+    ):
+        """T1467, the settle analogue of `test_a_rollback_does_not_
+        truncate_a_destination_it_cannot_rewrite` (:5483) for
+        `SwitchTransaction.rollback`. `_settle_login_restore`'s own
+        rollback still writes the config back with a bare
+        `Path.write_text` (O_TRUNC) -- the one fault that fails that
+        write also destroys the intact original before the restore it
+        is meant to perform can even happen.
+        """
+        import resource
+        import signal
+
+        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login)
+        config_path = temp_home / ".claude.json"
+        original = json.dumps({
+            "oauthAccount": {"emailAddress": "c@example.com",
+                              "accountUuid": "u-1", "organizationUuid": "o-1"},
+            "padding": "x" * 8192,
+        })
+        config_path.write_text(original, encoding="utf-8")
+        before = config_path.stat().st_size
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(s, "_write_json", _boom)
+        old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        # PREMISE: a quota that cannot hold the padded config, so the
+        # rollback's own write fails for the same reason a real
+        # disk-full would.
+        assert before // 2 < before
+        resource.setrlimit(resource.RLIMIT_FSIZE, (before // 2, hard))
+        try:
+            with patch.object(s, "_replan_new_active"), \
+                 patch.object(s._store, "_log_detected_login"):
+                outcome = s._settle_login_restore()
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, old_sig)
+        assert outcome is LoginRestoreOutcome.NONE, (
+            "the forced write failure must propagate past this "
+            "method's own internal-error handler"
+        )
+        text = config_path.read_text(encoding="utf-8")
+        assert text == original, (
+            "DEFECT: the settle's rollback truncated a config the "
+            "failed write never touched"
+        )
+
     def test_settle_waits_under_the_settle_floor(
         self, temp_home: Path, sample_sequence_data: dict,
     ):
@@ -24820,12 +24930,12 @@ class TestT1313LoginRestore:
             # down calls `_ex` on the same pair regardless.
             real_read = s._store._read_account_credentials
 
-            def _unreadable_read(num, email, failed=None):
+            def _unreadable_read(num, email, failed=None, **kw):
                 if (num, email) == ("1", "c@example.com"):
                     if failed is not None:
                         failed.append(True)
                     return ""
-                return real_read(num, email, failed)
+                return real_read(num, email, failed, **kw)
 
             monkeypatch.setattr(s._store, "_read_account_credentials", _unreadable_read)
         elif condition == "write_suppressed":

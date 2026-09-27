@@ -8642,8 +8642,8 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                                     )
                             if rollback_config_text is not None:
                                 try:
-                                    config_path.write_text(
-                                        rollback_config_text, encoding="utf-8"
+                                    _restore_atomically(
+                                        config_path, rollback_config_text
                                     )
                                 except Exception as e:
                                     self._logger.error(
@@ -8651,6 +8651,9 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                                         f"config: {e}"
                                     )
                             raise
+                        # CARRIES AFTER THE ROLLBACK BLOCK, reached only on
+                        # a successful write -- exactly as switch() does.
+                        _pin.carry_live_pointers(self)
                 finally:
                     consume_lock.release()
         except LockError:
