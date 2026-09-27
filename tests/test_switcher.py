@@ -20914,7 +20914,7 @@ class TestT1313LoginRestore:
         "write_time_unreadable", "write_time_future",
         "d_backup_changed_meanwhile", "d_backup_unreadable", "backup_unreadable",
         "write_suppressed",
-        "d_backup_unreadable_write_time_future",
+        "d_backup_unreadable_write_time_future", "d_backup_unreadable_unlocked",
     ])
     def test_a_refused_restore_never_writes_over_live(
         self, temp_home: Path, sample_sequence_data: dict,
@@ -21067,6 +21067,23 @@ class TestT1313LoginRestore:
                 return real_ex(num, email)
 
             monkeypatch.setattr(s, "_read_account_credentials_ex", _unreadable_ex)
+        elif condition == "d_backup_unreadable_unlocked":
+            # T1448 item 1: the UNLOCKED candidacy read for D's own backup
+            # (ahead of the lock, textually above "d_backup_unreadable"'s
+            # own locked re-check) must go through `_read_account_
+            # credentials_ex` too and treat an unreadable read as the same
+            # transient WAITING every other read failure in this method
+            # answers -- never a silent NONE, which is what a plain read
+            # (returning "" for "failed" the same as for "genuinely empty")
+            # would have produced here instead.
+            real_ex = s._read_account_credentials_ex
+
+            def _unreadable_ex(num, email):
+                if (num, email) == ("1", "c@example.com"):
+                    return "", True
+                return real_ex(num, email)
+
+            monkeypatch.setattr(s, "_read_account_credentials_ex", _unreadable_ex)
         elif condition == "write_suppressed":
             # T1313 (correctness-pass item 4): a dry-run/demoted engine
             # tick (or its own collect's no-drift resync) must never
@@ -21121,7 +21138,7 @@ class TestT1313LoginRestore:
             else LoginRestoreOutcome.WAITING
             if condition in (
                 "consume_locked", "d_backup_unreadable", "backup_unreadable",
-                "write_suppressed",
+                "write_suppressed", "d_backup_unreadable_unlocked",
             )
             else LoginRestoreOutcome.NONE
         )
