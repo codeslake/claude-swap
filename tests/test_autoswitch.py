@@ -13591,6 +13591,47 @@ class TestT1313SettleWiring:
             a_backup
         ), "the restore must put A's own backup back on live"
 
+    def test_run_loop_clears_the_write_suppression_on_a_reused_thread(
+        self, temp_home: Path,
+    ):
+        """(T1448) The flag is thread-local, so `stop()` (the sibling test
+        above) correctly never touches it -- but the TUI's worker threads
+        all come from Textual's one shared default executor
+        (`run_in_executor(None, ...)`): a stopped engine's own thread is
+        handed straight to the next refresh or user-initiated switch.
+        `run_loop`'s `finally` used to clear the flag only on the
+        unhandled-error/consumer-gone paths, so a `stop()`-ped dry-run
+        engine left True on its own thread for whatever ran there next."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        h = EngineHarness(temp_home)
+        h.engine.dry_run = True
+        self._seed_settle_candidate(h, age_s=10.0)  # A = 1, N = 2
+        tick_done = threading.Event()
+        real_tick = h.engine.tick
+
+        def tick_and_signal():
+            result = real_tick()
+            tick_done.set()
+            return result
+
+        h.engine.tick = tick_and_signal
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            run = executor.submit(h.engine.run_loop)
+            assert tick_done.wait(5.0), "premise: the engine ticked once"
+            h.engine.stop()
+            assert run.result(timeout=5.0) == 0
+            outcome = executor.submit(
+                h.switcher._settle_login_restore
+            ).result(timeout=5.0)
+        finally:
+            executor.shutdown(wait=True)
+        assert outcome is LoginRestoreOutcome.RESTORED, (
+            "a stopped engine's own write suppression must not survive "
+            "onto the next job its thread runs"
+        )
+
     def test_next_delay_rechecks_after_the_polls_own_collect_queues_a_settle(
         self, temp_home: Path, monkeypatch,
     ):

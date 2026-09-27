@@ -3674,9 +3674,12 @@ class AutoSwitchEngine:
         at ``_settle_login_restore``'s own flag read then read False and
         wrote. Left to clear itself: ``_tick_inner`` sets it fresh every
         tick to ``self.dry_run``, and ``run_loop``'s own ``finally`` clears
-        it on the exit path that skips ``stop()``. Scoped per-thread, a
-        stale flag left on a thread this engine no longer ticks on can
-        never reach ``_settle_login_restore`` again either.
+        it unconditionally on every exit path (T1448), this ``stop()``'d
+        one included -- the thread this engine last ticked on is not
+        retired, the TUI hands it straight to the next refresh or
+        user-initiated switch through the one shared executor pool, and a
+        stale flag left there would suppress a write for an engine that
+        never asked for it.
         """
         self._stop.set()
         self._wake.set()
@@ -3978,11 +3981,17 @@ class AutoSwitchEngine:
             if not self._stop.is_set():
                 reason = "consumer gone" if self._consumer_gone else "unhandled error"
                 self._release_live()
-                # This path exits without ever calling `stop()` (its own
-                # clearing is conditioned on `not self._stop.is_set()`
-                # above), so the write suppression left by this engine's
-                # last tick needs clearing here too.
-                self.switcher._suppress_login_restore_write = False
                 self._emit(
                     ErrorEvent(message=f"engine stopped: {reason}", transient=False)
                 )
+            # UNCONDITIONALLY, on both exit paths. This runs on the
+            # worker's own thread, after its last tick, so it never races
+            # `stop()` (which never touches this thread-local flag at all
+            # -- see `stop()`'s own docstring). The TUI's thread workers
+            # share ONE executor pool, so a thread this engine no longer
+            # ticks on is not retired, it is handed to the next refresh or
+            # user-initiated switch -- leaving the flag conditioned on
+            # `_stop` left it True there whenever `stop()` was the exit,
+            # and the next job on that thread read "waiting: write
+            # suppressed" for an engine that had already stopped.
+            self.switcher._suppress_login_restore_write = False
