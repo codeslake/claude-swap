@@ -920,9 +920,10 @@ def pytest_collection_modifyitems(items):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
 
 
-@pytest.hookimpl(tryfirst=True)
+@pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
-    # Green run: drop THIS process's own basetemp -- each xdist worker its own popen-gwX share in parallel, the controller its pytest-N -- before pytest's own tmpdir sessionfinish runs cleanup_numbered_dir, hence tryfirst.
+    # trylast: pytest's own tmpdir sessionfinish has already run cleanup_numbered_dir and released this process's lock on pytest-N (unregistering its atexit) by the time this runs, so nothing here touches that freed path.
+    # "Green" is per process: a worker whose own tests passed drops its share even inside a red -n run; a failing worker and the controller of a red run keep theirs.
     # Measured: a green run leaves ~45k entries in the shared /tmp/pytest-of-<user>, a ~3.8s serial rmtree landing on whichever later session evicts it, which made the -n 10 wall bimodal ~19s/~23s.
     # Not tmp_path_retention_policy="failed": its per-test rmtree runs while monkeypatch is still active, so a worker crashes with RealStoreWriteBlocked.
     # A user-given --basetemp is left alone in the controller; a worker always cleans its own share on green.
