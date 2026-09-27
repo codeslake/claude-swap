@@ -438,12 +438,16 @@ EXPECTED_WRITE_SITE_ROSTER: dict[tuple[str, str], int] = {
     ("switcher.py", "_consume_backup_grant_locked"): 2,
     ("switcher.py", "_adopt_stashed_successor"): 1,
     ("switcher.py", "_adopt_session_credential"): 1,
-    ("switcher.py", "add_account"): 2,
-    ("switcher.py", "add_account_from_token"): 2,
+    # The bodies of `add_account` / `add_account_from_token`, which run them
+    # under the account store lock; the write calls and the checks above
+    # them moved unchanged.
+    ("switcher.py", "_add_account_locked"): 2,
+    ("switcher.py", "_add_account_from_token_locked"): 2,
     ("switcher.py", "_fetch_active_usage"): 2,
     ("switcher.py", "_resync_rotated_backup"): 1,
     ("switcher.py", "_perform_switch_locked"): 1,
-    ("transfer.py", "import_accounts"): 1,
+    # The body of `import_accounts`, run under the account store lock.
+    ("transfer.py", "_import_accounts_locked"): 1,
     ("migrations.py", "migrate_windows_keyring_to_files"): 1,
 }
 

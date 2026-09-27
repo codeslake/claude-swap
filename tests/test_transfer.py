@@ -12,12 +12,13 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap.exceptions import TransferError
+from claude_swap.exceptions import LockError, TransferError
 from claude_swap.models import Platform
 from claude_swap.oauth import credential_fingerprint
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.transfer import export_accounts, import_accounts
 from claude_swap.usage_store import FetchRecord
+from tests.conftest import BackgroundCall
 
 
 # ---------------------------------------------------------------------------
@@ -2024,3 +2025,80 @@ class TestForceOverwriteNarratesTheStrikeClear:
         assert "same credential generation" in err
         assert "invalid_grant" not in err
         assert "refresh-token generation" not in err
+
+
+# ---------------------------------------------------------------------------
+# The account store lock
+# ---------------------------------------------------------------------------
+
+
+class TestTransferHoldsTheAccountStoreLock:
+    """Export reads, and import writes, the whole store under the switcher's
+    ``lock_file``, so an export never carries a credential file whose roster
+    row an `add` has not written yet, nor a row whose files a `remove` has
+    already deleted."""
+
+    def test_export_waits_for_the_store_lock_and_completes_after_release(
+        self, temp_home: Path, store_lock_holder
+    ):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        out_file = temp_home / "backup.cswap"
+
+        holder = store_lock_holder(s.lock_file)
+        call = BackgroundCall(lambda: export_accounts(s, str(out_file)))
+        assert call.still_waiting_after(0.3), "export did not wait for the lock"
+        assert not out_file.exists(), "export wrote while another process held the lock"
+
+        holder.release()
+        call.finish()
+        envelope = json.loads(out_file.read_text())
+        assert [a["email"] for a in envelope["accounts"]] == ["alice@example.com"]
+
+    def test_export_names_the_lock_file_and_holder_when_the_wait_runs_out(
+        self, temp_home: Path, store_lock_holder, monkeypatch
+    ):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        out_file = temp_home / "backup.cswap"
+        monkeypatch.setattr("claude_swap.transfer.STORE_LOCK_WAIT_S", 0.3)
+
+        holder = store_lock_holder(s.lock_file)
+        with pytest.raises(LockError) as exc:
+            export_accounts(s, str(out_file))
+
+        msg = str(exc.value)
+        assert msg.startswith("cswap export: waited 0.3s"), msg
+        assert str(s.lock_file) in msg, msg
+        assert "nothing was changed" in msg, msg
+        if sys.platform.startswith("linux"):
+            # `lock_holders` reads /proc/locks, which exists on Linux only.
+            assert f"pid {holder.pid} (" in msg, msg
+        else:
+            assert "held by an unidentified process" in msg, msg
+        assert not out_file.exists(), "a timed-out export left a file behind"
+
+    def test_import_waits_for_the_store_lock_and_completes_after_release(
+        self, temp_home: Path, store_lock_holder
+    ):
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                holder = store_lock_holder(dst.lock_file)
+                call = BackgroundCall(lambda: import_accounts(dst, str(out_file)))
+                assert call.still_waiting_after(0.3), "import did not wait for the lock"
+                assert not (dst._get_sequence_data() or {}).get("accounts"), (
+                    "import wrote while another process held the lock"
+                )
+
+                holder.release()
+                call.finish()
+                seq = dst._get_sequence_data()
+                assert seq["accounts"]["1"]["email"] == "alice@example.com"

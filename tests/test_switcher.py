@@ -38,6 +38,7 @@ from claude_swap.switcher import (
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
 )
+from tests.conftest import BackgroundCall, store_lock_is_free
 
 
 def _raise_locked(*args, **kwargs):
@@ -5373,6 +5374,139 @@ class TestAddAccountSlot:
 
         data = switcher._get_sequence_data()
         assert data["sequence"] == [2, 5]
+
+
+class TestAddAndRemoveHoldTheAccountStoreLock:
+    """`add` and `remove` read and write the store under the switcher's
+    ``lock_file``, the lock switch, swap and move already hold, and ask their
+    questions with it released: a prompt waiting on a person must not stall
+    every other store writer."""
+
+    _make_switcher = TestAddAccountSlot._make_switcher
+    FAKE_CREDS = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+
+    def _add_patches(self, switcher):
+        return (
+            patch.object(switcher, "_read_active_credentials",
+                         return_value=ActiveCredentials(self.FAKE_CREDS, False)),
+            patch.object(switcher, "_write_account_credentials"),
+            patch.object(switcher, "_delete_account_credentials"),
+        )
+
+    def _add(self, switcher, **kwargs):
+        read, write, delete = self._add_patches(switcher)
+        with read, write, delete:
+            switcher.add_account(**kwargs)
+
+    def _seed_roster(self, sample_sequence_data):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        return switcher
+
+    def test_add_waits_for_the_store_lock_and_completes_after_release(
+        self, temp_home, store_lock_holder
+    ):
+        switcher = self._make_switcher(temp_home, email="a@example.com")
+        holder = store_lock_holder(switcher.lock_file)
+
+        call = BackgroundCall(lambda: self._add(switcher, slot=5))
+        assert call.still_waiting_after(0.3), "add did not wait for the lock"
+        assert "5" not in switcher._get_sequence_data()["accounts"], (
+            "add wrote the roster while another process held the lock"
+        )
+
+        holder.release()
+        call.finish()
+        assert switcher._get_sequence_data()["accounts"]["5"]["email"] == "a@example.com"
+
+    def test_add_slot_overwrite_question_is_asked_with_the_lock_released(
+        self, temp_home, capsys
+    ):
+        switcher = self._make_switcher(temp_home, email="a@example.com")
+        self._add(switcher, slot=3)
+        switcher = self._make_switcher(temp_home, email="b@example.com")
+        lock_free_at_prompt: list[bool] = []
+
+        def answer(_prompt):
+            lock_free_at_prompt.append(store_lock_is_free(switcher.lock_file))
+            return "y"
+
+        with patch("builtins.input", side_effect=answer):
+            self._add(switcher, slot=3)
+
+        assert lock_free_at_prompt == [True], (
+            "the overwrite question was asked while add held the store lock"
+        )
+        assert switcher._get_sequence_data()["accounts"]["3"]["email"] == "b@example.com"
+        assert "Added" in capsys.readouterr().out
+
+    def test_add_slot_asks_again_when_the_occupant_changed_during_the_question(
+        self, temp_home, capsys
+    ):
+        """The yes was for the occupant named in the question. Another account
+        taking the slot while the lock was released is a new question, not a
+        yes to overwrite it."""
+        switcher = self._make_switcher(temp_home, email="a@example.com")
+        self._add(switcher, slot=3)
+        switcher = self._make_switcher(temp_home, email="b@example.com")
+        asked_about: list[str] = []
+
+        def answer(_prompt):
+            asked_about.append(capsys.readouterr().out)
+            if len(asked_about) == 1:
+                # Another writer takes slot 3 while the question is open.
+                data = switcher._get_sequence_data()
+                data["accounts"]["3"]["email"] = "c@example.com"
+                switcher._write_json(switcher.sequence_file, data)
+                return "y"
+            return "n"
+
+        with patch("builtins.input", side_effect=answer):
+            self._add(switcher, slot=3)
+
+        assert len(asked_about) == 2, "the changed occupant was overwritten unasked"
+        assert "a@example.com" in asked_about[0]
+        assert "c@example.com" in asked_about[1], asked_about[1]
+        assert switcher._get_sequence_data()["accounts"]["3"]["email"] == "c@example.com"
+        assert "Cancelled" in capsys.readouterr().out
+
+    def test_remove_waits_for_the_store_lock_and_completes_after_release(
+        self, temp_home, sample_sequence_data, store_lock_holder
+    ):
+        switcher = self._seed_roster(sample_sequence_data)
+        holder = store_lock_holder(switcher.lock_file)
+
+        with patch.object(switcher, "_delete_account_files") as delete:
+            call = BackgroundCall(lambda: switcher.remove_account("2", assume_yes=True))
+            assert call.still_waiting_after(0.3), "remove did not wait for the lock"
+            assert delete.call_count == 0, (
+                "remove deleted files while another process held the lock"
+            )
+            assert "2" in switcher._get_sequence_data()["accounts"]
+
+            holder.release()
+            call.finish()
+        assert "2" not in switcher._get_sequence_data()["accounts"]
+
+    def test_remove_confirmation_is_asked_with_the_lock_released(
+        self, temp_home, sample_sequence_data
+    ):
+        switcher = self._seed_roster(sample_sequence_data)
+        lock_free_at_prompt: list[bool] = []
+
+        def answer(_prompt):
+            lock_free_at_prompt.append(store_lock_is_free(switcher.lock_file))
+            return "y"
+
+        with patch("builtins.input", side_effect=answer), \
+             patch.object(switcher, "_delete_account_files"):
+            switcher.remove_account("2")
+
+        assert lock_free_at_prompt == [True], (
+            "the removal confirmation was asked while remove held the store lock"
+        )
+        assert "2" not in switcher._get_sequence_data()["accounts"]
 
 
 class TestPurgeLegacyCleanup:

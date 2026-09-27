@@ -9493,7 +9493,8 @@ class TestAddAccountWillNotRecordASplicedIdentity:
 
         from claude_swap import switcher as _sw
 
-        src = inspect.getsource(_sw.ClaudeAccountSwitcher.add_account)
+        # `add_account` runs this body under the account store lock.
+        src = inspect.getsource(_sw.ClaudeAccountSwitcher._add_account_locked)
         cap = src.find('oauth_data.get("accountUuid"')
         assert cap != -1, "the identity capture moved; this guard is blind"
         guard = src[:cap]
@@ -10029,8 +10030,9 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
             # Reads the literal triple because the drift guard compares against
             # it, and asks `_live_login_identity` BESIDE it: a mismatch is
             # refused outright rather than un-spliced, because `accountUuid` is
-            # recoverable from nowhere else.
-            "switcher.py:add_account",
+            # recoverable from nowhere else. `add_account` runs this body under
+            # the account store lock; the reads moved unchanged.
+            "switcher.py:_add_account_locked",
         }
         assert set(found) <= known, (
             "a NEW site re-derives the active slot from the identity file, "
@@ -12772,6 +12774,9 @@ class TestAddAccountRefusesASplicedIdentity:
             '{"claudeAiOauth": {"refreshToken": "rt-live"}}', False, False
         )
         sw._refuse_session_shell = lambda: None
+        # `add_account` holds the account store lock around its body; the
+        # autouse `_isolate_real_home` fixture gives each test its own home.
+        sw.lock_file = pathlib.Path.home() / ".claude-swap-backup" / ".lock"
         sw._setup_directories = lambda: None
         sw._init_sequence_file = lambda: None
         sw._migrate_org_fields = lambda: None
@@ -12870,6 +12875,9 @@ class TestAddAccountUnderASpliceRegistersTheLogin:
         sw._read_active_credentials = lambda: ActiveCredentials(live, False, False)
         sw._read_capture_credentials = lambda: live
         sw._refuse_session_shell = lambda: None
+        # `add_account` holds the account store lock around its body; the
+        # autouse `_isolate_real_home` fixture gives each test its own home.
+        sw.lock_file = pathlib.Path.home() / ".claude-swap-backup" / ".lock"
         sw._setup_directories = lambda: None
         sw._init_sequence_file = lambda: None
         sw._migrate_org_fields = lambda: None
