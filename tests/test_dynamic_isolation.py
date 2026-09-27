@@ -221,9 +221,19 @@ class TestDynamicLeavesTheBaseRevisionAlone:
         driver_path.write_text(driver)
         runs_dir = tmp_path / "runs"
         runs_dir.mkdir()
+        # The child is outside this test process, so it gets a dead proxy
+        # instead of ambient network access (measured: 7 non-loopback
+        # lookups to api.anthropic.com — no test here needs a real answer).
+        dead_proxy = "http://127.0.0.1:1"
+        child_env = {
+            **os.environ,
+            "http_proxy": dead_proxy, "https_proxy": dead_proxy,
+            "HTTP_PROXY": dead_proxy, "HTTPS_PROXY": dead_proxy,
+            "no_proxy": "", "NO_PROXY": "",
+        }
         result = subprocess.run(
             [sys.executable, str(driver_path), str(runs_dir), str(seed)],
-            capture_output=True, text=True, cwd=str(old_root),
+            capture_output=True, text=True, cwd=str(old_root), env=child_env,
         )
         assert result.returncode == 0, (
             f"driver failed: rc={result.returncode}\nSTDOUT={result.stdout}\n"
@@ -243,6 +253,48 @@ class TestDynamicLeavesTheBaseRevisionAlone:
             f"{_BASE_REV}"
         )
         return got
+
+    def test_the_driver_subprocess_gets_a_dead_proxy_env(self, tmp_path, monkeypatch):
+        """The driver runs outside this process, so it must not reach the
+        real network on the parent's env (measured: 7 non-loopback
+        `getaddrinfo` lookups to api.anthropic.com from this class's tests
+        at 8fd7dc6f with `*_proxy` unset). No test here needs a real
+        answer.
+
+        The `sys.executable` call is intercepted and answered without
+        actually running a child interpreter — only the six proxy keys are
+        recorded and checked, never the parent's whole environment (a
+        failure here must not publish an ambient token); `git` calls still
+        pass through to the real run."""
+        real_run = subprocess.run
+        seen = {}
+        dead_proxy = "http://127.0.0.1:1"
+        expected = {
+            "http_proxy": dead_proxy, "https_proxy": dead_proxy,
+            "HTTP_PROXY": dead_proxy, "HTTPS_PROXY": dead_proxy,
+            "no_proxy": "", "NO_PROXY": "",
+        }
+
+        def spy(cmd, *args, **kwargs):
+            if cmd[0] == sys.executable:
+                seen["env"] = kwargs.get("env")
+                stub = {
+                    "_claude_swap_file": str(
+                        tmp_path / "base" / "src" / "claude_swap" / "__init__.py"
+                    )
+                }
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=json.dumps(stub), stderr=""
+                )
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", spy)
+        self._digests_at_base_rev(tmp_path, [("best", "")], _SEED)
+        env = seen.get("env") or {}
+        got = {k: env.get(k) for k in expected}
+        assert got == expected, (
+            f"driver env's proxy keys are {got!r}, not the dead-proxy six {expected!r}"
+        )
 
     def test_e9afe401_produces_the_same_four_digests(self, tmp_path):
         got = self._digests_at_base_rev(tmp_path, _GOLDEN.keys(), _SEED)
