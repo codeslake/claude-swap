@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +17,7 @@ import pytest
 
 from claude_swap import macos_keychain as _macos_keychain
 from claude_swap import paths as _paths
+from claude_swap.locking import FileLock
 
 
 class RealStoreWriteBlocked(Exception):
@@ -965,3 +968,111 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if item.get_closest_marker("no_keychain_fake"):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
+
+
+# The account store lock (the switcher's ``lock_file``) held by ANOTHER
+# process, for the tests that assert a store writer waits for it. A real
+# second process rather than a second handle in this one, so ``lock_holders``
+# has a foreign pid to name; FileLock itself takes the lock, so the child
+# works on every platform FileLock does.
+_HOLD_STORE_LOCK = """
+import sys
+from pathlib import Path
+from claude_swap.locking import FileLock
+lock = FileLock(Path(sys.argv[1]), timeout=10.0)
+if not lock.acquire():
+    sys.exit(2)
+print("held", flush=True)
+sys.stdin.readline()
+lock.release()
+"""
+
+
+class StoreLockHolder:
+    """A child process holding ``lock_path`` until :meth:`release`."""
+
+    def __init__(self, lock_path: Path):
+        import claude_swap
+
+        src_root = str(Path(claude_swap.__file__).resolve().parent.parent)
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+            p for p in (src_root, os.environ.get("PYTHONPATH")) if p)}
+        self._proc = subprocess.Popen(
+            [sys.executable, "-c", _HOLD_STORE_LOCK, str(lock_path)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env,
+        )
+        line = self._proc.stdout.readline().strip()
+        assert line == "held", (
+            f"the holder process never took {lock_path} (said {line!r}, "
+            f"exit {self._proc.poll()})"
+        )
+        self.pid = self._proc.pid
+
+    def release(self) -> None:
+        """Let the child release the lock and exit; waits for the exit."""
+        self._proc.stdin.write("release\n")
+        self._proc.stdin.flush()
+        self._proc.wait(timeout=10.0)
+
+    def kill(self) -> None:
+        if self._proc.poll() is None:
+            self._proc.kill()
+            self._proc.wait(timeout=10.0)
+
+
+@pytest.fixture
+def store_lock_holder():
+    """Factory: ``store_lock_holder(path)`` holds ``path`` from another
+    process and returns the :class:`StoreLockHolder`. Every holder still
+    running at teardown is killed, so a failed test leaves no process."""
+    holders: list[StoreLockHolder] = []
+
+    def hold(lock_path: Path) -> StoreLockHolder:
+        holder = StoreLockHolder(lock_path)
+        holders.append(holder)
+        return holder
+
+    yield hold
+    for holder in holders:
+        holder.kill()
+
+
+class BackgroundCall:
+    """Run ``fn()`` on a thread, so a test can look while it waits on a lock.
+
+    :meth:`finish` joins it and re-raises what ``fn`` raised; a call still
+    running after the join timeout fails the test.
+    """
+
+    def __init__(self, fn):
+        self.error: BaseException | None = None
+
+        def run():
+            try:
+                fn()
+            except BaseException as exc:  # re-raised on the test's thread
+                self.error = exc
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+
+    def still_waiting_after(self, seconds: float) -> bool:
+        self._thread.join(timeout=seconds)
+        return self._thread.is_alive()
+
+    def finish(self, timeout: float = 10.0) -> None:
+        self._thread.join(timeout=timeout)
+        assert not self._thread.is_alive(), (
+            f"the call was still running {timeout}s after the lock was released"
+        )
+        if self.error is not None:
+            raise self.error
+
+
+def store_lock_is_free(lock_path: Path) -> bool:
+    """Whether ``lock_path`` can be taken right now (taken and released)."""
+    probe = FileLock(lock_path, timeout=0.0)
+    if probe.acquire():
+        probe.release()
+        return True
+    return False

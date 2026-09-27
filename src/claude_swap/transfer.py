@@ -22,6 +22,7 @@ from claude_swap.exceptions import (
     TransferError,
 )
 from claude_swap.fsutil import replace_with_retry
+from claude_swap.locking import STORE_LOCK_WAIT_S, FileLock
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
 
@@ -181,7 +182,24 @@ def export_accounts(
     Raises:
         TransferError: malformed/missing data, unknown account.
         CredentialReadError: failed to read credentials.
+        LockError: the account store lock stayed held past its wait.
+
+    The whole read runs under the account store lock (``lock_file``), which
+    every store writer holds across its writes, so the export is one
+    consistent store: never a credential file whose roster row an `add` has
+    not written yet, nor a roster row whose files a `remove` has deleted.
     """
+    with FileLock(switcher.lock_file, timeout=STORE_LOCK_WAIT_S).held_for("cswap export"):
+        _export_accounts_locked(switcher, destination, account, full)
+
+
+def _export_accounts_locked(
+    switcher: ClaudeAccountSwitcher,
+    destination: str,
+    account: str | None,
+    full: bool,
+) -> None:
+    """Body of :func:`export_accounts`; the caller holds ``switcher.lock_file``."""
     sequence_data = switcher._get_sequence_data_migrated()
     if not sequence_data or not sequence_data.get("accounts"):
         raise TransferError("no accounts to export — run cswap --add-account first")
@@ -371,6 +389,21 @@ def import_accounts(
     if not isinstance(accounts, list) or not accounts:
         raise TransferError("export file has no accounts to import")
 
+    # The input is read above with the lock released (a slow pipe must not
+    # hold it); the validation against local aliases and every write run
+    # under the account store lock, so a concurrent `export` never sees a
+    # credential file whose roster row this import has not written yet.
+    with FileLock(switcher.lock_file, timeout=STORE_LOCK_WAIT_S).held_for("cswap import"):
+        _import_accounts_locked(switcher, envelope, accounts, force)
+
+
+def _import_accounts_locked(
+    switcher: ClaudeAccountSwitcher,
+    envelope: dict,
+    accounts: list,
+    force: bool,
+) -> None:
+    """Body of :func:`import_accounts`; the caller holds ``switcher.lock_file``."""
     # Pass 1: validate every account before any writes. A malformed account
     # later in the list must not leave earlier accounts half-imported.
     local_data = switcher._get_sequence_data_migrated() or {}
