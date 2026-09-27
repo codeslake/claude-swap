@@ -922,52 +922,10 @@ def pytest_collection_modifyitems(items):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_sessionfinish(session, exitstatus):
-    """Self-delete THIS process's own basetemp on a green run, before
-    pytest's own tmpdir cleanup (``_pytest.tmpdir.pytest_sessionfinish``,
-    unmarked priority -- ``tryfirst`` here runs before it) ever counts it.
-
-    Measured (two independent analyzers, af4fccf551b36d50a and
-    a1d13f1b7a374c337): the green ``-n 10`` wall is bimodal, ~19s / ~23s, and
-    the ~4s difference is not a test -- it's pytest's own
-    ``cleanup_numbered_dir`` (``keep=3`` default) ``shutil.rmtree``-ing a
-    PAST session's leftover ``pytest-N`` directory serially. This suite's
-    autouse ``_isolate_real_home`` fixture alone makes ~1,987
-    ``tmp_path_factory.mktemp("isolated_home")`` dirs per run, and together
-    with ordinary ``tmp_path`` dirs that leaves ~45k filesystem entries per
-    green run under ``/tmp/pytest-of-<user>`` (upstream leaves ~21k);
-    whichever LATER session becomes the one to evict it pays one
-    ``rmtree`` over that whole tree, ~3.8s.
-
-    Deleting our own basetemp here, in an xdist WORKER, removes only that
-    worker's ``pytest-N/popen-gwX`` share (~1/10th of the tree) -- all ten
-    workers do this in parallel. xdist sends ``workerfinished`` only after a
-    worker's own ``sessionfinish`` hooks run, so the controller's
-    ``pytest_sessionfinish`` fires after every worker's; by then the
-    worker subdirectories under the controller's basetemp (``pytest-N``
-    itself) are already gone, so removing it here is cheap too. Net effect:
-    this run's ~45k entries come off in ten small parallel deletes instead
-    of landing as one serial 45k-entry one on whatever session runs next.
-
-    ``tmp_path_retention_policy = "failed"`` (delete per-test, not the whole
-    session) was tried and rejected: its per-test ``rmtree`` runs while a
-    test's own ``monkeypatch`` is still active, crashing xdist workers on
-    `test_an_interrupt_at_the_create_strands_nothing[*]` /
-    `test_a_signal_between_the_create_and_the_record_strands_nothing`
-    (``os.open`` raising ``KeyboardInterrupt``) and tripping
-    ``RealStoreWriteBlocked`` on the teardown ``rmdir`` -- rc=2 on 6/6 runs.
-    This hook is whole-basetemp, at session end, so no test's fixtures are
-    still unwound when it runs.
-
-    A red run keeps everything for debugging. A user-given ``--basetemp`` is
-    left alone in the CONTROLLER (``_given_basetemp is not None`` with no
-    ``workerinput``) -- xdist always sets a per-worker ``--basetemp`` under
-    the hood (``xdist/workermanage.py``), so that same check would also
-    (wrongly) skip every worker; the worker branch below has no such
-    carve-out and always cleans its own share on green.
-
-    ``tmp_path_factory._basetemp`` is ``None`` when nothing under it was
-    ever made (``mktemp`` never called) -- nothing to remove then.
-    """
+    # Green run: drop THIS process's own basetemp -- each xdist worker its own popen-gwX share in parallel, the controller its pytest-N -- before pytest's own tmpdir sessionfinish runs cleanup_numbered_dir, hence tryfirst.
+    # Measured: a green run leaves ~45k entries in the shared /tmp/pytest-of-<user>, a ~3.8s serial rmtree landing on whichever later session evicts it, which made the -n 10 wall bimodal ~19s/~23s.
+    # Not tmp_path_retention_policy="failed": its per-test rmtree runs while monkeypatch is still active, so a worker crashes with RealStoreWriteBlocked.
+    # A user-given --basetemp is left alone in the controller; a worker always cleans its own share on green.
     if exitstatus != 0:
         return
     factory = session.config._tmp_path_factory
