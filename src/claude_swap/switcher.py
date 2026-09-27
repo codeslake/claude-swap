@@ -637,6 +637,26 @@ class ClaudeAccountSwitcher:
 
         run_migrations(self)
         self._moving_keys = False
+        # T1313 (correctness-pass item 4): set by `AutoSwitchEngine` (never
+        # by anything in this class) for as long as it is dry-run or
+        # demoted, so `_settle_login_restore` answers WAITING instead of
+        # writing -- the candidate stays pending on disk for the live
+        # engine or a manual collect to act on instead. Defaults False:
+        # every on-demand caller (`--list`/`--status`, a bare `cswap
+        # switch`) has no engine setting it at all.
+        #
+        # Thread-local (T1448), same shape as `_active_verdict_tls`: a
+        # process-wide bool let `stop()` (the caller's thread) clear what
+        # the tick's own thread had just set, ahead of `_stop` -- a stop
+        # landing after the tick's own `_stop` gates but before the flag
+        # is read in `_settle_login_restore` read False and wrote. Scoped
+        # per-thread, `stop()` never needs to touch it at all, and a
+        # user-initiated `switch()` on another thread is never suppressed
+        # by some other, demoted engine's flag. `_with_active_verdict`
+        # carries it into a fetch-pool worker the same way it already
+        # carries the active-read verdict, since `_resync_rotated_backup`'s
+        # own settle call can run on one of those.
+        self._suppress_login_restore_write_tls = threading.local()
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -4632,16 +4652,22 @@ class ClaudeAccountSwitcher:
         self._active_verdict_tls.value = active
 
     def _with_active_verdict(self, fn):
-        """Wrap `fn` so a worker thread inherits THIS thread's verdict.
+        """Wrap `fn` so a worker thread inherits THIS thread's verdict and
+        write-suppression state.
 
         Thread-local keeps two TUI lanes from erasing each other's, but
         `_fetch_active_usage` always runs on a pool worker that never read —
-        measured 30/30 verdicts lost, and the consume gate never fired.
+        measured 30/30 verdicts lost, and the consume gate never fired. The
+        write-suppression flag (T1313 item 4, T1448) needs the same carry:
+        `_resync_rotated_backup`'s own settle call can run on this same pool
+        worker, on a demoted engine's collect pass.
         """
         verdict = self._active_verdict()
+        suppress = self._suppress_login_restore_write
 
         def _inherit(*args, **kwargs):
             self._record_active_verdict(verdict)
+            self._suppress_login_restore_write = suppress
             return fn(*args, **kwargs)
 
         return _inherit
@@ -4677,6 +4703,16 @@ class ClaudeAccountSwitcher:
     @property
     def _active_read_degraded(self) -> bool:
         return self._active_verdict().degraded
+
+    @property
+    def _suppress_login_restore_write(self) -> bool:
+        """THIS thread's write-suppression flag (see `_suppress_login_restore_write_tls`
+        in `__init__`)."""
+        return getattr(self._suppress_login_restore_write_tls, "value", False)
+
+    @_suppress_login_restore_write.setter
+    def _suppress_login_restore_write(self, value: bool) -> None:
+        self._suppress_login_restore_write_tls.value = value
 
     def _read_account_credentials_ex(
         self, account_num: str, email: str, *, probe_reassigned_slots: bool = True
@@ -8261,6 +8297,31 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             return mdat
         return max(mdat, file_mtime)
 
+    def _fingerprint_unknown_recovered(self, num: str, quarantined_at: str) -> bool:
+        """Is a ``fingerprintUnknown`` quarantine entry on slot ``num``,
+        recorded at ``quarantined_at``, superseded by a later
+        ``--add-account --slot num``?
+
+        A blind entry (the generation was never learned) has no
+        fingerprint to compare against, so the roster's own ``added``
+        stamp is the only signal: ``QuarantineEvent.human`` tells the user
+        to log in and re-add, and that rewrites it. Strictly after, so an
+        add in the same second as the quarantine -- a slot that conflicted
+        the moment it was added -- is not read as a recovery. Both stamps
+        are fixed-width UTC ISO strings.
+
+        The ONE predicate ``AutoSwitchEngine._release_recovered_quarantines``
+        (an engine tick) and ``_engine_quarantined`` (which the settle also
+        uses with no engine ticking at all) both call, so a re-add clears
+        the bar in manual mode too (T1313) -- that release only runs from a
+        tick, and without this a blind entry would otherwise refuse every
+        restore forever with nothing left to lift it.
+        """
+        added = (
+            (self._get_sequence_data() or {}).get("accounts", {}).get(num) or {}
+        ).get("added", "")
+        return bool(added) and bool(quarantined_at) and added > quarantined_at
+
     def _engine_quarantined(self, num: str, fingerprint: str | None) -> bool:
         """Is slot ``num`` in the auto-switch engine's own quarantine ledger
         right now (its ``autoswitch_state.json``, e.g. an
@@ -8284,12 +8345,10 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         Counted only while the entry's own ``refreshTokenFingerprint`` still
         matches ``num``'s current backup -- the same comparison
         ``AutoSwitchEngine._release_recovered_quarantines`` uses to decide a
-        quarantine is stale. That release only runs from an engine tick, so
-        in manual mode (no engine running) a login already replaced there
-        would otherwise refuse every restore forever with nothing left to
-        lift it. ``fingerprintUnknown`` (the generation was never learned)
-        still counts, same as the release leaves it bound rather than
-        cleared.
+        quarantine is stale. ``fingerprintUnknown`` (the generation was
+        never learned) still counts UNLESS :meth:`_fingerprint_unknown_recovered`
+        says the roster's own re-add stamp supersedes it -- see that
+        method's docstring for why this must not require an engine tick.
         """
         try:
             raw = json.loads(
@@ -8304,7 +8363,9 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         if not isinstance(entry, dict):
             return False
         if entry.get("fingerprintUnknown"):
-            return True
+            return not self._fingerprint_unknown_recovered(
+                num, entry.get("at", "")
+            )
         return fingerprint == entry.get("refreshTokenFingerprint")
 
     def _settle_login_restore(self) -> LoginRestoreOutcome:
@@ -8346,6 +8407,14 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         (:meth:`_target_config`, :meth:`_prepare_credentials_for_activation`,
         :meth:`_write_oauth_account_to_live_config`) and rolls back the same
         way. No probe, refresh, grant, roster write or disabled-flag write.
+        :attr:`_suppress_login_restore_write` (T1313 correctness-pass item
+        4, set only by :class:`AutoSwitchEngine`) still lets every refusal
+        above run and answer the same NONE/WAITING a live engine would --
+        it only turns the WRITE ITSELF into WAITING (T1448: gated right
+        before it, not ahead of the refusals), so a dry-run/demoted engine
+        answers identically to LIVE on a quarantined, expired or otherwise
+        unusable candidate, and only a fully-qualified restore stays
+        pending on disk rather than being consumed here.
         """
         active = self._read_active_credentials()
         live = active.value
@@ -8366,9 +8435,6 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         d_num = self._find_account_slot(data, d_email, d_org)
         if d_num is None or d_num == a_num:
             return LoginRestoreOutcome.NONE
-        d_backup = self._read_account_credentials(d_num, d_email)
-        if live_fp != oauth.credential_fingerprint(d_backup):
-            return LoginRestoreOutcome.NONE  # D's own backup doesn't hold this yet
 
         def _left(reason: str) -> LoginRestoreOutcome:
             self._store._log_detected_login(
@@ -8376,20 +8442,52 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             )
             return LoginRestoreOutcome.NONE
 
+        # Computed here, ahead of the candidacy check below, so `_transient`
+        # (T1313 correctness-pass item 1) has something to bound a
+        # transient failure there against too -- textually before its own
+        # def, which is fine: a closure reads `write_time` at CALL time, and
+        # every call below runs after this assignment.
+        write_time = self._live_write_time()
+
         def _transient(reason: str) -> LoginRestoreOutcome:
             """A refusal that can clear on its own shortly (someone else's
             lock, a backup read that failed this instant): WAITING lets the
             next call re-derive it, bounded by
             :data:`LOGIN_RESTORE_TRANSIENT_BOUND_S` so a refusal that keeps
-            recurring on N cannot hold the engine in front of it forever."""
-            if (time.time() - write_time) >= LOGIN_RESTORE_TRANSIENT_BOUND_S:
+            recurring on N cannot hold the engine in front of it forever.
+            ``write_time is None`` is not "unbounded transient": nothing
+            here would ever make an unreadable clock readable, so this
+            answers NONE the same as that check does further down. Nor is
+            a ``write_time`` more than :data:`LOGIN_RESTORE_CLOCK_SKEW_S`
+            in the future: ``time.time() - write_time`` is then negative
+            and would never reach the bound above, and nothing here would
+            ever make it move backward either -- called from BEFORE the
+            module's own future-write-time check further down, so this
+            bound must answer the same NONE that check does, on its own."""
+            if write_time is None:
+                return _left(reason)
+            now = time.time()
+            if (now - write_time) >= LOGIN_RESTORE_TRANSIENT_BOUND_S or (
+                write_time - now > LOGIN_RESTORE_CLOCK_SKEW_S
+            ):
                 return _left(reason)
             self._store._log_detected_login(
                 live, slot=d_num, outcome=f"waiting: {reason}",
             )
             return LoginRestoreOutcome.WAITING
 
-        write_time = self._live_write_time()
+        # T1313 (correctness-pass item 1): `_ex`, not the plain reader --
+        # the plain reader answers "" for a read that just failed the same
+        # way it answers "" for a genuinely empty backup, so a transient
+        # failure right here used to read as "D's own backup doesn't hold
+        # this yet" (a permanent NONE) instead of the transient WAITING
+        # every other read failure in this method answers.
+        d_backup, d_unreadable = self._read_account_credentials_ex(d_num, d_email)
+        if d_unreadable:
+            return _transient("its backup is unreadable right now")
+        if live_fp != oauth.credential_fingerprint(d_backup):
+            return LoginRestoreOutcome.NONE  # D's own backup doesn't hold this yet
+
         if write_time is None:
             # Unreadable, not merely unknown-and-recent: WAITING here would
             # never clear on its own (nothing marks it readable later), and
@@ -8502,6 +8600,23 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                             config_path.read_text(encoding="utf-8")
                             if config_path.exists() else None
                         )
+                        if self._suppress_login_restore_write:
+                            # T1313 (correctness-pass item 4), T1448: a
+                            # dry-run/demoted engine tick, or its own
+                            # collect's no-drift resync, must never
+                            # perform THE WRITE -- gated here, right before
+                            # it, rather than ahead of every refusal above,
+                            # so a suppressed engine answers the same
+                            # NONE/WAITING a live one would on a
+                            # quarantined, expired or otherwise unusable
+                            # candidate. The candidate stays pending on
+                            # disk for the live engine or a manual collect
+                            # instead.
+                            self._store._log_detected_login(
+                                live, slot=d_num,
+                                outcome="waiting: write suppressed",
+                            )
+                            return LoginRestoreOutcome.WAITING
                         creds_written = False
                         try:
                             self._write_credentials(

@@ -62,6 +62,7 @@ from claude_swap.switcher import (
     LOGIN_RESTORE_RECHECK_MARGIN_S,
     LOGIN_RESTORE_SETTLE_FLOOR_S,
     ClaudeAccountSwitcher,
+    LoginRestoreOutcome,
 )
 
 
@@ -19379,3 +19380,210 @@ class TestT1313SettleWiring:
         assert LOGIN_RESTORE_RECHECK_MARGIN_S / 2 < delay <= (
             LOGIN_RESTORE_RECHECK_MARGIN_S
         ), "a transient WAITING must not spin at the 0.1s floor"
+
+    def test_tick_write_suppressed_for_a_dry_run_engine(
+        self, temp_home: Path,
+    ):
+        """(correctness-pass item 4) A dry-run engine (a demoted one forces
+        `dry_run` True the same way) must never let its own settle calls
+        write the live store, even for a fully valid, past-floor candidate
+        -- it stays pending on disk for the live engine or a manual
+        collect instead, and the suppressed WAITING (past the settle
+        floor) must not arm the 1s recheck margin or spin `_next_delay` at
+        it (correctness-pass item 4's own WAITING) -- nothing would clear
+        it sooner, so arming it would spin every tick instead of the
+        ordinary cadence for no gain."""
+        h = EngineHarness(temp_home)
+        h.engine.dry_run = True
+        login = self._seed_settle_candidate(h, age_s=10.0)
+        with patch.object(h.engine, "_perform") as perform:
+            outcome = h.engine.tick()
+        perform.assert_not_called()
+        assert outcome is TickOutcome.NO_ACTION
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "a dry-run tick must never perform the settle's write"
+        assert h.engine._settle_wait_until is None, (
+            "a suppressed WAITING must not arm the recheck wait"
+        )
+        delay = h.engine._next_delay(outcome)
+        assert delay > LOGIN_RESTORE_RECHECK_MARGIN_S, (
+            "a suppressed WAITING must fall back to the ordinary cadence, "
+            "not spin at the recheck margin"
+        )
+
+    def test_stop_never_clears_the_write_suppression(
+        self, temp_home: Path,
+    ):
+        """(the prior fix's own race, T1448) `stop()` used to clear
+        `_suppress_login_restore_write` on the switcher, but that ran on
+        the CALLER's thread, ahead of `_stop`: a stop landing after
+        `_tick_inner`'s/`_next_delay`'s own `_stop` gates but before
+        `_settle_login_restore`'s flag read then read False and restored.
+
+        The flag is thread-local now (T1448): set only by this engine's
+        own tick, on its own thread, so `stop()` never needs to touch it
+        at all, and a settle on ANOTHER thread (a manual collect, a
+        freshly promoted LIVE engine, a user-initiated `switch()`) is
+        never suppressed by this engine's leftover flag."""
+        h = EngineHarness(temp_home)
+        h.engine.dry_run = True
+        self._seed_settle_candidate(h, age_s=10.0)  # A = 1, N = 2
+        with patch.object(h.engine, "_perform") as perform:
+            h.engine.tick()
+        perform.assert_not_called()
+        assert h.switcher._suppress_login_restore_write is True
+        h.engine.stop()
+        assert h.switcher._suppress_login_restore_write is True, (
+            "stop() must never clear the write suppression -- only this "
+            "engine's own tick, on its own thread, ever does"
+        )
+        result: dict[str, LoginRestoreOutcome] = {}
+        other_thread = threading.Thread(
+            target=lambda: result.setdefault(
+                "outcome", h.switcher._settle_login_restore()
+            )
+        )
+        other_thread.start()
+        other_thread.join()
+        assert result["outcome"] is LoginRestoreOutcome.RESTORED, (
+            "a different thread's restore must not be suppressed by this "
+            "engine's own flag"
+        )
+        live_now = h.switcher._read_credentials()
+        a_backup = h.switcher._read_account_credentials("1", "a@example.com")
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            a_backup
+        ), "the restore must put A's own backup back on live"
+
+    def test_run_loop_clears_the_write_suppression_on_a_reused_thread(
+        self, temp_home: Path,
+    ):
+        """(T1448) The flag is thread-local, so `stop()` (the sibling test
+        above) correctly never touches it -- but the TUI's worker threads
+        all come from Textual's one shared default executor
+        (`run_in_executor(None, ...)`): a stopped engine's own thread is
+        handed straight to the next refresh or user-initiated switch.
+        `run_loop`'s `finally` used to clear the flag only on the
+        unhandled-error/consumer-gone paths, so a `stop()`-ped dry-run
+        engine left True on its own thread for whatever ran there next."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        h = EngineHarness(temp_home)
+        h.engine.dry_run = True
+        self._seed_settle_candidate(h, age_s=10.0)  # A = 1, N = 2
+        tick_done = threading.Event()
+        real_tick = h.engine.tick
+
+        def tick_and_signal():
+            result = real_tick()
+            tick_done.set()
+            return result
+
+        h.engine.tick = tick_and_signal
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            run = executor.submit(h.engine.run_loop)
+            assert tick_done.wait(5.0), "premise: the engine ticked once"
+            h.engine.stop()
+            assert run.result(timeout=5.0) == 0
+            outcome = executor.submit(
+                h.switcher._settle_login_restore
+            ).result(timeout=5.0)
+        finally:
+            executor.shutdown(wait=True)
+        assert outcome is LoginRestoreOutcome.RESTORED, (
+            "a stopped engine's own write suppression must not survive "
+            "onto the next job its thread runs"
+        )
+
+    def test_next_delay_rechecks_after_the_polls_own_collect_queues_a_settle(
+        self, temp_home: Path, monkeypatch,
+    ):
+        """(correctness-pass item 5) `_next_delay` checks `_settle_wait_until`
+        BEFORE calling `_respect_poll_plan` -- but `_respect_poll_plan`'s own
+        collect (`usage_entries_by_account`, whose `_collect_usage_entries`
+        runs `_resync_rotated_backup`'s no-drift adopt) can itself make a
+        restore pending ON DISK, with no signal reaching `_settle_wait_until`
+        set before that call ran. A recheck after the delay is computed must
+        still catch the fresh candidate and cap the sleep near the settle
+        floor, not hand back the ordinary cadence."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com", expires_at=99_999_999_999_999)
+        h.seed(2, "z@example.com")  # N's own backup starts stale ("rt-2")
+        h.set_active(1)  # A = 1
+        login = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999}})
+        h.switcher._write_credentials(login)  # fresh write: under the floor
+        (h.temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "z@example.com",
+                              "accountUuid": "uuid-2"},
+        }))
+
+        def _collect_adopts(fetch=None, *, scheduled=False):
+            # The shape `_resync_rotated_backup`'s no-drift return leaves:
+            # N's own backup adopts the live login mid-collect. Attributed:
+            # this is slot 2's own (z@example.com's) login.
+            h.switcher._write_account_credentials(
+                "2", "z@example.com", login, attributed=True,
+            )
+            return {}
+
+        monkeypatch.setattr(h.switcher, "usage_entries_by_account", _collect_adopts)
+        h.engine._settle_wait_until = None
+        delay = h.engine._next_delay(TickOutcome.NO_ACTION)
+        assert delay <= LOGIN_RESTORE_SETTLE_FLOOR_S + LOGIN_RESTORE_RECHECK_MARGIN_S, (
+            "a settle candidate that appeared inside `_respect_poll_plan`'s "
+            "own collect must cap the sleep near the settle floor, not the "
+            "ordinary cadence"
+        )
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), (
+            "the fresh write is still under the settle floor, so this "
+            "recheck must answer WAITING, not perform the restore early"
+        )
+
+    def test_next_delay_never_writes_once_stopped(
+        self, temp_home: Path,
+    ):
+        """(correctness-pass item 5's own recheck) `run_loop` calls
+        `_next_delay` on the tick's own thread AFTER `tick()` has returned
+        -- `stop()` (a successor's SIGTERM, or the TUI's toggle) can land
+        in that gap and already have handed LIVE away by the time this
+        recheck runs. Unlike `_respect_poll_plan` just above it (stop-gated
+        for the identical reason), this recheck had no `_stop` check of its
+        own and could still perform the full restore write for an engine
+        that no longer holds LIVE."""
+        h = EngineHarness(temp_home)
+        login = self._seed_settle_candidate(h, age_s=10.0)
+        h.engine._stop.set()
+        h.engine._next_delay(TickOutcome.NO_ACTION)
+        live_now = h.switcher._read_credentials()
+        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
+            login
+        ), "a stopped engine's delay computation must never perform the restore"
+
+    def test_next_delay_recheck_swallows_a_raise(
+        self, temp_home: Path,
+    ):
+        """(correctness-pass item 5's own guard, T1448) The item 5 recheck
+        calls `_settle_or_arm_wait` outside any try -- its settle's own
+        pre-try reads (`_get_sequence_data()` on a torn `sequence.json`)
+        can raise, and unguarded that would escape `_next_delay` into
+        `run_loop`'s catch-all as a second ErrorEvent for the same tick.
+        Guarded the same way `_respect_poll_plan` guards itself just above
+        it: best-effort, the unshortened delay already computed stays
+        safe."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.set_active(1)
+        with patch.object(
+            h.engine, "_settle_or_arm_wait",
+            side_effect=RuntimeError("torn sequence.json"),
+        ):
+            delay = h.engine._next_delay(TickOutcome.NO_ACTION)  # must not raise
+        assert delay > 0

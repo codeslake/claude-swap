@@ -1878,13 +1878,14 @@ class AutoSwitchEngine:
                 # `--add-account --slot N`, and that rewrites this stamp.
                 # Without the check the bind takes the replacement as the
                 # quarantine's OWN generation, every later compare matches,
-                # and the slot stays barred with nothing said. Strictly
-                # after, so an add in the same second as the quarantine --
-                # a slot that conflicted the moment it was added -- is not
-                # read as a recovery. Both stamps are fixed-width UTC ISO.
-                added = roster.get(number, {}).get("added", "")
-                at = entry.get("at", "")
-                if added and at and added > at:
+                # and the slot stays barred with nothing said.
+                # THE ONE PREDICATE, shared with `_engine_quarantined` (the
+                # settle, which uses it with no engine ticking at all) --
+                # see `_fingerprint_unknown_recovered`'s own docstring
+                # (T1313).
+                if self.switcher._fingerprint_unknown_recovered(
+                    number, entry.get("at", "")
+                ):
                     to_release.append(
                         (number, email_now, "credentials-replaced")
                     )
@@ -2346,9 +2347,16 @@ class AutoSwitchEngine:
         call sites (T1313) -- before ``current`` is read, and again after the
         collect pass, whose own resync can settle a login mid-pass without
         moving ``current_account_number()`` at all (see the second call
-        site's comment)."""
+        site's comment) -- and by ``_next_delay``'s own recheck (T1313
+        correctness-pass item 5), once the ordinary cadence is computed.
+
+        A suppressed WAITING (``self.dry_run``) is never armed: the write
+        stays suppressed for as long as this engine runs, so nothing here
+        would ever clear it sooner, and arming it would spin every tick at
+        the 1s recheck margin instead of the ordinary cadence for no gain.
+        """
         settle = self.switcher._settle_login_restore()
-        if settle is LoginRestoreOutcome.WAITING:
+        if settle is LoginRestoreOutcome.WAITING and not self.dry_run:
             # Real wall time, not `self.clock()`: the floor is measured
             # against a real filesystem mtime (or Keychain `mdat`), which
             # only the OS's own clock can be compared against -- `self.clock`
@@ -2378,6 +2386,13 @@ class AutoSwitchEngine:
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         self._settle_wait_until = None
+        # T1313 (correctness-pass item 4): a demoted engine forces
+        # `dry_run` True the same way an explicit one does, so this one
+        # flag covers both -- every settle call this tick and every one
+        # `_resync_rotated_backup`'s own collect-path call makes must
+        # refuse to write, the same way every OTHER mutation below is
+        # gated on `dry_run`.
+        self.switcher._suppress_login_restore_write = self.dry_run
         if self._stop.is_set():
             # BEFORE the mutators, not among them. `stop()` releases the LIVE
             # lock synchronously and no caller joins the worker, so the
@@ -5622,6 +5637,22 @@ class AutoSwitchEngine:
         schedule. ``_switch_in_flight`` closes that: the release waits on the
         switch rather than on the state lock, which ``_perform`` already holds
         and which callers reach through this method.
+
+        Never touches the switcher's write suppression (T1313 correctness-
+        pass item 4): that flag is thread-local (T1448), set only by this
+        engine's own tick on its own thread, so a stop landing on ANOTHER
+        thread (the TUI, a SIGTERM handler outside the tick's own frame)
+        used to clear it here ahead of ``_stop`` -- a tick already past
+        the ``_stop`` gates in ``_tick_inner``/``_next_delay`` but not yet
+        at ``_settle_login_restore``'s own flag read then read False and
+        wrote. Left to clear itself: ``_tick_inner`` sets it fresh every
+        tick to ``self.dry_run``, and ``run_loop``'s own ``finally`` clears
+        it unconditionally on every exit path (T1448), this ``stop()``'d
+        one included -- the thread this engine last ticked on is not
+        retired, the TUI hands it straight to the next refresh or
+        user-initiated switch through the one shared executor pool, and a
+        stale flag left there would suppress a write for an engine that
+        never asked for it.
         """
         self._stop.set()
         self._wake.set()
@@ -5737,16 +5768,58 @@ class AutoSwitchEngine:
             # resumes one slow tick after they do.
             return max(interval, NO_RESET_FALLBACK_S)
         elif outcome is TickOutcome.NO_ACTION and self._settle_wait_until is not None:
-            # T1313: the last settle said WAITING (the floor since the live
-            # store's own write hasn't passed yet) -- recheck just past it
-            # rather than on the ordinary cadence, which could be minutes.
-            # Real wall time again, matching how `_settle_wait_until` itself
-            # was computed. Capped at `interval`: a write time read as
-            # FUTURE (clock skew, a bad mtime) must not sleep the engine
-            # past its own ordinary cadence either.
+            # T1313: the last settle said WAITING -- either the floor since
+            # the live store's own write hasn't passed yet (armed at
+            # write_time + floor + margin), or one of the TRANSIENT
+            # refusals past the floor already (a lock held elsewhere, a
+            # backup read that failed this instant), which re-arm at
+            # now + margin instead so this recheck lands just past the
+            # margin rather than racing the floor a second time. Either
+            # way: recheck just past it rather than on the ordinary
+            # cadence, which could be minutes. Real wall time again,
+            # matching how `_settle_wait_until` itself was computed. Capped
+            # at `interval`: a write time read as FUTURE (clock skew, a bad
+            # mtime) must not sleep the engine past its own ordinary
+            # cadence either.
             return min(max(self._settle_wait_until - time.time(), 0.1), interval)
         # ±10% jitter so multiple machines don't synchronize their API hits.
-        return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+        delay = self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+        # T1313 (correctness-pass item 5): `_respect_poll_plan`'s own
+        # collect (`usage_entries_by_account` -> `_resync_rotated_backup`'s
+        # no-drift adopt) can itself make a restore pending ON DISK, with
+        # no signal reaching `_settle_wait_until` above -- that check ran
+        # BEFORE this call. Recheck now that the delay is computed, and cap
+        # it the same way an already-armed wait would.
+        #
+        # Stop-gated, same reason `_respect_poll_plan` guards itself just
+        # above (see its own docstring): `run_loop` calls this on the
+        # tick's own thread AFTER `tick()` has returned, so a `stop()`
+        # landing in that gap may already have handed LIVE to a successor
+        # by the time this recheck runs -- performing the write here would
+        # do it for an engine that no longer holds LIVE.
+        if self._stop.is_set():
+            return delay
+        # A suppressed WAITING leaves `_settle_wait_until` unarmed (see
+        # `_settle_or_arm_wait`'s own docstring) -- guard on it too, not
+        # just the outcome, or this falls back to the ordinary cadence
+        # already computed above instead of a `None` arithmetic error.
+        #
+        # Guarded the same way `_respect_poll_plan` guards itself: this
+        # runs OUTSIDE `tick()`'s own try, on `run_loop`'s thread AFTER
+        # `tick()` has returned, and `_settle_or_arm_wait`'s pre-try reads
+        # (`_get_sequence_data()` on a torn ``sequence.json``) can raise --
+        # unguarded, that reaches `run_loop`'s catch-all as a second
+        # ErrorEvent for the same tick. Best-effort: the unshortened delay
+        # already computed above is always safe.
+        try:
+            if (
+                self._settle_or_arm_wait() is LoginRestoreOutcome.WAITING
+                and self._settle_wait_until is not None
+            ):
+                delay = min(delay, max(self._settle_wait_until - time.time(), 0.1))
+        except Exception:
+            pass
+        return delay
 
     def _respect_poll_plan(self, delay: float) -> float:
         """Shorten a normal-cadence sleep to the store's own next-poll time.
@@ -5900,6 +5973,17 @@ class AutoSwitchEngine:
                 self._emit(
                     ErrorEvent(message=f"engine stopped: {reason}", transient=False)
                 )
+            # UNCONDITIONALLY, on both exit paths. This runs on the
+            # worker's own thread, after its last tick, so it never races
+            # `stop()` (which never touches this thread-local flag at all
+            # -- see `stop()`'s own docstring). The TUI's thread workers
+            # share ONE executor pool, so a thread this engine no longer
+            # ticks on is not retired, it is handed to the next refresh or
+            # user-initiated switch -- leaving the flag conditioned on
+            # `_stop` left it True there whenever `stop()` was the exit,
+            # and the next job on that thread read "waiting: write
+            # suppressed" for an engine that had already stopped.
+            self.switcher._suppress_login_restore_write = False
 
 
 def _access_token_of(credentials) -> str | None:

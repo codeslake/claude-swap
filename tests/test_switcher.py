@@ -24454,12 +24454,13 @@ class TestT1313LoginRestore:
         now = time.time()
         os.utime(path, (now - age_s, now - age_s))
 
-    @pytest.mark.parametrize("n_disabled", [False, True])
     def test_settle_restores_the_active_account_past_the_floor(
-        self, temp_home: Path, sample_sequence_data: dict, n_disabled: bool,
+        self, temp_home: Path, sample_sequence_data: dict,
     ):
+        # n_disabled=True only: the discriminating value -- a settle that
+        # wrongly cleared N's disabled flag would still pass at False.
         s, login, active_backup = self._setup(
-            sample_sequence_data, temp_home, n_disabled=n_disabled,
+            sample_sequence_data, temp_home, n_disabled=True,
         )
         self._make_settled_candidate(s, login)
         with patch.object(s, "_replan_new_active") as replan, \
@@ -24487,7 +24488,7 @@ class TestT1313LoginRestore:
         assert live_config["oauthAccount"]["emailAddress"] == "b@example.com"
         data = s._get_sequence_data()
         assert data["activeAccountNumber"] == 2, "the active pointer moved"
-        assert data["accounts"]["1"].get("disabled", False) == n_disabled, (
+        assert data["accounts"]["1"].get("disabled", False) is True, (
             "N's disabled flag changed"
         )
         assert json.loads(s._read_account_credentials(
@@ -24648,11 +24649,16 @@ class TestT1313LoginRestore:
         )
 
     @pytest.mark.parametrize("condition", [
-        "quarantined", "inside_margin", "non_finite", "consume_locked",
+        "quarantined", "quarantined_while_suppressed", "inside_margin",
+        "non_finite", "consume_locked",
         "consume_locked_past_bound", "settled_meanwhile", "engine_quarantined",
         "engine_quarantined_stale", "engine_quarantined_read_fails",
+        "engine_quarantined_fingerprint_unknown_recovered",
+        "engine_quarantined_fingerprint_unknown_not_recovered",
         "write_time_unreadable", "write_time_future",
         "d_backup_changed_meanwhile", "d_backup_unreadable", "backup_unreadable",
+        "write_suppressed",
+        "d_backup_unreadable_write_time_future", "d_backup_unreadable_unlocked",
     ])
     def test_a_refused_restore_never_writes_over_live(
         self, temp_home: Path, sample_sequence_data: dict,
@@ -24671,6 +24677,16 @@ class TestT1313LoginRestore:
         held_lock = None
         if condition == "quarantined":
             monkeypatch.setattr(s, "_slot_token_dead", lambda num, email: num == "2")
+        elif condition == "quarantined_while_suppressed":
+            # T1448: the suppression gate used to sit ahead of every
+            # refusal below it (quarantined, expired, no usable stored
+            # login) -- a suppressed engine short-circuited to WAITING
+            # before ever reaching this one, instead of answering the same
+            # NONE a live engine hitting the SAME quarantine would. Gated
+            # right before the write now, so this must read identically to
+            # plain "quarantined" above.
+            monkeypatch.setattr(s, "_slot_token_dead", lambda num, email: num == "2")
+            s._suppress_login_restore_write = True
         elif condition == "engine_quarantined":
             # The auto-switch engine's own ledger, not `_slot_token_dead`'s
             # (a different quarantine, e.g. an `identity-conflict` strike),
@@ -24713,6 +24729,33 @@ class TestT1313LoginRestore:
                 return real_read(num, email)
 
             monkeypatch.setattr(s, "_read_account_credentials", _failing_read)
+        elif condition == "engine_quarantined_fingerprint_unknown_recovered":
+            # T1313 (correctness-pass item 3): a `fingerprintUnknown` entry
+            # has no generation to compare against -- only the roster's own
+            # re-add stamp (`added > at`) says the documented recovery
+            # (`--add-account --slot N`) happened.
+            # `_release_recovered_quarantines` reads that from an ENGINE
+            # TICK only; the settle must release the SAME entry with no
+            # engine ticking at all, or manual mode stays barred forever.
+            state_path = s.backup_dir / "autoswitch_state.json"
+            state_path.write_text(json.dumps({"quarantine": {"2": {
+                "fingerprintUnknown": True, "at": "2020-01-01T00:00:00Z",
+            }}}))
+            data = s._get_sequence_data()
+            data["accounts"]["2"]["added"] = "2099-01-01T00:00:00Z"
+            s._write_json(s.sequence_file, data)
+        elif condition == "engine_quarantined_fingerprint_unknown_not_recovered":
+            # T1313 (correctness-pass item 3)'s own settle-side control: the
+            # SAME `fingerprintUnknown` entry, but `added <= at` -- no
+            # `--add-account --slot N` after the quarantine, so the entry
+            # must still block the settle the same way it always did.
+            state_path = s.backup_dir / "autoswitch_state.json"
+            state_path.write_text(json.dumps({"quarantine": {"2": {
+                "fingerprintUnknown": True, "at": "2020-01-01T00:00:00Z",
+            }}}))
+            data = s._get_sequence_data()
+            data["accounts"]["2"]["added"] = "2019-01-01T00:00:00Z"
+            s._write_json(s.sequence_file, data)
         elif condition == "write_time_unreadable":
             monkeypatch.setattr(s, "_live_write_time", lambda: None)
         elif condition == "write_time_future":
@@ -24721,23 +24764,77 @@ class TestT1313LoginRestore:
         elif condition in (
             "d_backup_changed_meanwhile", "d_backup_unreadable", "backup_unreadable",
         ):
-            # The re-check under the lock, patched at one (num, email) pair:
-            # a genuine mismatch (read succeeds, differs) for N's own backup
-            # is "no longer matches" (permanent); a read that FAILS, for
-            # either N's or A's own backup, is transient (T1313).
+            # The re-check UNDER THE LOCK (switcher.py's "T1313: re-verify
+            # D's OWN backup ... under the lock too"), not the unlocked
+            # candidacy read a few lines above it in the source -- both now
+            # call `_read_account_credentials_ex` for D's pair (item 1
+            # moved the unlocked one onto it too), so patching that pair
+            # unconditionally trips the FIRST (unlocked) call and the
+            # locked re-check this row exists to prove never runs. D's
+            # pair is call-counted: the first call is real (the unlocked
+            # check must pass through to the lock), the second is patched.
+            # A's own backup (`backup_unreadable`) is read only once, under
+            # the lock, so it needs no such count.
             real_ex = s._read_account_credentials_ex
             match, result = {
                 "d_backup_changed_meanwhile": (("1", "c@example.com"), ("", False)),
                 "d_backup_unreadable": (("1", "c@example.com"), ("", True)),
                 "backup_unreadable": (("2", "b@example.com"), ("", True)),
             }[condition]
+            calls = {"n": 0}
 
             def _patched_ex(num, email):
-                if (num, email) == match:
-                    return result
-                return real_ex(num, email)
+                if (num, email) != match:
+                    return real_ex(num, email)
+                if match[0] == "1":
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        return real_ex(num, email)
+                return result
 
             monkeypatch.setattr(s, "_read_account_credentials_ex", _patched_ex)
+        elif condition == "d_backup_unreadable_write_time_future":
+            # `_transient`'s own bound compares `time.time() - write_time`,
+            # which is NEGATIVE for a write time in the future -- so this
+            # never trips the bound, and `_transient` (reached here from
+            # the UNLOCKED candidacy read, ahead of the module's own
+            # future-write-time check further down) would WAIT forever
+            # instead of answering NONE the same way "write_time_future"
+            # already does for the read that succeeds.
+            future = time.time() + 3600.0
+            monkeypatch.setattr(s, "_live_write_time", lambda: future)
+            real_ex = s._read_account_credentials_ex
+
+            def _unreadable_ex(num, email):
+                if (num, email) == ("1", "c@example.com"):
+                    return "", True
+                return real_ex(num, email)
+
+            monkeypatch.setattr(s, "_read_account_credentials_ex", _unreadable_ex)
+        elif condition == "d_backup_unreadable_unlocked":
+            # The unlocked candidacy read of D's backup: unreadable is WAITING,
+            # never NONE. Patched on the store's plain reader, not `_ex` --
+            # the unlocked read must go through `_ex` to see this at all (the
+            # plain reader carries no failure signal), which patching `_ex`
+            # directly cannot prove since the locked re-check a few lines
+            # down calls `_ex` on the same pair regardless.
+            real_read = s._store._read_account_credentials
+
+            def _unreadable_read(num, email, failed=None):
+                if (num, email) == ("1", "c@example.com"):
+                    if failed is not None:
+                        failed.append(True)
+                    return ""
+                return real_read(num, email, failed)
+
+            monkeypatch.setattr(s._store, "_read_account_credentials", _unreadable_read)
+        elif condition == "write_suppressed":
+            # T1313 (correctness-pass item 4): a dry-run/demoted engine
+            # tick (or its own collect's no-drift resync) must never
+            # perform the write, even for an otherwise fully valid
+            # candidate -- it stays pending on disk for the live engine or
+            # a manual collect instead.
+            s._suppress_login_restore_write = True
         elif condition == "inside_margin":
             s._write_account_credentials("2", "b@example.com", json.dumps({
                 "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
@@ -24775,18 +24872,23 @@ class TestT1313LoginRestore:
         # a quarantine entry that plainly does not name A's backup must
         # not block a legitimate restore; everything else, including the
         # SAME refusal past the bound, answers NONE like it always has.
+        restored_conditions = (
+            "engine_quarantined_stale",
+            "engine_quarantined_fingerprint_unknown_recovered",
+        )
         expected = (
             LoginRestoreOutcome.RESTORED
-            if condition == "engine_quarantined_stale"
+            if condition in restored_conditions
             else LoginRestoreOutcome.WAITING
             if condition in (
                 "consume_locked", "d_backup_unreadable", "backup_unreadable",
+                "write_suppressed", "d_backup_unreadable_unlocked",
             )
             else LoginRestoreOutcome.NONE
         )
         assert outcome is expected, condition
         live_now = s._read_credentials()
-        if condition == "engine_quarantined_stale":
+        if condition in restored_conditions:
             assert (
                 oauth.credential_fingerprint(live_now)
                 == oauth.credential_fingerprint(active_backup)
@@ -24796,6 +24898,43 @@ class TestT1313LoginRestore:
                 oauth.credential_fingerprint(live_now)
                 == oauth.credential_fingerprint(login)
             ), f"a refused restore ({condition}) must leave live on N's login"
+
+    def test_with_active_verdict_carries_write_suppression_across_threads(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """(T1448) `_with_active_verdict` already carries THIS thread's
+        active-read verdict across a `ThreadPoolExecutor` worker boundary
+        -- a plain thread-local does not cross it on its own. The write-
+        suppression flag needs the identical carry: `_run_usage_fetches`
+        wraps every pool worker in it, and `_resync_rotated_backup`'s own
+        settle call (the collect pass's no-drift adopt) can run on one of
+        those, fetching the ACTIVE account's usage. An unwrapped thread
+        must see the correctly-scoped default (False), or this test would
+        pin the fallback rather than the carry."""
+        import threading
+
+        s, _login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        s._suppress_login_restore_write = True
+        seen: dict[str, bool] = {}
+
+        def read_it():
+            seen["value"] = s._suppress_login_restore_write
+
+        wrapped = threading.Thread(target=s._with_active_verdict(read_it))
+        wrapped.start()
+        wrapped.join(3)
+        assert seen["value"] is True, (
+            "a fetch-pool worker must inherit the calling thread's "
+            "write-suppression, or a demoted engine's own collect-pass "
+            "resync could write the live store from inside "
+            "`_run_usage_fetches`"
+        )
+
+        seen.clear()
+        unwrapped = threading.Thread(target=read_it)
+        unwrapped.start()
+        unwrapped.join(3)
+        assert seen["value"] is False
 
     def test_settle_keeps_a_live_mcpOAuth_key(
         self, temp_home: Path, sample_sequence_data: dict,
@@ -24867,11 +25006,11 @@ class TestT1313LoginRestore:
              patch.object(s, "_usage_by_account", return_value=usage), \
              patch.object(s, "list_accounts"):
             s.switch(strategy="best", json_output=True, exclude=["2"])
+        # Not also "live is unchanged": with only 1 and 2 in the roster,
+        # excluding 2 with 1 already active leaves no OTHER candidate
+        # `_perform_switch` could move to -- that would hold regardless of
+        # whether settle ran, so it cannot discriminate this fix.
         settle.assert_not_called()
-        live_now = s._read_credentials()
-        assert oauth.credential_fingerprint(live_now) == oauth.credential_fingerprint(
-            login
-        ), "a walled A must never be restored onto live"
 
     def test_live_write_time_takes_the_later_of_mdat_and_the_file(
         self, temp_home: Path,
