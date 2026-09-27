@@ -1311,19 +1311,29 @@ def live_bridge_names() -> "dict[str, str] | None":
     return _ask("live_bridge_names")
 
 
-def carry_live_pointers():
-    """Point every live session's bridge record at the account now signed in.
+def carry_live_pointers(switcher):
+    """Point every live session's bridge record at the pin's account when one
+    is set, else the account signed in.
 
     Called right after a switch writes `~/.claude.json`. The package's daemon
     does this too, on noticing that file move -- but only while it is running,
     so a switch made with the daemon down left every live session vetoed until
-    it came back. The process that wrote the file can do it without waiting.
+    it came back. The process that wrote the file can do it without waiting,
+    asking the package for the SAME login its own daemon beat carries
+    (`_pointer_owner`) rather than recomputing one here.
 
-    None when the extra is absent or the call raised: the switch has already
-    written both files by then, and an optional feature must not turn a
-    completed switch into a reported failure.
+    None when the extra is absent, the call raised, or there is no login to
+    carry: the switch has already written both files by then, and an
+    optional feature must not turn a completed switch into a reported
+    failure.
     """
-    return _ask("carry_live_pointers")
+    try:
+        login = _ask("_pointer_owner", _certdir(switcher))
+    except Exception:  # noqa: BLE001 — a switcher with no backup dir: nothing to carry
+        return None
+    if not login:
+        return None
+    return _ask("carry_live_pointers", login)
 
 
 def titles_to_restore(sessions, names) -> "list | None":

@@ -10443,21 +10443,45 @@ class TestIdentityForConfigCanBeAskedAboutAnySlot:
         at all and every live session stays vetoed until it returns.
 
         `cswap` is the process that just wrote that file, so it can do it
-        itself. Best-effort by construction: an optional extra must never be
-        able to fail a switch that already succeeded.
+        itself, asking the package for the SAME login its own daemon beat
+        carries (`_pointer_owner`) rather than recomputing one here.
+        Best-effort by construction: an optional extra must never be able to
+        fail a switch that already succeeded.
         """
         from claude_swap import pin
 
-        seen = []
+        class _SW:
+            backup_dir = "/backup"
+
+        sw = _SW()
+        seen = {}
 
         class _Impl:
-            def carry_live_pointers(self, *a):
-                seen.append(a)
+            def _pointer_owner(self, certdir):
+                seen["certdir"] = certdir
+                return ("uuid-1", "org-1")
+
+            def carry_live_pointers(self, login):
+                seen["login"] = login
                 return 3
 
         monkeypatch.setattr("claude_swap.pin._live_impl", lambda: _Impl())
-        assert pin.carry_live_pointers() == 3
-        assert seen == [()], seen
+        assert pin.carry_live_pointers(sw) == 3
+        assert seen == {"certdir": pin._certdir(sw), "login": ("uuid-1", "org-1")}, seen
+
+        # No login to carry (no pin, no live account): the carry itself must
+        # never be asked, the same guard the daemon's own call sites use.
+        class _NoLogin:
+            def _pointer_owner(self, certdir):
+                return None
+
+            def carry_live_pointers(self, login):
+                seen["called"] = True
+                return 3
+
+        monkeypatch.setattr("claude_swap.pin._live_impl", lambda: _NoLogin())
+        assert pin.carry_live_pointers(sw) is None
+        assert "called" not in seen, "carried with nothing to carry"
 
     def test_a_carry_that_raises_does_not_reach_the_caller(self, monkeypatch):
         """THE CONTROL, and the reason this goes through `_ask`: the call sits
@@ -10465,15 +10489,23 @@ class TestIdentityForConfigCanBeAskedAboutAnySlot:
         would turn a completed switch into a reported failure."""
         from claude_swap import pin
 
+        class _SW:
+            backup_dir = "/backup"
+
+        sw = _SW()
+
         class _Boom:
-            def carry_live_pointers(self, *a):
+            def _pointer_owner(self, certdir):
+                return ("uuid-1", "org-1")
+
+            def carry_live_pointers(self, login):
                 raise RuntimeError("no daemon state")
 
         monkeypatch.setattr("claude_swap.pin._live_impl", lambda: _Boom())
-        assert pin.carry_live_pointers() is None
+        assert pin.carry_live_pointers(sw) is None
 
         monkeypatch.setattr("claude_swap.pin._live_impl", lambda: None)
-        assert pin.carry_live_pointers() is None
+        assert pin.carry_live_pointers(sw) is None
 
     def test_no_pin_and_no_email_is_still_None(self, monkeypatch):
         from claude_swap import pin

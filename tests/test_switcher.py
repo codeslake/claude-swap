@@ -5196,15 +5196,16 @@ class TestPerformSwitchPostDisplay:
                 },
             ), patch(
                 "claude_swap.pin.carry_live_pointers",
-                side_effect=lambda: carried.append(True),
+                side_effect=lambda sw: carried.append(sw),
             ):
                 switcher._perform_switch("2")
         finally:
             for p in patches:
                 p.stop()
 
-        assert carried, (
-            "carry_live_pointers() was not called on the ordinary switch path"
+        assert carried == [switcher], (
+            "carry_live_pointers() was not called with the switcher on the "
+            "ordinary switch path"
         )
 
     def test_switch_refuses_to_overwrite_backup_with_empty_current_creds(
@@ -7980,12 +7981,22 @@ class TestSwitchSkipsBrokenSlots:
             {"claudeAiOauth": {"accessToken": "sk-live-1",
                                "refreshToken": "rt-live-1"}}))
 
+        # The activation branch is the OTHER call site for the pointer
+        # carry too (:8256), and nothing else in this suite drives it.
+        carried = []
+        monkeypatch.setattr("claude_swap.pin.carry_live_pointers",
+                            lambda sw: carried.append(sw))
+
         s.switch()
 
         assert json.loads(policy.read_text()) == fresh, (
             "the activation path returned without refreshing the policy "
             "cache, so the previous account's restrictions keep gating every "
             "session on the machine")
+        assert carried == [s], (
+            "carry_live_pointers() was not called with the switcher on the "
+            "direct-activation path"
+        )
 
     def test_a_failed_policy_fetch_leaves_the_old_answer_rather_than_none(
         self, temp_home: Path, monkeypatch
