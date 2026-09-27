@@ -53,7 +53,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     shared_credential_fields,
 )
 from claude_swap.fsutil import read_text_with_retry
-from claude_swap.locking import FileLock
+from claude_swap.locking import STORE_LOCK_WAIT_S, FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
     AccountSnapshot,
@@ -364,6 +364,39 @@ def fetch_policy_limits(
 #: How far apart two `refreshTokenExpiresAt` values may sit and still be one
 #: login. See `_live_credential_is`.
 _LINEAGE_STAMP_JITTER_MS = 5_000
+
+
+@dataclasses.dataclass(frozen=True)
+class _SlotOccupied:
+    """`add --slot N` found N held by another account and must ask first.
+
+    Returned by the locked add bodies instead of prompting, so no prompt ever
+    waits on a person while the store lock is held; the caller asks with the
+    lock released and runs the body again with the answer.
+    """
+
+    slot: int
+    email: str
+    org_uuid: str
+    tag: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _AmbiguousEmail:
+    """`remove EMAIL` matched several slots; the user picks one, lock released."""
+
+    identifier: str
+    rows: tuple[tuple[str, str], ...]  # (slot number, display tag)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ConfirmRemoval:
+    """`remove` needs the user's yes for this slot, asked with the lock released."""
+
+    account_num: str
+    email: str
+    org_uuid: str
+    is_active: bool
 
 
 class ClaudeAccountSwitcher:
@@ -4331,17 +4364,70 @@ class ClaudeAccountSwitcher:
                   confirmation UI, e.g. the TUI, confirm before calling).
             alias: Optional short display alias to set on this account.
                   When omitted, an existing alias on the slot is preserved.
+
+        Every store read and write runs under the account store lock
+        (``self.lock_file``), so a concurrent `export` never sees the
+        credential and config written before the roster row that names them,
+        and a concurrent switch never renumbers the slot chosen here. The
+        overwrite prompt and the owner-proxy follow-up run with the lock
+        released: a prompt must not hold the lock while a person reads it,
+        and the follow-up may wait on a proxy daemon that takes the same lock.
         """
         self._refuse_session_shell()
-        self._setup_directories()
-        self._init_sequence_file()
-        self._migrate_org_fields()
-
         if alias is not None:
             try:
                 alias = normalize_alias(alias)
             except ValueError as e:
                 raise ValidationError(str(e)) from e
+
+        confirmed: tuple[str, str] | None = None
+        while True:
+            with FileLock(self.lock_file, timeout=STORE_LOCK_WAIT_S).held_for("cswap add"):
+                result = self._add_account_locked(slot, assume_yes, alias, confirmed)
+            if not isinstance(result, _SlotOccupied):
+                break
+            if not self._confirm_slot_overwrite(result):
+                return
+            # Run again with the answer: the body re-reads the slot under the
+            # lock and asks again if another account took it meanwhile.
+            confirmed = (result.email, result.org_uuid)
+        account_num, displaced = result
+        if displaced is not None:
+            self._clear_pin_if_removed(*displaced)
+        self._repin_if_pin_slot_refreshed(account_num)
+
+    def _confirm_slot_overwrite(self, occupied: _SlotOccupied) -> bool:
+        """Ask whether `add --slot N` may overwrite N's occupant; lock released."""
+        warning(f"Slot {occupied.slot} already occupied")
+        print(f"{occupied.email} {muted(f'[{occupied.tag}]')}")
+        try:
+            answer = input(f"Overwrite slot {occupied.slot}? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{dimmed('Cancelled')}")
+            return False
+        if answer not in ("y", "yes"):
+            print(dimmed("Cancelled"))
+            return False
+        return True
+
+    def _add_account_locked(
+        self,
+        slot: int | None,
+        assume_yes: bool,
+        alias: str | None,
+        confirmed: tuple[str, str] | None,
+    ) -> "_SlotOccupied | tuple[str, tuple[str, str] | None]":
+        """Body of :meth:`add_account`; the caller holds ``self.lock_file``.
+
+        Returns ``_SlotOccupied`` when the overwrite needs the user's yes and
+        ``confirmed`` (the occupant already approved) does not name the
+        occupant found now; otherwise ``(account_num, displaced)``, where
+        ``displaced`` is the ``(email, org_uuid)`` an overwrite removed.
+        Nothing here may take ``self.lock_file`` (FileLock is non-reentrant).
+        """
+        self._setup_directories()
+        self._init_sequence_file()
+        self._migrate_org_fields()
 
         identity = self._get_current_identity_triple()
         if identity is None:
@@ -4488,8 +4574,7 @@ class ClaudeAccountSwitcher:
                 f"{accent('Updated credentials')} for Account {account_num} "
                 f"({current_email} {muted(f'[{tag}]')})."
             )
-            self._repin_if_pin_slot_refreshed(account_num)
-            return
+            return account_num, None
 
         # Determine slot number and collect confirmation decisions
         # (no destructive operations until new account is verified readable)
@@ -4522,24 +4607,18 @@ class ClaudeAccountSwitcher:
                         existing.get("organizationName", ""),
                         existing.get("organizationUuid", ""),
                     )
-                    warning(f"Slot {slot} already occupied")
-                    print(
-                        f"{existing_email} {muted(f'[{existing_tag}]')}"
-                    )
-                    if not assume_yes:
-                        try:
-                            answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
-                        except (EOFError, KeyboardInterrupt):
-                            print(f"\n{dimmed('Cancelled')}")
-                            return
-                        if answer not in ("y", "yes"):
-                            print(dimmed("Cancelled"))
-                            return
-                    displace_slot = (
-                        account_num,
+                    occupant = (
                         existing_email,
                         existing.get("organizationUuid", "") or "",
                     )
+                    if not assume_yes and occupant != confirmed:
+                        return _SlotOccupied(slot, *occupant, existing_tag)
+                    if assume_yes:
+                        warning(f"Slot {slot} already occupied")
+                        print(
+                            f"{existing_email} {muted(f'[{existing_tag}]')}"
+                        )
+                    displace_slot = (account_num, *occupant)
         else:
             account_num = str(self._get_next_account_number())
 
@@ -4598,6 +4677,7 @@ class ClaudeAccountSwitcher:
             self._reject_identity_drift_since_verify(identity)
 
         # Now safe to perform destructive cleanup (new account data is in memory)
+        displaced = None
         if displace_slot:
             d_num, d_email, d_org = displace_slot
             self._delete_account_files(d_num, d_email)
@@ -4612,7 +4692,8 @@ class ClaudeAccountSwitcher:
             # destroys. A migration is NOT this: the account survives at
             # another slot, and the pin is matched on the identity, not the
             # number, so it stays valid.
-            self._clear_pin_if_removed(d_email, d_org)
+            # Cleared by `add_account` once the store lock is released.
+            displaced = (d_email, d_org)
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -4665,7 +4746,7 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
-        self._repin_if_pin_slot_refreshed(account_num)
+        return account_num, displaced
 
     def add_account_from_token(
         self,
@@ -4692,6 +4773,11 @@ class ClaudeAccountSwitcher:
             slot:  Slot number to use; auto-assigned when ``None``.
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the TUI, confirm first).
+
+        The token is read and checked first; every store read and write then
+        runs under the account store lock (``self.lock_file``), as in
+        :meth:`add_account`, with the overwrite prompt and the owner-proxy
+        follow-up run after it is released.
         """
         self._refuse_session_shell()
         import getpass
@@ -4705,10 +4791,38 @@ class ClaudeAccountSwitcher:
         if not token:
             raise ValidationError("Token cannot be empty")
 
-        is_api_key = looks_like_api_key(token)
-
         if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
+
+        confirmed: tuple[str, str] | None = None
+        while True:
+            with FileLock(self.lock_file, timeout=STORE_LOCK_WAIT_S).held_for("cswap add-token"):
+                result = self._add_account_from_token_locked(
+                    token, email, slot, assume_yes, confirmed
+                )
+            if not isinstance(result, _SlotOccupied):
+                break
+            if not self._confirm_slot_overwrite(result):
+                return
+            confirmed = (result.email, result.org_uuid)
+        account_num, displaced = result
+        if displaced is not None:
+            self._clear_pin_if_removed(*displaced)
+        self._repin_if_pin_slot_refreshed(account_num)
+
+    def _add_account_from_token_locked(
+        self,
+        token: str,
+        email: str | None,
+        slot: int | None,
+        assume_yes: bool,
+        confirmed: tuple[str, str] | None,
+    ) -> "_SlotOccupied | tuple[str, tuple[str, str] | None]":
+        """Body of :meth:`add_account_from_token`; the caller holds
+        ``self.lock_file``. Returns as :meth:`_add_account_locked` does.
+        Nothing here may take ``self.lock_file`` (FileLock is non-reentrant).
+        """
+        is_api_key = looks_like_api_key(token)
 
         self._setup_directories()
         self._init_sequence_file()
@@ -4780,8 +4894,7 @@ class ClaudeAccountSwitcher:
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
                 f"({email} {muted('[personal]')})."
             )
-            self._repin_if_pin_slot_refreshed(account_num)
-            return
+            return account_num, None
 
         displace_slot = None
         migrate_from = None
@@ -4810,25 +4923,20 @@ class ClaudeAccountSwitcher:
                         existing.get("organizationName", ""),
                         existing.get("organizationUuid", ""),
                     )
-                    warning(f"Slot {slot} already occupied")
-                    print(f"{existing_email} {muted(f'[{existing_tag}]')}")
-                    if not assume_yes:
-                        try:
-                            answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
-                        except (EOFError, KeyboardInterrupt):
-                            print(f"\n{dimmed('Cancelled')}")
-                            return
-                        if answer not in ("y", "yes"):
-                            print(dimmed("Cancelled"))
-                            return
-                    displace_slot = (
-                        account_num,
+                    occupant = (
                         existing_email,
                         existing.get("organizationUuid", "") or "",
                     )
+                    if not assume_yes and occupant != confirmed:
+                        return _SlotOccupied(slot, *occupant, existing_tag)
+                    if assume_yes:
+                        warning(f"Slot {slot} already occupied")
+                        print(f"{existing_email} {muted(f'[{existing_tag}]')}")
+                    displace_slot = (account_num, *occupant)
         else:
             account_num = str(self._get_next_account_number())
 
+        displaced = None
         if displace_slot:
             d_num, d_email, d_org = displace_slot
             self._delete_account_files(d_num, d_email)
@@ -4843,7 +4951,8 @@ class ClaudeAccountSwitcher:
             # destroys. A migration is NOT this: the account survives at
             # another slot, and the pin is matched on the identity, not the
             # number, so it stays valid.
-            self._clear_pin_if_removed(d_email, d_org)
+            # Cleared by `add_account_from_token` once the store lock is released.
+            displaced = (d_email, d_org)
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -4893,7 +5002,7 @@ class ClaudeAccountSwitcher:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
-        self._repin_if_pin_slot_refreshed(account_num)
+        return account_num, displaced
 
     def _clear_pin_if_removed(self, email: str, org_uuid: str) -> None:
         """Clear the cloud pin when the account it names is the one going away.
@@ -4949,8 +5058,62 @@ class ClaudeAccountSwitcher:
 
         When ``assume_yes`` is True the confirmation prompt is skipped (used by
         the TUI, which collects confirmation before calling).
+
+        Every store read and write runs under the account store lock
+        (``self.lock_file``), so a concurrent `export` never sees the roster
+        row after its credential file is gone. The questions (which of several
+        slots sharing an email, and the confirmation) are asked with the lock
+        released, and the body runs again with the answer, re-reading the slot
+        and asking again if its account changed meanwhile.
         """
         self._refuse_session_shell()
+        confirmed: tuple[str, str, str] | None = None
+        while True:
+            with FileLock(self.lock_file, timeout=STORE_LOCK_WAIT_S).held_for("cswap remove"):
+                result = self._remove_account_locked(identifier, assume_yes, confirmed)
+            if isinstance(result, _AmbiguousEmail):
+                print(f"Multiple accounts found for '{result.identifier}':")
+                for num, tag in result.rows:
+                    print(f"  {num}: {result.identifier} {muted(f'[{tag}]')}")
+                choice = input("Enter account number to remove: ").strip()
+                if not choice.isdigit() or choice not in {num for num, _ in result.rows}:
+                    print(dimmed("Cancelled"))
+                    return
+                identifier = choice
+                continue
+            if isinstance(result, _ConfirmRemoval):
+                if result.is_active:
+                    warning(
+                        f"Warning: Account-{result.account_num} ({result.email}) "
+                        f"is currently active"
+                    )
+                confirm = input(
+                    f"Are you sure you want to permanently remove "
+                    f"Account-{result.account_num} ({result.email})? [y/N] "
+                )
+                if confirm.lower() != "y":
+                    print(dimmed("Cancelled"))
+                    return
+                confirmed = (result.account_num, result.email, result.org_uuid)
+                continue
+            break
+        # After the lock is released: the clear may wait on a proxy daemon
+        # that takes the same lock.
+        self._clear_pin_if_removed(*result)
+
+    def _remove_account_locked(
+        self,
+        identifier: str,
+        assume_yes: bool,
+        confirmed: tuple[str, str, str] | None,
+    ) -> "_AmbiguousEmail | _ConfirmRemoval | tuple[str, str]":
+        """Body of :meth:`remove_account`; the caller holds ``self.lock_file``.
+
+        Returns the question the caller must ask, or the removed account's
+        ``(email, org_uuid)``. ``confirmed`` is the ``(slot, email, org_uuid)``
+        the user already said yes to. Nothing here may take
+        ``self.lock_file`` (FileLock is non-reentrant).
+        """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -4972,20 +5135,14 @@ class ClaudeAccountSwitcher:
                     if acc.get("email") == identifier
                 ]
                 if len(matches) > 1:
-                    print(f"Multiple accounts found for '{identifier}':")
-                    for num in matches:
-                        acc = data["accounts"][num]
-                        tag = self._get_display_tag(
-                            acc.get("email", ""),
-                            acc.get("organizationName", ""),
-                            acc.get("organizationUuid", ""),
-                        )
-                        print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
-                    choice = input("Enter account number to remove: ").strip()
-                    if not choice.isdigit() or choice not in matches:
-                        print(dimmed("Cancelled"))
-                        return
-                    identifier = choice
+                    return _AmbiguousEmail(identifier, tuple(
+                        (num, self._get_display_tag(
+                            data["accounts"][num].get("email", ""),
+                            data["accounts"][num].get("organizationName", ""),
+                            data["accounts"][num].get("organizationUuid", ""),
+                        ))
+                        for num in matches
+                    ))
 
         account_num = self._resolve_account_identifier(identifier)
         if not account_num:
@@ -5006,17 +5163,13 @@ class ClaudeAccountSwitcher:
         # _delete_account_files re-checks as a safety net for all paths.
         self._ensure_no_live_session(account_num, email, "--remove-account")
 
-        if str(active_account) == account_num:
-            warning(f"Warning: Account-{account_num} ({email}) is currently active")
-
-        if not assume_yes:
-            confirm = input(
-                f"Are you sure you want to permanently remove "
-                f"Account-{account_num} ({email})? [y/N] "
+        org_uuid = account_info.get("organizationUuid", "") or ""
+        if not assume_yes and (account_num, email, org_uuid) != confirmed:
+            return _ConfirmRemoval(
+                account_num, email, org_uuid, str(active_account) == account_num
             )
-            if confirm.lower() != "y":
-                print(dimmed("Cancelled"))
-                return
+        if assume_yes and str(active_account) == account_num:
+            warning(f"Warning: Account-{account_num} ({email}) is currently active")
 
         # Remove backup files
         self._delete_account_files(account_num, email)
@@ -5034,7 +5187,7 @@ class ClaudeAccountSwitcher:
         # AFTER the roster write, not before: the pin's own clear re-reads the
         # roster, and clearing first would have it resolve a slot that is still
         # there.
-        self._clear_pin_if_removed(email, account_info.get("organizationUuid", ""))
+        return email, account_info.get("organizationUuid", "")
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
