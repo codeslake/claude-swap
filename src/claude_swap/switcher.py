@@ -519,7 +519,19 @@ class ClaudeAccountSwitcher:
         # engine or a manual collect to act on instead. Defaults False:
         # every on-demand caller (`--list`/`--status`, a bare `cswap
         # switch`) has no engine setting it at all.
-        self._suppress_login_restore_write = False
+        #
+        # Thread-local (T1448), same shape as `_active_verdict_tls`: a
+        # process-wide bool let `stop()` (the caller's thread) clear what
+        # the tick's own thread had just set, ahead of `_stop` -- a stop
+        # landing after the tick's own `_stop` gates but before the flag
+        # is read in `_settle_login_restore` read False and wrote. Scoped
+        # per-thread, `stop()` never needs to touch it at all, and a
+        # user-initiated `switch()` on another thread is never suppressed
+        # by some other, demoted engine's flag. `_with_active_verdict`
+        # carries it into a fetch-pool worker the same way it already
+        # carries the active-read verdict, since `_resync_rotated_backup`'s
+        # own settle call can run on one of those.
+        self._suppress_login_restore_write_tls = threading.local()
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -3234,16 +3246,22 @@ class ClaudeAccountSwitcher:
         self._active_verdict_tls.value = active
 
     def _with_active_verdict(self, fn):
-        """Wrap `fn` so a worker thread inherits THIS thread's verdict.
+        """Wrap `fn` so a worker thread inherits THIS thread's verdict and
+        write-suppression state.
 
         Thread-local keeps two TUI lanes from erasing each other's, but
         `_fetch_active_usage` always runs on a pool worker that never read —
-        measured 30/30 verdicts lost, and the consume gate never fired.
+        measured 30/30 verdicts lost, and the consume gate never fired. The
+        write-suppression flag (T1313 item 4, T1448) needs the same carry:
+        `_resync_rotated_backup`'s own settle call can run on this same pool
+        worker, on a demoted engine's collect pass.
         """
         verdict = self._active_verdict()
+        suppress = self._suppress_login_restore_write
 
         def _inherit(*args, **kwargs):
             self._record_active_verdict(verdict)
+            self._suppress_login_restore_write = suppress
             return fn(*args, **kwargs)
 
         return _inherit
@@ -3279,6 +3297,16 @@ class ClaudeAccountSwitcher:
     @property
     def _active_read_degraded(self) -> bool:
         return self._active_verdict().degraded
+
+    @property
+    def _suppress_login_restore_write(self) -> bool:
+        """THIS thread's write-suppression flag (see `_suppress_login_restore_write_tls`
+        in `__init__`)."""
+        return getattr(self._suppress_login_restore_write_tls, "value", False)
+
+    @_suppress_login_restore_write.setter
+    def _suppress_login_restore_write(self, value: bool) -> None:
+        self._suppress_login_restore_write_tls.value = value
 
     def _read_account_credentials_ex(
         self, account_num: str, email: str
@@ -6340,10 +6368,13 @@ class ClaudeAccountSwitcher:
         :meth:`_write_oauth_account_to_live_config`) and rolls back the same
         way. No probe, refresh, grant, roster write or disabled-flag write.
         :attr:`_suppress_login_restore_write` (T1313 correctness-pass item
-        4, set only by :class:`AutoSwitchEngine`) turns a fully-qualified
-        restore into WAITING too, past the floor: a dry-run/demoted engine
-        must never perform this write, and the candidate stays pending on
-        disk rather than being consumed here.
+        4, set only by :class:`AutoSwitchEngine`) still lets every refusal
+        above run and answer the same NONE/WAITING a live engine would --
+        it only turns the WRITE ITSELF into WAITING (T1448: gated right
+        before it, not ahead of the refusals), so a dry-run/demoted engine
+        answers identically to LIVE on a quarantined, expired or otherwise
+        unusable candidate, and only a fully-qualified restore stays
+        pending on disk rather than being consumed here.
         """
         active = self._read_active_credentials()
         live = active.value
@@ -6439,16 +6470,6 @@ class ClaudeAccountSwitcher:
             )
             return LoginRestoreOutcome.WAITING
 
-        if self._suppress_login_restore_write:
-            # T1313 (correctness-pass item 4): a dry-run/demoted engine
-            # tick, or its own collect's no-drift resync, must never write
-            # here -- the candidate stays pending on disk for the live
-            # engine or a manual collect instead.
-            self._store._log_detected_login(
-                live, slot=d_num, outcome="waiting: write suppressed",
-            )
-            return LoginRestoreOutcome.WAITING
-
         try:
             with FileLock(self.lock_file):
                 data = self._get_sequence_data() or {}
@@ -6530,6 +6551,23 @@ class ClaudeAccountSwitcher:
                             config_path.read_text(encoding="utf-8")
                             if config_path.exists() else None
                         )
+                        if self._suppress_login_restore_write:
+                            # T1313 (correctness-pass item 4), T1448: a
+                            # dry-run/demoted engine tick, or its own
+                            # collect's no-drift resync, must never
+                            # perform THE WRITE -- gated here, right before
+                            # it, rather than ahead of every refusal above,
+                            # so a suppressed engine answers the same
+                            # NONE/WAITING a live one would on a
+                            # quarantined, expired or otherwise unusable
+                            # candidate. The candidate stays pending on
+                            # disk for the live engine or a manual collect
+                            # instead.
+                            self._store._log_detected_login(
+                                live, slot=d_num,
+                                outcome="waiting: write suppressed",
+                            )
+                            return LoginRestoreOutcome.WAITING
                         creds_written = False
                         try:
                             self._write_credentials(

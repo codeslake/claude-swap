@@ -3665,15 +3665,19 @@ class AutoSwitchEngine:
         switch rather than on the state lock, which ``_perform`` already holds
         and which callers reach through this method.
 
-        Clears the switcher's write suppression too (T1313 correctness-pass
-        item 4 sets it every tick, but nothing else ever clears it): a
-        stopped engine ticks no more, so left True it would make every
-        later ``_settle_login_restore()`` call on this same switcher --
-        a manual collect, or a freshly promoted LIVE engine, since the
-        switcher outlives any one engine -- answer WAITING forever instead
-        of performing the write.
+        Never touches the switcher's write suppression (T1313 correctness-
+        pass item 4): that flag is thread-local (T1448), set only by this
+        engine's own tick on its own thread, so a stop landing on ANOTHER
+        thread (the TUI, a SIGTERM handler outside the tick's own frame)
+        used to clear it here ahead of ``_stop`` -- a tick already past
+        the ``_stop`` gates in ``_tick_inner``/``_next_delay`` but not yet
+        at ``_settle_login_restore``'s own flag read then read False and
+        wrote. Left to clear itself: ``_tick_inner`` sets it fresh every
+        tick to ``self.dry_run``, and ``run_loop``'s own ``finally`` clears
+        it on the exit path that skips ``stop()``. Scoped per-thread, a
+        stale flag left on a thread this engine no longer ticks on can
+        never reach ``_settle_login_restore`` again either.
         """
-        self.switcher._suppress_login_restore_write = False
         self._stop.set()
         self._wake.set()
         with self._stop_lock:
@@ -3807,11 +3811,22 @@ class AutoSwitchEngine:
         # `_settle_or_arm_wait`'s own docstring) -- guard on it too, not
         # just the outcome, or this falls back to the ordinary cadence
         # already computed above instead of a `None` arithmetic error.
-        if (
-            self._settle_or_arm_wait() is LoginRestoreOutcome.WAITING
-            and self._settle_wait_until is not None
-        ):
-            delay = min(delay, max(self._settle_wait_until - time.time(), 0.1))
+        #
+        # Guarded the same way `_respect_poll_plan` guards itself: this
+        # runs OUTSIDE `tick()`'s own try, on `run_loop`'s thread AFTER
+        # `tick()` has returned, and `_settle_or_arm_wait`'s pre-try reads
+        # (`_get_sequence_data()` on a torn ``sequence.json``) can raise --
+        # unguarded, that reaches `run_loop`'s catch-all as a second
+        # ErrorEvent for the same tick. Best-effort: the unshortened delay
+        # already computed above is always safe.
+        try:
+            if (
+                self._settle_or_arm_wait() is LoginRestoreOutcome.WAITING
+                and self._settle_wait_until is not None
+            ):
+                delay = min(delay, max(self._settle_wait_until - time.time(), 0.1))
+        except Exception:
+            pass
         return delay
 
     def _respect_poll_plan(self, delay: float) -> float:

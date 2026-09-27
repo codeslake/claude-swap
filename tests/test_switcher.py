@@ -20905,13 +20905,15 @@ class TestT1313LoginRestore:
         )
 
     @pytest.mark.parametrize("condition", [
-        "quarantined", "inside_margin", "non_finite", "consume_locked",
+        "quarantined", "quarantined_while_suppressed", "inside_margin",
+        "non_finite", "consume_locked",
         "consume_locked_past_bound", "settled_meanwhile", "engine_quarantined",
         "engine_quarantined_stale", "engine_quarantined_read_fails",
         "engine_quarantined_fingerprint_unknown_recovered",
+        "engine_quarantined_fingerprint_unknown_not_recovered",
         "write_time_unreadable", "write_time_future",
         "d_backup_changed_meanwhile", "d_backup_unreadable", "backup_unreadable",
-        "d_backup_unreadable_before_lock", "write_suppressed",
+        "write_suppressed",
         "d_backup_unreadable_write_time_future",
     ])
     def test_a_refused_restore_never_writes_over_live(
@@ -20931,6 +20933,16 @@ class TestT1313LoginRestore:
         held_lock = None
         if condition == "quarantined":
             monkeypatch.setattr(s, "_slot_token_dead", lambda num, email: num == "2")
+        elif condition == "quarantined_while_suppressed":
+            # T1448: the suppression gate used to sit ahead of every
+            # refusal below it (quarantined, expired, no usable stored
+            # login) -- a suppressed engine short-circuited to WAITING
+            # before ever reaching this one, instead of answering the same
+            # NONE a live engine hitting the SAME quarantine would. Gated
+            # right before the write now, so this must read identically to
+            # plain "quarantined" above.
+            monkeypatch.setattr(s, "_slot_token_dead", lambda num, email: num == "2")
+            s._suppress_login_restore_write = True
         elif condition == "engine_quarantined":
             # The auto-switch engine's own ledger, not `_slot_token_dead`'s
             # (a different quarantine, e.g. an `identity-conflict` strike),
@@ -20988,6 +21000,18 @@ class TestT1313LoginRestore:
             data = s._get_sequence_data()
             data["accounts"]["2"]["added"] = "2099-01-01T00:00:00Z"
             s._write_json(s.sequence_file, data)
+        elif condition == "engine_quarantined_fingerprint_unknown_not_recovered":
+            # T1313 (correctness-pass item 3)'s own settle-side control: the
+            # SAME `fingerprintUnknown` entry, but `added <= at` -- no
+            # `--add-account --slot N` after the quarantine, so the entry
+            # must still block the settle the same way it always did.
+            state_path = s.backup_dir / "autoswitch_state.json"
+            state_path.write_text(json.dumps({"quarantine": {"2": {
+                "fingerprintUnknown": True, "at": "2020-01-01T00:00:00Z",
+            }}}))
+            data = s._get_sequence_data()
+            data["accounts"]["2"]["added"] = "2019-01-01T00:00:00Z"
+            s._write_json(s.sequence_file, data)
         elif condition == "write_time_unreadable":
             monkeypatch.setattr(s, "_live_write_time", lambda: None)
         elif condition == "write_time_future":
@@ -20996,21 +21020,33 @@ class TestT1313LoginRestore:
         elif condition in (
             "d_backup_changed_meanwhile", "d_backup_unreadable", "backup_unreadable",
         ):
-            # The re-check under the lock, patched at one (num, email) pair:
-            # a genuine mismatch (read succeeds, differs) for N's own backup
-            # is "no longer matches" (permanent); a read that FAILS, for
-            # either N's or A's own backup, is transient (T1313).
+            # The re-check UNDER THE LOCK (switcher.py's "T1313: re-verify
+            # D's OWN backup ... under the lock too"), not the unlocked
+            # candidacy read a few lines above it in the source -- both now
+            # call `_read_account_credentials_ex` for D's pair (item 1
+            # moved the unlocked one onto it too), so patching that pair
+            # unconditionally trips the FIRST (unlocked) call and the
+            # locked re-check this row exists to prove never runs. D's
+            # pair is call-counted: the first call is real (the unlocked
+            # check must pass through to the lock), the second is patched.
+            # A's own backup (`backup_unreadable`) is read only once, under
+            # the lock, so it needs no such count.
             real_ex = s._read_account_credentials_ex
             match, result = {
                 "d_backup_changed_meanwhile": (("1", "c@example.com"), ("", False)),
                 "d_backup_unreadable": (("1", "c@example.com"), ("", True)),
                 "backup_unreadable": (("2", "b@example.com"), ("", True)),
             }[condition]
+            calls = {"n": 0}
 
             def _patched_ex(num, email):
-                if (num, email) == match:
-                    return result
-                return real_ex(num, email)
+                if (num, email) != match:
+                    return real_ex(num, email)
+                if match[0] == "1":
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        return real_ex(num, email)
+                return result
 
             monkeypatch.setattr(s, "_read_account_credentials_ex", _patched_ex)
         elif condition == "d_backup_unreadable_write_time_future":
@@ -21031,29 +21067,6 @@ class TestT1313LoginRestore:
                 return real_ex(num, email)
 
             monkeypatch.setattr(s, "_read_account_credentials_ex", _unreadable_ex)
-        elif condition == "d_backup_unreadable_before_lock":
-            # T1313 (correctness-pass item 1): the UNLOCKED candidacy check
-            # -- before `write_time` is even computed -- used the plain
-            # reader, which answers "" for a read that just failed the same
-            # way it answers "" for a genuinely empty backup. A transient
-            # failure right here read as "D's own backup doesn't hold this
-            # yet" (a permanent NONE) instead of the transient WAITING every
-            # other read failure in this method answers.
-            real_read = s._read_account_credentials
-            real_ex = s._read_account_credentials_ex
-
-            def _failing_read(num, email):
-                if (num, email) == ("1", "c@example.com"):
-                    return ""
-                return real_read(num, email)
-
-            def _failing_ex(num, email):
-                if (num, email) == ("1", "c@example.com"):
-                    return "", True
-                return real_ex(num, email)
-
-            monkeypatch.setattr(s, "_read_account_credentials", _failing_read)
-            monkeypatch.setattr(s, "_read_account_credentials_ex", _failing_ex)
         elif condition == "write_suppressed":
             # T1313 (correctness-pass item 4): a dry-run/demoted engine
             # tick (or its own collect's no-drift resync) must never
@@ -21108,7 +21121,7 @@ class TestT1313LoginRestore:
             else LoginRestoreOutcome.WAITING
             if condition in (
                 "consume_locked", "d_backup_unreadable", "backup_unreadable",
-                "d_backup_unreadable_before_lock", "write_suppressed",
+                "write_suppressed",
             )
             else LoginRestoreOutcome.NONE
         )
@@ -21124,6 +21137,43 @@ class TestT1313LoginRestore:
                 oauth.credential_fingerprint(live_now)
                 == oauth.credential_fingerprint(login)
             ), f"a refused restore ({condition}) must leave live on N's login"
+
+    def test_with_active_verdict_carries_write_suppression_across_threads(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """(T1448) `_with_active_verdict` already carries THIS thread's
+        active-read verdict across a `ThreadPoolExecutor` worker boundary
+        -- a plain thread-local does not cross it on its own. The write-
+        suppression flag needs the identical carry: `_run_usage_fetches`
+        wraps every pool worker in it, and `_resync_rotated_backup`'s own
+        settle call (the collect pass's no-drift adopt) can run on one of
+        those, fetching the ACTIVE account's usage. An unwrapped thread
+        must see the correctly-scoped default (False), or this test would
+        pin the fallback rather than the carry."""
+        import threading
+
+        s, _login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        s._suppress_login_restore_write = True
+        seen: dict[str, bool] = {}
+
+        def read_it():
+            seen["value"] = s._suppress_login_restore_write
+
+        wrapped = threading.Thread(target=s._with_active_verdict(read_it))
+        wrapped.start()
+        wrapped.join(3)
+        assert seen["value"] is True, (
+            "a fetch-pool worker must inherit the calling thread's "
+            "write-suppression, or a demoted engine's own collect-pass "
+            "resync could write the live store from inside "
+            "`_run_usage_fetches`"
+        )
+
+        seen.clear()
+        unwrapped = threading.Thread(target=read_it)
+        unwrapped.start()
+        unwrapped.join(3)
+        assert seen["value"] is False
 
     def test_settle_keeps_a_live_mcpOAuth_key(
         self, temp_home: Path, sample_sequence_data: dict,
