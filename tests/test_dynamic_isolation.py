@@ -259,19 +259,41 @@ class TestDynamicLeavesTheBaseRevisionAlone:
         real network on the parent's env (measured: 7 non-loopback
         `getaddrinfo` lookups to api.anthropic.com from this class's tests
         at 8fd7dc6f with `*_proxy` unset). No test here needs a real
-        answer."""
+        answer.
+
+        The `sys.executable` call is intercepted and answered without
+        actually running a child interpreter — only the six proxy keys are
+        recorded and checked, never the parent's whole environment (a
+        failure here must not publish an ambient token); `git` calls still
+        pass through to the real run."""
         real_run = subprocess.run
         seen = {}
+        dead_proxy = "http://127.0.0.1:1"
+        expected = {
+            "http_proxy": dead_proxy, "https_proxy": dead_proxy,
+            "HTTP_PROXY": dead_proxy, "HTTPS_PROXY": dead_proxy,
+            "no_proxy": "", "NO_PROXY": "",
+        }
 
         def spy(cmd, *args, **kwargs):
             if cmd[0] == sys.executable:
                 seen["env"] = kwargs.get("env")
+                stub = {
+                    "_claude_swap_file": str(
+                        tmp_path / "base" / "src" / "claude_swap" / "__init__.py"
+                    )
+                }
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=json.dumps(stub), stderr=""
+                )
             return real_run(cmd, *args, **kwargs)
 
         monkeypatch.setattr(subprocess, "run", spy)
         self._digests_at_base_rev(tmp_path, [("best", "")], _SEED)
-        assert (seen["env"] or {}).get("https_proxy") == "http://127.0.0.1:1", (
-            f"driver env is {seen['env']!r}, not carrying the dead loopback proxy"
+        env = seen.get("env") or {}
+        got = {k: env.get(k) for k in expected}
+        assert got == expected, (
+            f"driver env's proxy keys are {got!r}, not the dead-proxy six {expected!r}"
         )
 
     def test_e9afe401_produces_the_same_four_digests(self, tmp_path):
