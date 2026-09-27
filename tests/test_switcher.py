@@ -5846,6 +5846,64 @@ class TestSwitchSkipsBrokenSlots:
         # Stale sequence reference to a missing account record.
         assert s._account_is_switchable("99") is False
 
+    def test_a_switch_opens_no_outbound_connection(
+        self, temp_home: Path, monkeypatch
+    ):
+        """HERMETICITY. An ordinary switch must never leave the box.
+
+        `switcher.fetch_policy_limits` (this PR's seam, so the switch path
+        has ONE thing to stub) is unstubbed by default, and every test that
+        does not stub it — this one included — drives a real
+        `oauth.fetch_policy_limits` -> `urlopen` against api.anthropic.com
+        with a fixture token. Clears any ambient proxy so the connect
+        targets the real address rather than a local one, stubs the
+        unrelated usage-poll fetch so the census isolates this seam, then
+        records every `socket.socket.connect` and blocks it: fails on a
+        switch that reaches outside the box, passes once the fetch is
+        stubbed hermetically by default.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "a@example.com",
+                              "accountUuid": "uuid-1"}}))
+
+        import socket
+
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+        monkeypatch.delenv("https_proxy", raising=False)
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+        monkeypatch.delenv("http_proxy", raising=False)
+
+        # Not this task's seam: usage polling has its own, unrelated
+        # real-network path and is stubbed here so the check isolates
+        # fetch_policy_limits.
+        monkeypatch.setattr(oauth, "request_usage_data", lambda *a, **k: {
+            "five_hour": {"utilization": 0.0, "resets_at": None},
+            "seven_day": {"utilization": 0.0, "resets_at": None},
+        })
+
+        seen = []
+
+        def _blocked_connect(_sock, address):
+            host = address[0] if isinstance(address, tuple) else address
+            if host not in ("127.0.0.1", "::1", "localhost"):
+                seen.append(address)
+            raise OSError("blocked: tests must not open real sockets")
+
+        monkeypatch.setattr(socket.socket, "connect", _blocked_connect)
+
+        s.switch()
+
+        assert seen == [], (
+            f"an ordinary switch opened a non-loopback connection to "
+            f"{seen!r}")
+
     def test_a_switch_refreshes_the_policy_cache_and_never_leaves_it_absent(
         self, temp_home: Path, monkeypatch
     ):

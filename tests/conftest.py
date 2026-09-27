@@ -637,6 +637,29 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def block_real_policy_limits_fetch(request, monkeypatch):
+    """Safety net: no test may make a live ``policy_limits`` request.
+
+    Every switch calls ``switcher.fetch_policy_limits`` (switcher.py:329,
+    "so the switch path has ONE thing to stub") unconditionally, and dozens
+    of unrelated switch tests exercise that path without mocking it — each
+    one silently opens a real HTTPS connection with a fixture token. Stub
+    the seam it calls, ``oauth.fetch_policy_limits``, to ``None`` (its
+    documented "unaskable" answer, which is also what a fixture token gets
+    from the server today, so no switch-path test changes meaning) so the
+    whole suite stays hermetic and fast by default. Tests that need to
+    exercise the fetch itself patch it explicitly (this module's own guard
+    tests do); ``@pytest.mark.no_policy_limits_fake`` opts out for tests
+    that mock ``urlopen`` beneath it.
+    """
+    if request.node.get_closest_marker("no_policy_limits_fake"):
+        yield
+        return
+    monkeypatch.setattr("claude_swap.oauth.fetch_policy_limits", lambda *a, **k: None)
+    yield
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""
