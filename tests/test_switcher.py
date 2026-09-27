@@ -7883,6 +7883,74 @@ class TestSwitchSkipsBrokenSlots:
         assert "Skipping Account-2" not in capsys.readouterr().out
         assert s._get_sequence_data()["activeAccountNumber"] == 2
 
+    def test_a_switch_opens_no_outbound_connection(
+        self, temp_home: Path, monkeypatch
+    ):
+        """HERMETICITY. An ordinary switch must never leave the box.
+
+        Guards the autouse `block_real_policy_limits_fetch` stub in
+        conftest.py: if that stub is ever bypassed, or a later change routes
+        the rotation around `_refresh_policy_cache` entirely, this must not
+        pass for the wrong reason. A pass-through spy on
+        `switcher.fetch_policy_limits` asserts the switch actually reached
+        that seam, and `socket.getaddrinfo` is blocked (recording any
+        non-loopback host before raising) so a leak is caught before any
+        resolver or connect runs -- independent of whether the runner can
+        resolve DNS at all. Clears any ambient proxy so a leak would target
+        the real address rather than a local one, and stubs the unrelated
+        usage-poll fetch so the census isolates this seam.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "a@example.com",
+                              "accountUuid": "uuid-1"}}))
+
+        import socket
+
+        from claude_swap import switcher as switcher_module
+
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+        monkeypatch.delenv("https_proxy", raising=False)
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+        monkeypatch.delenv("http_proxy", raising=False)
+
+        # Not this seam: usage polling has its own, unrelated real-network
+        # path and is stubbed here so the check isolates fetch_policy_limits.
+        monkeypatch.setattr(oauth, "request_usage_data", lambda *a, **k: {
+            "five_hour": {"utilization": 0.0, "resets_at": None},
+            "seven_day": {"utilization": 0.0, "resets_at": None},
+        })
+
+        # The premise: the switch must actually reach the seam, or the
+        # absence of a recorded host below proves nothing.
+        policy_spy = MagicMock(wraps=switcher_module.fetch_policy_limits)
+        monkeypatch.setattr(
+            "claude_swap.switcher.fetch_policy_limits", policy_spy)
+
+        seen = []
+
+        def _blocked_getaddrinfo(host, *args, **kwargs):
+            if host not in ("127.0.0.1", "::1", "localhost"):
+                seen.append(host)
+            raise socket.gaierror("blocked: tests must not resolve real hosts")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _blocked_getaddrinfo)
+
+        s.switch()
+
+        assert policy_spy.called, (
+            "the switch never reached switcher.fetch_policy_limits, so an "
+            "empty `seen` below would prove nothing")
+        assert seen == [], (
+            f"an ordinary switch tried to resolve a non-loopback host: "
+            f"{seen!r}")
+
     def test_a_switch_refreshes_the_policy_cache_and_never_leaves_it_absent(
         self, temp_home: Path, monkeypatch
     ):

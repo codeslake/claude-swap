@@ -2637,6 +2637,7 @@ class TestTheSslContextCacheHasACeiling:
         oauth._PIN_CTX_SLOT = None
 
 
+@pytest.mark.no_policy_limits_fake
 class TestThePolicyFetchActuallyCarriesItsBudget:
     """THE ONLY LINE THAT DELIVERS THE BUDGET HAD NO WITNESS.
 
