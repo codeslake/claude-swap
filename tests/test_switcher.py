@@ -21068,14 +21068,7 @@ class TestT1313LoginRestore:
 
             monkeypatch.setattr(s, "_read_account_credentials_ex", _unreadable_ex)
         elif condition == "d_backup_unreadable_unlocked":
-            # T1448 item 1: the UNLOCKED candidacy read for D's own backup
-            # (ahead of the lock, textually above "d_backup_unreadable"'s
-            # own locked re-check) must go through `_read_account_
-            # credentials_ex` too and treat an unreadable read as the same
-            # transient WAITING every other read failure in this method
-            # answers -- never a silent NONE, which is what a plain read
-            # (returning "" for "failed" the same as for "genuinely empty")
-            # would have produced here instead.
+            # The unlocked candidacy read of D's backup: unreadable is WAITING, never NONE.
             real_ex = s._read_account_credentials_ex
 
             def _unreadable_ex(num, email):
