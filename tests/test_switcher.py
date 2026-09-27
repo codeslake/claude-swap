@@ -21068,15 +21068,22 @@ class TestT1313LoginRestore:
 
             monkeypatch.setattr(s, "_read_account_credentials_ex", _unreadable_ex)
         elif condition == "d_backup_unreadable_unlocked":
-            # The unlocked candidacy read of D's backup: unreadable is WAITING, never NONE.
-            real_ex = s._read_account_credentials_ex
+            # The unlocked candidacy read of D's backup: unreadable is WAITING,
+            # never NONE. Patched on the store's plain reader, not `_ex` --
+            # the unlocked read must go through `_ex` to see this at all (the
+            # plain reader carries no failure signal), which patching `_ex`
+            # directly cannot prove since the locked re-check a few lines
+            # down calls `_ex` on the same pair regardless.
+            real_read = s._store._read_account_credentials
 
-            def _unreadable_ex(num, email):
+            def _unreadable_read(num, email, failed=None):
                 if (num, email) == ("1", "c@example.com"):
-                    return "", True
-                return real_ex(num, email)
+                    if failed is not None:
+                        failed.append(True)
+                    return ""
+                return real_read(num, email, failed)
 
-            monkeypatch.setattr(s, "_read_account_credentials_ex", _unreadable_ex)
+            monkeypatch.setattr(s._store, "_read_account_credentials", _unreadable_read)
         elif condition == "write_suppressed":
             # T1313 (correctness-pass item 4): a dry-run/demoted engine
             # tick (or its own collect's no-drift resync) must never
