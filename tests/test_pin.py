@@ -11314,7 +11314,7 @@ class TestARollbackWithNothingToRestoreStillClearsTheName:
     then. Only this case can.
     """
 
-    def _sw(self, live=("serving@example.com", "org-LIVE")):
+    def _sw(self, tmp_path, live=("serving@example.com", "org-LIVE")):
         """THE REAL `_live_login_identity`, not a stub of it.
 
         Stubbing it hid the whole defect: the real one un-splices only while
@@ -11323,12 +11323,10 @@ class TestARollbackWithNothingToRestoreStillClearsTheName:
         live login regardless passes whether the fix works or is a no-op.
         """
         import json
-        import tempfile
-        from pathlib import Path
 
         from claude_swap import switcher as _sw
 
-        root = Path(tempfile.mkdtemp())
+        root = tmp_path
         cfg = root / "claude.json"
         # `apply_pin` has already spliced the FAILED account here -- unless
         # the case is "nothing is logged in", which has to mean the config
@@ -11371,7 +11369,7 @@ class TestARollbackWithNothingToRestoreStillClearsTheName:
         return _Impl
 
     def test_a_failed_first_pin_hands_the_config_to_the_live_login(
-            self, monkeypatch):
+            self, monkeypatch, tmp_path):
         from claude_swap import pin
 
         spliced, record = [], {"value": ("failed@example.com", "org-F")}
@@ -11380,7 +11378,7 @@ class TestARollbackWithNothingToRestoreStillClearsTheName:
         monkeypatch.setattr(pin, "_pinned_email_now",
                             lambda _s: record["value"])
 
-        assert pin._restore_pin(self._sw(), None) is True
+        assert pin._restore_pin(self._sw(tmp_path), None) is True
         assert spliced, "splice_config_identity was never reached"
         assert spliced[-1] == {"emailAddress": "serving@example.com",
                                "accountUuid": "UUID-3"}, (
@@ -11389,7 +11387,7 @@ class TestARollbackWithNothingToRestoreStillClearsTheName:
             f"account nothing is pinned to and nobody is logged in as: "
             f"{spliced[-1]!r}")
 
-    def test_no_live_login_leaves_the_field_alone(self, monkeypatch):
+    def test_no_live_login_leaves_the_field_alone(self, monkeypatch, tmp_path):
         """None is not an erasure. With nothing logged in there is no correct
         owner to write, and a blank one is worse than a stale one -- the next
         switch rewrites it."""
@@ -11401,7 +11399,7 @@ class TestARollbackWithNothingToRestoreStillClearsTheName:
         monkeypatch.setattr(pin, "_pinned_email_now",
                             lambda _s: record["value"])
 
-        assert pin._restore_pin(self._sw(live=None), None) is True
+        assert pin._restore_pin(self._sw(tmp_path, live=None), None) is True
         assert spliced[-1] is None
 
 
