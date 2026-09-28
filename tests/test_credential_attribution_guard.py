@@ -429,7 +429,7 @@ EXPECTED_WRITE_SITE_ROSTER: dict[tuple[str, str], int] = {
     ("switcher.py", "add_account_from_token"): 2,
     ("switcher.py", "_fetch_active_usage"): 2,
     ("switcher.py", "_resync_rotated_backup"): 1,
-    ("switcher.py", "_perform_switch"): 2,
+    ("switcher.py", "_perform_switch"): 1,
     ("transfer.py", "import_accounts"): 1,
     ("migrations.py", "migrate_windows_keyring_to_files"): 1,
 }

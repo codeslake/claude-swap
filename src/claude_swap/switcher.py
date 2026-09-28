@@ -306,7 +306,9 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
         pass  # keyring unavailable — nothing to clean up
 
 
-
+#: How far apart two `refreshTokenExpiresAt` values may sit and still be one
+#: login. See `_live_is_own_newer_generation`.
+_LINEAGE_STAMP_JITTER_MS = 5_000
 
 
 class ClaudeAccountSwitcher:
@@ -6766,11 +6768,13 @@ class ClaudeAccountSwitcher:
           access token in the blob, bytes moved since the pre-lock read) —
           or was only *partially* established: a response missing email or
           organization matching nothing is indistinguishable from schema
-          drift, and preserve-and-skip on drift would silently recreate the
-          fail-closed behavior this design forbids. The caller falls back to
-          the exact pre-fix backup: the identity oracle is advisory, and
-          endpoint state must never change switch behavior beyond skipping
-          the extra safety.
+          drift. Routed like ``"foreign"``/``"alien"``: preserved in a
+          safety stash, never written into any slot. No longer fail-open
+          (an incident traced a wrong active slot resolving to one slot
+          while the live bytes were another's; the old pre-fix backup here
+          wrote the other slot's refresh token into the wrong slot's
+          backup) — the identity oracle is advisory only in the sense that
+          its failure never widens what gets written, only narrows it.
         """
         backup = self._read_account_credentials(current_account, current_email)
         if backup and backup == original_creds:
@@ -6794,6 +6798,10 @@ class ClaudeAccountSwitcher:
                 )
             ) is False:
                 return ("known-foreign", None)
+            if self._live_is_own_newer_generation(
+                current_account, live_oauth, backup, data
+            ):
+                return ("own-rotated", None)
             return ("unresolved", None)
         r_email = resolved.get("email") or ""
         r_org = resolved.get("organizationUuid") or ""
@@ -6865,6 +6873,7 @@ class ClaudeAccountSwitcher:
         reason: str,
         current_account: str,
         resolved: dict | None,
+        consumed_fp: str | None = None,
     ) -> str:
         """Preserve an unowned live credential before it is overwritten.
 
@@ -6872,6 +6881,26 @@ class ClaudeAccountSwitcher:
         live store (the bytes may be the only live copy of some account's
         refresh token). The logged evidence doubles as the instrumentation for
         identifying what wrote the credential (#117's writer is unidentified).
+
+        ``consumed_fp``, when given, is the fingerprint of the SLOT'S OWN
+        stored backup at stash time — the generation this stash supersedes.
+        It lets ``_adopt_stashed_successor`` install the stash back into that
+        slot once its own backup grant is next consumed, the way an ordinary
+        ``own-rotated`` resync would have.
+
+        No call site passes it today, including the "unresolved" arm: a CAS
+        match on ``configSlot``+``consumedFp`` only proves the slot has not
+        moved since the stash, never that the bytes belong to it, and
+        ``unresolved`` means ownership was never verified in the first
+        place. Passing it there made an unresolved stash adoptable by
+        construction the instant it was written — the exact incident this
+        stash exists to prevent, one step later. An unresolved stash must
+        never be made adoptable; it is left stranded until a manual
+        ``cswap add`` confirms it. A future caller must independently
+        re-verify ownership at ADOPTION time (inside
+        ``_adopt_stashed_successor``, under the slot's lock, against a fresh
+        oracle call or a fresh CAS against the ACTIVE store) before this
+        parameter is used for anything.
         """
         creds_mtime: str | None = None
         try:
@@ -6895,6 +6924,7 @@ class ClaudeAccountSwitcher:
             {
                 "reason": reason,
                 "configSlot": current_account,
+                "consumedFp": consumed_fp,
                 "fingerprint": oauth.credential_fingerprint(original_creds),
                 "liveOauthAccount": live_oauth_account,
                 "resolvedIdentity": resolved,
@@ -6972,6 +7002,70 @@ class ClaudeAccountSwitcher:
             "operate on the wrong live store — unset CLAUDE_CONFIG_DIR "
             "or run from a normal shell."
         )
+
+    def _live_is_own_newer_generation(
+        self,
+        current_account: str,
+        live_oauth: dict | None,
+        backup: str,
+        data: dict,
+    ) -> bool:
+        """Stamp-only rescue for an oracle-unresolved live credential.
+
+        True when the live bytes and this slot's own stored backup carry
+        ``refreshTokenExpiresAt`` within ``_LINEAGE_STAMP_JITTER_MS`` of each
+        other (same lineage — refresh never moves that stamp, so this is
+        proof of ancestry, not of order) AND the live credential's access
+        token ``expiresAt`` is later than the backup's (the newer
+        generation, the way the codebase already orders generations), and no
+        OTHER slot's backup stamp sits within that same jitter of the live
+        value. Guards a class of defect where a 401 on the ownership probe
+        (body never read) left the profile oracle silent on a genuine
+        same-lineage rotation, so the fail-narrow "unresolved" path stashed
+        the slot's own next generation as unadoptable while the backup kept
+        the generation the rotation had already consumed — invalid_grant on
+        the next refresh. Works from the bytes alone; no probe body is read
+        here.
+        """
+        if not backup or not live_oauth:
+            return False
+        own_oauth = oauth.extract_oauth_data(backup) or {}
+        try:
+            live_at = float(live_oauth.get("refreshTokenExpiresAt") or 0)
+            own_at = float(own_oauth.get("refreshTokenExpiresAt") or 0)
+        except (TypeError, ValueError):
+            return False
+        if not live_at or not own_at:
+            return False
+        if abs(live_at - own_at) > _LINEAGE_STAMP_JITTER_MS:
+            return False
+        live_exp = live_oauth.get("expiresAt") or 0
+        own_exp = own_oauth.get("expiresAt") or 0
+        if not (live_exp > own_exp):
+            return False
+        for num, acct in data.get("accounts", {}).items():
+            if num == current_account:
+                continue
+            other_backup, unreadable = self._read_account_credentials_ex(
+                num, acct.get("email", "")
+            )
+            if unreadable:
+                # Cannot verify a peer's backup does not also share this
+                # stamp — fail closed, the same rule
+                # `_refuse_if_peer_shares_grant`/`_check_attribution` apply
+                # to an unreadable peer: "cannot verify" refuses like a
+                # collision, never "empty" like an absent slot.
+                return False
+            if not other_backup:
+                continue
+            other_oauth = oauth.extract_oauth_data(other_backup) or {}
+            try:
+                other_at = float(other_oauth.get("refreshTokenExpiresAt") or 0)
+            except (TypeError, ValueError):
+                continue
+            if other_at and abs(live_at - other_at) <= _LINEAGE_STAMP_JITTER_MS:
+                return False
+        return True
 
     def _perform_switch(
         self,
@@ -7077,12 +7171,30 @@ class ClaudeAccountSwitcher:
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
             to_ref = account_ref(int(target_account), target_email)
+            # Memo-only, per the no-network rule above: the prefetch resolved
+            # this outside the locks, and `force_activate` skips that prefetch.
             current_identity = self._get_current_account()
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
-                current_account = self._find_account_slot(
+                candidate_slot = self._find_account_slot(
                     data, current_email, current_org_uuid
                 )
+                # AN IDENTITY FILE CLAIM IS NOT A VERIFICATION. An incident
+                # traced a re-login-forcing credential wipe to exactly this
+                # line: the config's oauthAccount named one slot while the
+                # roster's real active slot still held the live credential,
+                # and this override took that slot's word for it
+                # uncontested. Only trust the override when either the
+                # pre-lock oracle actually resolved the live bytes' owner
+                # (`provenance["resolved"]`), or the candidate slot's own
+                # stored backup already matches the live bytes (byte or
+                # refresh-token lineage) — an unmanaged/unresolved candidate
+                # is left as `None` unchanged, which already routes to the
+                # direct-activation path's own stash.
+                if candidate_slot is None or provenance.get("resolved") is not None or (
+                    self._live_matches_slot_backup(candidate_slot, current_email)
+                ):
+                    current_account = candidate_slot
 
             config_path = self._get_claude_config_path()
 
@@ -7281,8 +7393,25 @@ class ClaudeAccountSwitcher:
                 )
                 return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
-            current_email, _ = current_identity
-            from_ref = account_ref(int(current_account), current_email)
+            # NOT `current_identity[0]`: when the override above was
+            # rejected, that email is the identity file's unverified claim,
+            # while `current_account` correctly stayed the roster's real
+            # active slot — pairing the two would feed
+            # `_classify_outgoing_credential` a (slot, email) pair assembled
+            # from two different sources, so its backup lookup for the REAL
+            # slot misses (keyed on the wrong email) and a genuine
+            # own-rotation falls through to "unresolved" and is stashed as
+            # unclaimed instead of landing in its slot. The account's own
+            # stored email is right either way: when the override WAS
+            # accepted, `current_account` is the slot `_find_account_slot`
+            # matched on this exact email, so the two already agree.
+            try:
+                current_email = data["accounts"][current_account]["email"]
+                from_ref = account_ref(int(current_account), current_email)
+            except (KeyError, ValueError, TypeError):
+                raise AccountNotFoundError(
+                    f"Account-{current_account} does not exist"
+                ) from None
 
             # Create transaction for rollback capability
             try:
@@ -7401,25 +7530,42 @@ class ClaudeAccountSwitcher:
                         warnings_out.append(msg)
                 elif kind == "unresolved":
                     # Ownership could not be established (offline, endpoint
-                    # failure, malformed response, non-OAuth blob). Fail
-                    # open: exact pre-fix backup. Most such divergences are
-                    # the account's own rotation — skipping the backup would
-                    # leave the slot holding a consumed token — and the
-                    # .prev retention inside the write gives even a wrong
-                    # call a best-effort recovery cushion. Log only:
-                    # indistinguishable from a legitimate rotation, so a
-                    # warning would cry wolf.
-                    self._write_account_credentials(
-                        current_account, current_email, original_creds
+                    # failure, malformed response, non-OAuth blob). No
+                    # longer fail-open: an incident traced a wrong active
+                    # slot resolving to one slot while the live bytes were
+                    # another's; the old pre-fix backup here wrote the
+                    # other slot's refresh token into the wrong slot's
+                    # backup, and a background credential consumer later
+                    # consumed that slot's grant under the wrong one,
+                    # forcing a re-login. Same as the sibling foreign/alien
+                    # arms: never into a slot, always preserved.
+                    #
+                    # `unresolved` means ownership could not be verified (the
+                    # oracle was offline or failing) — never confirmed. No
+                    # `consumed_fp`: setting it here made the row match
+                    # `_adopt_stashed_successor`'s gate by construction the
+                    # instant it was written (nothing else need happen to the
+                    # slot in between), so a later grant-consume would
+                    # silently adopt these unverified bytes — a cross-wire
+                    # one step later. Left stranded until a manual
+                    # `cswap add` confirms it.
+                    self._stash_live_credential(
+                        original_creds, "unresolved", current_account,
+                        provenance.get("resolved"),
                     )
-                    self._write_account_config(
-                        current_account, current_email, original_config
+                    msg = (
+                        "The live credential diverges from Account-"
+                        f"{current_account}'s stored backup and its "
+                        "ownership could not be verified (offline or "
+                        "endpoint failure). It was preserved and not "
+                        f"written into Account-{current_account}. If "
+                        f"Account-{current_account} later cannot "
+                        "authenticate, log in as it and run: cswap add"
                     )
-                    self._logger.info(
-                        f"Backed up account {current_account} (lineage "
-                        "differs from the stored backup and ownership could "
-                        "not be verified — pre-fix backup)"
-                    )
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
                 elif kind == "own-bytes":
                     # Untouched since cswap wrote it — the slot already holds
                     # these bytes. Refresh only the config backup. (Rare since
@@ -7434,16 +7580,37 @@ class ClaudeAccountSwitcher:
                         "credentials unchanged)"
                     )
                 else:  # own-family / own-rotated
+                    # attributed only for "own-rotated": that kind is
+                    # established either by `_classify_outgoing_credential`'s
+                    # uuid-verified oracle match or by its stamp-only rescue
+                    # (`_live_is_own_newer_generation`, for an oracle-silent
+                    # rotation), so its fingerprint legitimately differs from
+                    # the stored backup and needs the attestation.
+                    # "own-family" is a stored-backup
+                    # fingerprint match already, which the store's own
+                    # attribution guard re-derives independently below — left
+                    # unattributed on purpose, as a second, redundant check
+                    # against exactly the incident this guard exists for (an
+                    # unverified switch-time claim once let a mismatched
+                    # `kind` reach this branch).
                     self._write_account_credentials(
-                        current_account, current_email, original_creds
+                        current_account, current_email, original_creds,
+                        attributed=(kind == "own-rotated"),
                     )
                     self._write_account_config(
                         current_account, current_email, original_config
                     )
-                    if kind == "own-rotated":
-                        # The profile call proved the identity; backfill a
-                        # missing slot uuid (add-token placeholder) while the
-                        # sequence file is being rewritten anyway.
+                    if kind == "own-rotated" and provenance.get("live") == original_creds:
+                        # The profile call proved the identity for THESE
+                        # bytes; backfill a missing slot uuid (add-token
+                        # placeholder) while the sequence file is being
+                        # rewritten anyway. Gated on live-bytes equality:
+                        # `resolved` is "only trustworthy while the live
+                        # bytes haven't moved" (`_prefetch_live_identity`'s
+                        # docstring) — the stamp-only rescue can return
+                        # "own-rotated" from bytes alone even when `resolved`
+                        # holds a stale identity for different bytes, and
+                        # backfilling that uuid would poison the roster.
                         resolved = provenance.get("resolved") or {}
                         acct = data.get("accounts", {}).get(current_account, {})
                         if not acct.get("uuid") and resolved.get("uuid"):

@@ -3423,7 +3423,7 @@ class TestPerformSwitchPostDisplay:
             # double and reads the real (empty) store instead.
             return creds_store.get((str(num), email), ""), False
 
-        def write_creds(num, email, creds):
+        def write_creds(num, email, creds, attributed=None):
             creds_store[(str(num), email)] = creds
 
         def read_cfg(num, email):
@@ -7384,8 +7384,9 @@ class TestProvenanceGuard:
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
         """A response missing email/organization that matches no slot is
-        indistinguishable from schema drift → unresolved (pre-fix backup),
-        never alien (preserve-and-skip)."""
+        indistinguishable from schema drift → unresolved, never alien
+        (preserve-and-skip stays unavailable to a partial response) — but
+        unresolved is itself preserve-and-skip now, never a slot write."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7405,9 +7406,11 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        assert creds_store[("1", "test@example.com")] == mystery
-        assert switcher.list_unclaimed_credentials() == {}
-        assert op["warnings"] == []
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        assert next(iter(entries.values()))["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
 
     def test_foreign_attribution_survives_missing_email(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -7442,12 +7445,11 @@ class TestProvenanceGuard:
     def test_unresolvable_mismatch_backs_up_pre_fix(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
-        """The fail-open core: offline / endpoint failure means the identity
-        oracle is silent, and the switch behaves exactly pre-fix — the
-        divergent bytes are backed into the outgoing slot (most such
-        divergences are the account's own rotation; skipping would leave the
-        slot holding a consumed token), with no safety copy and no
-        user-facing warning."""
+        """Offline / endpoint failure means the identity oracle is silent.
+        No longer fail-open: an unresolvable divergence is preserved as
+        unclaimed and never backed into the outgoing slot (incident: a
+        foreign refresh token consumed under the wrong slot forced a
+        re-login)."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7464,11 +7466,289 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        # Pre-fix backup happened; the switch completed quietly.
-        assert creds_store[("1", "test@example.com")] == mystery
+        # Outgoing slot's backup is untouched; the mystery bytes are stashed.
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id,) = entries
+        assert _read_safety_copy(switcher, entry_id) == mystery
+        assert entries[entry_id]["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
+        # The switch itself proceeded, onto the target's stored backup.
+        assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
+
+    def test_unresolved_probe_with_own_newer_generation_backs_up(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A 401 on the ownership probe (body never read) must not stash
+        the slot's own rotated grant as unadoptable while its stored
+        backup keeps the generation the rotation consumed (invalid_grant
+        2.5h after a fresh login). Same lineage stamp (a 700ms gap -- the
+        measured shape, refresh never moves it), newer generation by
+        access-token `expiresAt` (the way the codebase already orders
+        generations), no cross-slot collision -> backs up like a resolved
+        `own-rotated`."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        g1 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stored-1", "refreshToken": "rt-1",
+            "refreshTokenExpiresAt": 1_700_000_000_000, "expiresAt": 1000,
+        }})
+        creds_store[("1", "test@example.com")] = g1
+        g2 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-fresh-1", "refreshToken": "rt-1-rotated",
+            "refreshTokenExpiresAt": 1_700_000_000_700, "expiresAt": 2000,
+        }})
+        live_state = {"creds": g2}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == g2
         assert switcher.list_unclaimed_credentials() == {}
         assert op["warnings"] == []
-        assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
+
+    def test_unresolved_probe_with_older_access_expiry_stays_unresolved(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Same lineage stamp (within jitter) is only half the proof: a
+        live `expiresAt` EARLIER than the backup's is a consumed
+        predecessor, not the successor, and must not be written over the
+        slot's real (newer) backup."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        g1 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stored-1", "refreshToken": "rt-1",
+            "refreshTokenExpiresAt": 4_000_000_000_000,
+            "expiresAt": 2_300_000_002_000,
+        }})
+        creds_store[("1", "test@example.com")] = g1
+        g2 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stale-1", "refreshToken": "rt-1-stale",
+            "refreshTokenExpiresAt": 4_000_000_000_700,
+            "expiresAt": 2_300_000_001_000,
+        }})
+        live_state = {"creds": g2}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == g1
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id,) = entries
+        assert entries[entry_id]["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
+
+    def test_unresolved_probe_with_cross_slot_stamp_stays_unresolved(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The stamp rescue must not fire when another slot's own backup
+        stamp also sits inside the jitter of the live value -- a foreign
+        login must never be adopted this way (the cross-wire protection
+        this guard and the peer-shares-grant guard defend)."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        g1 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stored-1", "refreshToken": "rt-1",
+            "refreshTokenExpiresAt": 4_000_000_000_000,
+            "expiresAt": 2_300_000_001_000,
+        }})
+        creds_store[("1", "test@example.com")] = g1
+        g2 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-fresh-1", "refreshToken": "rt-1-rotated",
+            "refreshTokenExpiresAt": 4_000_000_000_700,
+            "expiresAt": 2_300_000_002_000,
+        }})
+        live_state = {"creds": g2}
+        creds_store[("2", "account2@example.com")] = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stale-2", "refreshToken": "rt-orig-2",
+            "refreshTokenExpiresAt": 4_000_000_000_900,
+        }})
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == g1
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id,) = entries
+        assert entries[entry_id]["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
+
+    def test_stamp_rescue_refuses_on_an_unreadable_peer_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """An unreadable peer (a locked Mac Keychain) must not read as
+        'no collision' -- `_refuse_if_peer_shares_grant`/`_check_attribution`
+        both fail closed on unreadable, and this rescue must match rather
+        than bypass them with attributed=True."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        data = switcher._get_sequence_data()
+        live_oauth = {"refreshTokenExpiresAt": 1_700_000_000_700, "expiresAt": 2000}
+        backup = json.dumps({"claudeAiOauth": {
+            "refreshTokenExpiresAt": 1_700_000_000_000, "expiresAt": 1000,
+        }})
+        with patch.object(
+            switcher, "_read_account_credentials_ex", return_value=("", True),
+        ):
+            assert switcher._live_is_own_newer_generation(
+                "1", live_oauth, backup, data,
+            ) is False
+
+    def test_unresolved_stash_is_not_adoptable_back_into_its_slot(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """An unresolved-arm stash must NOT be adoptable back into its slot.
+
+        `unresolved` means ownership could not be verified — the oracle was
+        offline or failing, not that it confirmed the bytes are this slot's
+        own next generation. Setting `consumedFp` from the slot's own stored
+        backup made the row match `_adopt_stashed_successor`'s gate BY
+        CONSTRUCTION the instant it was written (the gate is only
+        `configSlot == account_num AND consumedFp == the slot's current
+        stored backup`), so the next `consume_backup_grant` on that slot
+        would silently adopt genuinely foreign bytes into it — a
+        cross-wire one step later. The CAS proves the slot has not
+        moved since the stash; it never proves ownership, and for
+        `unresolved` ownership is unknown by definition."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        mystery = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-x", "refreshToken": "rt-x",
+        }})
+        live_state = {"creds": mystery}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        adopted = switcher._adopt_stashed_successor(
+            "1", "test@example.com", creds_store[("1", "test@example.com")],
+        )
+        assert adopted is None, (
+            "an unresolved stash was adoptable back into its own slot; "
+            "ownership was never verified, so a later grant-consume could "
+            "adopt genuinely foreign bytes into this slot"
+        )
+
+    def test_unresolvable_mismatch_with_wrong_active_slot_never_poisons_it(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A cross-wire shape: the roster's active slot is 2, but
+        the un-spliced identity file names slot 1's email. Two independent
+        guards must both hold: the roster's active slot (2) is not
+        overridden by the unverified identity-file claim (never attributed
+        to slot 1), and even if it were, an unresolved divergence is never
+        backed into whichever slot is named."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        a2_backup = creds_store[("2", "account2@example.com")]
+        # The live bytes are actually account 2's (the roster's real active
+        # slot) — not slot 1's, whichever slot classification lands on.
+        live_bytes = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-2", "refreshToken": "rt-live-2",
+        }})
+        live_state = {"creds": live_bytes}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert creds_store[("2", "account2@example.com")] == a2_backup
+        # No orphan key either: the arm no longer writes a slot at all, so
+        # there is nothing under the identity file's claimed email for
+        # slot 2 to have landed on.
+        assert ("2", "test@example.com") not in creds_store
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id, entry) = next(iter(entries.items()))
+        assert _read_safety_copy(switcher, entry_id) == live_bytes
+        # The attribution guard: the outgoing slot named is the roster's
+        # real active slot (2), never the identity file's unverified claim
+        # (1) — an unverified identity override cannot mask which account
+        # the switch left, so a re-login gets pointed at the right slot.
+        assert entry["configSlot"] == "2", (
+            f"outgoing slot misattributed to {entry['configSlot']!r} instead "
+            "of the roster's real active slot 2"
+        )
+        assert any(
+            "could not be verified" in w and "Account-2" in w
+            for w in op["warnings"]
+        )
+
+    def test_own_rotation_with_wrong_active_slot_lands_in_the_right_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Same cross-wire shape as the test above, but the live bytes are
+        genuinely slot 2's OWN rotation (same refresh-token lineage as its
+        stored backup) — the "right-slot-but-wrong-email" case.
+        `current_account` correctly stays 2 (the override above is
+        rejected), but `current_email` must not be left as slot 1's:
+        `_classify_outgoing_credential` reads the backup keyed on
+        ``(current_account, current_email)``, and slot 2's backup is stored
+        under slot 2's OWN email, not slot 1's. The wrong email makes the
+        own-family fast path unreachable and the classifier falls through to
+        "unresolved", stashing the freshly rotated token as unclaimed
+        instead of landing it in slot 2 — the same re-login-forcing outcome
+        this guard exists to prevent, reached one branch over."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        a2_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-orig", "refreshToken": "rt-2",
+        }})
+        creds_store[("2", "account2@example.com")] = a2_backup
+        # Same refresh-token lineage as the stored backup — a routine
+        # access-token rotation, not a foreign credential.
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-rotated", "refreshToken": "rt-2",
+        }})
+        live_state = {"creds": rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert creds_store[("2", "account2@example.com")] == rotated, (
+            "slot 2's own rotation was not recognised as its own lineage — "
+            "current_email leaked slot 1's identity into the classifier"
+        )
 
     def test_cached_foreign_verdict_survives_a_failed_switch_time_probe(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -7513,7 +7793,8 @@ class TestProvenanceGuard:
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
         """A raising profile call must be indistinguishable from None: the
-        switch completes with the pre-fix backup."""
+        switch completes, and the divergent bytes are stashed rather than
+        backed into the outgoing slot."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7534,16 +7815,18 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        assert creds_store[("1", "test@example.com")] == mystery
-        assert switcher.list_unclaimed_credentials() == {}
-        assert op["warnings"] == []
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        assert next(iter(entries.values()))["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
 
     def test_safety_copy_failure_aborts_before_live_overwrite(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
-        """Preservation is the safety boundary for positively-foreign bytes:
-        no safety copy, no switch. (Never reachable from endpoint failure —
-        the unresolved path writes no safety copy.)"""
+        """Preservation is the safety boundary for positively-foreign bytes
+        (and, since the unresolved arm now stashes too, for those as well):
+        no safety copy, no switch."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7640,7 +7923,8 @@ class TestProvenanceGuard:
     ):
         """A pre-lock resolution only binds to the bytes it resolved: when
         the live store moved in between, the stale answer is discarded and
-        the switch falls back to the pre-fix backup of the current bytes."""
+        the switch falls back to unresolved — stashed, never backed into
+        the outgoing slot."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7665,10 +7949,12 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        # Stale resolution rejected → unresolved → pre-fix backup, no copy.
-        assert creds_store[("1", "test@example.com")] == moved
-        assert switcher.list_unclaimed_credentials() == {}
-        assert op["warnings"] == []
+        # Stale resolution rejected → unresolved → stashed, slot untouched.
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        assert next(iter(entries.values()))["reason"] == "unresolved"
+        assert any("could not be verified" in w for w in op["warnings"])
 
 
 class TestSelfSwitchProvenance:
@@ -8158,6 +8444,74 @@ class TestActiveRefreshProvenance:
         write_backup.assert_called_once_with(
             "1", "test@example.com", refreshed, attributed=True
         )
+
+
+class TestDanglingActiveAccountRaisesNamedError:
+    """`current_account` can stay `str(activeAccountNumber)` — a slot the
+    roster no longer carries (edited by hand, or a stale value a prior bug
+    left behind) — when the live identity resolves to a REAL slot whose
+    stored backup does not (yet) match the live bytes, so the override at
+    `_perform_switch`'s top declines to trust it. `data["accounts"]
+    [current_account]["email"]` then raises a raw `KeyError` that escapes
+    the switch, telling the caller nothing -- this file's own convention
+    elsewhere (`AccountNotFoundError(f"Account-{account_num} does not
+    exist")`, e.g. `_remove_account`) names the containment instead.
+    `int(current_account)` right below it is the same failure mode for a
+    non-numeric `activeAccountNumber`.
+    """
+
+    def test_dangling_current_account_raises_account_not_found(
+        self, temp_home, sample_sequence_data,
+    ):
+        sample_sequence_data["activeAccountNumber"] = 99  # not in "accounts"
+        sample_sequence_data["accounts"]["1"]["email"] = "live@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+
+        with patch.object(
+            switcher, "_get_current_account",
+            return_value=("live@example.com", ""),
+        ):
+            with pytest.raises(AccountNotFoundError):
+                switcher._perform_switch(
+                    "2", emit_output=False,
+                    provenance={"live": None, "resolved": None},
+                )
+
+    def test_non_numeric_active_account_raises_account_not_found(
+        self, temp_home, sample_sequence_data,
+    ):
+        """The `int(current_account)` conversion right below the dict lookup
+        has the same containment gap: `activeAccountNumber` is arbitrary,
+        hand-editable JSON, so a non-numeric slot key that IS still present
+        in "accounts" clears the dict lookup and then raises a raw
+        `ValueError` instead."""
+        sample_sequence_data["activeAccountNumber"] = "abc"
+        sample_sequence_data["accounts"]["1"]["email"] = "live@example.com"
+        sample_sequence_data["accounts"]["abc"] = {
+            "email": "other@example.com", "uuid": "uuid-abc",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+
+        with patch.object(
+            switcher, "_get_current_account",
+            return_value=("live@example.com", ""),
+        ):
+            with pytest.raises(AccountNotFoundError):
+                switcher._perform_switch(
+                    "2", emit_output=False,
+                    provenance={"live": None, "resolved": None},
+                )
 
 
 class TestDirectActivationPreservation:
