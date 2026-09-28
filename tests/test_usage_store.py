@@ -2203,6 +2203,32 @@ class TestAdopt:
         store.adopt({"1": (USAGE, 0.0)}, IDENT)
         assert store.entries(IDENT)["1"].held_until == clock.now + 900.0
 
+    def test_a_hold_overrides_the_failed_row_trust_cap(self, store, clock):
+        # A row with a local failure is normally trusted only within
+        # POST_429_MIN_INTERVAL_S (360s) of its last reading. A hold
+        # overrides that: adopt()'s own docstring promises the reading stays
+        # "decision-trusted meanwhile", and the hold itself keeps every local
+        # collector off the slot, so a failed row's own counters never get a
+        # chance to clear while it lasts.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        clock.advance(POST_429_MIN_INTERVAL_S + 1)
+        entry = store.entries(IDENT)["1"]
+        assert entry.held(clock.now)
+        assert entry.trust_extended
+
+    def test_the_failed_row_cap_returns_once_the_hold_ends(self, store, clock):
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        clock.advance(900.0 + 1)
+        entry = store.entries(IDENT)["1"]
+        assert not entry.held(clock.now)
+        assert not entry.trust_extended
+
     def test_due_candidate_skips_a_held_slot(self, store, clock):
         store.adopt({"1": (USAGE, 0.0), "2": (USAGE, 0.0)}, IDENT, hold_s=600.0)
         plan = (clock.now + 60.0, 60.0)

@@ -2281,14 +2281,19 @@ class AutoSwitchEngine:
                 # is opportunistic, not an escape — never act on stale data
                 # or slide to a worse-ranked target; hold and retry next tick.
                 entry = entries.get(num)
-                if entry is None or not entry.fresh(self.clock()):
+                now = self.clock()
+                # A held reading (`UsageStore.adopt`) is usable here too: the
+                # hold is what refuses `reserve()` the refetch in the first
+                # place, and adopt()'s own docstring promises it stays
+                # decision-trusted while the hold lasts.
+                if entry is None or not (entry.fresh(now) or entry.held(now)):
                     self._emit(
                         NoSwitchEvent(
                             reason="stale-usage",
                             detail=(
                                 f"account {num} usage could not be refreshed "
-                                "this tick (backoff or a concurrent poller); "
-                                "retrying"
+                                "this tick (backoff, a hold, or a concurrent "
+                                "poller); retrying"
                             ),
                         )
                     )

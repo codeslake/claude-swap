@@ -1084,25 +1084,29 @@ class UsageStore:
             # reader must not flip trusted → unknown (and e.g. count an
             # unhealthy tick) for the seconds the result is in flight.
             #
+            # A live hold is deliberate staleness as well: another machine
+            # polls this account and hands its readings over, so between two
+            # hand-overs the last one is what decisions should run on. It
+            # overrides the failed-row cap below, matching adopt()'s promise
+            # that a held reading stays "decision-trusted meanwhile" — the
+            # hold itself keeps local collectors off the slot, so a failed
+            # row's own counters never get a chance to clear while it lasts.
+            held = held_until is not None and now < held_until
             # A row whose last poll attempt FAILED (any error, 429 included)
             # is capped at POST_429_MIN_INTERVAL_S past the last success,
             # full stop — never the scheduler-cadence/live-claim extension
             # below, and never a window's own reset: a reading the poller
             # could not refresh must go unknown quickly, not stay trusted on
-            # an old percentage. A row that has NOT failed keeps the
-            # scheduler-cadence/live-claim extension, capped at
+            # an old percentage. A row that has NOT failed (or is held) keeps
+            # the scheduler-cadence/live-claim extension, capped at
             # TRUST_MAX_AGE_S, exactly as before.
-            if consecutive_failures > 0:
+            if consecutive_failures > 0 and not held:
                 trust_extended = (
                     age_s is not None and age_s <= POST_429_MIN_INTERVAL_S
                 )
             else:
                 within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
                 live_claim = _live_claim(claim_until, last_attempt_at, now)
-                # A live hold is deliberate staleness as well: another machine
-                # polls this account and hands its readings over, so between
-                # two hand-overs the last one is what decisions should run on.
-                held = held_until is not None and now < held_until
                 trust_extended = within_ceiling and (
                     (next_poll_at is not None and now < next_poll_at)
                     or live_claim

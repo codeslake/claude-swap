@@ -2499,6 +2499,52 @@ class TestAdaptiveScheduler:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "consume-first"
 
+    def test_consume_first_held_target_switches_though_stale_by_ttl(
+        self, temp_home, monkeypatch
+    ):
+        """A target reading adopted from another machine (`cswap
+        import-usage`) stays decision-trusted while its hold lasts, but its
+        own freshness (``SERVE_TTL_S``, 180s) ages out well before the hold
+        does — and ``_row_eligible`` also refuses to refetch a held row, so
+        the phase-2 refetch can never freshen it either. The freshness gate
+        must accept a held reading too, or a held target past 180s old is
+        refused as stale-usage every tick forever."""
+        h = self._harness(temp_home, monkeypatch, strategy="consume-first")
+        counts: dict[str, int] = {}
+        # Populate the store while the active account resets soonest (holds).
+        view_a = {
+            "1": _usage7(50, 20, _R_SOON),
+            "2": _usage7(10, 10, _R_LATER),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        self._tick(h, counts, view_a)          # t0: fetches 1, 2
+        h.clock.advance(60)
+        self._tick(h, counts, view_a)          # t60: fetches 3
+        assert counts == {"1": 1, "2": 1, "3": 1}
+        # #2's reading is adopted from another machine: already 200s old
+        # (past SERVE_TTL_S, 180s) but held for 300s more.
+        h.switcher._usage_store.adopt(
+            {"2": (_usage7(10, 10, _R_LATER), 200.0)},
+            {"2": ("b@example.com", "")},
+            hold_s=480.0,
+        )
+        h.clock.advance(181)                   # active's plan is due again
+        h.events.clear()
+        # The active refetch now reports the LATEST reset, so stored #2
+        # (adopted, held, stale by TTL) is the provisional pick — phase 2
+        # cannot freshen it (`_row_eligible` refuses a held row), so it must
+        # be usable on the hold alone.
+        view_b = {
+            "1": _usage7(50, 20, _R_LATEST),
+            "2": _usage7(10, 10, _R_LATER),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        outcome = self._tick(h, counts, view_b)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "stale-usage" not in reasons
+
 
 class TestABareLoginHealsItsSlotThroughTheEngineTick:
     """THE ACCEPTANCE TEST: a bare ``/login`` as a managed slot's own roster
