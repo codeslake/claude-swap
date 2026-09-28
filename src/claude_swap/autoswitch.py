@@ -374,16 +374,24 @@ def candidate_usage_is_stale(entry: UsageEntry | None, now: float) -> bool:
     """Whether a candidate's cached usage cannot be trusted for admission.
 
     Unreadable, past ``UsageEntry.fresh``'s TTL (the collector could not
-    refresh it this tick — backoff or a concurrent poller), or a
-    collector-struck (``invalid_grant``) token (``token_dead()``, unqualified
-    — the same unbound call ``due_candidate`` uses). `_tick_inner`'s
-    consume-first admission HOLD only — sliding to a worse-ranked candidate
-    defeats consume-first's point, so it holds on anything less than fresh.
-    `proactive` has its own, looser bar: ``candidate_is_untrustworthy``.
-    `failover` gates on ``token_dead()`` alone (a backed-off peer is a fine
-    target when the ACTIVE credential is the one failing).
+    refresh it this tick — backoff or a concurrent poller) UNLESS it is
+    held (``UsageEntry.held``, ``cswap import-usage``): the store itself
+    refuses to refetch a held row, so the freshness bar must accept a held
+    reading too, or a held candidate past the TTL is refused forever. Also
+    a collector-struck (``invalid_grant``) token (``token_dead()``,
+    unqualified — the same unbound call ``due_candidate`` uses).
+    `_tick_inner`'s consume-first admission HOLD only — sliding to a
+    worse-ranked candidate defeats consume-first's point, so it holds on
+    anything less than fresh or held. `proactive` has its own, looser bar:
+    ``candidate_is_untrustworthy``. `failover` gates on ``token_dead()``
+    alone (a backed-off peer is a fine target when the ACTIVE credential is
+    the one failing).
     """
-    return entry is None or not entry.fresh(now) or entry.token_dead()
+    return (
+        entry is None
+        or not (entry.fresh(now) or entry.held(now))
+        or entry.token_dead()
+    )
 
 
 def candidate_is_untrustworthy(entry: UsageEntry | None, now: float) -> bool:
@@ -2775,8 +2783,8 @@ class AutoSwitchEngine:
                                 reason="stale-usage",
                                 detail=(
                                     f"account {num} usage could not be "
-                                    "refreshed this tick (backoff or a "
-                                    "concurrent poller); retrying"
+                                    "refreshed this tick (backoff, a hold, "
+                                    "or a concurrent poller); retrying"
                                 ),
                             )
                         )

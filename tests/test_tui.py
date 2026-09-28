@@ -3661,6 +3661,116 @@ class TestUnswitchableRowsAreListed:
             f"panel out:\n{rendered}"
         )
 
+    def test_panel_names_a_held_import_the_top_pick_when_the_engine_switches_to_it(
+        self, temp_home, monkeypatch
+    ):
+        """T1531 (b): a candidate's freshness gate (`candidate_usage_is_
+        stale`, autoswitch.py) now accepts a HELD reading (`cswap
+        import-usage`) too, so a consume-first tick can switch to a
+        target that is stale by `SERVE_TTL_S` on its own but still held.
+        The panel's ranking never gated on that freshness bar at all --
+        `rank_switch_candidates` reads `decision_value()`, which already
+        trusts a held row through `trust_extended` -- so it must already
+        show the held row as the top pick, both before and after the
+        gate fix, whenever the engine actually switches to it. Resets are
+        real-clock future timestamps, not the engine suite's own FakeClock
+        literals: the panel's own ranking runs on `time.time()`, and a
+        reset already past THAT clock reads as unknown
+        (`_seven_day_reset_ts`), which would refuse every candidate for a
+        reason that has nothing to do with this test."""
+        from unittest.mock import patch
+
+        from claude_swap import oauth
+        from claude_swap.autoswitch import TickOutcome
+        from claude_swap.settings import AutoSwitchSettings
+        from tests.test_autoswitch import EngineHarness, _iso_at
+
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = EngineHarness(temp_home, strategy="consume-first", threshold=90.0)
+        for num, email in (
+            (1, "a@x.invalid"), (2, "b@x.invalid"), (3, "c@x.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a@x.invalid", 1)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+
+        real_now = time.time()
+
+        def w(five_h, seven_d, hours_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(real_now + hours_out * 3600),
+                },
+            }
+
+        # Populate the store while the active account resets soonest --
+        # consume-first has nothing to switch to yet.
+        view_a = {"1": w(50, 20, 24), "2": w(10, 10, 240), "3": w(10, 10, 480)}
+        # The active's own refetch now reports the LATEST reset, so stored
+        # #2 (adopted, held, stale by TTL) becomes the provisional pick.
+        view_b = {"1": w(50, 20, 600), "2": w(10, 10, 240), "3": w(10, 10, 480)}
+
+        def fetch_from(view):
+            def fake_fetch(num, email, creds, is_active=False,
+                            persist_credentials=None, **kwargs):
+                value = view.get(str(num))
+                return oauth.UsageOutcome(dict(value) if value else None)
+            return fake_fetch
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=fetch_from(view_a),
+        ):
+            h.engine.tick()          # t0: fetches 1, 2
+            h.clock.advance(60)
+            h.engine.tick()          # t60: fetches 3
+
+        # #2's reading is adopted from another machine, held for 480s more.
+        h.switcher._usage_store.adopt(
+            {"2": (w(10, 10, 240), 30.0)},
+            {"2": ("b@x.invalid", "")}, hold_s=480.0,
+        )
+        h.clock.advance(181)  # #2 is now stale by SERVE_TTL_S on its own
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=fetch_from(view_b),
+        ):
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.SWITCHED
+        engine_pick = str(h.active_number())
+        assert engine_pick == "2"  # premise: the engine picked the held row
+
+        # The store's per-account rows the collect phase just wrote (the
+        # active's own refetch to `view_b`, #2's untouched held row) --
+        # what a panel polling right after that phase, still showing #1
+        # active, would render.
+        ident = {
+            "1": ("a@x.invalid", ""), "2": ("b@x.invalid", ""),
+            "3": ("c@x.invalid", ""),
+        }
+        entries = h.switcher._usage_store.entries(ident)
+
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0)
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True, usage=entries["1"]),
+            self._acct("2", "b@x.invalid", switchable=True, usage=entries["2"]),
+            self._acct("3", "c@x.invalid", switchable=True, usage=entries["3"]),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" not in rendered, (
+            f"the panel refused to rank at all instead of naming a top "
+            f"pick: {rendered!r}"
+        )
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == engine_pick, (
+            f"panel top={panel_top!r}, engine picked {engine_pick!r} — "
+            f"panel out:\n{rendered}"
+        )
+
     def test_an_unranked_row_still_orders_a_known_reset_before_an_unknown_one(self):
         """When the active's own usage reading is stale (`age_s` past
         `STALE_OK_S`, `decision_value()` -> None) the ranking pass never
