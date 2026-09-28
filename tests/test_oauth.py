@@ -882,8 +882,8 @@ class TestNativeTlsFallbackIsAudible:
     over a trust nicety. That part is right. What is wrong is that it leaves no
     trace, and the two paths do not trust the same roots.
 
-    Measured on macOS 2026-08-17, comparing the OS keychains against what
-    stdlib actually loads:
+    Measured on macOS, comparing the OS keychains against what stdlib
+    actually loads:
 
         OS-store unique roots           173   (system 154, admin 4, login 15)
         stdlib-loaded roots             128
@@ -937,7 +937,8 @@ class TestNativeTlsFallbackIsAudible:
             with caplog.at_level(logging.WARNING):
                 cli._use_native_tls()
             assert not [r for r in caplog.records
-                        if "truststore" in r.getMessage().lower()]
+                        if r.name == "claude-swap"
+                        and r.levelno == logging.WARNING]
         finally:
             try:
                 import truststore
@@ -1065,6 +1066,31 @@ class TestClassifyUsageError:
         assert "tls-cert" in ERROR_NOTES
         note = ERROR_NOTES["tls-cert"]
         assert "SSL_CERT_FILE" in note
+
+    def test_a_hostname_mismatch_is_tls_cert_and_its_note_says_so(self):
+        """``SSLCertVerificationError`` is not only an untrusted chain.
+
+        A certificate issued for another host (a captive portal, a proxy that
+        does not re-sign per host) raises the same class with OpenSSL
+        verify_code 62. One kind covers "the certificate check refused this
+        connection", so the note has to name that cause too, or it prescribes
+        a CA fix for a problem no CA fixes.
+        """
+        from claude_swap.switcher import ERROR_NOTES
+
+        err = ssl.SSLCertVerificationError(
+            1,
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+            "Hostname mismatch, certificate is not valid for 'api.example.com'. "
+            "(_ssl.c:1000)",
+        )
+        err.verify_code = 62
+        err.verify_message = (
+            "Hostname mismatch, certificate is not valid for 'api.example.com'"
+        )
+        e = urllib.error.URLError(err)
+        assert oauth._classify_usage_error(e)[0] == "tls-cert"
+        assert "different host" in ERROR_NOTES["tls-cert"]
 
     def test_bad_response(self):
         try:
