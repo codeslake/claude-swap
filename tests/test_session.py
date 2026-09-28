@@ -4503,8 +4503,8 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
         HOME and XDG_DATA_HOME are pointed at a scratch dir so that even an
         import side effect cannot reach the real account store.
         """
+        import inspect
         import json
-        import pathlib
         import subprocess
         import sys
         import tempfile
@@ -4514,13 +4514,13 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
             "def _emit(p, m): print(m)\n"
             "banner = partial(_emit, 'x')\n"
         )
-        here = pathlib.Path(__file__).resolve()
+        # THE TWO FUNCTIONS' OWN SOURCE, not the whole module: both already
+        # `import ast` themselves, so this needs no other module-level name.
         prog = (
-            "import importlib.util, json, sys\n"
-            f"spec = importlib.util.spec_from_file_location('t', {str(here)!r})\n"
-            "m = importlib.util.module_from_spec(spec)\n"
-            "spec.loader.exec_module(m)\n"
-            "print(json.dumps(sorted(m._bare_print_printers(sys.argv[1]))))\n"
+            "import json, sys\n"
+            + inspect.getsource(_own_scope) + "\n"
+            + inspect.getsource(_bare_print_printers) + "\n"
+            "print(json.dumps(sorted(_bare_print_printers(sys.argv[1]))))\n"
         )
         answers = {}
         with tempfile.TemporaryDirectory() as scratch:
