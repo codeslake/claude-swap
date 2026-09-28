@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -556,6 +557,37 @@ class TestStatusJson:
             payload = switcher.status(json_output=True)
 
         assert payload["active"]["alias"] == "dev"
+
+    def test_status_and_list_agree_for_a_walled_active_slot(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """status --json must use the same decision-grade projection as
+        list --json: a walled row's synthetic full reading (built only for
+        the switch decision) must never surface as "ok" from either
+        payload (T1537 m2)."""
+        from claude_swap.usage_store import UsageEntry
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        entry = UsageEntry(walled=True, walled_until=time.time() + 3600)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_active_account_usage", return_value=entry):
+            status_payload = switcher.status(json_output=True)
+
+        list_row = switcher._build_list_payload(
+            [(1, "test@example.com", "", "", True, active_creds, "")],
+            {"1": entry},
+        )["accounts"][0]
+
+        active = status_payload["active"]
+        assert active["usageStatus"] == list_row["usageStatus"] == "unavailable"
+        assert active["usage"] == list_row["usage"] is None
 
 
 # --------------------------------------------------------------------------- #

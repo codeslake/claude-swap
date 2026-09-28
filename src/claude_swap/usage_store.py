@@ -1781,3 +1781,17 @@ def with_sentinel(entry: UsageEntry, sentinel: str | None) -> UsageEntry:
     if sentinel is None:
         return entry
     return replace(entry, sentinel=sentinel)
+
+
+def json_decision_value(entry: UsageEntry) -> dict | str | None:
+    """Decision-grade value for a JSON export (``--list``/``--status``).
+
+    Same as ``entry.decision_value()`` except a walled row's synthetic full
+    reading (built only to drive the switch decision) never substitutes for
+    the real measurement: exporting it as "ok" would hand ``cswap
+    import-usage`` a fabricated reading to persist as a real lastGood. A
+    sentinel still wins and the STALE_OK_S/``trust_extended`` freshness gate
+    still applies, from the entry's own stored reading — this only turns
+    ``walled`` off before those checks run.
+    """
+    return replace(entry, walled=False).decision_value()

@@ -3120,6 +3120,29 @@ class TestActiveAccountRefresh:
         assert entries["1"].sentinel == USAGE_TOKEN_EXPIRED
         resync.assert_not_called()
 
+    def test_held_blocked_active_slot_with_expired_login_is_not_resynced(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Held twin of the expired-login control above: the hold exempts
+        the sentinel (that reading, not this token's expiry, is what the
+        row reports), but an expired live token must still never reach the
+        resync — it has no valid token pair to attribute (T1537 m1)."""
+        switcher = self._switcher(sample_sequence_data)
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        store.adopt(
+            {"1": ({"five_hour": {"pct": 1.0}}, 0.0)}, identity, hold_s=3600.0
+        )
+        assert store.entries(identity)["1"].held(store.clock())  # premise
+
+        info = [(1, "test@example.com", "", "", True, self._EXPIRED, "")]
+
+        with patch.object(switcher, "_resync_rotated_backup") as resync:
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["1"].sentinel is None
+        resync.assert_not_called()
+
     def test_backoff_blocked_active_slot_does_not_adopt_a_foreign_login(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -11586,6 +11609,56 @@ class TestLockstepUsageDetection:
         }
         payload = switcher._build_list_payload(self._info(), clean)
         assert "lockstepUsageWarnings" not in payload
+
+
+class TestListPayloadWalledProjection:
+    """``--list --json``'s decision-grade projection for a walled row must
+    keep both of ``decision_value()``'s other gates, not just drop the
+    synthetic reading (T1537 finding I): a sentinel still wins, and a stale
+    reading with no trust extension still reports unavailable."""
+
+    def _switcher(self, temp_home, sample_sequence_data):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        return switcher
+
+    @staticmethod
+    def _info():
+        return [(1, "account1@example.com", "", "", True, "creds-1", "")]
+
+    def test_walled_row_with_a_sentinel_reports_the_sentinel(
+        self, temp_home, sample_sequence_data,
+    ):
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        entry = UsageEntry(
+            sentinel=USAGE_TOKEN_EXPIRED,
+            walled=True,
+            walled_until=time.time() + 3600,
+            last_good={"five_hour": {"pct": 50.0}},
+            fetched_at=time.time(),
+            age_s=0.0,
+        )
+        payload = switcher._build_list_payload(self._info(), {"1": entry})
+        row = payload["accounts"][0]
+        assert row["usageStatus"] == "token_expired"
+        assert row["usage"] is None
+
+    def test_walled_row_with_a_stale_reading_reports_unavailable(
+        self, temp_home, sample_sequence_data,
+    ):
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        entry = UsageEntry(
+            walled=True,
+            walled_until=time.time() + 3600,
+            last_good={"five_hour": {"pct": 50.0}},
+            fetched_at=time.time() - 4000,
+            age_s=4000.0,  # past STALE_OK_S (300s), trust_extended False
+        )
+        payload = switcher._build_list_payload(self._info(), {"1": entry})
+        row = payload["accounts"][0]
+        assert row["usageStatus"] == "unavailable"
+        assert row["usage"] is None
 
 
 class TestStashAndRetentionStore:

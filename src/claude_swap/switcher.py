@@ -99,6 +99,7 @@ from claude_swap.usage_store import (
     PERMANENT_AUTH_ERRORS,
     UsageEntry,
     UsageStore,
+    json_decision_value,
     with_sentinel,
 )
 
@@ -7016,11 +7017,13 @@ class ClaudeAccountSwitcher:
             # hold must still be adopted into the backup, or the slot is left
             # pointing at the consumed predecessor for the hold's whole span.
             active_oauth = oauth.extract_oauth_data(info[5])
-            if not held and active_oauth and oauth.is_oauth_token_expired(
-                active_oauth.get("expiresAt")
-            ):
+            expired = bool(
+                active_oauth
+                and oauth.is_oauth_token_expired(active_oauth.get("expiresAt"))
+            )
+            if expired and not held:
                 sentinels[num] = USAGE_TOKEN_EXPIRED
-            elif active_oauth and not self._active_read_degraded:
+            elif active_oauth and not expired and not self._active_read_degraded:
                 # Adoption otherwise rides the fetch path alone (via
                 # `_fetch_active_usage`'s success branch), so the same gate
                 # that blocks the fetch here also blocked a fresh re-login
@@ -7029,9 +7032,14 @@ class ClaudeAccountSwitcher:
                 # `_resync_rotated_backup` already has (identity, its own
                 # fingerprint no-op check, the lock) — called directly, since
                 # a pre-check here would just repeat that no-op check at the
-                # cost of a second backup read on every pass.
+                # cost of a second backup read on every pass. Gated on `not
+                # expired` too: a held row whose live token is genuinely
+                # expired has no valid token pair to attribute (T1537 m1) —
+                # `_resync_rotated_backup`'s own docstring assumes a fresh
+                # access token, and the held reading, not a resync, is what
+                # the row reports for the hold's span.
                 self._resync_rotated_backup(num, info[1], info[3], info[5])
-            elif active_oauth:
+            elif active_oauth and not expired:
                 # Same "would have resynced but degraded" case as
                 # `_fetch_active_usage`'s success branch -- see
                 # `_log_ignored_degraded_login`.
@@ -8016,14 +8024,15 @@ class ClaudeAccountSwitcher:
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
             # keying on usageStatus == "ok" must not act on arbitrarily old data.
-            # A walled row's decision-grade value is `_walled_decision_value`'s
+            # A walled row's `decision_value()` is `_walled_decision_value`'s
             # SYNTHETIC full reading, built for the switch decision only (see
             # `UsageEntry.walled`'s own docstring: "display still reads
             # last_good/age_s as measured"). Exporting that as "ok" would hand
             # `cswap import-usage` a fabricated measurement to persist as a
-            # real lastGood, so this JSON path exports the entry's own
-            # measured last_good instead — unavailable when there is none yet.
-            usage_entry = entry.last_good if entry.walled else entry.decision_value()
+            # real lastGood, so this JSON path turns `walled` off before
+            # running the same sentinel/freshness gates `decision_value()`
+            # always runs — see `json_decision_value`.
+            usage_entry = json_decision_value(entry)
             accounts.append(
                 account_row(
                     num, email, org_name, org_uuid, is_active,
@@ -8216,9 +8225,12 @@ class ClaudeAccountSwitcher:
         entry = self._active_account_usage(
             account_num, current_email, org_uuid, read_only=read_only
         )
-        # Decision-grade projection, same rule as the --list payload: stale
-        # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
-        status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
+        # Decision-grade projection, same rule as the --list payload (see
+        # `json_decision_value`): stale beyond STALE_OK_S reports
+        # unavailable, not "ok" with old numbers, and a walled row's
+        # synthetic switch-decision reading never substitutes for the real
+        # measurement either.
+        status, usage = usage_fields(json_decision_value(entry), entry.fetched_at)
         active: dict = {
             "number": int(account_num),
             "email": current_email,
