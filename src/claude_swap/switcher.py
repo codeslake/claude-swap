@@ -6924,6 +6924,7 @@ class ClaudeAccountSwitcher:
                 )
                 entries = store.entries(identities, models)
 
+        now = store.clock()
         if read_only:
             # An expired ACTIVE credential gets the same read-only treatment:
             # a pure read (no reserve claim, no fetch path runs to surface it
@@ -6931,6 +6932,11 @@ class ClaudeAccountSwitcher:
             # claims-gated loop below, which read-only never reaches.
             for num, info in info_by_num.items():
                 if num in sentinels or not info[4]:  # info[4] = is_active
+                    continue
+                if entries[num].held(now):
+                    # Held for another machine's reading: that reading, not
+                    # this token's expiry, is what the row reports. Agrees
+                    # with the write-capable path's own held exemption below.
                     continue
                 active_oauth = oauth.extract_oauth_data(info[5])
                 if active_oauth and oauth.is_oauth_token_expired(
@@ -6995,21 +7001,22 @@ class ClaudeAccountSwitcher:
         # state so the auto engine idle-holds instead of counting the gap
         # toward a spurious failover (Finding 2). When the gate lifts, the
         # fetch path refreshes the token and the sentinel clears itself.
-        now = store.clock()
         for num, info in info_by_num.items():
             if num in sentinels or not info[4]:  # info[4] = is_active
                 continue
             if num in claims:
                 continue  # the fetch path will handle (or sentinel) it now
-            if entries[num].held(now):
-                # Held for another machine's reading (``cswap import-usage``):
-                # that reading, not this token's refresh, is what the row is
-                # waiting on, and it stays decision-trusted, so there is no
-                # gap to idle-hold over. The fetch path refreshes the token
-                # once the hold lapses.
-                continue
+            held = entries[num].held(now)
+            # Held for another machine's reading (``cswap import-usage``):
+            # that reading, not this token's refresh, is what the row is
+            # waiting on, and it stays decision-trusted, so the expired
+            # sentinel below is exempted — there is no gap to idle-hold over,
+            # and the fetch path refreshes the token once the hold lapses.
+            # The resync is NOT exempted: a Claude Code rotation during the
+            # hold must still be adopted into the backup, or the slot is left
+            # pointing at the consumed predecessor for the hold's whole span.
             active_oauth = oauth.extract_oauth_data(info[5])
-            if active_oauth and oauth.is_oauth_token_expired(
+            if not held and active_oauth and oauth.is_oauth_token_expired(
                 active_oauth.get("expiresAt")
             ):
                 sentinels[num] = USAGE_TOKEN_EXPIRED
@@ -8009,10 +8016,18 @@ class ClaudeAccountSwitcher:
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
             # keying on usageStatus == "ok" must not act on arbitrarily old data.
+            # A walled row's decision-grade value is `_walled_decision_value`'s
+            # SYNTHETIC full reading, built for the switch decision only (see
+            # `UsageEntry.walled`'s own docstring: "display still reads
+            # last_good/age_s as measured"). Exporting that as "ok" would hand
+            # `cswap import-usage` a fabricated measurement to persist as a
+            # real lastGood, so this JSON path exports the entry's own
+            # measured last_good instead — unavailable when there is none yet.
+            usage_entry = entry.last_good if entry.walled else entry.decision_value()
             accounts.append(
                 account_row(
                     num, email, org_name, org_uuid, is_active,
-                    entry.decision_value(),
+                    usage_entry,
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
                     last_good_usage=entry.last_good,

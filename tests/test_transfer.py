@@ -2560,6 +2560,102 @@ class TestImportUsage:
         assert row["usageStatus"] == "ok"
         assert row["usage"]["fiveHour"]["pct"] == 42.0
 
+    def test_a_held_active_account_shows_its_reading_not_token_expired_read_only(
+        self, temp_home: Path
+    ):
+        """The read-only twin: ``list --read-only`` skips the write-capable
+        collect loop entirely and used to run its own, separate expired-check
+        with no held exemption at all -- so a held active slot with an
+        expired live token read ``token_expired`` there while plain ``list``
+        already showed its reading. Both must agree."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "alice@example.com", "accountUuid": "acct-1"}}
+        ))
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "tok", "refreshToken": "rtok", "expiresAt": 1000}}
+        ))
+        self._import(
+            s, temp_home, _usage_document(_usage_row("alice@example.com", pct=42.0)),
+            hold_s=600.0,
+        )
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
+            payload = s.list_accounts(json_output=True, read_only=True)
+
+        fetch.assert_not_called()
+        (row,) = payload["accounts"]
+        assert row["active"] is True
+        assert row["usageStatus"] == "ok"
+        assert row["usage"]["fiveHour"]["pct"] == 42.0
+
+    def test_a_walled_row_with_no_reading_exports_unavailable_not_ok(
+        self, temp_home: Path, tmp_path: Path
+    ):
+        """``_walled_decision_value``'s synthetic full reading is for the
+        switch decision only (``UsageEntry.walled``'s own docstring: display
+        reads ``last_good``/``age_s`` as measured). A slot marked at-limit
+        before it was ever fetched has no measured reading to export -- the
+        JSON export must say so with a non-"ok" status instead of handing
+        ``import-usage`` an "ok" row with no ``usageAgeSeconds``, which used
+        to raise ``TransferError`` and refuse the whole document."""
+        from claude_swap.usage_store import UsageStore
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", creds=_live_creds("alice"))
+        identity = {"1": ("alice@example.com", "")}
+        s._usage_store.mark_at_limit("1", identity)
+        premise = s._usage_store.entries(identity)["1"]
+        assert premise.walled and premise.last_good is None  # premise
+
+        payload = s.list_accounts(json_output=True, read_only=True)
+        (row,) = payload["accounts"]
+        assert row["usageStatus"] != "ok", row
+        assert row["usage"] is None
+
+        s._usage_store = UsageStore(tmp_path / "second-store")
+        self._import(s, temp_home, json.dumps(payload))  # must not raise
+
+        entries = s._usage_store.entries(identity)
+        assert entries["1"].last_good is None
+
+    def test_a_walled_row_with_a_reading_exports_the_reading_not_the_synthetic_full(
+        self, temp_home: Path, tmp_path: Path
+    ):
+        """The counterpart: a walled slot that DOES hold a measured reading
+        exports that reading (and its real age), not the wall's synthetic
+        100% -- so a receiver's ``adopt()`` persists the measurement, not a
+        fabricated one."""
+        from claude_swap.usage_store import FetchRecord, UsageStore
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", creds=_live_creds("alice"))
+        identity = {"1": ("alice@example.com", "")}
+        s._usage_store.record(
+            {"1": FetchRecord(
+                usage={"five_hour": {"pct": 37.0}, "seven_day": {"pct": 10.0}}
+            )},
+            identity,
+        )
+        s._usage_store.mark_at_limit("1", identity)
+        premise = s._usage_store.entries(identity)["1"]
+        assert premise.walled and premise.last_good is not None  # premise
+        # The switch decision still sees the wall, unchanged by this fix.
+        assert premise.decision_value()["five_hour"]["pct"] == 100.0
+
+        payload = s.list_accounts(json_output=True, read_only=True)
+        (row,) = payload["accounts"]
+        assert row["usageStatus"] == "ok", row
+        assert row["usage"]["fiveHour"]["pct"] == 37.0, row
+        assert "usageAgeSeconds" in row
+
+        s._usage_store = UsageStore(tmp_path / "second-store")
+        self._import(s, temp_home, json.dumps(payload))
+
+        entries = s._usage_store.entries(identity)
+        assert entries["1"].last_good["five_hour"]["pct"] == 37.0
+
     def test_reads_stdin(self, temp_home: Path, monkeypatch):
         from claude_swap.transfer import import_usage
 

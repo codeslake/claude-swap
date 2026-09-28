@@ -3209,8 +3209,9 @@ class AutoSwitchEngine:
         escalation band, so it instead decides *provisionally* on the stored
         snapshot and, only when a switch would fire, re-runs an escalated
         collection and re-verifies the choice in ``_tick_inner`` (two-phase
-        commit), plus a per-target ``UsageEntry.fresh`` gate before
-        performing.
+        commit), plus a per-target ``UsageEntry.fresh`` gate (or a live hold
+        from ``cswap import-usage``, which stands in for freshness while it
+        lasts) before performing.
 
         Stalest-first needs no rotation cursor: it reads the persisted store,
         so the loop and cron-driven ``--once`` runs schedule identically.

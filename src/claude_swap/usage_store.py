@@ -94,15 +94,18 @@ def _live_claim(
         and (now - last_attempt_at) < LEGACY_CLAIM_TTL_S
     )
 
-# Deliberate staleness (a not-yet-due scheduler cadence, or a live fetch
-# lease) extends decision trust past STALE_OK_S, but never past this ceiling:
-# an account with nothing scheduled must eventually read as unknown so the
-# unknown-path machinery (escalate-all, unhealthy ticks, verified failover)
-# takes back over. A row whose last poll attempt FAILED does not use this
-# ceiling: it is capped at poll_policy.POST_429_MIN_INTERVAL_S instead (see
+# Deliberate staleness (a not-yet-due scheduler cadence, a live fetch lease,
+# or a live hold from `cswap import-usage`) extends decision trust past
+# STALE_OK_S, but never past this ceiling: an account with nothing scheduled
+# must eventually read as unknown so the unknown-path machinery
+# (escalate-all, unhealthy ticks, verified failover) takes back over. A row
+# whose last poll attempt FAILED does not use this ceiling UNLESS it is also
+# held: it is capped at poll_policy.POST_429_MIN_INTERVAL_S instead (see
 # UsageStore.entries), whatever Retry-After or any window reset says — a
 # throttled or erroring account must go unknown for decisions quickly, not
-# stay trusted on the strength of a stale measurement.
+# stay trusted on the strength of a stale measurement, unless another
+# machine is actively handing it readings, in which case the hold keeps it
+# trusted up to this wider ceiling instead.
 TRUST_MAX_AGE_S = 3600.0
 
 # Failure backoff when the server sent no Retry-After: 30s · 2^(n-1), capped.
@@ -362,10 +365,11 @@ class UsageEntry:
     rejected_fingerprint: str | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the scheduler itself chose the cadence (within
-    # nextPollAt), or a fetch lease is live. Capped at TRUST_MAX_AGE_S. A row
-    # whose last poll attempt FAILED never sets this from either of those —
-    # see UsageStore.entries, which caps a failed row's trust at
-    # poll_policy.POST_429_MIN_INTERVAL_S directly. Computed by
+    # nextPollAt), a fetch lease is live, or the row is held for another
+    # machine's reading. Capped at TRUST_MAX_AGE_S. A row whose last poll
+    # attempt FAILED never sets this from any of those UNLESS it is also
+    # held — see UsageStore.entries, which caps a failed, unheld row's trust
+    # at poll_policy.POST_429_MIN_INTERVAL_S directly. Computed by
     # UsageStore.entries().
     trust_extended: bool = False
     # Appended to preserve positional compatibility for the older read-model
@@ -482,10 +486,10 @@ class UsageEntry:
         ``entries()`` caps a row whose last poll attempt FAILED at
         ``poll_policy.POST_429_MIN_INTERVAL_S`` (360s), so such a row still
         reaches the ``trust_extended`` branch between ``STALE_OK_S`` (300s)
-        and that cap; a row whose last attempt did not fail keeps the wider
-        ``TRUST_MAX_AGE_S`` ceiling instead. Display code reads
-        ``last_good``/``age_s`` directly instead — it may show older data,
-        annotated with its age.
+        and that cap; a row whose last attempt did not fail, or is held for
+        another machine's reading, keeps the wider ``TRUST_MAX_AGE_S``
+        ceiling instead. Display code reads ``last_good``/``age_s`` directly
+        instead — it may show older data, annotated with its age.
         """
         if self.sentinel is not None:
             return self.sentinel
@@ -748,7 +752,11 @@ def _failure_backoff_s(
         # to `fetched_at + poll_policy.POST_429_MIN_INTERVAL_S` (360s) on
         # EVERY arm — no window-reset component, and no separate wider
         # ceiling for the 429 arm (the old `RATE_LIMIT_TRUST_MAX_AGE_S` this
-        # replaced is gone). So the 4500s wait never sits inside its own
+        # replaced is gone) — except a row also HELD for another machine's
+        # reading (`cswap import-usage`), which keeps the wider
+        # `TRUST_MAX_AGE_S` ceiling instead: the hold's own promise that a
+        # handed-over reading stays trusted outranks this row's own failure
+        # state (`UsageStore.entries`). So the 4500s wait never sits inside its own
         # trust, not even for a row fresh at the moment it failed: `record()`
         # writes `fetchedAt` on SUCCESS only, so a chain of failed blocks
         # keeps measuring trust from the first success while each block adds
