@@ -12576,6 +12576,58 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
         assert harness.engine._sleep_until_ts is None
 
 
+class TestActiveUnknownIsNotReportedAsAnExhaustedFleet:
+    """lmd42, 2026-09-28: the active row went blind under a live usage-
+    endpoint 429 backoff (record_header_reading's now-lifted refusal,
+    usage_store.py) while its last real reading held 59% headroom. Every
+    candidate genuinely was spent, and the engine reported `all accounts
+    exhausted` over a row nobody had actually measured as spent this tick --
+    `truly_exhausted` only ever asked about the CANDIDATES.
+    """
+
+    def test_active_unknown_with_a_healthy_last_read_holds(self, harness):
+        harness.engine.settings = replace(harness.engine.settings, unhealthy_ticks=1)
+        entries = {
+            "1": UsageEntry(
+                last_good=_usage(41.0),  # 59% headroom, well under threshold
+                fetched_at=harness.clock.now - 5000.0,
+                age_s=5000.0,
+                consecutive_failures=1,
+                last_error="http-429",
+            ),
+            "2": _entry_for(_usage(100.0), harness.clock.now),
+            "3": _entry_for(_usage(100.0), harness.clock.now),
+        }
+        outcome = harness.tick_with_entries(entries)
+        assert outcome is TickOutcome.BLOCKED
+        assert not [e for e in harness.events if isinstance(e, AllExhaustedEvent)], (
+            "the active's own last reading held 59% headroom -- the fleet "
+            "was never measured exhausted"
+        )
+        holds = [
+            e for e in harness.events
+            if isinstance(e, NoSwitchEvent) and "active usage unknown" in e.detail
+        ]
+        assert holds, (
+            "no hold reported; events="
+            f"{[type(e).__name__ for e in harness.events]}"
+        )
+
+    def test_a_known_spent_active_still_reports_all_exhausted(self, harness):
+        """CONTROL: a genuinely spent (not unknown) active must be
+        unaffected -- the new guard only reads on `active_headroom is None`.
+        """
+        outcome = harness.tick_with_usage({
+            "1": _usage(100.0),
+            "2": _usage(100.0),
+            "3": _usage(100.0),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        exhausted = [e for e in harness.events if isinstance(e, AllExhaustedEvent)]
+        assert exhausted, "premise: a genuinely spent fleet must still be reported"
+        assert "all accounts exhausted" in exhausted[-1].human()
+
+
 class TestTheBindingRecoveryAgreesWithWhenTheAccountIsUsable:
     """`_binding_recovery_ts` and `_earliest_recovery` must not disagree about
     the SAME account, and on the ordinary exhausted shape they did.

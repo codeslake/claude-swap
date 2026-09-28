@@ -1454,15 +1454,24 @@ class UsageStore:
         write the store that often.
 
         Records nothing and returns False when the row carries any auth
-        strike (``authDeadStrikes`` > 0) or any endpoint failure
-        (``consecutiveFailures`` > 0): a header reading refreshes only a row
-        whose last endpoint fetch succeeded. Bumping ``fetchedAt`` on a
-        struck or failed row would otherwise reach past the endpoint's own
+        strike (``authDeadStrikes`` > 0), or any endpoint failure whose
+        ``lastError`` is not ``"http-429"``: a header reading refreshes only
+        a row whose last endpoint fetch either succeeded or hit the usage
+        endpoint's own budget. Bumping ``fetchedAt`` on a struck or
+        non-429-failed row would otherwise reach past the endpoint's own
         failure/strike machinery — erasing ``_strike_is_suspected_race``'s
         doubt (it compares the strike time against ``fetchedAt``) and
         letting ``entries()`` trust the row again at age 0 through the whole
-        backoff — so the strike and failure state stays keyed on the
+        backoff — so the strike and non-429 failure state stays keyed on the
         endpoint alone.
+
+        A row failed with ``http-429`` is the one exception: a reply
+        header is a genuine current reading of the ACCOUNT, and a 429 on the
+        usage endpoint (a shared budget, not an account signal) says nothing
+        about it. Recorded exactly as a healthy row is — ``lastGood`` and
+        ``fetchedAt`` update — while ``consecutiveFailures``, ``lastError``,
+        ``last429At`` and ``backoffUntil`` are left untouched, so no
+        endpoint poll is invited before the backoff itself clears.
 
         Returns True when a reading was recorded (the 5h utilization header
         was present and the row was eligible); False, recording nothing,
@@ -1478,9 +1487,9 @@ class UsageStore:
 
         def apply(_num: str, row: dict) -> None:
             nonlocal recorded
-            if (
-                int(row.get("authDeadStrikes") or 0) > 0
-                or int(row.get("consecutiveFailures") or 0) > 0
+            if int(row.get("authDeadStrikes") or 0) > 0 or (
+                int(row.get("consecutiveFailures") or 0) > 0
+                and row.get("lastError") != "http-429"
             ):
                 return
             recorded = True

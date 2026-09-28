@@ -1540,6 +1540,36 @@ class TestHeaderReading:
         assert store.record_header_reading("1", IDENT, headers) is False
         assert store.entries(IDENT)["1"] == before
 
+    def test_records_over_a_live_http_429_backoff(self, store, clock):
+        # T1514: a 429 is the usage ENDPOINT's own shared budget, not a
+        # signal about the account -- so unlike an arbitrary failure, a
+        # reply header landing mid-block is a genuine current reading and
+        # must not be refused. Measured incident (lmd42, 2026-09-28): the
+        # refusal held here left the active row blind for ~4140s of its
+        # backoff, climbing 41% -> 100% unseen.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        before = store.entries(IDENT)["1"]
+        assert before.consecutive_failures == 1
+        assert before.last_error == "http-429"
+        clock.advance(60)
+
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.41"}
+        assert store.record_header_reading("1", IDENT, headers) is True
+
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good["five_hour"]["pct"] == pytest.approx(41.0)
+        assert entry.fetched_at == clock.now
+        # The endpoint's own failure/backoff state is untouched: no poll is
+        # invited before the backoff the 429 earned actually clears.
+        assert entry.consecutive_failures == before.consecutive_failures
+        assert entry.last_error == before.last_error
+        assert entry.backoff_until == pytest.approx(before.backoff_until)
+        assert entry.last_429_at == pytest.approx(before.last_429_at)
+        # entries() reports the fresh reading, trusted.
+        assert entry.decision_value() == entry.last_good
+
 
 class TestLast429Marker:
     def test_last_429_survives_recovery(self, store, clock):
