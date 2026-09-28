@@ -911,15 +911,13 @@ def _use_native_tls() -> None:
     with its own bundled roots) is unaffected. ``truststore`` delegates to them.
 
     Best-effort: on any failure fall back to stdlib ``ssl`` rather than block
-    the CLI over a TLS-trust nicety — but SAY SO, because the fallback is not
-    trust-neutral. Measured on macOS 2026-08-17: the OS keychains carry 173
-    unique roots and stdlib loads 128, of which 67 are trusted by the OS and
-    not by stdlib. Four of those sit in /Library/Keychains/System.keychain,
-    where an administrator installs a corporate MITM CA. So a swallowed
-    failure here can withdraw the exact root the machine was configured with,
-    and the user is then told by ``ERROR_NOTES["tls-cert"]`` to trust the CA in
-    a store nothing is reading. One WARNING costs nothing on the healthy path,
-    which never reaches it.
+    the CLI over a TLS-trust nicety -- but SAY SO, because the fallback is not
+    trust-neutral. Measured on macOS, the OS keychains carry 173 unique roots
+    against stdlib's 128, and 67 are trusted by the OS and not by stdlib, four
+    of them in the system keychain where an administrator installs a corporate
+    MITM CA. A swallowed failure can withdraw the exact root the machine was
+    configured with, and ``ERROR_NOTES["tls-cert"]`` then sends the user to a
+    store nothing is reading.
     """
     try:
         import truststore
@@ -927,7 +925,7 @@ def _use_native_tls() -> None:
         truststore.inject_into_ssl()
     except Exception as e:
         _logger.warning(
-            "native TLS trust unavailable (%s: %s) — falling back to stdlib "
+            "native TLS trust unavailable (%s: %s); falling back to stdlib "
             "ssl, which does not read the OS certificate store; a CA trusted "
             "only there will not verify",
             type(e).__name__,

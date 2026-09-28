@@ -433,7 +433,7 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
             return "timeout", None
         # A TLS handshake the SERVER answered and we refused is not a
         # transport failure, and calling it one sends you to DNS while the
-        # repair is a CA bundle. Measured 2026-08-17: a TLS-terminating proxy
+        # repair is a CA bundle. Measured: a TLS-terminating proxy
         # presented a CA urllib does not trust, every poll raised
         # URLError(SSLCertVerificationError), all of it stored as "network",
         # and one account sat unpolled for ten days with that one word as the
