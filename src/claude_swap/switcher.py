@@ -20,6 +20,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
+    CredentialWriteError,
     LockError,
     SessionError,
     SwitchError,
@@ -781,6 +782,7 @@ class ClaudeAccountSwitcher:
         pass ``attributed=True`` only with the same independent proof that
         method requires.
         """
+        self._refuse_if_peer_shares_grant(account_num, email, credentials, attributed)
         self._store._check_attribution(account_num, email, credentials, attributed)
         self._store._write_backup_enc(account_num, email, credentials)
 
@@ -793,8 +795,106 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Backend-only write (no session invalidation, no dispatch): see
         ``_write_backup_enc``, same guard and same reason it exists."""
+        self._refuse_if_peer_shares_grant(account_num, email, credentials, attributed)
         self._store._check_attribution(account_num, email, credentials, attributed)
         self._store._kc_write_backup(account_num, email, credentials)
+
+    def _refuse_if_peer_shares_grant(
+        self, account_num: str, email: str, credentials: str, attributed: bool,
+    ) -> None:
+        """Refuse a write that would leave two slots holding the same
+        single-use refresh grant -- the precondition for the fan-out
+        double-spend: two slots each POST the same grant, one wins, the
+        other's lineage dies and forces a re-login inside its own grant's
+        window. Closes the write-time path that CREATES a new
+        duplicate; it does not by itself retire the consume gate's lock (an
+        attributed=True write -- the same login added under a second org,
+        for one -- can still leave a peer holding matching bytes, since
+        ``attributed`` attests IDENTITY, never NON-DUPLICATION).
+
+        Scoped to the ``sha256:`` fingerprint arm only. ``sha256-full:`` is
+        a raw setup-token with no ``refreshToken``, and one pasted into two
+        slots on purpose is a SUPPORTED shape, not this defect --
+        ``add_account_from_token`` itself always writes ``attributed=True``
+        and never reaches this arm either way; what it exempts is the two
+        unattributed writers below that could otherwise re-refuse an
+        already-duplicated setup-token account.
+
+        Skipped whenever ``attributed`` is True: every ``attributed=True``
+        call site already independently verified this write's identity, and
+        several of them (a slot swap, a relocate) legitimately hold the same
+        bytes in two slots for the instant between the two halves of a move.
+        By the same token every write on the consume gate's fan-out
+        (``_consume_backup_grant_locked``, ``_fetch_active_usage``) is
+        always attributed=True, so this guard costs it nothing -- the only
+        payers are the rare unattributed writes (a switch's own-family
+        resync, a session-bootstrap seam), each an O(other slots) read,
+        never a network call.
+
+        Reads each peer with ``_read_account_credentials_direct`` -- this
+        slot's own key, never a merge partner's renumber-fallback sweep for
+        the same email under a different slot (see
+        ``_check_attribution``'s docstring) -- and refuses on a peer whose
+        backup could not be read at all, the same fail-closed rule
+        ``_check_attribution`` already applies to THIS slot's own prior
+        state: unreadable is "cannot verify", which refuses like a
+        mismatch, never "empty", which would permit like an absent slot.
+        """
+        # ponytail: refuses the write that would CREATE a new duplicate, not
+        # a backfill scan for one already on disk before this guard existed
+        # -- the fleet's own zero-collision reading is what makes that
+        # ceiling acceptable today.
+        if attributed:
+            return
+        fp = oauth.credential_fingerprint(credentials)
+        if not fp or not fp.startswith("sha256:"):
+            return
+        own_failed: list = []
+        own_creds = self._store._read_account_credentials_direct(
+            account_num, email, own_failed
+        )
+        if own_creds and oauth.credential_fingerprint(own_creds) == fp:
+            # This slot's own stored backup already carries this exact
+            # fingerprint -- an own-family resync writing back what the
+            # slot already held creates no NEW duplicate, even if a peer
+            # also shares it from before this guard existed.
+            return
+        data = self._get_sequence_data() or {}
+        for num in data.get("sequence", []):
+            peer_num = str(num)
+            if peer_num == str(account_num):
+                continue
+            peer_email = data.get("accounts", {}).get(peer_num, {}).get(
+                "email", "unknown"
+            )
+            failed: list = []
+            peer_creds = self._store._read_account_credentials_direct(
+                peer_num, peer_email, failed
+            )
+            if bool(failed) and not peer_creds:
+                self._logger.error(
+                    "Refusing to write Account-%s-%s's backup: Account-%s's "
+                    "own backup could not be read to verify it does not "
+                    "already hold this grant. Retry once it is readable.",
+                    account_num, email, peer_num,
+                )
+                raise CredentialWriteError(
+                    f"Refusing write into Account-{account_num} ({email}): "
+                    f"Account-{peer_num}'s backup is unreadable, so it "
+                    "cannot be ruled out as already holding this grant"
+                )
+            if peer_creds and oauth.credential_fingerprint(peer_creds) == fp:
+                self._logger.error(
+                    "Refusing to write Account-%s-%s's backup: Account-%s "
+                    "already holds this exact refresh grant, and writing it "
+                    "here too would let both slots race to spend it once. "
+                    "Log in fresh for one of them: cswap add --slot %s",
+                    account_num, email, peer_num, account_num,
+                )
+                raise CredentialWriteError(
+                    f"Refusing write into Account-{account_num} ({email}): "
+                    f"Account-{peer_num} already holds this refresh grant"
+                )
 
     def _delete_backup_keychain_quiet(self, account_num: str, email: str) -> None:
         self._store._delete_backup_keychain_quiet(account_num, email)
@@ -871,6 +971,7 @@ class ClaudeAccountSwitcher:
         ``Exception`` disarmed exactly that guard for every write routing
         through here.
         """
+        self._refuse_if_peer_shares_grant(account_num, email, credentials, attributed)
         self._store._write_account_credentials(
             account_num, email, credentials, attributed=attributed
         )
