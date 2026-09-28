@@ -2464,14 +2464,16 @@ class TestAdaptiveScheduler:
         # #2's reading is adopted from another machine: 30s old at hand-over
         # (fresher than #2's own t0 fetch, so `adopt` actually replaces it),
         # held for 480s more. By the time phase 2 re-checks it below, it has
-        # aged past SERVE_TTL_S (180s) on its own.
+        # aged past both SERVE_TTL_S (180s) and STALE_OK_S (300s) on its
+        # own, so it is trusted only through the still-live hold.
         adopted = h.switcher._usage_store.adopt(
             {"2": (_usage7(10, 10, _R_LATER), 30.0)},
             {"2": ("b@example.com", "")},
             hold_s=480.0,
         )
         assert adopted == {"2"}  # premise: this is an ADOPTED reading
-        h.clock.advance(181)                   # active's plan is due again
+        # 320s past adoption (age 350s): past STALE_OK_S, hold lifts at 480s.
+        h.clock.advance(320)
         h.events.clear()
         # The active refetch now reports the LATEST reset, so stored #2
         # (adopted, held, stale by TTL) is the provisional pick — phase 2

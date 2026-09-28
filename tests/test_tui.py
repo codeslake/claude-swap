@@ -3664,20 +3664,19 @@ class TestUnswitchableRowsAreListed:
     def test_panel_names_a_held_import_the_top_pick_when_the_engine_switches_to_it(
         self, temp_home, monkeypatch
     ):
-        """T1531 (b): a candidate's freshness gate (`candidate_usage_is_
-        stale`, autoswitch.py) now accepts a HELD reading (`cswap
-        import-usage`) too, so a consume-first tick can switch to a
-        target that is stale by `SERVE_TTL_S` on its own but still held.
-        The panel's ranking never gated on that freshness bar at all --
-        `rank_switch_candidates` reads `decision_value()`, which already
-        trusts a held row through `trust_extended` -- so it must already
-        show the held row as the top pick, both before and after the
-        gate fix, whenever the engine actually switches to it. Resets are
-        real-clock future timestamps, not the engine suite's own FakeClock
-        literals: the panel's own ranking runs on `time.time()`, and a
-        reset already past THAT clock reads as unknown
-        (`_seven_day_reset_ts`), which would refuse every candidate for a
-        reason that has nothing to do with this test."""
+        """A candidate's freshness gate (`candidate_usage_is_stale`,
+        autoswitch.py) accepts a HELD reading (`cswap import-usage`) too,
+        so a consume-first tick can switch to a target that is stale by
+        `SERVE_TTL_S` on its own but still held. The panel's ranking
+        never gated on that freshness bar at all -- `rank_switch_
+        candidates` reads `decision_value()`, which already trusts a
+        held row through `trust_extended` -- so it must show the held
+        row as the top pick whenever the engine actually switches to it.
+        Resets are real-clock future timestamps, not the engine suite's
+        own FakeClock literals: the panel's own ranking runs on
+        `time.time()`, and a reset already past THAT clock reads as
+        unknown (`_seven_day_reset_ts`), which would refuse every
+        candidate for a reason that has nothing to do with this test."""
         from unittest.mock import patch
 
         from claude_swap import oauth
@@ -3732,7 +3731,10 @@ class TestUnswitchableRowsAreListed:
             {"2": (w(10, 10, 240), 30.0)},
             {"2": ("b@x.invalid", "")}, hold_s=480.0,
         )
-        h.clock.advance(181)  # #2 is now stale by SERVE_TTL_S on its own
+        # 320s past adoption (age 350s): stale by SERVE_TTL_S (180s) *and*
+        # past STALE_OK_S (300s) -- trusted only through the still-live
+        # hold (lifts at 480s), never through age alone.
+        h.clock.advance(320)
 
         with patch(
             "claude_swap.oauth.try_fetch_usage_for_account",
