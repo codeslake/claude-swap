@@ -2524,6 +2524,71 @@ class TestActiveAccountRefresh:
         assert result.sentinel is None
         write_live.assert_called_once_with(self._REFRESHED)
 
+    def test_backup_write_failure_and_live_refusal_stashes_the_successor(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A consumed grant may never end up nowhere: when the backup write
+        raises AND the roster-active guard refuses the live write, the
+        POSTed successor must still reach the unclaimed stash -- the same
+        shape the gate's own stash uses (configSlot, consumedFp) -- so a
+        later adopt pass can recover it instead of the generation
+        vanishing with no record anywhere."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=""), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=Exception("backup write failed"),
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        write_live.assert_not_called()
+        mock_fetch.assert_not_called()
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id, entry) = next(iter(entries.items()))
+        assert entry["configSlot"] == "1"
+        assert entry["consumedFp"] == oauth.credential_fingerprint(self._EXPIRED)
+        assert _read_safety_copy(switcher, entry_id) == self._REFRESHED
+
+    def test_CONTROL_a_successful_backup_write_needs_no_stash(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Positive control: when the backup write succeeds, the successor
+        already survives in the slot's own backup and nothing is stashed --
+        otherwise the RED test above would pass just as well for code that
+        stashes unconditionally."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=""), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        write_live.assert_not_called()
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED, attributed=True
+        )
+        mock_fetch.assert_not_called()
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        assert switcher.list_unclaimed_credentials() == {}
+
     def test_identity_check_compares_organization_too(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):

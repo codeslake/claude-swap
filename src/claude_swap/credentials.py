@@ -1330,9 +1330,9 @@ class CredentialStore:
         an UNREADABLE populated slot (a locked/denied Keychain, an EIO'd
         ``.enc``) exactly as it does for a genuinely absent one, and
         treating those alike disables the guard on any host where a
-        process can't read its own Keychain (ssh/launchd on macOS, per
-        CONTEXT.md) — precisely where the incident this guard exists for
-        lives. Unreadable is "cannot verify", which refuses like a
+        process can't read its own Keychain (ssh/launchd on macOS) —
+        precisely where the incident this guard exists for lives.
+        Unreadable is "cannot verify", which refuses like a
         mismatch, not "empty", which would permit like an absent slot.
 
         Marks ``self._in_attribution_read`` around the read. Nothing on this

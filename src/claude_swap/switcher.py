@@ -1022,8 +1022,8 @@ class ClaudeAccountSwitcher:
         """
         # ponytail: refuses the write that would CREATE a new duplicate, not
         # a backfill scan for one already on disk before this guard existed
-        # -- the fleet's own zero-collision reading is what makes that
-        # ceiling acceptable today.
+        # -- a census finding no existing duplicate across the managed
+        # accounts is what makes that ceiling acceptable today.
         if attributed:
             return
         fp = oauth.credential_fingerprint(credentials)
@@ -2718,8 +2718,8 @@ class ClaudeAccountSwitcher:
             # file at this exact instant raises `ConfigError` straight
             # through `try_refresh_oauth_credentials` (whose own `condemned`
             # call is likewise unguarded) and `consume_backup_grant`
-            # (try/finally, no except), killing the whole collect pass. R1:
-            # unreadable is absence of evidence, never a refusal — caught
+            # (try/finally, no except), killing the whole collect pass.
+            # Unreadable is absence of evidence, never a refusal — caught
             # here and reported as "no evidence" rather than left to raise.
             try:
                 return self._probe_verdicts.get(
@@ -5199,7 +5199,7 @@ class ClaudeAccountSwitcher:
                         # `_condemned`: this runs outside the locked `try`
                         # below, and `_lineage_key` reads `sequence.json`
                         # with `strict=True`, raising `ConfigError` on a
-                        # torn/unreadable file. R1: unreadable is absence of
+                        # torn/unreadable file. Unreadable is absence of
                         # evidence, never a refusal — caught here instead of
                         # escaping uncaught through `_fetch_active_usage`
                         # (whose caller, `_fetch_account_usage`, promises
@@ -5536,8 +5536,8 @@ class ClaudeAccountSwitcher:
                             # Same shape as `_consume_backup_grant_locked`'s
                             # `_condemned`: `_lineage_key` reads
                             # `sequence.json` with `strict=True` and raises
-                            # `ConfigError` on a torn/unreadable file. R1:
-                            # unreadable is absence of evidence, never a
+                            # `ConfigError` on a torn/unreadable file.
+                            # Unreadable is absence of evidence, never a
                             # refusal — caught here instead of escaping to
                             # this call's own blanket `except Exception`
                             # (below), which would otherwise defer a live
@@ -5617,7 +5617,7 @@ class ClaudeAccountSwitcher:
                             # too (mirrors try_fetch_usage_for_account's own
                             # retry-branch treatment) — collapsing it to the
                             # generic "refresh-failed" hides the one signal
-                            # this round exists to produce. No strike either
+                            # this branch exists to produce. No strike either
                             # way: struck_fp is only set in the branch above.
                             return FetchRecord(
                                 error=result.error
@@ -5679,14 +5679,37 @@ class ClaudeAccountSwitcher:
                         live_ok = False
                         self._logger.warning(
                             "Active-store write failed after a %s for "
-                            "account %s%s.",
+                            "account %s.",
                             "backup restore" if restore_source is not None
                             else "consumed refresh",
                             account_num,
-                            "" if backup_ok
-                            else "; the rotated credential was NOT persisted "
-                                 "anywhere — re-login may be required",
                         )
+                    if not backup_ok and not live_ok:
+                        # The grant is consumed and neither store holds the
+                        # successor (a refused live write is a return value,
+                        # not an exception, so the handler above never sees
+                        # it): stash it in the consume gate's shape, keyed
+                        # on the generation it superseded, so the next gate
+                        # pass adopts it.
+                        try:
+                            self._store._write_unclaimed_credential(
+                                working,
+                                {
+                                    "reason": "recovery-write-refused",
+                                    "configSlot": account_num,
+                                    "consumedFp": oauth.credential_fingerprint(
+                                        refresh_input
+                                    ),
+                                },
+                            )
+                        except Exception:
+                            self._logger.warning(
+                                "Backup and active-store writes failed after "
+                                "a consumed refresh for account %s; the "
+                                "rotated credential was NOT persisted "
+                                "anywhere — re-login may be required.",
+                                account_num,
+                            )
                     if not live_ok:
                         # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.

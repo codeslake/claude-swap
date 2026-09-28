@@ -525,7 +525,7 @@ class TestTryRefreshOAuthCredentials:
         assert outcome.error == "no_refresh_token"
 
     def test_condemned_true_refuses_before_any_network_call(self):
-        """R1's polarity, proven at the chokepoint itself: a CONFIRMED
+        """The guard's polarity, proven at the chokepoint itself: a CONFIRMED
         mismatch refuses without a single byte on the wire."""
         with patch("claude_swap.oauth.urllib.request.urlopen") as mock_urlopen:
             outcome = oauth.try_refresh_oauth_credentials(
@@ -539,7 +539,8 @@ class TestTryRefreshOAuthCredentials:
         """Positive control: without this, the RED test above would pass
         just as well for a guard that refuses every refresh. Absence of
         evidence (``condemned`` returning False, or not passed at all) must
-        never refuse — that is the harm R1 exists to prevent."""
+        never refuse — refusing a legitimate refresh is the harm the guard
+        exists to prevent."""
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps({
             "access_token": "new-access",
