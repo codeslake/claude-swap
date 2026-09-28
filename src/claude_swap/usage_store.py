@@ -750,6 +750,11 @@ def _failure_backoff_s(
         #     block 2  wait [ 4500,  9000]  trust ends   360  blind   4500s (whole block)
         #     block 3  wait [ 9000, 13500]  trust ends   360  blind   4500s (whole block)
         #
+        # record_header_reading (T1514) is the one exception: a reply header
+        # can refresh `fetchedAt` on an http-429 row mid-block without a
+        # `record()` success, shortening these figures when the pin's own
+        # traffic supplies one.
+        #
         # That is the tradeoff this margin makes in exchange for fewer
         # requests, and it is worth stating at its true, now much larger,
         # size rather than as a single-block figure.
@@ -957,7 +962,8 @@ def _failure_backoff_s(
     #
     # And the wait cannot move the deadline it was clipping against.
     # `entries()` decides trust from `lastGood`/`fetchedAt`, which `record()`
-    # writes in the SUCCESS branch only — a 429 refreshes neither. So the
+    # writes in the SUCCESS branch only — a 429 refreshes neither (unless a
+    # header reading lands one, record_header_reading, T1514). So the
     # instant the row goes unknown is fixed by the last successful fetch, and a
     # shorter wait only samples that same instant more often, one request each.
     # Un-pollable and unknown are independent axes; the previous round treated
@@ -1447,7 +1453,8 @@ class UsageStore:
         never pulled EARLIER than a plan already in place), so while replies
         keep flowing the endpoint is still asked at least every
         ``CANDIDATE_MAX_INTERVAL_S`` for what these headers don't carry,
-        instead of on every scheduled tick.
+        instead of on every scheduled tick -- except an http-429 row, which
+        stays un-probed until ``backoffUntil`` regardless of ``nextPollAt``.
 
         Callers must throttle themselves — the pin calls this at most once
         per 30s per slot; a hot path replying every request would otherwise

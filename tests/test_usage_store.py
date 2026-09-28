@@ -1540,6 +1540,31 @@ class TestHeaderReading:
         assert store.record_header_reading("1", IDENT, headers) is False
         assert store.entries(IDENT)["1"] == before
 
+    def test_skips_a_row_that_is_both_auth_struck_and_http_429(self, store, clock):
+        # T1514 [m5]: the http-429 carve-out is scoped to the
+        # consecutiveFailures arm alone. A row that carries an auth strike
+        # TOO must still refuse -- authDeadStrikes wins regardless of
+        # lastError, or the strike-race doubt (_strike_is_suspected_race)
+        # would be erased by the very reading meant to relieve a budget
+        # failure that carries no information about the strike.
+        store.path.parent.mkdir(parents=True, exist_ok=True)
+        store.path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                "1": {
+                    "email": IDENT["1"][0],
+                    "organizationUuid": IDENT["1"][1],
+                    "authDeadStrikes": 1,
+                    "consecutiveFailures": 1,
+                    "lastError": "http-429",
+                }
+            },
+        }), encoding="utf-8")
+        before = store.entries(IDENT)["1"]
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        assert store.record_header_reading("1", IDENT, headers) is False
+        assert store.entries(IDENT)["1"] == before
+
     def test_records_over_a_live_http_429_backoff(self, store, clock):
         # T1514: a 429 is the usage ENDPOINT's own shared budget, not a
         # signal about the account -- so unlike an arbitrary failure, a
