@@ -5679,6 +5679,50 @@ class TestConsumeFirstProbesAnUnknownReset:
             "account must not be reprobed just because its headroom is best"
         )
 
+    def test_a_held_candidate_is_not_selected_as_the_probe_target(
+        self, temp_home
+    ):
+        """`adopt` backdates an imported reading's ``fetchedAt`` by its own
+        age, so a held row can still read ``fresh()`` for up to 180s minus
+        that age -- but ``_row_eligible`` refuses to fetch anything held,
+        so admitting it here would spend the tick's one probe slot on a
+        candidate that cannot resolve its unmeasured reset until the hold
+        lifts. Same shape as the cooldown case above: the would-be probe
+        target is excluded, so the tick falls through to account 3's own
+        known, sooner reset."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": UsageEntry(
+                last_good=_usage7(20, 20, _R_LATER), fetched_at=now, age_s=0.0
+            ),
+            "2": UsageEntry(
+                last_good=_usage7(10, 10),  # unknown reset, best headroom --
+                fetched_at=now,             # fresh, but HELD
+                age_s=0.0,
+                held_until=now + 100.0,
+            ),
+            "3": UsageEntry(
+                last_good=_usage7(10, 10, _R_SOON), fetched_at=now, age_s=0.0
+            ),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            f"got {h.active_number()} — a held unknown-reset account must "
+            "not be picked as the probe target; it cannot be fetched while "
+            "held"
+        )
+
+        # Control: the identical candidate, unheld, IS admitted -- the fix
+        # must not also refuse an ordinary fresh candidate.
+        unheld = UsageEntry(
+            last_good=_usage7(10, 10), fetched_at=now, age_s=0.0
+        )
+        assert autoswitch_mod._probe_source_fresh({"2": unheld}, "2", now), (
+            "an unheld, fresh candidate must still be admitted as a probe "
+            "source"
+        )
+
     def test_a_probe_switch_records_the_cooldown(self, temp_home):
         h = self._harness(temp_home)
         h.tick_with_usage({
