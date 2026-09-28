@@ -922,13 +922,33 @@ class TestNativeTlsFallbackIsAudible:
 
     def test_a_successful_injection_stays_quiet(self, caplog):
         """The control: the normal path must not warn, or the warning is noise
-        every run and stops being read."""
+        every run and stops being read.
+
+        It also puts ssl back. ``inject_into_ssl`` is process-global with no
+        automatic undo, so without the ``finally`` every later
+        ``ssl.create_default_context()`` on this worker returns a
+        ``truststore`` context, a different class with a different API.
+        """
         import logging
+        import ssl
         from claude_swap import cli
 
-        with caplog.at_level(logging.WARNING):
-            cli._use_native_tls()
-        assert not [r for r in caplog.records if "truststore" in r.getMessage().lower()]
+        try:
+            with caplog.at_level(logging.WARNING):
+                cli._use_native_tls()
+            assert not [r for r in caplog.records
+                        if "truststore" in r.getMessage().lower()]
+        finally:
+            try:
+                import truststore
+
+                truststore.extract_from_ssl()
+            except Exception:  # noqa: BLE001 -- nothing to undo is fine
+                pass
+
+        assert type(ssl.create_default_context()).__module__ == "ssl", (
+            "this test left truststore injected into ssl"
+        )
 
 
 class TestClassifyUsageError:
