@@ -1596,6 +1596,61 @@ class TestHeaderReading:
         assert store.record_header_reading("1", IDENT, headers) is False
         assert store.entries(IDENT)["1"] == before
 
+    def test_skips_a_row_that_is_both_auth_struck_and_http_429(self, store, clock):
+        # T1514 [m5]: the http-429 carve-out is scoped to the
+        # consecutiveFailures arm alone. A row that carries an auth strike
+        # TOO must still refuse -- authDeadStrikes wins regardless of
+        # lastError, or the strike-race doubt (_strike_is_suspected_race)
+        # would be erased by the very reading meant to relieve a budget
+        # failure that carries no information about the strike.
+        store.path.parent.mkdir(parents=True, exist_ok=True)
+        store.path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                "1": {
+                    "email": IDENT["1"][0],
+                    "organizationUuid": IDENT["1"][1],
+                    "authDeadStrikes": 1,
+                    "consecutiveFailures": 1,
+                    "lastError": "http-429",
+                }
+            },
+        }), encoding="utf-8")
+        before = store.entries(IDENT)["1"]
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+        assert store.record_header_reading("1", IDENT, headers) is False
+        assert store.entries(IDENT)["1"] == before
+
+    def test_records_over_a_live_http_429_backoff(self, store, clock):
+        # T1514: a 429 is the usage ENDPOINT's own shared budget, not a
+        # signal about the account -- so unlike an arbitrary failure, a
+        # reply header landing mid-block is a genuine current reading and
+        # must not be refused. Measured incident (lmd42, 2026-09-28): the
+        # refusal held here left the active row blind for ~4140s of its
+        # backoff, climbing 41% -> 100% unseen.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        before = store.entries(IDENT)["1"]
+        assert before.consecutive_failures == 1
+        assert before.last_error == "http-429"
+        clock.advance(60)
+
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.41"}
+        assert store.record_header_reading("1", IDENT, headers) is True
+
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good["five_hour"]["pct"] == pytest.approx(41.0)
+        assert entry.fetched_at == clock.now
+        # The endpoint's own failure/backoff state is untouched: no poll is
+        # invited before the backoff the 429 earned actually clears.
+        assert entry.consecutive_failures == before.consecutive_failures
+        assert entry.last_error == before.last_error
+        assert entry.backoff_until == pytest.approx(before.backoff_until)
+        assert entry.last_429_at == pytest.approx(before.last_429_at)
+        # entries() reports the fresh reading, trusted.
+        assert entry.decision_value() == entry.last_good
+
 
 class TestLast429Marker:
     def test_last_429_survives_recovery(self, store, clock):

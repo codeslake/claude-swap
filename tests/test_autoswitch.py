@@ -49,9 +49,15 @@ from claude_swap.autoswitch import (
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import SERVE_TTL_S, STALE_OK_S, FetchRecord, UsageEntry
+from claude_swap.json_output import (
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.paths import get_credentials_path
 from claude_swap.usage_store import (
     USAGE_HEADER_5H_PCT,
+    WALL_FALLBACK_S,
     FetchRecord,
     UsageEntry,
     UsageStore,
@@ -16936,6 +16942,247 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
             "an ordinary hysteresis block was announced as a wait with an end"
         )
         assert harness.engine._sleep_until_ts is None
+
+
+class TestActiveUnknownIsNotReportedAsAnExhaustedFleet:
+    """lmd42, 2026-09-28: the active row went blind under a live usage-
+    endpoint 429 backoff (record_header_reading's now-lifted refusal,
+    usage_store.py) while its last real reading held 59% headroom. Every
+    candidate genuinely was spent, and the engine reported `all accounts
+    exhausted` over a row nobody had actually measured as spent this tick --
+    `truly_exhausted` only ever asked about the CANDIDATES.
+    """
+
+    def test_active_unknown_with_a_healthy_last_read_holds(self, harness):
+        harness.engine.settings = replace(harness.engine.settings, unhealthy_ticks=1)
+        entries = {
+            "1": UsageEntry(
+                last_good=_usage(41.0),  # 59% headroom, well under threshold
+                fetched_at=harness.clock.now - 5000.0,
+                age_s=5000.0,
+                consecutive_failures=1,
+                last_error="http-429",
+            ),
+            "2": _entry_for(_usage(100.0), harness.clock.now),
+            "3": _entry_for(_usage(100.0), harness.clock.now),
+        }
+        outcome = harness.tick_with_entries(entries)
+        assert outcome is TickOutcome.BLOCKED
+        assert not [e for e in harness.events if isinstance(e, AllExhaustedEvent)], (
+            "the active's own last reading held 59% headroom -- the fleet "
+            "was never measured exhausted"
+        )
+        holds = [
+            e for e in harness.events
+            if isinstance(e, NoSwitchEvent) and "active usage unknown" in e.detail
+        ]
+        assert holds, (
+            "no hold reported; events="
+            f"{[type(e).__name__ for e in harness.events]}"
+        )
+
+    def test_a_known_spent_active_still_reports_all_exhausted(self, harness):
+        """CONTROL: a genuinely spent (not unknown) active must be
+        unaffected -- the new guard only reads on `active_headroom is None`.
+        """
+        outcome = harness.tick_with_usage({
+            "1": _usage(100.0),
+            "2": _usage(100.0),
+            "3": _usage(100.0),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        exhausted = [e for e in harness.events if isinstance(e, AllExhaustedEvent)]
+        assert exhausted, "premise: a genuinely spent fleet must still be reported"
+        assert "all accounts exhausted" in exhausted[-1].human()
+
+    def _blind_active_entry(self, now, age_s=5000.0):
+        """A row that read http-429 last attempt, decision-unknown this tick
+        (``age_s`` past ``STALE_OK_S``), holding a healthy last-good 41%
+        (59% headroom)."""
+        return UsageEntry(
+            last_good=_usage(41.0),
+            fetched_at=now - age_s,
+            age_s=age_s,
+            consecutive_failures=1,
+            last_error="http-429",
+        )
+
+    def _assert_still_reports_all_exhausted(self, harness, message):
+        exhausted = [e for e in harness.events if isinstance(e, AllExhaustedEvent)]
+        assert exhausted, message
+        assert not any(
+            isinstance(e, NoSwitchEvent) and "active usage unknown" in (e.detail or "")
+            for e in harness.events
+        )
+
+    def test_hold_arms_the_same_wait_as_all_exhausted(self, harness):
+        """[I]: the hold must be armed AT the all-exhausted emit point, after
+        `_blocked_wait_long`/`_sleep_until_ts` are set -- so a hold tick sleeps
+        exactly as long as the all-exhausted tick it replaces, instead of
+        dropping to the ordinary ~60s cadence (`_next_delay`, autoswitch.py).
+        """
+        harness.engine.settings = replace(harness.engine.settings, unhealthy_ticks=1)
+        now = harness.clock.now
+        entries = {
+            "1": self._blind_active_entry(now),
+            "2": UsageEntry(
+                last_good=_usage(100.0, "2026-07-03T10:57:00Z"),
+                fetched_at=now, age_s=0.0,
+            ),
+            "3": UsageEntry(
+                last_good=_usage(100.0, "2026-07-03T12:00:00Z"),
+                fetched_at=now, age_s=0.0,
+            ),
+        }
+        outcome = harness.tick_with_entries(entries)
+        assert outcome is TickOutcome.BLOCKED
+        holds = [
+            e for e in harness.events
+            if isinstance(e, NoSwitchEvent) and "active usage unknown" in (e.detail or "")
+        ]
+        assert holds, [type(e).__name__ for e in harness.events]
+        assert harness.engine._blocked_wait_long is True
+        from datetime import datetime, timezone
+        expected = (
+            datetime.fromisoformat("2026-07-03T10:57:00+00:00").timestamp()
+            + poll_policy.RESET_SLACK_S
+        )
+        assert harness.engine._sleep_until_ts == pytest.approx(expected), (
+            "the hold must arm the same reset-aware sleep the all-exhausted "
+            f"case would have: {harness.engine._sleep_until_ts}"
+        )
+        delay = harness.engine._next_delay(outcome)
+        assert delay > 2 * harness.settings.interval_seconds, (
+            f"delay={delay}: dropped to the ordinary cadence instead of "
+            "sleeping toward the earliest candidate reset"
+        )
+
+    def test_a_merely_unreadable_candidate_is_not_reported_as_a_hold(self, harness):
+        """[m1]: the hold used to be checked BEFORE the no-qualifying-
+        candidate return, so it also swallowed that reason whenever a
+        CANDIDATE was merely unreadable (not exhausted) this tick, on an
+        active that is itself blind with a healthy last read. Moving the
+        check past that return (the [I] fix) restores it: this state is
+        `no-qualifying-candidate`, never a "holding" line about the active.
+        """
+        harness.engine.settings = replace(harness.engine.settings, unhealthy_ticks=1)
+        now = harness.clock.now
+        entries = {
+            "1": self._blind_active_entry(now),
+            "2": UsageEntry(),  # unreadable this tick, not exhausted
+            "3": _entry_for(_usage(100.0), now),
+        }
+        outcome = harness.tick_with_entries(entries)
+        assert outcome is TickOutcome.BLOCKED
+        assert not any(isinstance(e, AllExhaustedEvent) for e in harness.events)
+        no_switches = [e for e in harness.events if isinstance(e, NoSwitchEvent)]
+        reasons = [e.reason for e in no_switches]
+        assert reasons == ["no-qualifying-candidate"], reasons
+        assert not any("active usage unknown" in (e.detail or "") for e in no_switches)
+
+    def test_a_disabled_active_with_a_healthy_last_read_still_reports_all_exhausted(
+        self, harness
+    ):
+        """[m2] row: `disabled-active` is a deliberate, non-budget reason the
+        active went blind -- the user asked it out of rotation regardless of
+        its own usage, so a "holding" line over it would misname the cause.
+        """
+        harness.switcher.set_account_disabled("1", True)
+        now = harness.clock.now
+        entries = {
+            "1": self._blind_active_entry(now),
+            "2": _entry_for(_usage(100.0), now),
+            "3": _entry_for(_usage(100.0), now),
+        }
+        outcome = harness.tick_with_entries(entries)
+        assert outcome is TickOutcome.BLOCKED
+        self._assert_still_reports_all_exhausted(
+            harness, "a disabled active's own blindness must not hold the fleet"
+        )
+
+    def test_a_relogin_required_active_still_reports_all_exhausted(self, harness):
+        """[m2] row: `USAGE_RELOGIN_REQUIRED` says the stored credential's own
+        refresh failed -- a real account problem, not the usage endpoint's
+        shared budget -- so it must not be read as the kind of blindness the
+        hold exists for, even carrying a healthy last-good reading.
+        """
+        harness.engine.settings = replace(harness.engine.settings, unhealthy_ticks=1)
+        now = harness.clock.now
+        entries = {
+            "1": UsageEntry(
+                sentinel=USAGE_RELOGIN_REQUIRED,
+                last_good=_usage(41.0),
+                fetched_at=now - 5000.0,
+                age_s=5000.0,
+            ),
+            "2": _entry_for(_usage(100.0), now),
+            "3": _entry_for(_usage(100.0), now),
+        }
+        outcome = harness.tick_with_entries(entries)
+        assert outcome is TickOutcome.BLOCKED
+        self._assert_still_reports_all_exhausted(
+            harness, "a relogin-required active must not be reported as holding"
+        )
+
+    def test_a_stale_last_good_still_reports_all_exhausted(self, harness):
+        """[m2] row: a last-good reading older than WALL_FALLBACK_S (the
+        widest ordinary window: 5h) has outlived its own window's
+        usefulness -- it proves nothing about the active NOW, so it must not
+        stand in for a fresh reading.
+        """
+        harness.engine.settings = replace(harness.engine.settings, unhealthy_ticks=1)
+        now = harness.clock.now
+        entries = {
+            "1": self._blind_active_entry(now, age_s=WALL_FALLBACK_S + 1.0),
+            "2": _entry_for(_usage(100.0), now),
+            "3": _entry_for(_usage(100.0), now),
+        }
+        outcome = harness.tick_with_entries(entries)
+        assert outcome is TickOutcome.BLOCKED
+        self._assert_still_reports_all_exhausted(
+            harness, "a last-good reading past its window's usefulness must not hold"
+        )
+
+    def test_an_unhealthy_last_read_still_reports_all_exhausted(self, harness):
+        """[m6] row: the active's last-known reading was AT/ABOVE the
+        threshold (not "healthy") -- deleting the `< settings.threshold`
+        comparison must fail this.
+        """
+        harness.engine.settings = replace(harness.engine.settings, unhealthy_ticks=1)
+        now = harness.clock.now
+        entries = {
+            "1": UsageEntry(
+                last_good=_usage(95.0),  # 5% headroom: at/over the threshold
+                fetched_at=now - 5000.0,
+                age_s=5000.0,
+                consecutive_failures=1,
+                last_error="http-429",
+            ),
+            "2": _entry_for(_usage(100.0), now),
+            "3": _entry_for(_usage(100.0), now),
+        }
+        outcome = harness.tick_with_entries(entries)
+        assert outcome is TickOutcome.BLOCKED
+        self._assert_still_reports_all_exhausted(
+            harness, "an unhealthy last read must not hold the fleet"
+        )
+
+    def test_no_last_good_read_still_reports_all_exhausted(self, harness):
+        """[m6] row: the active has no last-good reading at all -- deleting
+        the `last_active_headroom is not None` guard must fail this.
+        """
+        harness.engine.settings = replace(harness.engine.settings, unhealthy_ticks=1)
+        now = harness.clock.now
+        entries = {
+            "1": UsageEntry(),  # never measured
+            "2": _entry_for(_usage(100.0), now),
+            "3": _entry_for(_usage(100.0), now),
+        }
+        outcome = harness.tick_with_entries(entries)
+        assert outcome is TickOutcome.BLOCKED
+        self._assert_still_reports_all_exhausted(
+            harness, "an active with no last-good read must not hold the fleet"
+        )
 
 
 class TestTheBindingRecoveryAgreesWithWhenTheAccountIsUsable:

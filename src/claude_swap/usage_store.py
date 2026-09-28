@@ -832,6 +832,11 @@ def _failure_backoff_s(
         #     block 2  wait [ 4500,  9000]  trust ends   360  blind   4500s (whole block)
         #     block 3  wait [ 9000, 13500]  trust ends   360  blind   4500s (whole block)
         #
+        # record_header_reading (T1514) is the one exception: a reply header
+        # can refresh `fetchedAt` on an http-429 row mid-block without a
+        # `record()` success, shortening these figures when the pin's own
+        # traffic supplies one.
+        #
         # That is the tradeoff this margin makes in exchange for fewer
         # requests, and it is worth stating at its true, now much larger,
         # size rather than as a single-block figure.
@@ -1039,7 +1044,8 @@ def _failure_backoff_s(
     #
     # And the wait cannot move the deadline it was clipping against.
     # `entries()` decides trust from `lastGood`/`fetchedAt`, which `record()`
-    # writes in the SUCCESS branch only — a 429 refreshes neither. So the
+    # writes in the SUCCESS branch only — a 429 refreshes neither (unless a
+    # header reading lands one, record_header_reading, T1514). So the
     # instant the row goes unknown is fixed by the last successful fetch, and a
     # shorter wait only samples that same instant more often, one request each.
     # Un-pollable and unknown are independent axes; the previous round treated
@@ -1529,22 +1535,32 @@ class UsageStore:
         never pulled EARLIER than a plan already in place), so while replies
         keep flowing the endpoint is still asked at least every
         ``CANDIDATE_MAX_INTERVAL_S`` for what these headers don't carry,
-        instead of on every scheduled tick.
+        instead of on every scheduled tick -- except an http-429 row, which
+        stays un-probed until ``backoffUntil`` regardless of ``nextPollAt``.
 
         Callers must throttle themselves — the pin calls this at most once
         per 30s per slot; a hot path replying every request would otherwise
         write the store that often.
 
         Records nothing and returns False when the row carries any auth
-        strike (``authDeadStrikes`` > 0) or any endpoint failure
-        (``consecutiveFailures`` > 0): a header reading refreshes only a row
-        whose last endpoint fetch succeeded. Bumping ``fetchedAt`` on a
-        struck or failed row would otherwise reach past the endpoint's own
+        strike (``authDeadStrikes`` > 0), or any endpoint failure whose
+        ``lastError`` is not ``"http-429"``: a header reading refreshes only
+        a row whose last endpoint fetch either succeeded or hit the usage
+        endpoint's own budget. Bumping ``fetchedAt`` on a struck or
+        non-429-failed row would otherwise reach past the endpoint's own
         failure/strike machinery — erasing ``_strike_is_suspected_race``'s
         doubt (it compares the strike time against ``fetchedAt``) and
         letting ``entries()`` trust the row again at age 0 through the whole
-        backoff — so the strike and failure state stays keyed on the
+        backoff — so the strike and non-429 failure state stays keyed on the
         endpoint alone.
+
+        A row failed with ``http-429`` is the one exception: a reply
+        header is a genuine current reading of the ACCOUNT, and a 429 on the
+        usage endpoint (a shared budget, not an account signal) says nothing
+        about it. Recorded exactly as a healthy row is — ``lastGood`` and
+        ``fetchedAt`` update — while ``consecutiveFailures``, ``lastError``,
+        ``last429At`` and ``backoffUntil`` are left untouched, so no
+        endpoint poll is invited before the backoff itself clears.
 
         Returns True when a reading was recorded (the 5h utilization header
         was present and the row was eligible); False, recording nothing,
@@ -1560,9 +1576,9 @@ class UsageStore:
 
         def apply(_num: str, row: dict) -> None:
             nonlocal recorded
-            if (
-                int(row.get("authDeadStrikes") or 0) > 0
-                or int(row.get("consecutiveFailures") or 0) > 0
+            if int(row.get("authDeadStrikes") or 0) > 0 or (
+                int(row.get("consecutiveFailures") or 0) > 0
+                and row.get("lastError") != "http-429"
             ):
                 return
             recorded = True

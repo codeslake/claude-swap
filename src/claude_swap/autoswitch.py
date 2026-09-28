@@ -46,7 +46,11 @@ from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    SCHEMA_VERSION,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import decision_logger
 from claude_swap.poll_policy import (
@@ -56,7 +60,7 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome
-from claude_swap.usage_store import UsageEntry, due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import UsageEntry, WALL_FALLBACK_S, due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -3548,6 +3552,53 @@ class AutoSwitchEngine:
                     earliest_num = None
             elif earliest_ts is not None:
                 self._sleep_until_ts = earliest_ts + RESET_SLACK_S
+            # THE ACTIVE CAN BE BLIND WITHOUT BEING SPENT. `truly_exhausted`
+            # above answers only for the CANDIDATES; a `None` active_headroom
+            # means this tick never measured the active at all (that is what
+            # put `trigger` on the failover path in the first place). Its own
+            # last real reading is the only fact this tick has for it — while
+            # that reading was healthy and recent, reporting "all accounts
+            # exhausted" claims a fleet state nobody measured (lmd42,
+            # 2026-09-28: the active held 59% headroom at its last read,
+            # unseen for ~70 minutes under a live usage-endpoint 429).
+            #
+            # Checked HERE, after both wait flags above are armed, so a hold
+            # shares the all-exhausted case's cadence exactly -- only the
+            # reported line differs.
+            #
+            # Scoped to a genuine usage-READ failure: `disabled-active` and
+            # the sentinel values below are real, non-budget reasons the
+            # active went blind, so a "holding" line over them would misname
+            # the cause. A last-good reading older than WALL_FALLBACK_S (the
+            # widest ordinary window: 5h) has outlived its own window's
+            # usefulness and proves nothing about now either.
+            active_value = usage.get(current)
+            if (
+                active_headroom is None
+                and trigger != "disabled-active"
+                and active_value != USAGE_RELOGIN_REQUIRED
+                and active_value != USAGE_TOKEN_EXPIRED
+            ):
+                last_active = entries.get(current)
+                last_active_headroom = oauth.account_headroom(
+                    last_active.last_good if last_active else None, self._models
+                )
+                if (
+                    last_active_headroom is not None
+                    and (100.0 - last_active_headroom) < settings.threshold
+                    and last_active.age_s is not None
+                    and last_active.age_s <= WALL_FALLBACK_S
+                ):
+                    detail = "active usage unknown, holding"
+                    if earliest is not None:
+                        detail += (
+                            "; earliest reset "
+                            + earliest.isoformat().replace("+00:00", "Z")
+                        )
+                    self._emit(
+                        NoSwitchEvent(reason="active-usage-unknown", detail=detail)
+                    )
+                    return TickOutcome.BLOCKED
             self._emit(
                 AllExhaustedEvent(
                     earliest_reset_at=(

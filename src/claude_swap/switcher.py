@@ -3350,8 +3350,9 @@ class ClaudeAccountSwitcher:
         utilization scale, and the throttle contract (the pin calls this at
         most once per 30s per slot). Returns False, recording nothing, for
         an unknown slot, a reply carrying no 5h utilization header, or a row
-        currently struck (``authDeadStrikes`` > 0) or failed
-        (``consecutiveFailures`` > 0) — see ``record_header_reading``.
+        currently struck (``authDeadStrikes`` > 0) or failed on anything but
+        ``http-429`` (``consecutiveFailures`` > 0) — see
+        ``record_header_reading``.
         """
         data = self._get_sequence_data() or {}
         info = data.get("accounts", {}).get(num)
@@ -9768,9 +9769,10 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         poll is only ever pulled earlier, never pushed later. A row with a
         recent failed attempt skips the defer
         term entirely: ``record_header_reading`` refuses any row with
-        ``consecutiveFailures > 0``, so no free reading can ever land there
-        and waiting out the window only delays the real retry that could
-        heal it. Best-effort by contract: the switch this rides on has
+        ``consecutiveFailures > 0`` other than an ``http-429`` one, so
+        ordinarily no free reading can land there and waiting out the window
+        only delays the real retry that could heal it. Best-effort by
+        contract: the switch this rides on has
         already committed, so a cache hiccup here must not surface as a
         switch failure."""
         try:
