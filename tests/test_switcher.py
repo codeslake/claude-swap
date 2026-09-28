@@ -3428,14 +3428,17 @@ class TestRecoveryNeverWritesAnotherSlotLive:
         """Positive control: the routine case (the fetched slot IS the
         roster's active one) must still persist to the live store --
         otherwise the RED test above would pass just as well for a guard
-        that refuses every recovery live-write."""
+        that refuses every recovery live-write. Live is left empty (not
+        equal to refresh_input) so this exercises the roster-active arm
+        of ``_recovery_may_write_live`` rather than its earlier
+        ``refresh_input == live`` shortcut."""
         sample_sequence_data["accounts"]["1"]["email"] = "account1@example.com"
         switcher = self._switcher(
             temp_home, sample_sequence_data, "account1@example.com"
         )
         assert sample_sequence_data["activeAccountNumber"] == 1
 
-        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+        with patch.object(switcher, "_read_credentials", return_value=""), \
              patch.object(
                  switcher, "_read_account_credentials", return_value=self._EXPIRED
              ), \
@@ -3451,6 +3454,81 @@ class TestRecoveryNeverWritesAnotherSlotLive:
 
         write_live.assert_called_once_with(self._REFRESHED)
         assert result.sentinel is None
+
+    def test_backup_write_failure_and_live_refusal_stashes_the_successor(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """A consumed grant may never end up nowhere: when the backup write
+        raises AND the roster-active guard refuses the live write, the
+        POSTed successor must still reach the unclaimed stash -- the same
+        shape the gate's own stash uses (configSlot, consumedFp) -- so a
+        later adopt pass can recover it instead of the generation
+        vanishing with no record anywhere."""
+        sample_sequence_data["accounts"]["2"]["email"] = "account2@example.com"
+        switcher = self._switcher(
+            temp_home, sample_sequence_data, "account2@example.com"
+        )
+        assert sample_sequence_data["activeAccountNumber"] == 1
+
+        with patch.object(switcher, "_read_credentials", return_value=""), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(
+                 switcher, "_write_account_credentials",
+                 side_effect=Exception("backup write failed"),
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._REFRESHED, None)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage(
+                "2", "account2@example.com", self._EXPIRED
+            )
+
+        write_live.assert_not_called()
+        mock_fetch.assert_not_called()
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id, entry) = next(iter(entries.items()))
+        assert entry["configSlot"] == "2"
+        assert entry["consumedFp"] == oauth.credential_fingerprint(self._EXPIRED)
+        assert _read_safety_copy(switcher, entry_id) == self._REFRESHED
+
+    def test_CONTROL_a_successful_backup_write_needs_no_stash(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Positive control: when the backup write succeeds, the successor
+        already survives in the slot's own backup and nothing is stashed --
+        otherwise the RED test above would pass just as well for code that
+        stashes unconditionally."""
+        sample_sequence_data["accounts"]["2"]["email"] = "account2@example.com"
+        switcher = self._switcher(
+            temp_home, sample_sequence_data, "account2@example.com"
+        )
+        assert sample_sequence_data["activeAccountNumber"] == 1
+
+        with patch.object(switcher, "_read_credentials", return_value=""), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._REFRESHED, None)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage(
+                "2", "account2@example.com", self._EXPIRED
+            )
+
+        write_live.assert_not_called()
+        write_backup.assert_called_once_with(
+            "2", "account2@example.com", self._REFRESHED, attributed=True
+        )
+        mock_fetch.assert_not_called()
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        assert switcher.list_unclaimed_credentials() == {}
 
     def test_a_recorded_active_slot_of_none_permits_the_write(self):
         """No roster active slot at all (a fresh machine) is absence of
@@ -7883,6 +7961,8 @@ class TestProvenanceGuard:
             "slot 2's own rotation was not recognised as its own lineage — "
             "current_email leaked slot 1's identity into the classifier"
         )
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
 
     def test_cached_foreign_verdict_survives_a_failed_switch_time_probe(
         self, temp_home, mock_claude_config, sample_sequence_data,

@@ -41,9 +41,9 @@ without review:
   ``src/claude_swap`` (not three named files — a hand-named list is blind to
   a caller in a module nobody named) for every call into the write
   chokepoint and asserts the derived (file, enclosing function) roster
-  matches exactly what this round reviewed — a new call site (or a second
+  matches exactly what was reviewed here — a new call site (or a second
   call added to an existing one, in ANY module) changes the count and fails
-  the test, forcing the same review this round gave every other site.
+  the test, forcing the same review every other site already went through.
 """
 
 from __future__ import annotations
@@ -174,7 +174,7 @@ class TestAttributionGuardRefusesUnattributedCrossIdentityWrite:
         The plain read the guard used to call returns ``""`` for a populated
         slot it merely could not read (permission denied, EIO) exactly as it
         does for a genuinely empty slot — so on any host where a process
-        cannot read its own Keychain (ssh/launchd on macOS, per CONTEXT.md)
+        cannot read its own Keychain (ssh/launchd on macOS)
         the guard was silently off for every such write, precisely where
         the incident it exists for lives."""
         store = CredentialStore(_Host(tmp_path))
@@ -441,7 +441,7 @@ _WRAPPER_BODIES = {"_write_account_credentials", "write_account_credentials"}
 
 class TestWriteSiteRosterIsReviewed:
     """Every caller of the write chokepoint, derived from the AST rather
-    than hand-listed, must match a roster this round actually reviewed for
+    than hand-listed, must match a roster that was actually reviewed for
     whether it may pass ``attributed=True`` and why (see switcher.py's
     inline comments at each site). A new call site — or a second call added
     to an existing one — changes the derived roster and fails this test,
@@ -465,7 +465,7 @@ class TestWriteSiteRosterIsReviewed:
                 derived[(filename, enclosing)] += 1
 
         assert dict(derived) == EXPECTED_WRITE_SITE_ROSTER, (
-            "the derived write-site roster no longer matches what this round "
+            "the derived write-site roster no longer matches what was "
             "reviewed — a writer was added, removed, or duplicated; review "
             "whether it may pass attributed=True and update the roster above"
         )
