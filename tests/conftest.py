@@ -1128,3 +1128,22 @@ def _crossing_clock(reads):
         return tick
 
     return clock
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    # trylast: pytest's own tmpdir sessionfinish has already run cleanup_numbered_dir and released this process's lock on pytest-N (unregistering its atexit) by the time this runs, so nothing here touches that freed path.
+    # "Green" is per process: a worker whose own tests passed drops its share even inside a red -n run; a failing worker and the controller of a red run keep theirs.
+    # Measured: a green run leaves ~45k entries in the shared /tmp/pytest-of-<user>, a ~3.8s serial rmtree landing on whichever later session evicts it, which made the -n 10 wall bimodal ~19s/~23s.
+    # Not tmp_path_retention_policy="failed": its per-test rmtree runs while monkeypatch is still active, so a worker crashes with RealStoreWriteBlocked.
+    # A user-given --basetemp is left alone in the controller; a worker always cleans its own share on green.
+    if exitstatus != 0:
+        return
+    factory = session.config._tmp_path_factory
+    basetemp = factory._basetemp
+    if basetemp is None:
+        return
+    is_worker = hasattr(session.config, "workerinput")
+    if factory._given_basetemp is not None and not is_worker:
+        return
+    shutil.rmtree(basetemp, ignore_errors=True)
