@@ -183,11 +183,16 @@ _DEMOTING_STASH_REASONS = (
 
 ERROR_NOTES = {
     "tls-cert": (
-        "the certificate chain was not trusted, most often a TLS-terminating "
-        "proxy whose CA is missing here, sometimes an expired duplicate root "
-        "shadowing a valid one; fix it in the OS store on macOS/Windows, or "
-        "via SSL_CERT_FILE on Linux (REQUESTS_CA_BUNDLE and "
-        "NODE_EXTRA_CA_CERTS are not read on this path)"
+        "the TLS certificate check refused this connection: an untrusted "
+        "chain (a proxy re-signing traffic with a CA this machine lacks, or "
+        "an expired duplicate root shadowing a valid one), fixed in the OS "
+        "store on macOS/Windows or via SSL_CERT_FILE on Linux "
+        "(REQUESTS_CA_BUNDLE and NODE_EXTRA_CA_CERTS are not read on this "
+        "path); a certificate issued for a different host (a captive portal, "
+        "or a proxy that does not re-sign per host), fixed by signing in to "
+        "the portal or fixing the proxy; a clock far enough off that the "
+        "certificate reads as not yet valid or expired, fixed by correcting "
+        "the clock"
     ),
     "store-unmirrored": (
         "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
@@ -820,22 +825,24 @@ class ClaudeAccountSwitcher:
         active = self._read_active_credentials()
         # A MANAGED API KEY IS NOT OURS TO REFUSE. It has no generation to
         # supersede, and its real door is `--add-token`, which
-        # `_reject_live_api_key_capture` names a few lines on. Raising here
-        # reaches the user with a remedy for a different cause AND hides the
-        # one that would work: on a session with no GUI the Keychain does not
-        # become readable inside this process, so the correct message is
-        # never printed at all.
+        # `_reject_live_api_key_capture` names when `add_account` runs it right
+        # after this read. Raising here reaches the user with a remedy for a
+        # different cause AND hides the one that would work: on a session with
+        # no GUI the Keychain does not become readable inside this process, so
+        # the correct message is never printed at all.
         if active.degraded and not looks_like_api_key(active.value or ""):
             # SAYS WHAT IS KNOWN IN EVERY ARM. Two of the reachable ones have
-            # nothing readable at all, so "whatever is readable here" was
-            # vacuous there; what holds throughout is that a capture taken
-            # from a degraded read is either empty or already superseded.
+            # nothing readable at all, so a message about a readable fallback
+            # would be vacuous there. What holds throughout is that a capture
+            # taken from a degraded read is either empty or possibly already
+            # superseded: with no GUI Claude Code writes the plaintext file
+            # itself, and then the fallback IS the live generation.
             raise CredentialReadError(
                 "The OAuth Keychain read failed, so a capture now would "
-                "either store nothing or store a superseded generation "
-                "against this slot. A locked Keychain or a session with no "
-                "GUI is the usual cause, and retrying from a GUI terminal is "
-                "what clears that one."
+                "either store nothing or store a possibly superseded "
+                "generation against this slot. A locked Keychain or a "
+                "session with no GUI is the usual cause, and retrying from "
+                "a GUI terminal is what clears that one."
             )
         return active.value
 
