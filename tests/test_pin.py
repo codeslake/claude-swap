@@ -156,6 +156,8 @@ def _port_literal_offenders(directory, own_file, own_class_name: str) -> list:
         # A source file's encoding is UTF-8 by definition (PEP 3120), so
         # the platform default is never the right answer for reading one.
         text = path.read_text(encoding="utf-8")
+        if "36301" not in text:
+            continue
         tree = ast.parse(text)
         skip = set()
         is_own_file = path.resolve() == own_file
@@ -212,7 +214,10 @@ class TestImportSafeWithoutTheExtra:
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
         offenders = []
         for path in root.rglob("*.py"):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            if "cswap_pin" not in text:
+                continue
+            tree = ast.parse(text)
             nested = set()
             for fn in ast.walk(tree):
                 if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -736,6 +741,7 @@ class TestLaunchIsNeverBlocked:
 
         monkeypatch.setattr(pin, "_dead_wired_configs", _dead_spy)
         monkeypatch.setattr(pin, "clear_wiring", _spy)
+        monkeypatch.setattr(pin, "_LAUNCH_LOCK_BUDGET_S", 0.05)
         monkeypatch.setattr(pin, "heal", lambda s, **_k: (True, "Restored"))
 
         sw = types.SimpleNamespace(
@@ -1670,6 +1676,7 @@ class TestTheWiringCanAlwaysBeRemoved:
         # that `timeout=` kwarg would fall back to the default and still
         # clear this assertion. Only the mutant pays this value.
         monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 4.0)
+        monkeypatch.setattr(pin, "_LAUNCH_LOCK_BUDGET_S", 0.05)
 
         cfg = self._wired(tmp_path)
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
@@ -6161,6 +6168,7 @@ class TestHealNeverTearsDownAServingPin:
                 paths, "get_default_global_config_path", lambda: default_cfg
             )
             monkeypatch.setattr(pin, "_live_impl", lambda: None)
+            monkeypatch.setattr(pin, "_LAUNCH_LOCK_BUDGET_S", 0.05)
             # Fresh mtime by construction, so `proper_lockfile` refuses rather
             # than taking it over (0.5s launch budget against a 10s staleness
             # window — see TestTheLockFailureThatStrandsTheWiringIsNamed).
@@ -9011,7 +9019,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         # under test: the real lock, the real `proper_lockfile` and the real
         # `heal` are all still in the loop.
         with caplog.at_level(logging.DEBUG, logger="claude-swap"):
-            changed, message = pin.heal(sw, lock_timeout=1.0)
+            changed, message = pin.heal(sw, lock_timeout=0.2)
 
         # THE LOCK DIR SURVIVING IS THE GATE, not the message. `heal` returns
         # this same `(False, "…could not be removed…")` for ANY raise inside
@@ -12576,6 +12584,7 @@ class TestASourceFileIsReadAsUTF8:
                 continue
             text = path.read_text(encoding="utf-8")
             tree = ast.parse(text)
+            lines = text.splitlines()
             for node in ast.walk(tree):
                 if not (isinstance(node, ast.Call)
                         and isinstance(node.func, ast.Attribute)
@@ -12583,8 +12592,11 @@ class TestASourceFileIsReadAsUTF8:
                     continue
                 if any(k.arg == "encoding" for k in node.keywords):
                     continue
-                seg = ast.get_source_segment(text, node) or ""
-                line = text.splitlines()[node.lineno - 1]
+                line = lines[node.lineno - 1]
+                if node.end_lineno != node.lineno:
+                    seg = ast.get_source_segment(text, node) or ""
+                else:
+                    seg = line
                 # THE LINT'S OWN LITERALS, which it must contain to look for
                 # them. Scoped to this file, so a same-named helper elsewhere
                 # cannot borrow the exemption.
