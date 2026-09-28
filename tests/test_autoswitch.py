@@ -2435,7 +2435,7 @@ class TestAdaptiveScheduler:
         does — and ``_row_eligible`` also refuses to refetch a held row, so
         the phase-2 refetch can never freshen it either. The freshness gate
         must accept a held reading too, or a held target past 180s old is
-        refused as stale-usage every tick forever."""
+        refused as stale-usage for as long as the hold lasts."""
         h = self._harness(temp_home, monkeypatch, strategy="consume-first")
         counts: dict[str, int] = {}
         # Populate the store while the active account resets soonest (holds).
@@ -2448,13 +2448,16 @@ class TestAdaptiveScheduler:
         h.clock.advance(60)
         self._tick(h, counts, view_a)          # t60: fetches 3
         assert counts == {"1": 1, "2": 1, "3": 1}
-        # #2's reading is adopted from another machine: already 200s old
-        # (past SERVE_TTL_S, 180s) but held for 300s more.
-        h.switcher._usage_store.adopt(
-            {"2": (_usage7(10, 10, _R_LATER), 200.0)},
+        # #2's reading is adopted from another machine: 30s old at hand-over
+        # (fresher than #2's own t0 fetch, so `adopt` actually replaces it),
+        # held for 480s more. By the time phase 2 re-checks it below, it has
+        # aged past SERVE_TTL_S (180s) on its own.
+        adopted = h.switcher._usage_store.adopt(
+            {"2": (_usage7(10, 10, _R_LATER), 30.0)},
             {"2": ("b@example.com", "")},
             hold_s=480.0,
         )
+        assert adopted == {"2"}  # premise: this is an ADOPTED reading
         h.clock.advance(181)                   # active's plan is due again
         h.events.clear()
         # The active refetch now reports the LATEST reset, so stored #2
@@ -2469,6 +2472,7 @@ class TestAdaptiveScheduler:
         outcome = self._tick(h, counts, view_b)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+        assert counts["2"] == 1  # the hold kept phase 2 from refetching #2
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert "stale-usage" not in reasons
 
@@ -10413,9 +10417,9 @@ class TestLiveLock:
             reasons=['PollEvent', 'stale-usage']
 
         against `['PollEvent', 'engine-stopped']` unmutated. "usage could not
-        be refreshed this tick (backoff or a concurrent poller); retrying"
-        sends an operator after a fetch problem that does not exist, for an
-        engine that simply stopped.
+        be refreshed this tick (backoff, a hold, or a concurrent poller);
+        retrying" sends an operator after a fetch problem that does not
+        exist, for an engine that simply stopped.
 
         Asserts the REASON, which is what the gate decides now, rather than
         the freshen count, which something else already bounds.
