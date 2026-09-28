@@ -195,6 +195,10 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "foreign-lineage": (
+        "this slot's stored grant is confirmed another account's — a switch "
+        "restores the slot's own backup"
+    ),
 }
 
 SENTINEL_NOTES = {
@@ -2438,7 +2442,27 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
-        result = oauth.try_refresh_oauth_credentials(refresh_input)
+        def _condemned(fp: str) -> bool:
+            # This runs OUTSIDE any handler here (between the pre-consume
+            # window's own `except` above and the next `try` below), and
+            # `_lineage_key` -> `account_identity` -> `_get_sequence_data()`
+            # reads `sequence.json` with `strict=True` — a torn/unreadable
+            # file at this exact instant raises `ConfigError` straight
+            # through `try_refresh_oauth_credentials` (whose own `condemned`
+            # call is likewise unguarded) and `consume_backup_grant`
+            # (try/finally, no except), killing the whole collect pass. R1:
+            # unreadable is absence of evidence, never a refusal — caught
+            # here and reported as "no evidence" rather than left to raise.
+            try:
+                return self._probe_verdicts.get(
+                    self._lineage_key(account_num, email, fp)
+                ) is False
+            except Exception:
+                return False
+
+        result = oauth.try_refresh_oauth_credentials(
+            refresh_input, condemned=_condemned,
+        )
         if result.error is not None or not result.credentials:
             # Strike binding must follow the POSTed bytes: the gate may have
             # substituted a locked re-read or the session profile for the
@@ -4368,12 +4392,28 @@ class ClaudeAccountSwitcher:
                         self._resync_rotated_backup(
                             account_num, email, org_uuid, creds
                         )
-                    if self._probe_verdicts and self._probe_verdicts.get(
-                        self._lineage_key(
-                            account_num, email,
-                            oauth.credential_fingerprint(creds) or "",
-                        )
-                    ) is False:
+
+                    def _confirmed_foreign() -> bool:
+                        # Same shape as `_consume_backup_grant_locked`'s
+                        # `_condemned`: this runs outside the locked `try`
+                        # below, and `_lineage_key` reads `sequence.json`
+                        # with `strict=True`, raising `ConfigError` on a
+                        # torn/unreadable file. R1: unreadable is absence of
+                        # evidence, never a refusal — caught here instead of
+                        # escaping uncaught through `_fetch_active_usage`
+                        # (whose caller, `_fetch_account_usage`, promises
+                        # never to raise) and killing the whole collect pass.
+                        try:
+                            return self._probe_verdicts.get(
+                                self._lineage_key(
+                                    account_num, email,
+                                    oauth.credential_fingerprint(creds) or "",
+                                )
+                            ) is False
+                        except Exception:
+                            return False
+
+                    if self._probe_verdicts and _confirmed_foreign():
                         # The probe just proved the served credential is
                         # another account's: its quota is not this slot's,
                         # and recording it would poison history and switch
@@ -4691,8 +4731,26 @@ class ClaudeAccountSwitcher:
                         # inside that budget so a slow network can't make a
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
+                        def _condemned(fp: str) -> bool:
+                            # Same shape as `_consume_backup_grant_locked`'s
+                            # `_condemned`: `_lineage_key` reads
+                            # `sequence.json` with `strict=True` and raises
+                            # `ConfigError` on a torn/unreadable file. R1:
+                            # unreadable is absence of evidence, never a
+                            # refusal — caught here instead of escaping to
+                            # this call's own blanket `except Exception`
+                            # (below), which would otherwise defer a live
+                            # refresh for one pass on no evidence at all.
+                            try:
+                                return self._probe_verdicts.get(
+                                    self._lineage_key(account_num, email, fp)
+                                ) is False
+                            except Exception:
+                                return False
+
                         result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
+                            refresh_input, timeout_s=6.0,
+                            condemned=_condemned,
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"
@@ -4754,7 +4812,17 @@ class ClaudeAccountSwitcher:
                             )
                         if result.error is not None:
                             # Transient (network) failure: backoff via store.
-                            return FetchRecord(error="refresh-failed")
+                            # "foreign-lineage" keeps its own identity here
+                            # too (mirrors try_fetch_usage_for_account's own
+                            # retry-branch treatment) — collapsing it to the
+                            # generic "refresh-failed" hides the one signal
+                            # this round exists to produce. No strike either
+                            # way: struck_fp is only set in the branch above.
+                            return FetchRecord(
+                                error=result.error
+                                if result.error == "foreign-lineage"
+                                else "refresh-failed"
+                            )
                         working = result.credentials
                         # Our own POST produced this lineage — self-attributed,
                         # no oracle needed. The verdict is what lets the next
