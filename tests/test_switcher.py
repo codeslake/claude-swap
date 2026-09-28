@@ -3341,6 +3341,140 @@ class TestActiveAccountRefresh:
         mock_fetch.assert_not_called()
 
 
+class TestRecoveryNeverWritesAnotherSlotLive:
+    """The live store is the roster's active slot's alone. A grant refreshed
+    for an INACTIVE slot's backup (the collector's recovery branch, or any
+    other slot whose token happens to be expired) must never also land in
+    the live store: another slot's backup may not overwrite it, and the
+    machine may have changed login with no switch recorded while the
+    roster still names the old slot. The backup write still always
+    happens -- only the live-store write is gated."""
+
+    _EXPIRED = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-2-old", "refreshToken": "rt-2-orig",
+            "expiresAt": 1000,
+        }
+    })
+    _REFRESHED = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-2-new", "refreshToken": "rt-2-new",
+            "expiresAt": 9999999999000,
+        }
+    })
+
+    def _switcher(self, temp_home, sample_sequence_data, live_email):
+        """A switcher whose live ~/.claude.json identity matches
+        ``live_email`` -- ``_fetch_active_usage`` refuses under lock unless
+        the live config identity matches the email it was called with
+        (TOCTOU guard against a switch landing between the caller's
+        snapshot and this method actually running), which is orthogonal to
+        the roster-active-slot guard this class tests."""
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": live_email, "accountUuid": "u"},
+        }))
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        return switcher
+
+    def test_refuses_to_write_live_for_a_slot_that_is_not_the_roster_active_one(
+        self, temp_home: Path, sample_sequence_data: dict, caplog,
+    ):
+        """RED for the guard: without it, refreshing slot 2's expired token
+        (the roster's active slot stays 1 -- e.g. a switch landed between
+        the collector's stale is_active snapshot and this call actually
+        running) would still land the rotated successor in the live
+        store -- the account the live store is actually serving never
+        asked for it."""
+        sample_sequence_data["accounts"]["2"]["email"] = "account2@example.com"
+        switcher = self._switcher(
+            temp_home, sample_sequence_data, "account2@example.com"
+        )
+        assert sample_sequence_data["activeAccountNumber"] == 1
+
+        # Live store empty (CC cleared it) -> refresh_input becomes the
+        # slot's own backup, which differs from `live` -- the shape that
+        # exercises the guard, as opposed to a refresh_input == live
+        # recovery (always permitted regardless of slot; see the CONTROL
+        # test's sibling unit test).
+        with patch.object(switcher, "_read_credentials", return_value=""), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._REFRESHED, None)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch, \
+             caplog.at_level(logging.WARNING, logger="claude-swap"):
+            result = switcher._fetch_active_usage(
+                "2", "account2@example.com", self._EXPIRED
+            )
+
+        write_live.assert_not_called()
+        write_backup.assert_called_once_with(
+            "2", "account2@example.com", self._REFRESHED, attributed=True
+        )
+        mock_fetch.assert_not_called()
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        assert any(
+            "is that slot's to keep" in r.message for r in caplog.records
+        )
+
+    def test_CONTROL_the_roster_active_slot_still_gets_the_live_write(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Positive control: the routine case (the fetched slot IS the
+        roster's active one) must still persist to the live store --
+        otherwise the RED test above would pass just as well for a guard
+        that refuses every recovery live-write."""
+        sample_sequence_data["accounts"]["1"]["email"] = "account1@example.com"
+        switcher = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com"
+        )
+        assert sample_sequence_data["activeAccountNumber"] == 1
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._REFRESHED, None)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 1}})):
+            result = switcher._fetch_active_usage(
+                "1", "account1@example.com", self._EXPIRED
+            )
+
+        write_live.assert_called_once_with(self._REFRESHED)
+        assert result.sentinel is None
+
+    def test_a_recorded_active_slot_of_none_permits_the_write(self):
+        """No roster active slot at all (a fresh machine) is absence of
+        evidence, never a refusal -- the pre-fix behavior for this case."""
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(
+            switcher, "_get_sequence_data", return_value={"activeAccountNumber": None},
+        ):
+            assert switcher._recovery_may_write_live("2", "input", "live") is True
+
+    def test_refresh_input_matching_live_always_permits_regardless_of_slot(self):
+        """A grant refreshed FROM the live credential goes back where it
+        came from, whatever the roster says -- the live store already held
+        exactly these bytes."""
+        switcher = ClaudeAccountSwitcher()
+        with patch.object(
+            switcher, "_get_sequence_data",
+            return_value={"activeAccountNumber": 9},
+        ):
+            assert switcher._recovery_may_write_live(
+                "2", "same-bytes", "same-bytes"
+            ) is True
+
+
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""
 

@@ -4305,6 +4305,29 @@ class ClaudeAccountSwitcher:
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
 
+    def _recovery_may_write_live(
+        self, account_num: str, refresh_input: str, live: str
+    ) -> bool:
+        """The live store is the roster's active slot's. A grant refreshed
+        from the live credential goes back where it came from; another
+        slot's backup may not, or the machine changes login with no switch
+        recorded and the roster still naming the old slot."""
+        if refresh_input == live:
+            return True
+        data = self._get_sequence_data() or {}
+        recorded = data.get("activeAccountNumber")
+        if recorded is None or str(recorded) == str(account_num):
+            return True
+        key = (account_num, "", "not-the-active-slot")
+        if key not in self._provenance_warned:
+            self._provenance_warned.add(key)
+            self._logger.warning(
+                "Account-%s's credential was refreshed for its backup only: "
+                "the roster's active slot is %s, and the live store is that "
+                "slot's to keep.", account_num, recorded,
+            )
+        return False
+
     def _fetch_active_usage(
         self, account_num: str, email: str, creds: str, org_uuid: str = ""
     ) -> FetchRecord:
@@ -4868,7 +4891,14 @@ class ClaudeAccountSwitcher:
                         # this write. A timeout here is a live-write failure
                         # (the grant is already consumed), not a defer.
                         with claude_config_lock():
-                            self._write_credentials(working)  # active store — CC reads this
+                            # A REFUSAL IS A DEFERRAL: it leaves the live
+                            # store on bytes this pass judged unusable, which
+                            # is the state the guard below reports.
+                            live_ok = self._recovery_may_write_live(
+                                account_num, refresh_input, live
+                            )
+                            if live_ok:
+                                self._write_credentials(working)  # active store — CC reads this
                     except Exception:
                         live_ok = False
                         self._logger.warning(
