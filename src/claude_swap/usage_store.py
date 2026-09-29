@@ -94,15 +94,18 @@ def _live_claim(
         and (now - last_attempt_at) < LEGACY_CLAIM_TTL_S
     )
 
-# Deliberate staleness (a not-yet-due scheduler cadence, or a live fetch
-# lease) extends decision trust past STALE_OK_S, but never past this ceiling:
-# an account with nothing scheduled must eventually read as unknown so the
-# unknown-path machinery (escalate-all, unhealthy ticks, verified failover)
-# takes back over. A row whose last poll attempt FAILED does not use this
-# ceiling: it is capped at poll_policy.POST_429_MIN_INTERVAL_S instead (see
+# Deliberate staleness (a not-yet-due scheduler cadence, a live fetch lease,
+# or a live hold from `cswap import-usage`) extends decision trust past
+# STALE_OK_S, but never past this ceiling: an account with nothing scheduled
+# must eventually read as unknown so the unknown-path machinery
+# (escalate-all, unhealthy ticks, verified failover) takes back over. A row
+# whose last poll attempt FAILED does not use this ceiling UNLESS it is also
+# held: it is capped at poll_policy.POST_429_MIN_INTERVAL_S instead (see
 # UsageStore.entries), whatever Retry-After or any window reset says — a
 # throttled or erroring account must go unknown for decisions quickly, not
-# stay trusted on the strength of a stale measurement.
+# stay trusted on the strength of a stale measurement, unless another
+# machine is actively handing it readings, in which case the hold keeps it
+# trusted up to this wider ceiling instead.
 TRUST_MAX_AGE_S = 3600.0
 
 # Failure backoff when the server sent no Retry-After: 30s · 2^(n-1), capped.
@@ -362,10 +365,11 @@ class UsageEntry:
     rejected_fingerprint: str | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the scheduler itself chose the cadence (within
-    # nextPollAt), or a fetch lease is live. Capped at TRUST_MAX_AGE_S. A row
-    # whose last poll attempt FAILED never sets this from either of those —
-    # see UsageStore.entries, which caps a failed row's trust at
-    # poll_policy.POST_429_MIN_INTERVAL_S directly. Computed by
+    # nextPollAt), a fetch lease is live, or the row is held for another
+    # machine's reading. Capped at TRUST_MAX_AGE_S. A row whose last poll
+    # attempt FAILED never sets this from any of those UNLESS it is also
+    # held — see UsageStore.entries, which caps a failed, unheld row's trust
+    # at poll_policy.POST_429_MIN_INTERVAL_S directly. Computed by
     # UsageStore.entries().
     trust_extended: bool = False
     # Appended to preserve positional compatibility for the older read-model
@@ -387,12 +391,20 @@ class UsageEntry:
     # Exposed so a read-model consumer like due_candidate can honor the same
     # cap without a second copy of the count.
     attempts_in_window: int = 0
+    # Until when a reading adopted from another machine (``cswap
+    # import-usage``) keeps every collector off this slot. Appended for the
+    # same positional compatibility as ``claim_until``.
+    held_until: float | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
 
     def in_backoff(self, now: float) -> bool:
         return self.backoff_until is not None and now < self.backoff_until
+
+    def held(self, now: float) -> bool:
+        """Whether an adopted reading's hold still keeps collectors off."""
+        return self.held_until is not None and now < self.held_until
 
     def recent_429(self, now: float) -> bool:
         """Whether this token 429'd recently enough to keep the post-429 cadence.
@@ -492,13 +504,14 @@ class UsageEntry:
         reconfirmed. The whole reading nulls instead, same as pre-#325 (the
         failed-row arm is bounded far tighter than any reset test:
         ``entries()`` caps ``trust_extended`` at ``POST_429_MIN_INTERVAL_S``
-        (360s) once ``consecutiveFailures`` is nonzero, so a failed row's own
-        ``soonest <= now`` test (via ``_earliest_reset`` -- this method's own
-        check, not ``_drop_rolled_windows``'s) is reachable only in the narrow
+        (360s) once ``consecutiveFailures`` is nonzero and the row is not
+        held, so a failed row's own ``soonest <= now`` test (via
+        ``_earliest_reset`` -- this method's own check, not
+        ``_drop_rolled_windows``'s) is reachable only in the narrow
         ``STALE_OK_S``-to-360s window (300s-360s) before ``trust_extended``
-        itself goes False; a row whose last attempt
-        did not fail keeps the wider ``TRUST_MAX_AGE_S`` ceiling instead of the
-        failed-row arm's 360s cap).
+        itself goes False; a row whose last attempt did not fail, or is held
+        for another machine's reading, keeps the wider ``TRUST_MAX_AGE_S``
+        ceiling instead of the failed-row arm's 360s cap).
 
         This CAN null a healthy account too — the scheduled-next-poll
         disjunct (``now < next_poll_at``) is true for a row simply not due
@@ -569,8 +582,9 @@ def due_candidate(
 ) -> str | None:
     """The due candidate with the stalest data, or None.
 
-    Due = past its ``nextPollAt``, not in failure backoff, and not already at
-    its hourly attempt cap (``ATTEMPTS_PER_HOUR_MAX``, the same count
+    Due = past its ``nextPollAt``, not in failure backoff, not held for
+    another machine's reading (``UsageStore.adopt``), and not already at its
+    hourly attempt cap (``ATTEMPTS_PER_HOUR_MAX``, the same count
     ``_row_eligible`` refuses ``reserve()`` on — picking a capped row here
     would waste the pass, since ``reserve()`` would then refuse it too).
     Sentinel accounts (api-key / no credentials) have nothing to fetch. A
@@ -608,6 +622,8 @@ def due_candidate(
         if entry.token_dead():
             continue  # quarantined; what lifts it is the docstring's business
         if entry.in_backoff(now):
+            continue
+        if entry.held(now):
             continue
         if (
             entry.next_poll_at is not None
@@ -819,7 +835,11 @@ def _failure_backoff_s(
         # to `fetched_at + poll_policy.POST_429_MIN_INTERVAL_S` (360s) on
         # EVERY arm — no window-reset component, and no separate wider
         # ceiling for the 429 arm (the old `RATE_LIMIT_TRUST_MAX_AGE_S` this
-        # replaced is gone). So the 4500s wait never sits inside its own
+        # replaced is gone) — except a row also HELD for another machine's
+        # reading (`cswap import-usage`), which keeps the wider
+        # `TRUST_MAX_AGE_S` ceiling instead: the hold's own promise that a
+        # handed-over reading stays trusted outranks this row's own failure
+        # state (`UsageStore.entries`). So the 4500s wait never sits inside its own
         # trust, not even for a row fresh at the moment it failed: `record()`
         # writes `fetchedAt` on SUCCESS only, so a chain of failed blocks
         # keeps measuring trust from the first success while each block adds
@@ -1148,21 +1168,30 @@ class UsageStore:
             last_attempt_at = _num_or_none(row.get("lastAttemptAt"))
             claim_until = _num_or_none(row.get("claimUntil"))
             walled_until = _num_or_none(row.get("walledUntil"))
+            held_until = _num_or_none(row.get("heldUntil"))
             # Strict < mirrors due_candidate: at nextPollAt the entry is due,
             # its staleness no longer scheduler-chosen. A live claim keeps the
             # trust bridge up: when another collector just won the fetch, this
             # reader must not flip trusted → unknown (and e.g. count an
             # unhealthy tick) for the seconds the result is in flight.
             #
+            # A live hold is deliberate staleness as well: another machine
+            # polls this account and hands its readings over, so between two
+            # hand-overs the last one is what decisions should run on. It
+            # overrides the failed-row cap below, matching adopt()'s promise
+            # that a held reading stays "decision-trusted meanwhile" — the
+            # hold itself keeps local collectors off the slot, so a failed
+            # row's own counters never get a chance to clear while it lasts.
+            held = held_until is not None and now < held_until
             # A row whose last poll attempt FAILED (any error, 429 included)
             # is capped at POST_429_MIN_INTERVAL_S past the last success,
             # full stop — never the scheduler-cadence/live-claim extension
             # below, and never a window's own reset: a reading the poller
             # could not refresh must go unknown quickly, not stay trusted on
-            # an old percentage. A row that has NOT failed keeps the
-            # scheduler-cadence/live-claim extension, capped at
+            # an old percentage. A row that has NOT failed (or is held) keeps
+            # the scheduler-cadence/live-claim extension, capped at
             # TRUST_MAX_AGE_S, exactly as before.
-            if consecutive_failures > 0:
+            if consecutive_failures > 0 and not held:
                 trust_extended = (
                     age_s is not None and age_s <= POST_429_MIN_INTERVAL_S
                 )
@@ -1172,6 +1201,7 @@ class UsageStore:
                 trust_extended = within_ceiling and (
                     (next_poll_at is not None and now < next_poll_at)
                     or live_claim
+                    or held
                 )
             out[num] = UsageEntry(
                 last_good=last_good if isinstance(last_good, dict) else None,
@@ -1193,6 +1223,7 @@ class UsageStore:
                 walled=walled_until is not None and now < walled_until,
                 walled_until=walled_until,
                 attempts_in_window=len(_pruned_attempts(row, now)),
+                held_until=held_until,
             )
         return out
 
@@ -1249,8 +1280,9 @@ class UsageStore:
         Deciding eligibility on a lock-free :meth:`entries` read and then
         claiming separately lets two collectors both pass the check and both
         fetch; the re-check under the lock closes that window. Eligibility:
-        not quarantined (dead token), not in failure backoff, not claimed
-        within ``CLAIM_TTL_S``, not already holding ``ATTEMPTS_PER_HOUR_MAX``
+        not quarantined (dead token), not in failure backoff, not held for
+        another machine's reading (:meth:`adopt`), not claimed within
+        ``CLAIM_TTL_S``, not already holding ``ATTEMPTS_PER_HOUR_MAX``
         attempts inside the trailing ``ATTEMPT_WINDOW_S`` (the row's own
         ``attempts`` ledger, pruned and stamped with ``now`` here on a win —
         binds in every caller mode below, forced or scheduled), and then by
@@ -1606,6 +1638,68 @@ class UsageStore:
         self._mutate(identities, [num], apply)
         return recorded
 
+    def adopt(
+        self,
+        readings: dict[str, tuple[dict, float]],
+        identities: dict[str, Identity],
+        hold_s: float | None = None,
+    ) -> set[str]:
+        """Merge measurements another machine took for the same accounts.
+
+        ``readings`` maps slot → ``(usage, age_s)``: the usage dict in the
+        shape :func:`oauth.build_usage_result` produces, and how old that
+        measurement was when it was handed over. An age rather than a
+        timestamp, so the two machines' clocks never have to agree:
+        ``fetchedAt`` becomes ``now - age_s`` on this store's clock.
+
+        A reading replaces ``lastGood`` only when it is newer than the stored
+        one, so a measurement this machine made itself is never downgraded.
+        Fetch state (failures, backoff, poll plan, claim) is left alone: it
+        describes this machine's own requests, and a fetch already in flight
+        still records normally when it lands.
+
+        ``hold_s`` > 0 stamps ``heldUntil``: no collector fetches the slot
+        before then (``_row_eligible``, ``due_candidate``), and its last-good
+        stays decision-trusted meanwhile. The hold never runs past the stored
+        reading's earliest window reset, scoped windows included (after it the
+        reading no longer describes that window), nor past ``TRUST_MAX_AGE_S``
+        from the stored measurement, so a slot cannot sit unfetched on data
+        too old to act on, and a producer that stops renewing it gets ordinary
+        collection back when it lapses. The latest hold replaces an earlier
+        one, so ``hold_s`` 0 lifts it; ``None`` leaves it as it is. Returns
+        the slots whose ``lastGood`` was replaced.
+        """
+        if not readings:
+            return set()
+        now = self.clock()
+        adopted: set[str] = set()
+
+        def apply(num: str, row: dict) -> None:
+            usage, age_s = readings[num]
+            fetched_at = now - max(0.0, age_s)
+            stored = _num_or_none(row.get("fetchedAt"))
+            if stored is None or fetched_at > stored:
+                row["lastGood"] = usage
+                row["fetchedAt"] = fetched_at
+                stored = fetched_at
+                adopted.add(num)
+            if hold_s is None:
+                return
+            held_until = min(now + hold_s, stored + TRUST_MAX_AGE_S)
+            # Every scoped window, not only the models this machine watches:
+            # the store does not know them, and a hold lifted early costs one
+            # fetch at most.
+            reset_at = _earliest_reset(row.get("lastGood"), ("all",))
+            if reset_at is not None:
+                held_until = min(held_until, reset_at)
+            if held_until > now:
+                row["heldUntil"] = held_until
+            else:
+                row.pop("heldUntil", None)
+
+        self._mutate(identities, readings.keys(), apply)
+        return adopted
+
     def set_poll_plan(
         self,
         plans: dict[str, tuple[float | None, float | None]],
@@ -1739,6 +1833,9 @@ def _row_eligible(
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
         return False
+    held_until = _num_or_none(row.get("heldUntil"))
+    if held_until is not None and now < held_until:
+        return False
     if _live_claim(
         _num_or_none(row.get("claimUntil")),
         _num_or_none(row.get("lastAttemptAt")),
@@ -1767,3 +1864,17 @@ def with_sentinel(entry: UsageEntry, sentinel: str | None) -> UsageEntry:
     if sentinel is None:
         return entry
     return replace(entry, sentinel=sentinel)
+
+
+def json_decision_value(entry: UsageEntry) -> dict | str | None:
+    """Decision-grade value for a JSON export (``--list``/``--status``).
+
+    Same as ``entry.decision_value()`` except a walled row's synthetic full
+    reading (built only to drive the switch decision) never substitutes for
+    the real measurement: exporting it as "ok" would hand ``cswap
+    import-usage`` a fabricated reading to persist as a real lastGood. A
+    sentinel still wins and the STALE_OK_S/``trust_extended`` freshness gate
+    still applies, from the entry's own stored reading — this only turns
+    ``walled`` off before those checks run.
+    """
+    return replace(entry, walled=False).decision_value()

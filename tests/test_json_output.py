@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -575,6 +576,37 @@ class TestStatusJson:
 
         assert payload["active"]["alias"] == "dev"
 
+    def test_status_and_list_agree_for_a_walled_active_slot(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """status --json must use the same decision-grade projection as
+        list --json: a walled row's synthetic full reading (built only for
+        the switch decision) must never surface as "ok" from either
+        payload (T1537 m2)."""
+        from claude_swap.usage_store import UsageEntry
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        entry = UsageEntry(walled=True, walled_until=time.time() + 3600)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_active_account_usage", return_value=entry):
+            status_payload = switcher.status(json_output=True)
+
+        list_row = switcher._build_list_payload(
+            [(1, "test@example.com", "", "", True, active_creds, "")],
+            {"1": entry},
+        )["accounts"][0]
+
+        active = status_payload["active"]
+        assert active["usageStatus"] == list_row["usageStatus"] == "unavailable"
+        assert active["usage"] == list_row["usage"] is None
+
 
 # --------------------------------------------------------------------------- #
 # --switch / --switch-to --json
@@ -884,3 +916,52 @@ def test_the_relogin_remedy_names_the_switch_step():
     # THE CONTROL: the sibling already does this, so the assertion above is
     # not merely describing whatever text happens to be there.
     assert "switch" in SENTINEL_NOTES[USAGE_NO_CREDENTIALS].lower()
+
+
+class TestUsageFromJson:
+    """``list --json`` usage read back into the internal dict (import-usage)."""
+
+    INTERNAL = {
+        "five_hour": {"pct": 12.0, "resets_at": "2099-01-01T05:00:00+00:00"},
+        "seven_day": {"pct": 40.0, "resets_at": "2099-01-07T00:00:00+00:00"},
+        "spend": {"used": 5.0, "limit": 50.0, "pct": 10.0, "currency": "USD",
+                  "resets_at": "2099-02-01T00:00:00+00:00"},
+        "scoped": [{"name": "Fable", "pct": 30.0,
+                    "resets_at": "2099-01-07T00:00:00+00:00"}],
+    }
+
+    def test_round_trips_what_the_api_measured(self):
+        import time
+
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        back = usage_from_json(usage_to_json(self.INTERNAL, fetched_at=time.time()))
+        # Pace fields are dropped; countdown/clock are rebuilt from resets_at,
+        # the way a fresh fetch writes them.
+        windows = (back["five_hour"], back["seven_day"], back["spend"], back["scoped"][0])
+        for window in windows:
+            assert window.pop("countdown") and window.pop("clock")
+        assert back == self.INTERNAL
+
+    def test_a_window_without_a_reset_keeps_its_pct(self):
+        from claude_swap.json_output import usage_from_json
+
+        assert usage_from_json({"fiveHour": {"pct": 3}}) == {"five_hour": {"pct": 3.0}}
+
+    @pytest.mark.parametrize("usage", [
+        None,
+        {},
+        {"fiveHour": {"pct": "12"}},
+        {"fiveHour": {"pct": -1}},
+        {"fiveHour": {"pct": float("nan")}},
+        {"fiveHour": {"pct": True}},
+        {"sevenDay": {"pct": 1, "resetsAt": "next tuesday"}},
+        {"spend": {"pct": 1, "used": 1, "currency": "USD"}},
+        {"scoped": [{"pct": 1}]},
+        {"scoped": {"name": "Fable", "pct": 1}},
+    ])
+    def test_malformed_usage_is_refused(self, usage):
+        from claude_swap.json_output import usage_from_json
+
+        with pytest.raises(ValueError):
+            usage_from_json(usage)

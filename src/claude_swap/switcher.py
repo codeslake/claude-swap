@@ -106,6 +106,7 @@ from claude_swap.usage_store import (
     PERMANENT_AUTH_ERRORS,
     UsageEntry,
     UsageStore,
+    json_decision_value,
     with_sentinel,
 )
 
@@ -8978,6 +8979,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 )
                 entries = store.entries(identities, models)
 
+        now = store.clock()
         if read_only:
             # An expired ACTIVE credential gets the same read-only treatment:
             # a pure read (no reserve claim, no fetch path runs to surface it
@@ -8985,6 +8987,11 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             # claims-gated loop below, which read-only never reaches.
             for num, info in info_by_num.items():
                 if num in sentinels or not info[4]:  # info[4] = is_active
+                    continue
+                if entries[num].held(now):
+                    # Held for another machine's reading: that reading, not
+                    # this token's expiry, is what the row reports. Agrees
+                    # with the write-capable path's own held exemption below.
                     continue
                 active_oauth = oauth.extract_oauth_data(info[5])
                 if active_oauth and oauth.is_oauth_token_expired(
@@ -9054,12 +9061,23 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 continue
             if num in claims:
                 continue  # the fetch path will handle (or sentinel) it now
+            held = entries[num].held(now)
+            # Held for another machine's reading (``cswap import-usage``):
+            # that reading, not this token's refresh, is what the row is
+            # waiting on, and it stays decision-trusted, so the expired
+            # sentinel below is exempted — there is no gap to idle-hold over,
+            # and the fetch path refreshes the token once the hold lapses.
+            # The resync is NOT exempted: a Claude Code rotation during the
+            # hold must still be adopted into the backup, or the slot is left
+            # pointing at the consumed predecessor for the hold's whole span.
             active_oauth = oauth.extract_oauth_data(info[5])
-            if active_oauth and oauth.is_oauth_token_expired(
-                active_oauth.get("expiresAt")
-            ):
+            expired = bool(
+                active_oauth
+                and oauth.is_oauth_token_expired(active_oauth.get("expiresAt"))
+            )
+            if expired and not held:
                 sentinels[num] = USAGE_TOKEN_EXPIRED
-            elif active_oauth and not self._active_read_degraded:
+            elif active_oauth and not expired and not self._active_read_degraded:
                 # Adoption otherwise rides the fetch path alone (via
                 # `_fetch_active_usage`'s success branch), so the same gate
                 # that blocks the fetch here also blocked a fresh re-login
@@ -9068,9 +9086,14 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 # `_resync_rotated_backup` already has (identity, its own
                 # fingerprint no-op check, the lock) — called directly, since
                 # a pre-check here would just repeat that no-op check at the
-                # cost of a second backup read on every pass.
+                # cost of a second backup read on every pass. Gated on `not
+                # expired` too: a held row whose live token is genuinely
+                # expired has no valid token pair to attribute (T1537 m1) —
+                # `_resync_rotated_backup`'s own docstring assumes a fresh
+                # access token, and the held reading, not a resync, is what
+                # the row reports for the hold's span.
                 self._resync_rotated_backup(num, info[1], info[3], info[5])
-            elif active_oauth:
+            elif active_oauth and not expired:
                 # Same "would have resynced but degraded" case as
                 # `_fetch_active_usage`'s success branch -- see
                 # `_log_ignored_degraded_login`.
@@ -10081,10 +10104,19 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             # window that rolled.
             # models=() — see `_usage_by_account`; `--list` shows the
             # account-wide picture, never a model-pinned one.
+            # A walled row's `decision_value()` is `_walled_decision_value`'s
+            # SYNTHETIC full reading, built for the switch decision only (see
+            # `UsageEntry.walled`'s own docstring: "display still reads
+            # last_good/age_s as measured"). Exporting that as "ok" would hand
+            # `cswap import-usage` a fabricated measurement to persist as a
+            # real lastGood, so this JSON path turns `walled` off before
+            # running the same sentinel/freshness gates `decision_value()`
+            # always runs — see `json_decision_value`.
+            usage_entry = json_decision_value(entry)
             accounts.append(
                 account_row(
                     num, email, org_name, org_uuid, is_active,
-                    entry.decision_value(),
+                    usage_entry,
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
                     last_good_usage=entry.last_good,
@@ -10276,11 +10308,14 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         entry, _login_expires_at = self._active_account_usage(
             account_num, current_email, org_uuid, read_only=read_only
         )
-        # Decision-grade projection, same rule as the --list payload: stale
-        # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
+        # Decision-grade projection, same rule as the --list payload (see
+        # `json_decision_value`): stale beyond STALE_OK_S reports
+        # unavailable, not "ok" with old numbers, and a walled row's
+        # synthetic switch-decision reading never substitutes for the real
+        # measurement either.
         # models=() — see `_usage_by_account`; `--status` shows the
         # account-wide picture, never a model-pinned one.
-        status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
+        status, usage = usage_fields(json_decision_value(entry), entry.fetched_at)
         active: dict = {
             "number": int(account_num),
             "email": current_email,
