@@ -401,7 +401,7 @@ def _config_address(oauth) -> str:
 
     `.claude.json` is a file a human edits, and all THREE readers of this
     field casefold it: two on the clear path, whose contract is "never
-    raises", and `_config_already_names` on the rollback, where a raise is
+    raises", and cswap-pin's `_config_already_names` on the rollback, where a raise is
     swallowed into a False that reports a clean rollback as a failure.
     """
     value = oauth.get("emailAddress")
@@ -1181,9 +1181,10 @@ def identity_for_config(switcher, email: str | None = None,
     """The `oauthAccount` the config should name while a pin is set, or None.
 
     ``email`` asks about a DIFFERENT account than the one currently recorded.
-    Two callers need it: the rollback, because by then the record has already
-    been overwritten by the pin that failed; and ``set_pin``, because this
-    argument is evaluated BEFORE ``apply_pin`` writes the record.
+    Two callers need it, both in cswap-pin now: the rollback, because by then
+    the record has already been overwritten by the pin that failed; and
+    ``set_pin``, because this argument is evaluated BEFORE ``apply_pin``
+    writes the record.
 
     ``num`` is a slot the caller already resolved, and passing it skips the
     lookup. `_resolve_account_identifier` RAISES when one address matches two
@@ -1381,42 +1382,10 @@ def pin_is_applying(switcher) -> bool | None:
 def repin_current(switcher) -> bool:
     """Re-apply the pin already recorded, to replace a daemon that cannot mint.
 
-    THE REPAIR THE PRODUCT ALREADY KNEW HOW TO DO. When a daemon publishes
-    `unpinnable` the pin is set, the account is fine, and the daemon is serving
-    — it simply cannot read the credential, so every request goes out on the
-    active account. `heal` declines this by design ("something IS serving"), so
-    the state persisted until a human ran `cswap pin <n>` by hand.
-
-    That hand-run command lands here: `apply_pin` ends in
-    ``return ensure_proxy(switcher) is not None``, and `ensure_proxy` reads the
-    daemon record WITH a fingerprint — the read an `unpinnable` daemon answers
-    "nothing is serving" to. So it spawns a successor, and a successor born
-    somewhere that CAN read the credential mints again.
-
-    Returns False on anything unexpected. A repair that raises is worse than a
-    pin that stays broken: it takes down whatever asked for it.
+    The repair is cswap-pin's; False when there is no usable package.
     """
     impl = _live_impl()
-    if impl is None:
-        return False
-    try:
-        pin = impl.load_pin(switcher.backup_dir)
-        if not pin:
-            return False
-        email, org = pin[0], (pin[1] if len(pin) > 1 else None)
-        # Name the pin in the live config, exactly as `set_pin` does. Without
-        # `identity=` the splice returns early, so the repair restores a
-        # serving daemon while `~/.claude.json` still names whichever account
-        # is active -- and Claude Code takes that field as the OWNER of every
-        # bridge minted afterwards. Ask about `email`, the account this call
-        # is re-pinning: the bare form reads the record, which only happens to
-        # agree here because two readers share a file.
-        return bool(impl.apply_pin(switcher, email, org,
-                                   identity=identity_for_config(
-                                       switcher, email=email,
-                                       num=_slot_for(switcher, email, org))))
-    except Exception:  # noqa: BLE001 — a repair must not take its caller down
-        return False
+    return bool(impl) and impl.repin_current(switcher)
 
 
 # -- launch integration ------------------------------------------------------
@@ -1478,7 +1447,7 @@ def _pinned_email_now(switcher) -> tuple[str, str] | None:
     # `or ""` to match the WRITER. cswap_pin.save_pin always writes
     # `org_uuid or ""`, so a record with no org key read back as None here
     # while the same record after a rollback read as "" — unequal, and
-    # _restore_pin then reported a successful rollback as a failure. The
+    # cswap-pin's _restore_pin then reported a successful rollback as a failure. The
     # package's own load_pin already normalizes; this reader had diverged.
     return email, section.get("pinnedOrganizationUuid") or ""
 
@@ -1503,129 +1472,6 @@ def _safe(exc: object) -> str:
     # scheme://userinfo@host  ->  scheme://***@host. Anchored on "://" so an
     # ordinary email address in a message is left alone.
     return re.sub(r"(?<=://)[^/\s@]+@", "***@", str(exc))
-
-
-def _rollback_tail(rolled: bool, before, email: str) -> str:
-    """How a failed set_pin ended, in the record's own terms.
-
-    Both failure branches say the same three things and said them twice.
-    """
-    if not rolled:
-        return f"and the record may still name {email}, check with `cswap pin`"
-    return "the previous pin is unchanged" if before else "nothing is pinned"
-
-
-def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
-    """Put the record back the way ``before`` had it. True when it IS back.
-
-    The verdict is MEASURED, never inferred from the restore call: when
-    ``_impl()`` itself is what raised, ``apply_pin`` never ran and the record
-    was never touched, so a message claiming "may still name <email>" was
-    telling the user to go check a state the code could already disprove.
-    """
-    # RESOLVED BEFORE THE CALL THAT DESTROYS ITS INPUT, in its own guard.
-    # `apply_pin(None, None)` drops the pin record, and `_live_login_identity`
-    # un-splices only while the config still equals that record — so asking
-    # afterwards returns the account whose pin just failed. The separate `try`
-    # is load-bearing: naming the config is best-effort, restoring the RECORD
-    # is the job, and a raising lookup sharing the guard below skipped
-    # `apply_pin` entirely.
-    _back = None
-    # Best-effort whenever there IS a pin to go back to; see below.
-    unspliced = bool(before)
-    if not before:
-        try:
-            _back = _live_login_for_config(switcher)
-        except Exception:  # noqa: BLE001 — a name must not cost the rollback
-            _back = None
-    try:
-        _impl().apply_pin(switcher, *(before or (None, None)))
-        # And the config, which the record alone does not put back:
-        # `apply_pin` splices `~/.claude.json` BEFORE it starts the proxy, so
-        # a pin that failed to start has already written its account there.
-        # Restoring a previous pin means that pin; restoring NOTHING means the
-        # live login, exactly as `clear_pin` decides it -- without the second
-        # case a failed FIRST pin left its own account named in a config
-        # nobody is logged in as.
-        if before:
-            # Safe to ask now: `apply_pin` has just RESTORED this record, so
-            # the lookup sees the state it is naming. The None case cannot,
-            # which is why it is resolved above.
-            _back = identity_for_config(
-                switcher, email=before[0],
-                num=_slot_for(switcher, before[0], before[1]))
-        # PART OF THE VERDICT ONLY WHEN THERE IS NO PIN TO GO BACK TO.
-        # Restoring a PREVIOUS pin leaves the record naming it, so a config
-        # that lags is a worse pin and not a failed one -- best-effort, as
-        # every other splice site treats it. Restoring NOTHING is a
-        # different state: the record is cleared, so a config still naming
-        # the pin that never started has no record to un-splice against,
-        # and the next switch backs the live credential up under that
-        # account's slot key. `splice_config_identity` SKIPS and returns
-        # False on a contended config lock rather than raising, so reading
-        # only the record announces that as a clean rollback.
-        result = _impl().splice_config_identity(_back)
-        # FALSE IS TWO ANSWERS. `splice_config_identity` returns it for a
-        # write it SKIPPED and for a config that already names the identity
-        # -- the success case. Reading the bool alone graded a clean
-        # rollback as a failure and sent the user to check a state the code
-        # could already disprove, which is the defect one frame up.
-        unspliced = (
-            unspliced or _back is None or bool(result)
-            or _config_already_names(_back)
-        )
-    except Exception:  # noqa: BLE001 — the re-read below is the verdict
-        pass
-    return unspliced and _pinned_email_now(switcher) == before
-
-
-def _config_already_names(identity: "dict | None") -> bool:
-    """Does the global config already carry this identity? On the ACCOUNT.
-
-    The package answers a skipped write and an already-correct config with
-    the same `False`, and only the file can separate them.
-
-    THE UUID ALONE, NOT THE ORG, when both sides carry one -- the same call
-    `_config_names_the_pin` makes, and a DELIBERATE divergence from
-    `_resolved_matches_slot_identity`, which keeps a lenient org conjunct
-    ("uuid is globally unique; the org only corroborates"). Here the org
-    would only ever narrow a verdict the uuid has already settled, and a
-    wrong False is what strands the rollback message. The composite
-    fallback below still carries the org, so the personal/org pair at one
-    address stays separated on the path where no uuid is available.
-    """
-    if not identity:
-        return False
-    try:
-        from claude_swap.paths import get_global_config_path
-
-        raw = json.loads(get_global_config_path().read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 — an unreadable config decides nothing
-        return False
-    current = raw.get("oauthAccount") if isinstance(raw, dict) else None
-    if not isinstance(current, dict):
-        return False
-    # THE STRONG KEY FIRST, as `_config_names_the_pin` decides the same
-    # question. `identity_for_config` hands back a stored config VERBATIM,
-    # so the identity itself can carry a non-string address: the composite
-    # then blanks and declines about a config that matches byte for byte,
-    # and `_restore_pin` reads that as a rollback that did not happen.
-    uuid = identity.get("accountUuid")
-    # AND THE CONFIG MUST HAVE ONE TOO, or the strong key is not available
-    # and the composite is still the best evidence. `cswap add --token`
-    # writes a stored config with a BLANK `accountUuid` while
-    # `backfill_account_uuid` fills only the roster row, so the identity can
-    # carry a uuid the config has never held -- and keying on the identity's
-    # alone declines a config matching every field it actually has.
-    if uuid and current.get("accountUuid"):
-        return current.get("accountUuid") == uuid
-    want = (_config_address(identity), identity.get("organizationUuid") or "")
-    # A BLANK IS NOT A MATCH: with no uuid to fall back on, two unreadable
-    # addresses would compare equal and invent an "already correct".
-    if not want[0]:
-        return False
-    return (_config_address(current),
-            current.get("organizationUuid") or "") == want
 
 
 def _config_still_names(email: str, instead_of: "dict | None") -> bool:
@@ -1958,75 +1804,10 @@ def set_pin(
 ) -> tuple[bool, str]:
     """Pin the cloud surface to ``email``. ``(ok, message)``.
 
-    A failure ROLLS THE RECORD BACK: ``apply_pin`` writes ``remoteControl``
-    before it starts the proxy, so reporting the failure while leaving it makes
-    every read-back — ``cswap pin``, the TUI badge — contradict the message.
-
-    ``num`` is the slot both call sites ALREADY resolved. Re-deriving it from
-    the email here was a real bypass, not a tidiness point: cswap's own
-    documented personal+org pattern gives one address two slots, so
-    ``resolve_account(email)`` raises ``ConfigError`` and the API-key refusal
-    below was skipped entirely — accepting exactly the account it exists to
-    reject.
+    The refusals, the rollback and the verdict are cswap-pin's: the TUI and
+    `cswap pin` both land in its `set_pin`, so there is one copy of them.
     """
-    # Refused here, not at the call sites. An API-key account can never be
-    # pinned -- `sk-ant-api...` is not OAuth JSON, so the provider returns None
-    # for every request and each fails open: daemon spawned, badge lit,
-    # nothing pinned. The TUI's row filter is a courtesy, not the enforcement:
-    # an open submenu is never rebuilt, so a row that was OAuth when drawn can
-    # pin an API-key account when selected. A kind we cannot READ is refused
-    # too -- swallowing the lookup is indistinguishable from no refusal.
-    if num is None:
-        try:
-            num = switcher.resolve_account(email)[0]
-        except Exception as exc:  # noqa: BLE001
-            return False, (
-                f"Could not resolve {email} to one account ({_safe(exc)}), so the "
-                "cloud pin cannot check it is not an API-key account"
-            )
-    try:
-        kind = switcher._account_kind(num)
-    except Exception as exc:  # noqa: BLE001
-        return False, (
-            f"Could not read what kind of account {email} is ({_safe(exc)}); the "
-            "cloud pin needs an OAuth account and will not guess"
-        )
-    if kind == "api_key":
-        return False, (
-            f"{email} is an API-key account, which the cloud pin cannot "
-            "use: Remote Control and Artifacts need an OAuth bearer"
-        )
-    before = _pinned_email_now(switcher)
-    try:
-        # Hand over the identity, do not apply it here. Once a pin is set the
-        # live config must name it (`oauthAccount` is what Claude Code reads
-        # to decide who owns a bridge) and that rule is pin functionality. The
-        # LOOKUP cannot move: it reads cswap's backup store, whose layout the
-        # package has no business knowing. Ask about `email`, not about the
-        # record -- this argument is evaluated BEFORE `apply_pin` writes it,
-        # so the no-argument form resolves the PREVIOUS pin.
-        started = _impl().apply_pin(
-            switcher, email, org_uuid,
-            identity=identity_for_config(switcher, email=email, num=num))
-    except Exception as exc:  # noqa: BLE001 — a traceback tells a user nothing
-        rolled = _restore_pin(switcher, before)
-        return False, (
-            f"Could not pin the cloud account: {_safe(exc)}. "
-            + _rollback_tail(rolled, before, email)
-        )
-    if not started:
-        # SAME DEFECT AS THE RAISE PATH, sibling branch. apply_pin writes the
-        # record before starting the proxy, so leaving it here made the two
-        # commands contradict each other: `cswap pin 2` said "nothing is
-        # pinned yet" and exited 1 while `cswap pin` then printed the address
-        # and exited 0, with the ○ cloud badge lit. Roll back to whatever was
-        # pinned before, exactly as a raise does.
-        rolled = _restore_pin(switcher, before)
-        return False, (
-            f"Could not pin the cloud account to {email}: no proxy is running, "
-            "so nothing is pinned yet. " + _rollback_tail(rolled, before, email)
-        )
-    return True, f"Pinned the cloud account (RC/artifacts) to {email}"
+    return _impl().set_pin(switcher, email, org_uuid, num=num)
 
 
 def _wired_ports() -> list[int]:
@@ -2578,139 +2359,6 @@ def run(
         )
         return 0
 
-    pin = _impl()  # raises ClaudeSwitchError with the install hint
-
-    if account is None:
-        # Same rule for the read-only path: a malformed pin file is "no pin I
-        # can read", not "the package is broken". The TUI badge already answers
-        # None in this exact state, so reporting an error here made the two
-        # front ends disagree about one file.
-        try:
-            current = pin.load_pin(switcher.backup_dir)
-        except Exception:  # noqa: BLE001
-            current = None
-        if current:
-            print(f"Cloud account (RC/artifacts): {current[0]}")
-            _warn_if_bridges_disagree(pin, switcher)
-        else:
-            print(dimmed("No cloud account pinned"))
-        return 0
-
-    account_num, email, org_uuid = switcher.resolve_account(account)
-    # THE SAME set_pin THE TUI CALLS. This branch carried its own copy of the
-    # refusal, the rollback and the no-proxy verdict — and the API-key refusal
-    # is the divergence that survived in it after the shared pair was added.
-    # num is passed, not re-derived: a duplicate email resolves ambiguously
-    # and would skip the API-key refusal (see set_pin).
-    ok, msg = set_pin(switcher, email, org_uuid, num=account_num)
-    if not ok:
-        warning(msg)
-        if "no proxy is running" in msg:
-            print(dimmed("  the daemon log says why: <backup>/pin-proxy/daemon.log"))
-        return 1
-    print(
-        f"{accent('Pinned')} the cloud account (RC/artifacts) to "
-        f"Account-{account_num} ({email})"
-    )
-
-    # A re-pin takes effect under the live proxy: the pinned account is
-    # re-read per request. The one thing it cannot move is a Remote Control
-    # session that is ALREADY open -- the server fixed its owner at creation,
-    # so reconnecting inside it is what mints a new one. Name those sessions
-    # instead of telling everyone to restart.
-    #
-    # A note must not fail the action: the pin is applied and "Pinned..." has
-    # printed, so everything below is advice. Unguarded, a raise from the peer
-    # turned a SUCCEEDED pin into an error telling the user to run `--clear`.
-    try:
-        open_rc = pin.live_remote_control_sessions()
-    except Exception:  # noqa: BLE001 — advice is not the operation
-        open_rc = None
-    if open_rc:
-        which = ", ".join(open_rc[:3])
-        if len(open_rc) > 3:
-            which += f", +{len(open_rc) - 3} more"
-        print(
-            dimmed(
-                f"Remote Control is open on: {which}. Those stay on the "
-                "previous account until you reconnect them "
-                "(/rc -> Disconnect this session -> /rc)."
-            )
-        )
-    else:
-        print(dimmed("New sessions pick this up."))
-    return 0
-
-
-def _warn_if_bridges_disagree(pin, switcher) -> None:
-    """Say so when the live bridges do not belong to the account we pinned.
-
-    The status line reports the PIN, which is what we wrote, never what the
-    machine has. Measured with three accounts at once: thirteen live bridges,
-    none on the pinned org, and the command reported "pinned" throughout. What
-    ended the silence was the server answering `API Error: 500` on a reattach,
-    which cost the user the session.
-
-    NEVER FATAL. This is the second unguarded call into the optional package
-    on this path; the first turned a SUCCEEDED pin into `Error: ... not usable`
-    with advice to run `--clear`, which would have destroyed it.
-    `observed_bridge_owners` landed in cswap-pin 0.1.85 and the two ship on
-    separate schedules, so a host on an older one must lose this extra line and
-    keep the command.
-
-    Only a bridge whose recorded owner DISAGREES is named. An unrecorded owner
-    (`None`) is not evidence of anything and stays quiet.
-    """
-    # Imported here, like `run` does: `printer` is pulled in at call time
-    # throughout this module, and a module-level import would be the one
-    # difference between this helper and every other renderer in the file.
-    from claude_swap.printer import warning
-
-    try:
-        owners = pin.observed_bridge_owners()
-    except Exception:  # noqa: BLE001 — see the docstring: a raise unpins nothing
-        return
-    if not isinstance(owners, dict):
-        return
-    # Compare against the CONFIG, not the pin. `bridgeOwnerAccountUuid` has
-    # two writers that mean opposite things: Claude Code records the bridge's
-    # true server-side owner, and cswap-pin's live carry writes the account
-    # now signed in so CC's own comparison agrees and it REATTACHES instead of
-    # minting. This sentence asks the reattach question, and CC answers it by
-    # comparing the stored pointer to `.claude.json`'s `oauthAccount` -- never
-    # to the pin. `_get_current_account` over `_live_login_identity` for the
-    # same reason: the latter UN-SPLICES the pin, and CC has no such notion.
-    try:
-        live = switcher._get_current_account()
-    except Exception:  # noqa: BLE001 — a note must not fail the action
-        return
-    live_org = (live[1] if live and len(live) > 1 else "") or ""
-    if not live_org:
-        return
-    # `oauthAccount` oscillates between the pin and the active login, so this
-    # sentence would otherwise be decided by WHEN the command ran. The roster's
-    # active slot does not oscillate. A bridge on NEITHER is the failure this
-    # exists to catch and still warns; the gate stays narrow, which is what
-    # keeps the carry itself honest.
-    reachable = {live_org}
-    try:
-        row = ((switcher._get_sequence_data_migrated() or {})
-               .get("accounts", {})
-               .get(str(switcher.current_account_number()), {}))
-        if row.get("organizationUuid"):
-            reachable.add(row["organizationUuid"])
-    except Exception:  # noqa: BLE001 — a note must not fail the action
-        pass
-    # `None` is dropped on purpose: an unrecorded owner is UNKNOWN, not a
-    # disagreement, and `observed_bridge_owners` keeps the key so the two stay
-    # distinguishable. Claiming a mismatch from unknown is the shape this
-    # warning exists to catch, one level up.
-    other = sorted({o for o in owners.values() if o and o not in reachable})
-    if not other:
-        return
-    warning(
-        "the live Remote Control bridges do not belong to it: "
-        f"{len(other)} other organization(s) — {', '.join(other)}. "
-        "A reattach against a bridge this login does not own is refused by "
-        "the server; those sessions lose their history when they restart."
-    )
+    # Show and set are the package's: it resolves the account, pins it through the
+    # one `set_pin` the TUI calls, and prints what the command prints.
+    return _impl().pin_run(switcher, account)  # raises ClaudeSwitchError with the install hint

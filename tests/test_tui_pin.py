@@ -88,7 +88,9 @@ class TestThePinTuiSurface:
             finally:
                 pin.is_available = monkey
 
-    async def test_a_failing_pin_does_not_kill_the_dashboard(self, tmp_path):
+    async def test_a_failing_pin_does_not_kill_the_dashboard(
+        self, tmp_path, monkeypatch
+    ):
         """apply_pin failing must be an error message, not a dead TUI.
 
         The guard above the dispatch catches `pin._impl()` but stopped one
@@ -97,24 +99,29 @@ class TestThePinTuiSurface:
         needs no injection: a plain FILE where <backup>/pin-proxy should be a
         directory makes ensure_proxy's mkdir raise FileExistsError.
         """
+        import cswap_pin.proxy as proxy
+
         from claude_swap import pin
 
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        # The verdict is the package's `set_pin`, which turns a raise out of
+        # `apply_pin` into `(False, message)`; the fault is injected at
+        # `apply_pin`, where the package sees it, not at `set_pin` itself.
+        fake._account_kind = lambda _n: "oauth"
         app = make_app(fake)
+        fired = []
 
-        class _Impl:
-            def load_pin(self, _d):
-                return None
+        def _apply_pin(*_a, **_k):
+            fired.append("apply_pin")
+            raise OSError("disk full")
 
-            def apply_pin(self, *_a):
-                raise OSError("disk full")
-
-            def live_remote_control_sessions(self):
-                return []
-
-        real_avail, real_impl = pin.is_available, pin._impl
+        monkeypatch.setattr(proxy, "apply_pin", _apply_pin)
+        # `_impl` refuses on Windows before it looks for the package; the
+        # module itself imports there, so hand it over and keep this case
+        # running on every platform.
+        monkeypatch.setattr(pin, "_impl", lambda: proxy)
+        real_avail = pin.is_available
         pin.is_available = lambda: True
-        pin._impl = lambda: _Impl()
         try:
             async with app.run_test(size=(100, 32)) as pilot:
                 await settle(pilot)
@@ -132,9 +139,10 @@ class TestThePinTuiSurface:
                 # half the loud way — Windows CI, `assert 'clear_wiring' in []`.
                 await app.screen._dispatch("pin:1")
                 await settle(pilot)
+                assert fired, "the injected fault never fired"
                 assert app.is_running, "a failing pin killed the dashboard"
         finally:
-            pin.is_available, pin._impl = real_avail, real_impl
+            pin.is_available = real_avail
 
     async def test_an_informational_row_does_not_kill_the_dashboard(self, tmp_path):
         """A row with no action must do nothing, not raise KeyError.
