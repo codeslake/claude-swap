@@ -277,17 +277,20 @@ _KEY = ("svc", "acct")
 
 class _FakeSecurity:
     """Stands in for ``subprocess.run`` against ``security``: a dict of items,
-    a forced rc for reads (36 = locked) and for writes, the services whose
-    reads are denied, and a count of read execs."""
+    a forced rc for reads (36 = locked) and for writes, an OSError for a spawn
+    that fails, the services whose reads are denied, and a count of read execs."""
 
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], str] = {}
         self.rc: int | None = None
         self.write_rc: int | None = None
+        self.spawn_error: OSError | None = None
         self.denied: set[str] = set()
         self.execs = 0
 
     def __call__(self, args, **kwargs):
+        if self.spawn_error:
+            raise self.spawn_error
         if "find-generic-password" not in args:  # add / delete
             return _completed(self.write_rc or 0, stderr="locked")
         self.execs += 1
@@ -398,24 +401,32 @@ def test_item_modified_at_memoizes_a_definite_answer_only(fake_security, kc_file
     assert fake_security.execs == 4
 
 
-@pytest.mark.parametrize("op, forced, raises", [
-    (lambda: macos_keychain.get_password(*_KEY), "rc", True),
-    (lambda: macos_keychain.item_modified_at(*_KEY), "rc", False),
-    (lambda: macos_keychain.set_password(*_KEY, "v"), "write_rc", True),
-    (lambda: macos_keychain.delete_password(*_KEY), "write_rc", True),
+_KC = macos_keychain.KeychainError
+_SPAWN = OSError(11, "Resource temporarily unavailable")  # EAGAIN, or a blocked exec
+
+
+@pytest.mark.parametrize("op, fault, raises", [
+    (lambda: macos_keychain.get_password(*_KEY), ("rc", 36), _KC),
+    (lambda: macos_keychain.item_modified_at(*_KEY), ("rc", 36), None),
+    (lambda: macos_keychain.set_password(*_KEY, "v"), ("write_rc", 36), _KC),
+    (lambda: macos_keychain.delete_password(*_KEY), ("write_rc", 36), _KC),
+    (lambda: macos_keychain.get_password(*_KEY), ("spawn_error", _SPAWN), OSError),
+    (lambda: macos_keychain.item_modified_at(*_KEY), ("spawn_error", _SPAWN), None),
+    (lambda: macos_keychain.set_password(*_KEY, "v"), ("spawn_error", _SPAWN), OSError),
+    (lambda: macos_keychain.delete_password(*_KEY), ("spawn_error", _SPAWN), OSError),
 ])
 def test_a_failed_exec_forgets_every_memoized_read(
-    fake_security, kc_file, op, forced, raises
+    fake_security, kc_file, op, fault, raises
 ):
     fake_security.items[("svc", "other")] = "kept"
     macos_keychain.get_password("svc", "other")
-    setattr(fake_security, forced, 36)
+    setattr(fake_security, *fault)
     if raises:
-        with pytest.raises(macos_keychain.KeychainError):
+        with pytest.raises(raises):
             op()
     else:
         op()
-    setattr(fake_security, forced, None)
+    setattr(fake_security, fault[0], None)
     before = fake_security.execs
     assert macos_keychain.get_password("svc", "other") == "kept"
     assert fake_security.execs == before + 1

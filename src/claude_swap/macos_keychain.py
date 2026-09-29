@@ -185,6 +185,13 @@ def fresh_reads():
     Keychain as it is. A refresh token is one-time-use: a POST decided on a
     memoized read of an item that has since locked spends it, the successor
     cannot be written back, and Claude Code keeps the spent generation.
+
+    EXEMPT by decision, writing from memoized reads: ``_adopt_session_credential``
+    (via ``_session_profile_ahead``), ``swap_accounts``/``move_account``
+    (``_read_backup_or_abort``) and ``session._bootstrap``. None reaches a grant
+    POST (the only POST sites run inside this block), the stamp keeps a memoized
+    value equal to the item, and a write under a lock falls back to the ``.enc``
+    that wins.
     """
     prev = getattr(_local, "fresh", False)
     _local.fresh = True
@@ -228,6 +235,9 @@ def get_password(service: str, account: str) -> str | None:
         raise KeychainError(
             f"security find-generic-password timed out after {_TIMEOUT}s"
         ) from e
+    except OSError:  # a spawn that failed is a failed exec too
+        _invalidate()
+        raise
     if result.returncode == 0:
         # `-w` prints the value followed by one newline; strip exactly that so
         # values with meaningful leading/trailing whitespace survive intact.
@@ -349,6 +359,9 @@ def set_password(service: str, account: str, password: str) -> None:
         raise KeychainError(
             f"security add-generic-password timed out after {_TIMEOUT}s"
         ) from e
+    except OSError:
+        _invalidate()
+        raise
     if result.returncode != 0:
         _invalidate()
         raise KeychainError(
@@ -375,6 +388,9 @@ def delete_password(service: str, account: str) -> None:
         raise KeychainError(
             f"security delete-generic-password timed out after {_TIMEOUT}s"
         ) from e
+    except OSError:
+        _invalidate()
+        raise
     if result.returncode in (0, _NOT_FOUND_RC):
         return
     _invalidate()
