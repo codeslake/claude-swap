@@ -595,7 +595,8 @@ class TestStatusJson:
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_active_account_usage", return_value=entry):
+             patch.object(switcher, "_active_account_usage",
+                          return_value=(entry, None)):
             status_payload = switcher.status(json_output=True)
 
         list_row = switcher._build_list_payload(

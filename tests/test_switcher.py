@@ -3339,7 +3339,9 @@ class TestActiveAccountRefresh:
             switcher._collect_usage_entries(info)
 
         run_fetches.assert_not_called()  # premise: the hold blocked the claim
-        write_backup.assert_called_once_with("1", "test@example.com", fresh_login)
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", fresh_login, attributed=True,  # T0938 sweep
+        )
 
     def test_backoff_blocked_active_slot_with_expired_login_is_not_resynced(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict

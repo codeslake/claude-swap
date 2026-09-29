@@ -423,7 +423,7 @@ class TestBootstrap:
             # is added for the merged tree. Witnessed here anyway: without a
             # reader, a sibling branch renaming it is a silent un-wiring, and
             # this file has already had one.
-            ("tls-cert", "certificate chain was not trusted"),
+            ("tls-cert", "SSL_CERT_FILE"),
         ],
     )
     def test_the_refresh_failure_warning_outlives_the_terminal(
