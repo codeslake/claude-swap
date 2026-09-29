@@ -46,10 +46,14 @@ menubar = ["rumps>=0.4.0"]
 # before the seam existed. Degraded, not a TypeError -- which is what keeps
 # this floor a correctness one.
 #
+# 0.1.303 is where `set_pin`, `repin_current` and `pin_run` live: `cswap pin
+# <n>` and the TUI hand off to them, and a release without them raises
+# AttributeError at that call.
+#
 # NO `; sys_platform != 'win32'` MARKER (proposed twice): the dev group
 # installs this so the seam test runs on Windows too, and a marker makes that
 # test decorative instead of red.
-pin = ["cswap-pin>=0.1.143"]
+pin = ["cswap-pin>=0.1.303"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
