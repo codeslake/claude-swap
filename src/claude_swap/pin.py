@@ -125,8 +125,8 @@ def _pid_is_alive(pid: int) -> bool:
     event to the whole console process group rather than checking anything.
     Called with this process's own pid inside a CI worker that IS the
     console's process group leader, that took down the entire pytest run
-    with a stray `KeyboardInterrupt` -- reproduced on `test-windows
-    (pin-cli)`. Windows instead asks the OS to open a handle: access denied
+    with a stray `KeyboardInterrupt` -- reproduced on `test-windows`.
+    Windows instead asks the OS to open a handle: access denied
     (the pid exists, we may not query it) means alive, and a pid nothing
     can open at all means gone.
 
@@ -135,7 +135,7 @@ def _pid_is_alive(pid: int) -> bool:
     long as ANY handle to it is still held, including one this same test
     process's own `subprocess.Popen` never closed after `.wait()`. That
     read a genuinely-exited pid as alive and reproduced the T2 regression
-    on `test-windows (pin-cli)` the run after the broadcast fix. So a
+    on `test-windows` the run after the broadcast fix. So a
     successful open is followed by `GetExitCodeProcess`: only `STILL_ACTIVE`
     means the process itself, not merely its handle, is still running.
 
@@ -1181,10 +1181,12 @@ def identity_for_config(switcher, email: str | None = None,
     """The `oauthAccount` the config should name while a pin is set, or None.
 
     ``email`` asks about a DIFFERENT account than the one currently recorded.
-    Two callers need it, both in cswap-pin now: the rollback, because by then
-    the record has already been overwritten by the pin that failed; and
+    Callers that pass it: in cswap-pin, the rollback, because by then the
+    record has already been overwritten by the pin that failed, and
     ``set_pin``, because this argument is evaluated BEFORE ``apply_pin``
-    writes the record.
+    writes the record; and here, `_config_names_the_pin`,
+    `_live_login_for_config` and `heal`, each with an address it has already
+    read.
 
     ``num`` is a slot the caller already resolved, and passing it skips the
     lookup. `_resolve_account_identifier` RAISES when one address matches two
@@ -1382,10 +1384,11 @@ def pin_is_applying(switcher) -> bool | None:
 def repin_current(switcher) -> bool:
     """Re-apply the pin already recorded, to replace a daemon that cannot mint.
 
-    The repair is cswap-pin's; False when there is no usable package.
+    The repair is cswap-pin's; False when there is no usable package, or one
+    older than the release that carries it.
     """
-    impl = _live_impl()
-    return bool(impl) and impl.repin_current(switcher)
+    repin = getattr(_live_impl(), "repin_current", None)
+    return bool(repin) and repin(switcher)
 
 
 # -- launch integration ------------------------------------------------------

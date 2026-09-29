@@ -564,10 +564,9 @@ class TestThePinBadgeDoesNotOverstate:
 
         # THE DECISION IS WHAT THIS CASE OWNS, not package resolution. Written
         # against the installed extra it returned None wherever cswap-pin is
-        # absent, and `is False` failed there — green on linux and the pin-cli
-        # shard, red on the windows `rest` shard, which is exactly the split
-        # between "extra installed" and "not". Stub the resolver so the
-        # three-state answer is tested on every shard.
+        # absent, and `is False` failed there — green with the extra installed,
+        # red without it. Stub the resolver so the three-state answer is tested
+        # whether or not the extra is present.
         def _fake_read(cd):
             try:
                 return json.loads((cd / "proxy.json").read_text())

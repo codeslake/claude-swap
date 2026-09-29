@@ -3579,6 +3579,18 @@ class TestAPinnedEmailThatIsNotAString:
                 f"DEFECT: {bad!r} reached every consumer of pinnedEmail, and "
                 "one of them calls .casefold() on it")
 
+    def test_a_record_with_no_org_key_reads_back_as_an_empty_org(self, temp_home):
+        """`save_pin` always writes `org_uuid or ""`, and cswap-pin's
+        `_restore_pin` and `account_is_pinned` compare this tuple with `==`,
+        so a record with no org key must read as `(email, "")`, not None."""
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+
+        s = _r37_pin_switcher(temp_home)
+        _s.atomic_write_json(_s.settings_path(s.backup_dir),
+                             {"remoteControl": {"pinnedEmail": SHARED_PIN_EMAIL}})
+        assert pin_mod._pinned_email_now(s) == (SHARED_PIN_EMAIL, "")
+
 
 class TestClearRunsWithTheExtraGone:
     """`cswap pin --clear` is priority 1 and the whole reason clear_wiring
@@ -3955,7 +3967,7 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
     thing it just claimed. Each drives the seam, not a stub.
     """
 
-    def _cli(self, tmp_path, impl_src, clear=False, wired=True):
+    def _cli(self, tmp_path, impl_src, wired=True):
         import subprocess
         import textwrap
         from pathlib import Path
@@ -3996,7 +4008,7 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
                 pin._impl = _impl_factory
                 class _SW:
                     backup_dir = Path({str(backup)!r})
-                sys.exit(pin.run(_SW(), None, clear={clear!r}))
+                sys.exit(pin.run(_SW(), None, clear=True))
                 """
             )
         )
@@ -4016,7 +4028,7 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
         )
         # Make clear_wiring a no-op so the wiring survives, as a held lock does.
         impl += "pin.clear_wiring = lambda *a, **k: False\n"
-        r, cfg, _ = self._cli(tmp_path, impl, clear=True)
+        r, cfg, _ = self._cli(tmp_path, impl)
         assert "Unpinned" not in r.stdout, r.stdout
         assert "Could not remove" in r.stdout, r.stdout + r.stderr[-300:]
         assert r.returncode == 1
@@ -4431,9 +4443,11 @@ class TestSetShowAndRepinAreThePackagesToRun:
     the flag arms, the wiring removal). Pinning itself is
     `cswap_pin.proxy.set_pin`, `repin_current` and `pin_run`: called once, and
     what they return or print is what the user and the TUI get. The package
-    is faked to see the hand-off, then run for real to see that the six names
-    it asks of this module answer (`identity_for_config`, `_slot_for`,
-    `_live_login_for_config`, `_pinned_email_now`, `_safe`, `_config_address`).
+    is faked to see the hand-off, then run for real to see that the names it
+    asks of this module answer: `identity_for_config`, `_slot_for`,
+    `_live_login_for_config`, `_pinned_email_now` and `_safe`. The sixth,
+    `_config_address`, sits behind the package's `_config_already_names`
+    fallback, which none of these runs enters.
     """
 
     class _Pkg:
@@ -4479,6 +4493,15 @@ class TestSetShowAndRepinAreThePackagesToRun:
         assert pkg.calls == [("repin_current", sw)]
         monkeypatch.setattr(pin, "_live_impl", lambda: None)
         assert pin.repin_current(sw) is False
+
+    def test_repin_current_is_false_on_a_package_older_than_it(self, monkeypatch):
+        """Below the floor `repin_current` is absent: False, not AttributeError."""
+        import types
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: types.SimpleNamespace())
+        assert pin.repin_current(object()) is False
 
     def test_run_hands_the_show_and_set_arms_to_pin_run(self, monkeypatch):
         from claude_swap import pin
@@ -4528,7 +4551,7 @@ class TestSetShowAndRepinAreThePackagesToRun:
         monkeypatch.setattr(pin, "_impl", lambda: proxy)
         return s, seen
 
-    def test_the_real_package_pins_through_the_six_names_it_asks_of_cswap(
+    def test_the_real_package_pins_and_repins_through_the_names_it_asks_of_cswap(
             self, monkeypatch, temp_home, capsys):
         from claude_swap import pin
 
@@ -4538,6 +4561,27 @@ class TestSetShowAndRepinAreThePackagesToRun:
         assert "Pinned" in out and f"Account-1 ({SHARED_PIN_EMAIL})" in out, out
         assert seen[0]["accountUuid"] == "uuid-personal", seen
         assert pin._pinned_email_now(s) == (SHARED_PIN_EMAIL, "")
+        # `repin_current` resolves the recorded pin's slot through `_slot_for`;
+        # a rename there is False here, not a raise.
+        assert pin.repin_current(s) is True
+        assert seen[1]["accountUuid"] == "uuid-personal", seen
+
+    def test_the_real_package_renders_a_failure_through_safe(
+            self, monkeypatch, temp_home, capsys):
+        import cswap_pin.proxy as proxy
+
+        from claude_swap import pin
+
+        s, _ = self._real(monkeypatch, temp_home, serving=True)
+
+        def refuse(*_a, **_k):
+            raise RuntimeError("dial via http://user:hunter2@proxy.example:8118")
+
+        monkeypatch.setattr(proxy, "apply_pin", refuse)
+        assert pin.run(s, "1") == 1
+        cap = capsys.readouterr()
+        assert "http://***@proxy.example:8118" in cap.out + cap.err, cap
+        assert "hunter2" not in cap.out + cap.err, cap
 
     def test_the_real_package_rolls_a_failed_pin_back_and_says_so(
             self, monkeypatch, temp_home, capsys):
@@ -4849,7 +4893,7 @@ class TestHealADeadPin:
         # assertion below PASSES, and the only symptom is `seen == {}`: a bare
         # empty dict with nothing saying why.
         #
-        # Observed once on CI (Linux, `-n 8`) and once locally, never
+        # Observed once on CI (Linux, under xdist) and once locally, never
         # reproducibly; `-n0` over the whole suite is green, so whatever it
         # is lives in the concurrency, not in this file's ordering. This does
         # not fix that — it makes the next occurrence name itself instead of
@@ -5040,8 +5084,8 @@ class TestHealADeadPin:
         and it is asserted against this writer in
         `TestClearRunsWithTheExtraGone` where the extra is installed.
 
-        Stated in raw JSON here so the check still runs on CI, which does not
-        install the extra (see ci.yml).
+        Stated in raw JSON here so the check runs whether or not the extra is
+        installed.
         """
         import types
 
