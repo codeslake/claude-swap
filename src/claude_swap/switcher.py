@@ -2349,9 +2349,11 @@ class ClaudeAccountSwitcher:
 
         try:
             with FileLock(self.lock_file):
-                current, unreadable = self._read_account_credentials_ex(
-                    account_num, email
-                )
+                # Never a memoized read: this copy may be consumed.
+                with macos_keychain.fresh_reads():
+                    current, unreadable = self._read_account_credentials_ex(
+                        account_num, email
+                    )
                 if unreadable:
                     # The backup may exist but cannot be seen (macOS
                     # keychain locked/denied): the snapshot is exactly the

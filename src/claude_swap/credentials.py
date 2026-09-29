@@ -773,7 +773,11 @@ class CredentialStore:
         # derivation (pinned against its source) and the delete, session-read
         # and capture paths already depend on it.
         if self._use_keychain():
-            val, keychain_failed, kc_service = self._read_active_oauth_keychain()
+            # With a plaintext file to arbitrate against, Claude Code may have
+            # fallen back to it because the Keychain is locked, and a memoized
+            # copy would hide that (no `degraded`, no "unavailable"): read live.
+            with macos_keychain.fresh_reads(get_credentials_path().exists()):
+                val, keychain_failed, kc_service = self._read_active_oauth_keychain()
             # THIS read's own verdict, kept so a later success on some OTHER
             # item cannot erase it. Sticky until this read succeeds again,
             # which is what makes it self-heal without being erasable.

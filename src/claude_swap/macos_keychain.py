@@ -38,6 +38,8 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
@@ -95,6 +97,62 @@ def keychain_account_name() -> str:
         return "claude-code-user"
 
 
+# In-process memo of ``security`` reads (memory only, never on disk), so a
+# steady-state poll costs one exec per item instead of one per pass: every exec
+# is scanned by endpoint security software. An entry is valid while the login
+# keychain file's stat is what it was BEFORE the exec that produced the answer:
+# every write to the keychain (ours or Claude Code's) moves ``st_mtime_ns`` (size
+# alone does not: measured unchanged across two writes), and stat-ing first means
+# a write during the exec is stored under the old stamp and re-read next call.
+# No stat-able file, no memo.
+# ponytail: assumes the default keychain is login.keychain-db (the macOS default,
+# and where ``add-generic-password`` without a keychain argument writes); a
+# different default keychain would need its own stamp path.
+_KEYCHAIN_FILE = "~/Library/Keychains/login.keychain-db"
+_memo: dict[tuple[str, str, str], tuple[tuple, object]] = {}
+_local = threading.local()
+
+
+def _stamp() -> tuple | None:
+    path = os.path.expanduser(_KEYCHAIN_FILE)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (path, st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _recall(key, stamp):
+    hit = _memo.get(key)
+    if stamp and hit and hit[0] == stamp and not getattr(_local, "fresh", False):
+        return hit
+
+
+def _remember(key, stamp, value) -> None:
+    if stamp:
+        _memo[key] = (stamp, value)
+
+
+def _forget(service: str, account: str) -> None:
+    for kind in ("pw", "mdat"):
+        _memo.pop((kind, service, account), None)
+
+
+@contextmanager
+def fresh_reads(when: bool = True):
+    """Reads on this thread inside the block skip the memo (and refresh it).
+
+    For a caller that must act on what the Keychain holds NOW, e.g. the consume
+    gate, which may spend a one-time refresh token. ``when=False`` is a no-op.
+    """
+    prev = getattr(_local, "fresh", False)
+    _local.fresh = prev or when
+    try:
+        yield
+    finally:
+        _local.fresh = prev
+
+
 def _quote(value: str) -> str:
     """Quote a value for a ``security -i`` stdin command line.
 
@@ -111,8 +169,12 @@ def get_password(service: str, account: str) -> str | None:
 
     Raises :class:`KeychainError` on any other non-zero exit (locked / denied /
     unavailable) or a timeout, so a genuine miss is not confused with a transient
-    failure.
+    failure. Only these two definite answers are memoized, never an error.
     """
+    stamp = _stamp()  # before the exec, see the memo note above
+    key = ("pw", service, account)
+    if hit := _recall(key, stamp):
+        return hit[1]
     try:
         result = subprocess.run(
             [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service],
@@ -127,8 +189,11 @@ def get_password(service: str, account: str) -> str | None:
     if result.returncode == 0:
         # `-w` prints the value followed by one newline; strip exactly that so
         # values with meaningful leading/trailing whitespace survive intact.
-        return result.stdout.removesuffix("\n")
+        value = result.stdout.removesuffix("\n")
+        _remember(key, stamp, value)
+        return value
     if result.returncode == _NOT_FOUND_RC:
+        _remember(key, stamp, None)
         return None
     raise KeychainError(
         f"security find-generic-password failed (rc={result.returncode}): "
@@ -167,8 +232,12 @@ def item_modified_at(service: str, account: str) -> float | None:
     Attribute-only lookup (no ``-w``): nothing is decrypted. Non-raising —
     absent item, parse failure, timeout or a missing binary all return
     ``None``, since this feeds a freshness comparison where "don't know"
-    must never be read as a claim.
+    must never be read as a claim. Only a parsed answer is memoized.
     """
+    stamp = _stamp()
+    key = ("mdat", service, account)
+    if hit := _recall(key, stamp):
+        return hit[1]
     try:
         result = subprocess.run(
             [_SECURITY, "find-generic-password", "-a", account, "-s", service],
@@ -184,11 +253,13 @@ def item_modified_at(service: str, account: str) -> float | None:
     if not match:
         return None
     try:
-        return datetime.strptime(
+        mdat = datetime.strptime(
             match.group(1), "%Y%m%d%H%M%S"
         ).replace(tzinfo=timezone.utc).timestamp()
     except ValueError:
         return None
+    _remember(key, stamp, mdat)
+    return mdat
 
 
 def set_password(service: str, account: str, password: str) -> None:
@@ -198,6 +269,7 @@ def set_password(service: str, account: str, password: str) -> None:
     argv only for payloads that would overflow the stdin line buffer. Raises
     :class:`KeychainError` on a non-zero exit or a timeout.
     """
+    _forget(service, account)
     hex_value = password.encode("utf-8").hex()
     # `-X` passes the value as hex, avoiding any escaping issues for the secret.
     command = (
@@ -242,6 +314,7 @@ def delete_password(service: str, account: str) -> None:
 
     Raises :class:`KeychainError` on any other non-zero exit or a timeout.
     """
+    _forget(service, account)
     try:
         result = subprocess.run(
             [_SECURITY, "delete-generic-password", "-a", account, "-s", service],
