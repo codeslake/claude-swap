@@ -30,7 +30,7 @@ import ast
 from collections import Counter
 from pathlib import Path
 
-from tests.conftest import source_tree
+from tests.conftest import source_text, source_tree
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "src" / "claude_swap"
@@ -53,6 +53,8 @@ def _post_call_sites(path: Path) -> list[tuple[str | None, int, bool]]:
     project's own control for that gap is the reviewed roster below staying
     small enough to read by eye).
     """
+    if TARGET not in source_text(path):
+        return []
     tree = source_tree(path)
 
     class Visitor(ast.NodeVisitor):

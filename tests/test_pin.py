@@ -25,11 +25,24 @@ def _fast_default_lock_timeout(monkeypatch):
     suite 27.6% of the fork's whole-suite cost. Shrunk once, for every test,
     rather than per-test: a case that DOES need a specific value — the
     doubled-deadline arithmetic below, and two mutant-detection budgets that
-    would otherwise land inside this fixture's own 0.3s — still sets its own
-    on top of this."""
+    would otherwise land inside this fixture's own 0.05s, still sets its own
+    on top of this.
+
+    THE RETRY STEP IS SHRUNK WITH IT. `proper_lockfile` looks at its deadline
+    only at the top of the loop, so a held lock costs one sleep of 0.25-0.5s
+    whatever the budget: a 0.05s budget alone still paid 0.25s per contended
+    attempt. The tenth-second step keeps the loop's shape (check, sleep,
+    check) and only this module's clock for it: every other module keeps the
+    real `time`."""
+    import time
+    import types
+
     from claude_swap import claude_locks
 
-    monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(claude_locks, "time", types.SimpleNamespace(
+        monotonic=time.monotonic, time=time.time,
+        sleep=lambda s: time.sleep(s / 10)))
 
 
 def _pinwiring():
@@ -242,11 +255,22 @@ class TestImportSafeWithoutTheExtra:
         import textwrap
         from pathlib import Path
 
-        src = str(Path(__file__).resolve().parent.parent / "src")
+        src = Path(__file__).resolve().parent.parent / "src"
+        # ponytail: only a module that spells `cswap_pin` can fail when it is
+        # blocked, and importing it drags in whatever it imports, so the rest
+        # are left out (the full walk paid ~0.5s for the TUI and the menu bar).
+        # A module that builds the name at runtime is invisible here, and to
+        # the two static scans around this case.
+        mods = [
+            ".".join(p.relative_to(src).with_suffix("").parts).removesuffix(".__init__")
+            for p in sorted((src / "claude_swap").rglob("*.py"))
+            if "cswap_pin" in source_text(p)
+        ]
+        assert mods, "no module names cswap_pin: the walk found nothing to import"
         code = textwrap.dedent(
             f"""
-            import pkgutil, sys
-            sys.path.insert(0, {src!r})
+            import sys
+            sys.path.insert(0, {str(src)!r})
             class Block:
                 def find_spec(self, name, path=None, target=None):
                     if name.split(".")[0] == "cswap_pin":
@@ -254,8 +278,8 @@ class TestImportSafeWithoutTheExtra:
                     return None
             sys.meta_path.insert(0, Block())
             import claude_swap
-            for m in pkgutil.walk_packages(claude_swap.__path__, "claude_swap."):
-                __import__(m.name)
+            for name in {mods!r}:
+                __import__(name)
             """
         )
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
@@ -281,7 +305,7 @@ class TestImportSafeWithoutTheExtra:
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
         offenders = []
         for path in root.rglob("*.py"):
-            if path.name == "pin.py":
+            if path.name == "pin.py" or "cswap_pin" not in source_text(path):
                 continue
             for node in ast.walk(source_tree(path)):
                 names = []
@@ -1510,8 +1534,9 @@ class TestTheWiringCanAlwaysBeRemoved:
     def test_a_contended_first_path_does_not_starve_a_free_second(
         self, tmp_path, monkeypatch
     ):
-        """Only the session lock held, at the REAL
-        production budget ``_LAUNCH_LOCK_BUDGET_S = 0.5``): `clear_wiring`
+        """Only the session lock held, at a tenth of the production budget
+        (``_LAUNCH_LOCK_BUDGET_S = 0.5``, with the retry step a tenth too):
+        `clear_wiring`
         returned False with BOTH configs still wired. The first path waited
         the WHOLE budget on a lock nobody released, so `left <= 0` by the
         time the loop reached the second path — free the entire time — and
@@ -1528,8 +1553,9 @@ class TestTheWiringCanAlwaysBeRemoved:
         ``claude_swap.claude_locks.proper_lockfile`` that records every
         ``lock_dir`` it is asked to acquire.
 
-        Runs at the REAL `_LAUNCH_LOCK_BUDGET_S` (0.5s), not a test-only
-        constant, so the arithmetic under test is the arithmetic that ships.
+        Runs at a tenth of `_LAUNCH_LOCK_BUDGET_S`, against a retry step a
+        tenth as long (the autouse fixture): the fair-share arithmetic under
+        test has no unit, so the ratio is what ships.
 
         WHAT THIS DOES NOT ASSERT IS ELAPSED TIME, and the earlier wording
         here claimed it could, on the strength of a clamp in
@@ -1559,9 +1585,11 @@ class TestTheWiringCanAlwaysBeRemoved:
         # -show-red proof in the task report) starves path 2 on some runs and
         # not others: 5/5 green with the mutant in and the jitter
         # left to chance. Forcing `random.random() == 1.0` makes every retry
-        # sleep exactly 0.5s — the full budget on the FIRST path alone — so
+        # sleep exactly one step (0.5s, a tenth of that here as is the budget):
+        # the full budget on the FIRST path alone, so
         # the unclamped mutant fails every time, not by luck of the draw.
         monkeypatch.setattr(claude_locks.random, "random", lambda: 1.0)
+        monkeypatch.setattr(pin, "_LAUNCH_LOCK_BUDGET_S", 0.05)
 
         real_proper_lockfile = claude_locks.proper_lockfile
         attempted = []
@@ -1617,7 +1645,7 @@ class TestTheWiringCanAlwaysBeRemoved:
         Every other test here passes an explicit ``timeout``, so none of them
         exercises the branch that resolves ``DEFAULT_TIMEOUT_S`` itself. Fast
         by construction: ``DEFAULT_TIMEOUT_S`` is shrunk before the call, so
-        the whole test still runs in a couple of seconds rather than 9-18.
+        the whole test runs in under a second rather than 9-18.
         """
         import time
 
@@ -1633,7 +1661,7 @@ class TestTheWiringCanAlwaysBeRemoved:
         # Shrink the DEFAULT this function resolves internally when no
         # timeout is passed — the mutation under test doubles WHATEVER this
         # is, so a small value keeps the doubled case fast too.
-        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 1.0)
+        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.4)
 
         # BOTH locks live-held, for real: a stubbed lock would not exercise
         # clear_wiring's own per-path share arithmetic.
@@ -1651,11 +1679,11 @@ class TestTheWiringCanAlwaysBeRemoved:
 
         assert not changed, "fixture invalid: nothing should have been removed"
         # 1x the (shrunk) default plus slack, never 2x it — the doubled
-        # mutation reliably clears this bar (~2.2s against a 1.0s
-        # DEFAULT_TIMEOUT_S here; the fix stays under ~1.3s).
-        assert elapsed < 1.9, (
+        # mutation reliably clears this bar (0.8s and up against a 0.4s
+        # DEFAULT_TIMEOUT_S here; the fix stays under ~0.5s).
+        assert elapsed < 0.65, (
             f"the untimed deadline behaved as a PER-PATH allowance, not a "
-            f"total: {elapsed:.2f}s against a shrunk default of 1.0s"
+            f"total: {elapsed:.2f}s against a shrunk default of 0.4s"
         )
 
     def test_the_launch_path_does_not_wait_on_the_config_lock(
@@ -4305,8 +4333,8 @@ class TestTheLockProbeActuallyProbes:
         from claude_swap import pin
         from claude_swap.claude_locks import proper_lockfile
 
-        # Above the 2.0s bar below: the module default (0.3s) now equals this
-        # test's own 0.3s budget, so a mutant dropping `_config_lock_is_free`'s
+        # Above the 2.0s bar below: the module default (0.05s) sits inside this
+        # test's own 0.1s budget, so a mutant dropping `_config_lock_is_free`'s
         # `timeout=budget` and falling back to the default would land inside
         # the window too. Only the mutant pays this value; the probe below
         # always passes its own explicit budget.
@@ -4323,15 +4351,15 @@ class TestTheLockProbeActuallyProbes:
         lock_dir = cfg.parent / (cfg.name + ".lock")
         with proper_lockfile(lock_dir, timeout=5):
             start = _time.monotonic()
-            held_result = pin._config_lock_is_free(0.3)
+            held_result = pin._config_lock_is_free(0.1)
             elapsed = _time.monotonic() - start
 
         assert held_result is False, "answered True while the lock was held"
         # roughly `budget`, not instant and not the process default (9s) —
         # confirms the probe actually waited on the held lock rather than
         # short-circuiting some other way.
-        assert 0.2 <= elapsed <= 2.0, (
-            f"took {elapsed:.2f}s against a 0.3s budget — not bounded by it"
+        assert 0.1 <= elapsed <= 2.0, (
+            f"took {elapsed:.2f}s against a 0.1s budget — not bounded by it"
         )
 
         # THE CONTROL: same path, lock released, must now answer True. If a
@@ -4373,12 +4401,12 @@ class TestTheLockProbeActuallyProbes:
         monkeypatch.setattr(
             paths, "get_default_global_config_path", lambda: default_cfg)
 
-        assert pin._config_lock_is_free(0.3) is True, (
+        assert pin._config_lock_is_free(0.1) is True, (
             "precondition: with neither lock held the probe must say free")
 
         lock_dir = default_cfg.parent / (default_cfg.name + ".lock")
         with proper_lockfile(lock_dir, timeout=5):
-            held = pin._config_lock_is_free(0.3)
+            held = pin._config_lock_is_free(0.1)
 
         assert held is False, (
             "the DEFAULT config's lock was held and the probe said free — the "
@@ -8083,7 +8111,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         # under test: the real lock, the real `proper_lockfile` and the real
         # `heal` are all still in the loop.
         with caplog.at_level(logging.DEBUG, logger="claude-swap"):
-            changed, message = pin.heal(sw, lock_timeout=0.2)
+            changed, message = pin.heal(sw, lock_timeout=0.05)
 
         # THE LOCK DIR SURVIVING IS THE GATE, not the message. `heal` returns
         # this same `(False, "…could not be removed…")` for ANY raise inside
@@ -9033,6 +9061,10 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
         found = []
         for path in sorted(root.rglob("*.py")):
+            text = source_text(path)
+            if ("_get_current_account" not in text
+                    and "_get_current_identity_triple" not in text):
+                continue
             tree = source_tree(path)
             for fn in ast.walk(tree):
                 if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -11187,8 +11219,19 @@ class TestASourceFileIsReadAsUTF8:
             if not path.exists():
                 continue
             text = source_text(path)
-            tree = source_tree(path)
             lines = text.splitlines()
+            # ponytail: an offender names one of `srcish` in its own call, and
+            # a call is a few lines, so a file with no `.read_text(` within 10
+            # lines of a marker is never parsed. The
+            # ceiling is a call whose receiver or arguments run past 10 lines
+            # with the marker only out there; the AST below is still the
+            # judge of every file this lets through.
+            if not any(
+                    ".read_text(" in ln and any(
+                        s in "\n".join(lines[max(0, i - 10):i + 11]) for s in srcish)
+                    for i, ln in enumerate(lines)):
+                continue
+            tree = source_tree(path)
             for node in ast.walk(tree):
                 if not (isinstance(node, ast.Call)
                         and isinstance(node.func, ast.Attribute)
@@ -11773,6 +11816,8 @@ class TestAPinSwingIsNotALoginInFlight:
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
         callers = []
         for path in sorted(root.rglob("*.py")):
+            if "identity_move_is_not_a_login" not in source_text(path):
+                continue
             for node in ast.walk(source_tree(path)):
                 if not isinstance(node, ast.Call):
                     continue

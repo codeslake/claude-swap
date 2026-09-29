@@ -498,6 +498,31 @@ def source_tree(path: Path) -> ast.Module:
     return ast.parse(source_text(path), filename=str(path))
 
 
+_orphan_walk = {"modules": 0, "cs": [], "stamp": None}
+
+
+def _orphan_stamp() -> tuple[int, int]:
+    """What the orphan walk reads, as two integers: `len(sys.modules)` and the
+    attribute count of the claude_swap modules.
+
+    An orphan is born as a NEW attribute on its parent (the import binds the
+    child there), so a birth moves the second number even when `patch.dict`
+    has already put `sys.modules` back to its old size. The list of claude_swap
+    modules is rebuilt only when `len(sys.modules)` changes, which is what
+    keeps this near zero.
+
+    ponytail: a test that adds one such attribute and removes another between
+    two teardowns is not seen; hashing `sorted(vars(m))` per module is the
+    upgrade if that ever shows.
+    """
+    walk = _orphan_walk
+    if walk["modules"] != len(sys.modules):
+        walk["modules"] = len(sys.modules)
+        walk["cs"] = [m for k, m in list(sys.modules.items())
+                      if k.startswith("claude_swap")]
+    return walk["modules"], sum(len(getattr(m, "__dict__", ())) for m in walk["cs"])
+
+
 @pytest.fixture(autouse=True)
 def _no_orphaned_claude_swap_modules():
     """Re-attach after every test, so the NEXT test patches what it calls.
@@ -505,10 +530,13 @@ def _no_orphaned_claude_swap_modules():
     Teardown, not setup: the orphan is created inside the test that runs the
     `patch.dict` block, and the damage is done to whichever test patches that
     module afterwards. Repairing at the end of each test closes the window
-    before anything can fall into it.
+    before anything can fall into it. The walk itself repeats only when
+    `_orphan_stamp` has moved since the last one.
     """
     yield
-    _reattach_orphaned_modules()
+    if _orphan_stamp() != _orphan_walk["stamp"]:
+        _reattach_orphaned_modules()
+        _orphan_walk["stamp"] = _orphan_stamp()
 
 
 class _KeychainStore:
