@@ -14595,9 +14595,9 @@ class TestLiveLock:
             reasons=['PollEvent', 'stale-usage']
 
         against `['PollEvent', 'engine-stopped']` unmutated. "usage could not
-        be refreshed this tick (backoff or a concurrent poller); retrying"
-        sends an operator after a fetch problem that does not exist, for an
-        engine that simply stopped.
+        be refreshed this tick (backoff, a hold, or a concurrent poller);
+        retrying" sends an operator after a fetch problem that does not
+        exist, for an engine that simply stopped.
 
         Asserts the REASON, which is what the gate decides now, rather than
         the freshen count, which something else already bounds.
