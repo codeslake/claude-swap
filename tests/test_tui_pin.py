@@ -21,41 +21,25 @@ import pytest
 
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_KEYCHAIN_UNAVAILABLE, USAGE_NO_CREDENTIALS
+from tests.conftest import source_tree
 from tests.test_tui import FakeSwitcher, make_account, make_app, menu_select, settle
 
 
 @pytest.mark.asyncio
 class TestThePinTuiSurface:
-    async def test_poll_does_not_move_the_root_menu_cursor(self, tmp_path):
-        """A background poll must not steal the cursor from the user.
+    async def test_the_root_menu_cursor_survives_a_poll_and_a_rebuild(self, tmp_path):
+        """A poll must not steal the cursor, and a rebuild follows the action.
 
-        The root menu is rebuilt on every snapshot so the pin row can appear
-        when the extra is installed mid-session. `_render_menu` ends with
+        POLL. The root menu is rebuilt on every snapshot so the pin row can
+        appear when the extra is installed mid-session. `_render_menu` ends with
         `menu.index = 0`, which is right for opening or popping a menu and
         wrong for refreshing the one the user is already reading: the cursor
         jumped home every POLL_INTERVAL_S (3s), so anyone slower than one poll
         could not finish choosing.
-        """
-        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
-        app = make_app(fake)
-        async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
-            from textual.widgets import ListView
 
-            menu = app.screen.query_one("#menu", ListView)
-            await pilot.press("down", "down")
-            await pilot.pause()
-            assert menu.index == 2
-
-            await app.screen.refresh_root_menu()
-            await pilot.pause()
-            assert menu.index == 2, "a poll moved the cursor"
-
-    async def test_root_menu_rebuild_keeps_the_cursor_on_its_action(self, tmp_path):
-        """When the rows DO change, follow the action, not the row number.
-
-        Installing the extra inserts `pin-menu` above `remove-menu`, so a
-        remembered integer lands on a different action than the one the user
+        REBUILD. When the rows DO change, follow the action, not the row
+        number. Installing the extra inserts `pin-menu` above `remove-menu`, so
+        a remembered integer lands on a different action than the one the user
         was pointing at. The identity to preserve is the action id.
         """
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
@@ -67,6 +51,14 @@ class TestThePinTuiSurface:
             from claude_swap.tui.widgets import MenuItem
 
             menu = app.screen.query_one("#menu", ListView)
+            await pilot.press("down", "down")
+            await pilot.pause()
+            assert menu.index == 2
+
+            await app.screen.refresh_root_menu()
+            await pilot.pause()
+            assert menu.index == 2, "a poll moved the cursor"
+
             items = list(menu.query(MenuItem))
             target = next(
                 i for i, it in enumerate(items) if it.action_id == "remove-menu"
@@ -144,14 +136,22 @@ class TestThePinTuiSurface:
         finally:
             pin.is_available = real_avail
 
-    async def test_an_informational_row_does_not_kill_the_dashboard(self, tmp_path):
-        """A row with no action must do nothing, not raise KeyError.
+    async def test_only_the_actionless_row_is_inert(self, tmp_path):
+        """A row with no action does nothing; an unknown id is still loud.
 
-        _pin_entries returns [(str(exc), ""), _BACK] when the package is
-        present but unusable — an informational row, deliberately without an
-        action. `actions[action_id]()` raised KeyError out of
+        INFORMATIONAL. `_pin_entries` returns [(str(exc), ""), _BACK] when the
+        package is present but unusable: an informational row, deliberately
+        without an action. `actions[action_id]()` raised KeyError out of
         on_list_view_selected and took the app down: the same class as a
         raising apply_pin, one menu level up.
+
+        AND ONLY THAT ROW IS INERT. The fix for the case above was
+        `elif action_id in actions`, which silences every unknown id. Rename a
+        key in `_root_entries`, or typo a new one, and the menu row goes
+        permanently dead with no exception, no notify and nothing in any log.
+        That is a special case repaired by widening shared infrastructure, and
+        the KeyError it removed is the only thing that surfaces the typo. An id
+        that is SUPPOSED to resolve must still be loud when it does not.
         """
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
@@ -160,24 +160,6 @@ class TestThePinTuiSurface:
             await app.screen._dispatch("")
             await pilot.pause()
             assert app.is_running, "an actionless row killed the dashboard"
-
-    async def test_an_id_that_should_resolve_and_does_not_still_raises(
-        self, tmp_path
-    ):
-        """AND ONLY THE ACTIONLESS ROW IS INERT — the fix for the case above
-        was `elif action_id in actions`, which silences every unknown id.
-
-        Rename a key in `_root_entries`, or typo a new one, and the menu row
-        goes permanently dead with no exception, no notify and nothing in any
-        log. That is a special case repaired by widening shared
-        infrastructure, and the KeyError it removed is the only thing that
-        surfaces the typo. An id that is SUPPOSED to resolve must still be
-        loud when it does not.
-        """
-        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
-        app = make_app(fake)
-        async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
             with pytest.raises(KeyError):
                 await app.screen._dispatch("no-such-action-id")
 
@@ -226,58 +208,96 @@ class TestThePinTuiSurface:
         finally:
             pin.is_available, pin._impl, pin.clear_wiring, pin.pinned_email = real
 
-    async def test_the_tui_does_not_report_a_pin_no_proxy_serves(self, tmp_path):
-        """apply_pin returning False must not read as success.
-
-        Asserted on `_run_pin_op`, the seam between pin.py's verdict and the
+    async def test_a_failed_pin_op_is_raised_and_a_good_one_is_a_toast(self, tmp_path):
+        """Asserted on `_run_pin_op`, the seam between pin.py's verdict and the
         TUI's reporting: it prints the message (which `run_action` captures and
         `_action_done` toasts) and RAISES on failure, which is what routes a
         failure to the modal instead of a toast the user can miss. Driving the
         worker instead would assert on Textual's scheduling rather than on the
         contract.
-        """
-        import contextlib
-        import io
 
+        SET. `apply_pin` returning False must not read as success.
+
+        REPAIR. `repin_current` RETURNS False and never raises, so handing it
+        straight to `_start_action` lost the failure entirely: `run_action`
+        builds `ActionResult(True, ...)` for any fn that does not raise and this
+        one prints nothing, so `_action_done` found an empty first line and
+        notified nothing. Against a daemon publishing `unpinnable` the repair
+        ran on mount, failed, held `app.busy` for its duration and the cloud
+        UNPINNED badge stayed lit with no explanation anywhere.
+        """
         from claude_swap import pin
 
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
-        async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
-            screen = app.screen
-            buf = io.StringIO()
-            # ClaudeSwitchError specifically: run_action catches only that and
-            # EOFError, so a RuntimeError escaped to the worker handler and
-            # became a toast — the modal this raise exists to open never opened.
-            from claude_swap.exceptions import ClaudeSwitchError
+        real = pin.repin_current
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                screen = app.screen
+                buf = io.StringIO()
+                # ClaudeSwitchError specifically: run_action catches only that
+                # and EOFError, so a RuntimeError escaped to the worker handler
+                # and became a toast: the modal this raise exists to open never
+                # opened.
+                with contextlib.redirect_stdout(buf), pytest.raises(
+                    ClaudeSwitchError, match="no proxy is running"
+                ):
+                    screen._run_pin_op(lambda: (False, "no proxy is running"))
+                # Carried by the RAISE, not by a print: run_action renders a
+                # ClaudeSwitchError as "Error: {e}", so printing it here too put
+                # the same sentence in the modal twice.
+                assert buf.getvalue() == "", (
+                    f"the message was printed as well as raised: {buf.getvalue()!r}"
+                )
 
-            with contextlib.redirect_stdout(buf), pytest.raises(
-                ClaudeSwitchError, match="no proxy is running"
-            ):
-                screen._run_pin_op(lambda: (False, "no proxy is running"))
-            # Carried by the RAISE, not by a print: run_action renders a
-            # ClaudeSwitchError as "Error: {e}", so printing it here too put
-            # the same sentence in the modal twice.
-            assert buf.getvalue() == "", (
-                f"the message was printed as well as raised: {buf.getvalue()!r}"
-            )
+                # And the success path stays a plain toast, no raise.
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    screen._run_pin_op(lambda: (True, "Pinned the cloud account"))
+                assert "Pinned" in buf.getvalue()
+                assert app.is_running
 
-            # And the success path stays a plain toast, no raise.
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                screen._run_pin_op(lambda: (True, "Pinned the cloud account"))
-            assert "Pinned" in buf.getvalue()
-            assert app.is_running
+                pin.repin_current = lambda _sw: False           # the failure, silent
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), pytest.raises(
+                    ClaudeSwitchError, match="cloud pin"
+                ):
+                    screen._run_pin_op(partial(screen._repin, fake))
+                assert buf.getvalue() == "", (
+                    "the message was printed as well as raised, so the modal "
+                    f"carries it twice: {buf.getvalue()!r}")
 
-    async def test_the_tui_pin_verdict_comes_from_pin_py(self, tmp_path):
-        """The TUI must not re-implement the verdict.
+                # And the success path stays a plain toast, no raise: or a
+                # working repair starts opening a modal at every launch.
+                pin.repin_current = lambda _sw: True
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    screen._run_pin_op(partial(screen._repin, fake))
+                assert buf.getvalue().strip(), (
+                    "a successful repair said nothing, which is the silence "
+                    "this case exists to remove, in the other direction")
+        finally:
+            pin.repin_current = real
 
-        A fix on the CLI whose sibling here keeps the
-        old behaviour. `_apply_pin` therefore delegates to `pin.set_pin` and
-        only adds the note it alone can produce.
+    async def test_the_tui_asks_pin_py_and_filters_api_keys_by_kind(self, tmp_path):
+        """The TUI must not re-implement the verdict, and must filter on the
+        SAME fact the CLI refuses on.
+
+        VERDICT. A fix on the CLI whose sibling here keeps the old behaviour.
+        `_apply_pin` therefore delegates to `pin.set_pin` and only adds the note
+        it alone can produce. `num` is asserted too: passing the slot the TUI
+        already has is what keeps a duplicate email from bypassing the API-key
+        refusal.
+
+        KIND. The CLI refuses on switcher._account_kind(n) == "api_key"; this
+        filtered on acc.usage.sentinel == USAGE_API_KEY, and those diverge: the
+        sentinel reads USAGE_NO_CREDENTIALS for an unreadable backup blob and
+        USAGE_KEYCHAIN_UNAVAILABLE for an API-key slot behind a locked macOS
+        keychain. Either one offered the row, and the pin went through.
         """
         from claude_swap import pin
+        from claude_swap.json_output import USAGE_NO_CREDENTIALS
 
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
@@ -287,9 +307,10 @@ class TestThePinTuiSurface:
             def live_remote_control_sessions(self):
                 return ["sess-1"]
 
-        real = pin.set_pin
-        # num is asserted too: passing the slot the TUI already has is what
-        # keeps a duplicate email from bypassing the API-key refusal.
+        # `_live_impl` is what is_available() calls; stubbing both keeps this
+        # off the real resolution path, which invalidates importlib caches and
+        # cost 15s per run.
+        real = (pin.set_pin, pin.is_available, pin._impl, pin.pinned_email)
         pin.set_pin = lambda sw, email, org, num=None: (
             seen.append((email, num)) or (True, f"Pinned {email}")
         )
@@ -298,54 +319,27 @@ class TestThePinTuiSurface:
                 await settle(pilot)
                 acc = app.snapshot.accounts[0]
                 ok, msg = app.screen._apply_pin(acc, _Impl())
-            assert seen == [(acc.email, acc.number)], (
-                "the TUI did not go through pin.set_pin with its resolved slot"
-            )
-            assert ok and "Pinned" in msg
-            assert "Reconnect open Remote Control" in msg, (
-                "the RC note only this side can produce was dropped"
-            )
-        finally:
-            pin.set_pin = real
-
-    async def test_an_api_key_row_is_filtered_by_kind_not_sentinel(self, tmp_path):
-        """The TUI filter must read the SAME fact the CLI refuses on.
-
-        The CLI refuses on switcher._account_kind(n) == "api_key"; this filtered
-        on acc.usage.sentinel == USAGE_API_KEY, and those diverge — the sentinel
-        reads USAGE_NO_CREDENTIALS for an unreadable backup blob and
-        USAGE_KEYCHAIN_UNAVAILABLE for an API-key slot behind a locked macOS
-        keychain. Either one offered the row, and the pin went through.
-        """
-        from claude_swap import pin
-        from claude_swap.json_output import USAGE_NO_CREDENTIALS
-
-        acc = make_account(1, active=True)
-        fake = FakeSwitcher([acc], tmp_path)
-        app = make_app(fake)
-        # _live_impl is what is_available() calls; stubbing both keeps this
-        # off the real resolution path, which invalidates importlib caches and
-        # cost 15s per run.
-        real = (pin.is_available, pin._impl, pin.pinned_email)
-        pin.is_available = lambda: True
-        pin._impl = lambda: object()
-        pin.pinned_email = lambda _sw: None
-        try:
-            async with app.run_test(size=(100, 32)) as pilot:
-                await settle(pilot)
-                snap_acc = app.snapshot.accounts[0]
-                # kind says api_key while the sentinel says something else —
-                # exactly the divergence that let the row through.
-                object.__setattr__(snap_acc, "kind", "api_key")
-                object.__setattr__(
-                    snap_acc.usage, "sentinel", USAGE_NO_CREDENTIALS
+                assert seen == [(acc.email, acc.number)], (
+                    "the TUI did not go through pin.set_pin with its resolved slot"
                 )
+                assert ok and "Pinned" in msg
+                assert "Reconnect open Remote Control" in msg, (
+                    "the RC note only this side can produce was dropped"
+                )
+
+                pin.is_available = lambda: True
+                pin._impl = lambda: object()
+                pin.pinned_email = lambda _sw: None
+                # kind says api_key while the sentinel says something else:
+                # exactly the divergence that let the row through.
+                object.__setattr__(acc, "kind", "api_key")
+                object.__setattr__(acc.usage, "sentinel", USAGE_NO_CREDENTIALS)
                 ids = [aid for _label, aid in app.screen._pin_entries()]
-                assert f"pin:{snap_acc.number}" not in ids, (
+                assert f"pin:{acc.number}" not in ids, (
                     "an API-key account was offered for pinning"
                 )
         finally:
-            pin.is_available, pin._impl, pin.pinned_email = real
+            pin.set_pin, pin.is_available, pin._impl, pin.pinned_email = real
 
     async def test_opening_the_tui_repairs_a_pin_that_stopped_applying(
         self, tmp_path
@@ -393,58 +387,6 @@ class TestThePinTuiSurface:
         finally:
             (pin.is_available, pin._impl, pin.pinned_email,
              pin.pin_is_applying, pin.repin_current) = real
-
-    async def test_a_repair_that_fails_is_not_silent(self, tmp_path):
-        """`repin_current` RETURNS False and never raises, so handing it
-        straight to `_start_action` lost the failure entirely.
-
-        `run_action` builds `ActionResult(True, ...)` for any fn that does not
-        raise and this one prints nothing, so `_action_done` found an empty
-        first line and notified nothing. Against a daemon publishing
-        `unpinnable` the repair ran on mount, failed, held `app.busy` for its
-        duration — the user's next keystroke answering "Another action is
-        still running" — and the cloud UNPINNED badge stayed lit with no
-        explanation anywhere.
-        """
-        from claude_swap import pin
-
-        acc = make_account(1, active=True)
-        fake = FakeSwitcher([acc], tmp_path)
-        app = make_app(fake)
-
-        # ASSERTED ON THE SEAM, like `_run_pin_op`'s sibling above: driving the
-        # worker asserts on Textual's scheduling rather than on the contract.
-        import contextlib
-        import io
-
-        from claude_swap.exceptions import ClaudeSwitchError
-
-        real = pin.repin_current
-        pin.repin_current = lambda _sw: False           # the failure, silent
-        try:
-            async with app.run_test(size=(100, 32)) as pilot:
-                await settle(pilot)
-                screen = app.screen
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf), pytest.raises(
-                    ClaudeSwitchError, match="cloud pin"
-                ):
-                    screen._run_pin_op(partial(screen._repin, fake))
-                assert buf.getvalue() == "", (
-                    "the message was printed as well as raised, so the modal "
-                    f"carries it twice: {buf.getvalue()!r}")
-
-                # And the success path stays a plain toast, no raise — or a
-                # working repair starts opening a modal at every launch.
-                pin.repin_current = lambda _sw: True
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    screen._run_pin_op(partial(screen._repin, fake))
-                assert buf.getvalue().strip(), (
-                    "a successful repair said nothing, which is the silence "
-                    "this case exists to remove, in the other direction")
-        finally:
-            pin.repin_current = real
 
     async def test_opening_the_tui_does_not_recycle_a_healthy_pin(self, tmp_path):
         """The control, and the one that keeps this from being a menace.
@@ -765,7 +707,9 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
     who uninstalled the extra had a wired config and no visible way out.
     """
 
-    async def test_the_row_appears_when_only_a_wiring_remains(self, tmp_path):
+    async def test_the_row_follows_the_wiring_not_the_extra(self, tmp_path):
+        """A wiring the uninstalled extra left behind keeps its way out, and a
+        user who never asked for the pin still sees nothing."""
         from claude_swap import pin
 
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
@@ -781,46 +725,44 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
                 assert "pin-menu" in ids, (
                     "no way to remove a wiring the uninstalled extra left behind"
                 )
-        finally:
-            pin.is_available, pin._wiring_present, pin.pinned_email = real
-
-    async def test_the_row_stays_hidden_when_nothing_is_wired(self, tmp_path):
-        """...and a user who never asked for the pin still sees nothing."""
-        from claude_swap import pin
-
-        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
-        app = make_app(fake)
-        real = (pin.is_available, pin._wiring_present)
-        pin.is_available = lambda: False
-        pin._wiring_present = lambda _sw: False
-        try:
-            async with app.run_test(size=(100, 32)) as pilot:
-                await settle(pilot)
+                pin._wiring_present = lambda _sw: False
                 ids = [aid for _label, aid in app.screen._root_entries()]
                 assert "pin-menu" not in ids
         finally:
-            pin.is_available, pin._wiring_present = real
+            pin.is_available, pin._wiring_present, pin.pinned_email = real
 
-    async def test_the_submenu_offers_the_clear_a_partial_clear_left_behind(
+    async def test_the_submenu_offers_the_clear_whichever_half_survived(
         self, tmp_path
     ):
-        """The two gates must ask the same question.
+        """The two gates must ask the same question, in both directions.
 
         The root gate is `is_available() or _wiring_present(...)`; the submenu
-        gated the clear row on the RECORD alone. A partial `clear_pin` drops
-        the record and gets locked out of the wiring ("Could not remove the
-        wiring — re-run once it frees up"), so the root menu showed the Cloud
-        row, the submenu showed the accounts and `← back`, and the user
-        following the TUI's own advice found nothing to press.
+        gated the clear row on the RECORD alone.
+
+        WIRING ONLY. A partial `clear_pin` drops the record and gets locked out
+        of the wiring ("Could not remove the wiring: re-run once it frees up"),
+        so the root menu showed the Cloud row, the submenu showed the accounts
+        and `<- back`, and the user following the TUI's own advice found nothing
+        to press. `_impl` must resolve: without it `_pin_entries` takes its
+        broken-package branch, which offers the clear on `_wiring_present`
+        already, so the case would pass against the record-only gate it exists
+        to catch.
+
+        RECORD ONLY. The row is gated on `pinned_email`, which asks the PACKAGE
+        (`_live_impl().load_pin`) and returns None whenever the package is
+        absent or broken. `clear_pin` decides from `_pinned_email_now`, which
+        reads cswap's OWN settings.json. So with a live record and a package
+        that cannot answer, the two disagree: `clear_pin` has real work to do
+        (it clears the record itself, precisely for this case) and the TUI
+        offers no row to run it from. The wiring is absent, so `_wiring_present`
+        cannot carry the row either and the record is the only thing that can.
         """
         from claude_swap import pin
 
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
-        real = (pin._impl, pin._wiring_present, pin.pinned_email)
-        # _impl must resolve: without it `_pin_entries` takes its broken-package
-        # branch, which offers the clear on `_wiring_present` already — so the
-        # test would pass against the record-only gate it exists to catch.
+        real = (pin._impl, pin._wiring_present, pin.pinned_email,
+                pin._pinned_email_now)
         pin._impl = lambda: object()
         pin._wiring_present = lambda _sw: True   # the wiring survived
         pin.pinned_email = lambda _sw: None      # the record did not
@@ -832,44 +774,13 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
                     "the TUI told the user to re-run the clear and then "
                     f"offered no row to run it from: {ids}"
                 )
-        finally:
-            pin._impl, pin._wiring_present, pin.pinned_email = real
 
-    async def test_the_submenu_offers_the_clear_for_a_record_only_the_repo_can_see(
-        self, tmp_path
-    ):
-        """The other half of the same mismatch, and the opposite direction.
-
-        The row is gated on `pinned_email`, which asks the PACKAGE
-        (`_live_impl().load_pin`) and returns None whenever the package is
-        absent or broken. `clear_pin` decides from `_pinned_email_now`, which
-        reads cswap's OWN settings.json. So with a live record and a package
-        that cannot answer, the two disagree: `clear_pin` has real work to do
-        (it clears the record itself, precisely for this case) and the TUI
-        offers no row to run it from.
-
-        Not the broken-package branch: `_impl` resolves here, so the submenu
-        takes its normal path — the branch whose gate is under test. The
-        wiring is absent, so `_wiring_present` cannot carry the row either and
-        the record is the only thing that can.
-        """
-        from claude_swap import pin
-
-        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
-        app = make_app(fake)
-        real = (pin._impl, pin._wiring_present, pin.pinned_email,
-                pin._pinned_email_now)
-        pin._impl = lambda: object()
-        pin._wiring_present = lambda _sw: False        # no wiring left
-        pin.pinned_email = lambda _sw: None            # the PACKAGE cannot say
-        pin._pinned_email_now = lambda _sw: ("a@b.c", "")  # cswap's file CAN
-        try:
-            async with app.run_test(size=(100, 32)) as pilot:
-                await settle(pilot)
+                pin._wiring_present = lambda _sw: False        # no wiring left
+                pin._pinned_email_now = lambda _sw: ("a@b.c", "")  # cswap's file CAN
                 ids = [aid for _label, aid in app.screen._pin_entries()]
                 assert "pin:clear" in ids, (
-                    f"a pin record cswap can see and remove — and which keeps "
-                    f"the pin live the moment the package returns — had no "
+                    f"a pin record cswap can see and remove, and which keeps "
+                    f"the pin live the moment the package returns, had no "
                     f"row to remove it from: {ids}"
                 )
         finally:
@@ -1107,7 +1018,13 @@ class TestTwoSlotsAtOneAddressLightOneBadge:
     async def test_only_the_pinned_organization_gets_the_badge(
         self, tmp_path, monkeypatch
     ):
+        """Both render sites, one pilot. `AccountItem` is fed `cloud_pinned` by
+        `dashboard.py`; `AccountsPanel.render` decides for itself, and a
+        laundered email-only badge in the panel (the reader attribute renamed,
+        the address aliased) passed the whole suite with the structural
+        tripwire green, so the panel is asserted on its own."""
         from claude_swap.tui import dashboard as _dash
+        from claude_swap.tui import widgets as _w
         from claude_swap.tui.widgets import AccountCard, AccountItem
 
         accounts = [
@@ -1121,6 +1038,15 @@ class TestTwoSlotsAtOneAddressLightOneBadge:
         app = make_app(fake)
         async with app.run_test(size=(100, 32)) as pilot:
             await settle(pilot)
+            panel = app.screen.query_one(_w.AccountsPanel)
+            panel._resolve_and_refresh()
+            text = panel.render().plain
+            assert text.count("○ cloud") == 1, (
+                "two slots share one address across organizations and the panel "
+                f"drew {text.count('○ cloud')} badges, an email-only answer "
+                "lights both"
+            )
+
             await menu_select(pilot, "switch")
             await settle(pilot)
 
@@ -1131,42 +1057,9 @@ class TestTwoSlotsAtOneAddressLightOneBadge:
                             if "○ cloud" in c.render().plain)
             assert badged == ["2"], (
                 f"two slots share one address across organizations and the "
-                f"badge landed on {badged} — an email-only answer lights both"
+                f"badge landed on {badged}, an email-only answer lights both"
             )
 
-
-    @pytest.mark.asyncio
-    async def test_the_accounts_panel_badges_one_card_too(
-        self, tmp_path, monkeypatch
-    ):
-        """THE OTHER RENDER SITE. `AccountItem` is fed `cloud_pinned` by
-        `dashboard.py`; `AccountsPanel.render` decides for itself. The case
-        above cannot see this one, and a laundered email-only badge here —
-        the reader attribute renamed, the address aliased — passed the whole
-        suite with the structural tripwire green.
-        """
-        from claude_swap.tui import widgets as _w
-
-        accounts = [
-            make_account(1, active=True, email="shared@e.com", org_uuid="org-A"),
-            make_account(2, email="shared@e.com", org_uuid="org-B"),
-        ]
-        fake = FakeSwitcher(accounts, tmp_path)
-        monkeypatch.setattr(
-            _w.pin, "pinned_identity", lambda _sw: ("shared@e.com", "org-B"))
-
-        app = make_app(fake)
-        async with app.run_test(size=(100, 32)) as pilot:
-            await settle(pilot)
-            panel = app.screen.query_one(_w.AccountsPanel)
-            panel._resolve_and_refresh()
-            text = panel.render().plain
-
-        assert text.count("○ cloud") == 1, (
-            "two slots share one address across organizations and the panel "
-            f"drew {text.count('○ cloud')} badges — an email-only answer "
-            "lights both"
-        )
 
 
 class TestEveryBadgeSiteAsksTheSameQuestion:
@@ -1238,7 +1131,7 @@ class TestEveryBadgeSiteAsksTheSameQuestion:
         modules = sorted(root.rglob("*.py"))
         offenders = []
         for path in modules:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = source_tree(path)
             pin_names, is_pin = self._pin_valued(tree)
 
             def pin_valued(node):
@@ -1272,8 +1165,7 @@ class TestEveryBadgeSiteAsksTheSameQuestion:
                         f"{path.name}:{node.lineno}  {rendered[0]} == {rendered[1]}")
         # THE CONTROL: an empty walk would pass vacuously.
         assert len(modules) > 2, "the walk found no TUI modules"
-        assert any(self._pin_valued(ast.parse(m.read_text(encoding="utf-8")))[0]
-                   for m in modules), (
+        assert any(self._pin_valued(source_tree(m))[0] for m in modules), (
             "no TUI module binds a pin value — the alias tracker matched "
             "nothing, so its half of this guard proves nothing"
         )

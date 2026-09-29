@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import functools
 import json
 import os
 import shutil
@@ -481,6 +483,19 @@ def _reattach_orphaned_modules() -> list[str]:
                 _sys.modules[name] = child
                 restored.append(name)
     return restored
+
+
+@functools.lru_cache(maxsize=None)
+def source_text(path: Path) -> str:
+    """One read per source file per worker, for every scan that walks a tree."""
+    return path.read_text(encoding="utf-8")
+
+
+@functools.lru_cache(maxsize=None)
+def source_tree(path: Path) -> ast.Module:
+    """One parse per source file per worker. A scan only READS what it gets:
+    one that mutates the tree poisons every later scan in the process."""
+    return ast.parse(source_text(path), filename=str(path))
 
 
 @pytest.fixture(autouse=True)

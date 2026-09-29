@@ -14,6 +14,7 @@ import sys
 import pytest
 
 from claude_swap.exceptions import ClaudeSwitchError
+from tests.conftest import source_text, source_tree
 
 
 @pytest.fixture(autouse=True)
@@ -155,10 +156,10 @@ def _port_literal_offenders(directory, own_file, own_class_name: str) -> list:
         #
         # A source file's encoding is UTF-8 by definition (PEP 3120), so
         # the platform default is never the right answer for reading one.
-        text = path.read_text(encoding="utf-8")
+        text = source_text(path)
         if "36301" not in text:
             continue
-        tree = ast.parse(text)
+        tree = source_tree(path)
         skip = set()
         is_own_file = path.resolve() == own_file
         for n in ast.walk(tree):
@@ -214,10 +215,9 @@ class TestImportSafeWithoutTheExtra:
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
         offenders = []
         for path in root.rglob("*.py"):
-            text = path.read_text(encoding="utf-8")
-            if "cswap_pin" not in text:
+            if "cswap_pin" not in source_text(path):
                 continue
-            tree = ast.parse(text)
+            tree = source_tree(path)
             nested = set()
             for fn in ast.walk(tree):
                 if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -283,7 +283,7 @@ class TestImportSafeWithoutTheExtra:
         for path in root.rglob("*.py"):
             if path.name == "pin.py":
                 continue
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            for node in ast.walk(source_tree(path)):
                 names = []
                 if isinstance(node, ast.Import):
                     names = [a.name for a in node.names]
@@ -3714,92 +3714,63 @@ class TestAFailedClearIsNotReportedAsSuccess:
     when the package is the thing that is broken.
     """
 
-    def _run(self, tmp_path, impl_src):
-        import subprocess
-        import textwrap
-        from pathlib import Path
+    def test_the_message_is_right_exactly_when_the_clear_worked(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Three packages over the same real record, one verdict each.
 
-        src = str(Path(__file__).resolve().parent.parent / "src")
+        - unusable (`_impl` raises): `--clear` must CONVERGE when the package
+          cannot help. The record is cswap's own file (settings.json ->
+          remoteControl), so an unusable package is no reason to leave it.
+          Leaving it made --clear fail, tell the user to REINSTALL the package
+          they had just removed, never converge on a re-run, and re-pin the
+          old account live the moment anything reinstalled it.
+        - `apply_pin` raises and the record cannot be cleared either: the
+          control, when the record genuinely survives, say so.
+        - a package that really clears: the message must be right exactly when
+          it worked.
+        """
+        import claude_swap.paths as paths
+        from claude_swap import pin
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
         cfg = tmp_path / ".claude.json"
         cfg.write_text(json.dumps({"env": {}}))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
         backup = tmp_path / "backup"
         backup.mkdir()
-        # A real pin record, written the way cswap writes one.
-        (backup / "settings.json").write_text(
-            json.dumps({"remoteControl": {"pinnedEmail": "cloud@example.com"}}, indent=2)
-        )
-        code = (
-            textwrap.dedent(
-                f"""
-                import sys
-                sys.path.insert(0, {src!r})
-                from pathlib import Path
-                import claude_swap.paths as paths
-                cfg = Path({str(cfg)!r})
-                paths.get_global_config_path = lambda: cfg
-                paths.get_default_global_config_path = lambda: cfg
-                from claude_swap import pin
-                """
-            )
-            + impl_src
-            + textwrap.dedent(
-                f"""
-                pin._impl = _impl_factory
-                from claude_swap.switcher import ClaudeAccountSwitcher
-                sw = ClaudeAccountSwitcher()
-                sw.backup_dir = Path({str(backup)!r})
-                sys.exit(pin.run(sw, None, clear=True))
-                """
-            )
-        )
-        return subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, text=True
-        )
+        record = backup / "settings.json"
+        sw = ClaudeAccountSwitcher()
+        sw.backup_dir = backup
+        real_clear_record = pin._clear_pin_record
 
-    def test_an_unusable_package_still_clears_the_record(self, tmp_path):
-        """`--clear` must CONVERGE when the package cannot help.
+        def unusable():
+            raise ImportError("cryptography")
 
-        The record is cswap's own file (settings.json -> remoteControl), so an
-        unusable package is no reason to leave it. Leaving it made --clear fail,
-        tell the user to REINSTALL the package they had just removed, never
-        converge on a re-run, and re-pin the old account live the moment
-        anything reinstalled it.
-        """
-        impl = (
-            "def _impl_factory():\n"
-            "    raise ImportError('cryptography')\n"
-        )
-        r = self._run(tmp_path, impl)
-        assert "Unpinned" in r.stdout, r.stdout + r.stderr[-400:]
-        assert r.returncode == 0, "a clear that converged must not exit 1"
+        class _Raises:
+            def apply_pin(self, *a, **k):
+                raise OSError("disk full")
 
-    def test_a_clear_that_leaves_the_record_is_a_failure(self, tmp_path):
-        """The control: when the record genuinely survives, say so."""
-        impl = (
-            "class _I:\n"
-            "    def apply_pin(self, *a, **k): raise OSError('disk full')\n"
-            "def _impl_factory(): return _I()\n"
-            # the record cannot be cleared either
-            "import claude_swap.pin as _p\n"
-            "_p._clear_pin_record = lambda *a: None\n"
-        )
-        r = self._run(tmp_path, impl)
-        assert "Unpinned" not in r.stdout
-        assert "Could not remove" in r.stdout, r.stdout + r.stderr[-400:]
-        assert r.returncode == 1
+        class _Clears:
+            def apply_pin(self, sw, *a, **kw):
+                (sw.backup_dir / "settings.json").write_text(json.dumps({}))
 
-    def test_a_real_clear_still_reports_success(self, tmp_path):
-        """The control: the message must be right exactly when it worked."""
-        impl = (
-            "import json as _j\n"
-            "class _I:\n"
-            "    def apply_pin(self, sw, *a, **kw):\n"
-            "        (sw.backup_dir / 'settings.json').write_text(_j.dumps({}))\n"
-            "def _impl_factory(): return _I()\n"
-        )
-        r = self._run(tmp_path, impl)
-        assert "Unpinned" in r.stdout, r.stdout + r.stderr[-400:]
-        assert r.returncode == 0
+        for label, impl, clear_record, unpinned in (
+            ("unusable package", unusable, real_clear_record, True),
+            ("record survives", lambda: _Raises(), lambda *a: None, False),
+            ("real clear", lambda: _Clears(), real_clear_record, True),
+        ):
+            # A real pin record, written the way cswap writes one.
+            record.write_text(json.dumps(
+                {"remoteControl": {"pinnedEmail": "cloud@example.com"}}, indent=2))
+            monkeypatch.setattr(pin, "_impl", impl)
+            monkeypatch.setattr(pin, "_clear_pin_record", clear_record)
+            rc = pin.run(sw, None, clear=True)
+            out = capsys.readouterr().out
+            assert ("Unpinned" in out) is unpinned, (label, out)
+            assert rc == (0 if unpinned else 1), (label, rc, out)
+            assert ("Could not remove" in out) is (not unpinned), (label, out)
 
 
 class TestTheExtraIsGatedByOneFloorOnly:
@@ -3826,8 +3797,9 @@ class TestTheExtraIsGatedByOneFloorOnly:
 
     WIN = sys.platform == "win32"
 
-    def _probe(self, version_literal):
-        """Run `_impl()` against a synthetic cswap_pin carrying any version."""
+    def _probe(self, *version_literals):
+        """Run `_impl()` against a synthetic cswap_pin per version literal, in
+        one process. One `ACCEPTED` or `REFUSED: ...` line each."""
         import subprocess
         import textwrap
         from pathlib import Path
@@ -3837,11 +3809,7 @@ class TestTheExtraIsGatedByOneFloorOnly:
             f"""
             import sys, types
             sys.path.insert(0, {src!r})
-            pkg = types.ModuleType("cswap_pin")
-            pkg.__path__ = []
-            {version_literal}
             proxy = types.ModuleType("cswap_pin.proxy")
-            sys.modules["cswap_pin"] = pkg
             sys.modules["cswap_pin.proxy"] = proxy
             import importlib.util
             real = importlib.util.find_spec
@@ -3850,11 +3818,16 @@ class TestTheExtraIsGatedByOneFloorOnly:
             import importlib
             importlib.import_module = lambda n, *a, **k: sys.modules[n]
             from claude_swap import pin
-            try:
-                pin._impl()
-                print("ACCEPTED")
-            except Exception as e:
-                print("REFUSED:", e)
+            for literal in {version_literals!r}:
+                pkg = types.ModuleType("cswap_pin")
+                pkg.__path__ = []
+                exec(literal)
+                sys.modules["cswap_pin"] = pkg
+                try:
+                    pin._impl()
+                    print("ACCEPTED")
+                except Exception as e:
+                    print("REFUSED:", e)
             """
         )
         return subprocess.run(
@@ -3925,12 +3898,14 @@ class TestTheExtraIsGatedByOneFloorOnly:
     def test_no_version_is_refused_at_runtime(self):
         """Any installed version imports. Refusing one here would need a
         constant this project cannot keep current."""
-        for literal in (
+        literals = (
             'pkg.__version__ = "0.1.0"',
             'pkg.__version__ = "0.0.1"',
             "pass",  # a dev checkout with no __version__ at all
-        ):
-            out = self._probe(literal)
+        )
+        lines = self._probe(*literals).splitlines()
+        assert len(lines) == len(literals), lines
+        for literal, out in zip(literals, lines):
             expected = "not available on Windows" if self.WIN else "ACCEPTED"
             assert expected in out, f"{literal!r} -> {out}"
             assert "too old" not in out, f"a runtime floor came back: {out}"
@@ -4233,6 +4208,13 @@ class TestTheCliRendersABrokenPackageHonestly:
     asserts is a guard someone deletes."""
 
     def test_the_cli_renders_a_broken_package_instead_of_a_traceback(self, tmp_path):
+        """One process, both readings of the same output.
+
+        The advice printed alongside a broken package must not tell the user
+        `--clear` unconditionally 'still works and removes the wiring':
+        `clear_wiring` skips a config whose lock is contended, so that promises
+        an outcome the code cannot guarantee under a held lock.
+        """
         import subprocess
         import textwrap
         from pathlib import Path
@@ -4260,6 +4242,11 @@ class TestTheCliRendersABrokenPackageHonestly:
         assert "Traceback" not in combined, combined[-500:]
         assert "not usable" in combined, combined[-500:]
         assert "EXIT 1" in combined, combined[-300:]
+        assert "--clear" in combined, combined[-500:]
+        assert "still works and removes the wiring." not in combined, (
+            "the advice still promises an unconditional outcome: "
+            f"{combined[-500:]}"
+        )
 
     def test_the_launch_unwire_is_bounded_by_the_budget(self, monkeypatch):
         """The unwire took the package's own 5s lock, unbounded by the budget
@@ -4282,43 +4269,6 @@ class TestTheCliRendersABrokenPackageHonestly:
         monkeypatch.setattr(pin, "_config_lock_is_free", lambda b: True)
         pin.wire_launch_env(sw, {"A": "1"})
         assert calls == ["unwired"], "the unwire never runs, even when free"
-
-    def test_the_broken_package_advice_does_not_promise_an_unconditional_clear(
-        self, tmp_path
-    ):
-        """Finding 3 makes a contended config lock a reachable reason
-        `clear_wiring` skips a config it never got to try. The catch-all
-        advice printed alongside a broken-package traceback must not tell the
-        user `--clear` unconditionally 'still works and removes the wiring' —
-        that promises an outcome the code cannot guarantee under a held lock.
-        """
-        import subprocess
-        import textwrap
-        from pathlib import Path
-
-        src = str(Path(__file__).resolve().parent.parent / "src")
-        code = textwrap.dedent(
-            f"""
-            import sys
-            sys.path.insert(0, {src!r})
-            from claude_swap import pin
-            pin.run = lambda *a, **k: (_ for _ in ()).throw(
-                ImportError("No module named 'cryptography'", name="cryptography"))
-            from claude_swap import cli
-            sys.argv = ["cswap", "pin", "2"]
-            try:
-                cli._pin_command(["2"])
-            except SystemExit as e:
-                print("EXIT", e.code)
-            """
-        )
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-        combined = r.stdout + r.stderr
-        assert "--clear" in combined, combined[-500:]
-        assert "still works and removes the wiring." not in combined, (
-            "the advice still promises an unconditional outcome: "
-            f"{combined[-500:]}"
-        )
 
 
 class TestTheLockProbeActuallyProbes:
@@ -9083,7 +9033,7 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
         found = []
         for path in sorted(root.rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = source_tree(path)
             for fn in ast.walk(tree):
                 if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
@@ -9569,7 +9519,7 @@ class TestNoNameIsDefinedTwiceInThisModule:
         checked = 0
         problems = []
         for path in sorted(root.rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = source_tree(path)
             checked += 1
             names = collections.Counter(
                 n.name for n in tree.body
@@ -10267,24 +10217,19 @@ class TestAnUnreadableConfigIsNotACleanOne:
         assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {
             cfg: ["HTTPS_PROXY"]}
 
-    def test_CONTROL_a_readable_cleared_config_is_clean(self, tmp_path):
-        """Without this, the two above pass on a function that reports
-        everything as surviving."""
-        cfg = self._config(tmp_path, '{"env": {}}')
-        assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {}
+    def test_a_config_that_no_longer_carries_the_key_is_clean(self, tmp_path):
+        """CONTROL: without the first body, the cases above pass on a function
+        that reports everything as surviving. The second: a hand-edited
+        `"env": "HTTPS_PROXY"` made `n in env` a SUBSTRING test, so the key read
+        as surviving over a config with no env block at all."""
+        for body in ('{"env": {}}', '{"env": "HTTPS_PROXY"}'):
+            cfg = self._config(tmp_path, body)
+            assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {}, body
 
     def test_a_readable_config_that_KEPT_the_key_is_named(self, tmp_path):
         cfg = self._config(tmp_path, '{"env": {"HTTPS_PROXY": "http://dead"}}')
         assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY", "GONE"]}) == {
             cfg: ["HTTPS_PROXY"]}
-
-    def test_an_env_block_that_is_not_a_dict_is_not_searched_as_a_string(
-            self, tmp_path):
-        """A hand-edited `"env": "HTTPS_PROXY"` made `n in env` a SUBSTRING
-        test, so the key read as surviving over a config with no env block at
-        all."""
-        cfg = self._config(tmp_path, '{"env": "HTTPS_PROXY"}')
-        assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {}
 
 
 
@@ -10662,19 +10607,15 @@ class TestAnAddThatRefreshesThePinnedSlotRepairsThePin:
         assert calls == [], (
             "a serving daemon was restarted under live sessions for nothing")
 
-    def test_cannot_tell_reads_as_healthy(self, monkeypatch):
-        """`None` is "no extra, no daemon record, an unreadable one"."""
-        calls = []
-        self._patch(monkeypatch, slot="1", applying=None, calls=calls)
-        self._switcher()._repin_if_pin_slot_refreshed("1")
-        assert calls == []
-
-    def test_another_slot_is_not_the_pin(self, monkeypatch):
-        """Adding slot 3 says nothing about slot 1's credential."""
-        calls = []
-        self._patch(monkeypatch, slot="1", applying=False, calls=calls)
-        self._switcher()._repin_if_pin_slot_refreshed("3")
-        assert calls == []
+    def test_a_slot_that_is_not_known_broken_is_not_repinned(self, monkeypatch):
+        """`None` is "no extra, no daemon record, an unreadable one": cannot
+        tell reads as healthy. And adding slot 3 says nothing about slot 1's
+        credential."""
+        for applying, added in ((None, "1"), (False, "3")):
+            calls = []
+            self._patch(monkeypatch, slot="1", applying=applying, calls=calls)
+            self._switcher()._repin_if_pin_slot_refreshed(added)
+            assert calls == [], (applying, added)
 
     def test_an_int_slot_still_matches(self, monkeypatch):
         """`account_num` is a str everywhere in `add_account`, but the guard
@@ -10983,25 +10924,18 @@ class TestALoginAsThePinnedAccountIsNotASplice:
         s._live_login_identity()
         assert asked == ["other-a", "other-a", "other-a"], asked
 
-    def test_CONTROL_a_real_splice_is_still_un_spliced(
+    def test_CONTROL_the_recorded_slots_own_credential_is_still_un_spliced(
             self, tmp_path, monkeypatch):
         """Same config, same pin. Only the credential differs: it is still the
-        roster's active account, which is what a splice leaves behind."""
-        s = self._switcher(
-            tmp_path, monkeypatch,
-            live_tokens={"accessToken": "login-a", "refreshToken": "login-r"},
-            stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
-        assert s._live_login_identity() == ("login@example.com", "org-login")
-
-    def test_CONTROL_a_rotated_access_token_is_still_the_same_account(
-            self, tmp_path, monkeypatch):
-        """A refresh moves one token and not the other. Matching EITHER is what
+        roster's active account, which is what a splice leaves behind. A
+        refresh moves one token and not the other, and matching EITHER is what
         keeps a refresh in flight from reading as a different account."""
-        s = self._switcher(
-            tmp_path, monkeypatch,
-            live_tokens={"accessToken": "login-a2", "refreshToken": "login-r"},
-            stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
-        assert s._live_login_identity() == ("login@example.com", "org-login")
+        for live in ({"accessToken": "login-a", "refreshToken": "login-r"},
+                     {"accessToken": "login-a2", "refreshToken": "login-r"}):
+            s = self._switcher(
+                tmp_path, monkeypatch, live_tokens=live,
+                stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
+            assert s._live_login_identity() == ("login@example.com", "org-login"), live
 
     def test_CONTROL_an_unreadable_store_is_not_a_mismatch(
             self, tmp_path, monkeypatch):
@@ -11252,8 +11186,8 @@ class TestASourceFileIsReadAsUTF8:
         for path in sorted(root.glob("*.py")) + [root / "conftest.py"]:
             if not path.exists():
                 continue
-            text = path.read_text(encoding="utf-8")
-            tree = ast.parse(text)
+            text = source_text(path)
+            tree = source_tree(path)
             lines = text.splitlines()
             for node in ast.walk(tree):
                 if not (isinstance(node, ast.Call)
@@ -11605,25 +11539,21 @@ class TestAddAccountUnderASpliceRegistersTheLogin:
         return sw, seen, _Past, oracle
 
     def test_the_login_is_the_account_the_server_names(self):
-        """THE SLICE: past the guard as the token's owner, not as the pin."""
+        """THE SLICE: past the guard as the token's owner, not as the pin. And
+        the CONTROL: the server naming the pin's own account is not a splice."""
         import pytest
-        sw, seen, past, oracle = self._sw(
-            {"uuid": "u-2", "email": "b@example.com", "organizationUuid": "o-2"})
-        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value=oracle), \
-                pytest.raises(past):
-            sw.add_account()
-        assert seen == [("b@example.com", "o-2")], seen
-
-    def test_the_pin_account_itself_is_still_added_as_itself(self):
-        """CONTROL: the server naming the pin's own account is not a splice."""
-        import pytest
-        sw, seen, past, oracle = self._sw(
-            {"uuid": "uuid-PIN", "email": "pinned@example.com",
-             "organizationUuid": "org-PIN"})
-        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value=oracle), \
-                pytest.raises(past):
-            sw.add_account()
-        assert seen == [("pinned@example.com", "org-PIN")], seen
+        for profile, expected in (
+            ({"uuid": "u-2", "email": "b@example.com", "organizationUuid": "o-2"},
+             ("b@example.com", "o-2")),
+            ({"uuid": "uuid-PIN", "email": "pinned@example.com",
+              "organizationUuid": "org-PIN"},
+             ("pinned@example.com", "org-PIN")),
+        ):
+            sw, seen, past, oracle = self._sw(profile)
+            with _patch("claude_swap.oauth.fetch_oauth_profile", return_value=oracle), \
+                    pytest.raises(past):
+                sw.add_account()
+            assert seen == [expected], seen
 
     def test_a_server_that_cannot_say_still_refuses(self):
         """CONTROL: no answer is not the pin's account, and it is not a login
@@ -11843,8 +11773,7 @@ class TestAPinSwingIsNotALoginInFlight:
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
         callers = []
         for path in sorted(root.rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
+            for node in ast.walk(source_tree(path)):
                 if not isinstance(node, ast.Call):
                     continue
                 f = node.func
@@ -12232,16 +12161,20 @@ class TestThePinStateVerb:
         assert rc == 0
         assert capsys.readouterr().out.strip() == "OK"
 
-    def test_both_probes_ok_is_ok(self, tmp_path, monkeypatch, capsys):
-        """`no / yes / ok`: the RED test, row 1 of the brief."""
+    def test_the_daemon_half_decides_ok_or_not_ok(self, tmp_path, monkeypatch, capsys):
+        """`no / yes / ok` is the RED test, row 1 of the brief. `no / yes /
+        bad` is row 2b, the token half fails: the same word as row 2a from a
+        different probe, which is why both must be driven."""
         from claude_swap import pin
 
         monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
         monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
-        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: (True, "can_pin=true"))
-        rc = pin.run(self._sw(tmp_path), None, state=True)
-        assert rc == 0
-        assert capsys.readouterr().out.strip() == "OK"
+        for verdict, word in (((True, "can_pin=true"), "OK"),
+                              ((False, "can_pin=false"), "NOT-OK")):
+            monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, _v=verdict, **k: _v)
+            rc = pin.run(self._sw(tmp_path / word), None, state=True)
+            assert rc == 0
+            assert capsys.readouterr().out.strip() == word, verdict
 
     def test_stale_wiring_is_not_ok(self, tmp_path, monkeypatch, capsys):
         """`yes / no / none`: row 2a, the wiring half fails.
@@ -12278,18 +12211,6 @@ class TestThePinStateVerb:
             {"remoteControl": {"pinnedEmail": "a@example.com"}}))
         monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
         rc = pin.run(sw, None, state=True)
-        assert rc == 0
-        assert capsys.readouterr().out.strip() == "NOT-OK"
-
-    def test_daemon_says_cannot_pin_is_not_ok(self, tmp_path, monkeypatch, capsys):
-        """`no / yes / bad`: row 2b, the token half fails -- same word as
-        row 2a from a different probe, which is why both must be driven."""
-        from claude_swap import pin
-
-        monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
-        monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
-        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: (False, "can_pin=false"))
-        rc = pin.run(self._sw(tmp_path), None, state=True)
         assert rc == 0
         assert capsys.readouterr().out.strip() == "NOT-OK"
 
@@ -12381,24 +12302,28 @@ class TestDaemonCanPinReadsHealth:
         monkeypatch.setattr("urllib.request.build_opener", _build_opener)
         return calls
 
-    def test_can_pin_true(self, monkeypatch):
+    def test_the_health_body_decides_the_verdict(self, monkeypatch):
         from claude_swap import pin
 
-        self._stub_urlopen(monkeypatch, b'{"can_pin": true}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is True
-
-    def test_can_pin_false(self, monkeypatch):
-        from claude_swap import pin
-
-        self._stub_urlopen(monkeypatch, b'{"can_pin": false}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is False
-
-    def test_missing_field_is_no_verdict(self, monkeypatch):
-        """An old daemon whose `/health` predates the field."""
-        from claude_swap import pin
-
-        self._stub_urlopen(monkeypatch, b'{"ok": true}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is None
+        for body, verdict, why in (
+            (b'{"can_pin": true}', True, "can_pin true"),
+            (b'{"can_pin": false}', False, "can_pin false"),
+            (b'{"ok": true}', None, "an old daemon whose /health predates the field"),
+            (b"not json", None, "malformed json"),
+            (b"[1, 2, 3]", None, "valid json but not an object: no can_pin on it"),
+            # Exactly at the wedge is not past it: mirrors the pin's own strict
+            # `>`, not `>=`.
+            (b'{"can_pin": true, "mint_stalled_s": 60.0}', True, "at the wedge"),
+            # Every HEALTHY 0.1.262 daemon publishes `mint_stalled_s` on every
+            # response, `null` when nothing is stalled: the live common case,
+            # distinct from a field genuinely absent (an old daemon).
+            (b'{"can_pin": true, "mint_stalled_s": null}', True, "explicit null"),
+            # The wedge check runs before `can_pin` is even read, so it
+            # overrides a missing field too, not only `can_pin: true`.
+            (b'{"mint_stalled_s": 90.0}', False, "past the wedge, no can_pin"),
+        ):
+            self._stub_urlopen(monkeypatch, body)
+            assert pin._daemon_can_pin(4242, timeout=1.0)[0] is verdict, why
 
     def test_unreachable_is_no_verdict(self, monkeypatch):
         from claude_swap import pin
@@ -12428,19 +12353,6 @@ class TestDaemonCanPinReadsHealth:
             monkeypatch, raises=http.client.RemoteDisconnected("disconnected"))
         assert pin._daemon_can_pin(4242, timeout=1.0)[0] is False
 
-    def test_malformed_json_is_no_verdict(self, monkeypatch):
-        from claude_swap import pin
-
-        self._stub_urlopen(monkeypatch, b"not json")
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is None
-
-    def test_valid_but_non_dict_json_is_no_verdict(self, monkeypatch):
-        """Valid JSON, but not an object -- `can_pin` cannot exist on it."""
-        from claude_swap import pin
-
-        self._stub_urlopen(monkeypatch, b"[1, 2, 3]")
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is None
-
     def test_mint_stalled_past_wedge_is_not_can_pin(self, monkeypatch):
         """The pin's own consumer (`proxy.py _serving_can_pin`) reads
         `can_pin` only after checking this same wedge; a reader of the same
@@ -12453,33 +12365,6 @@ class TestDaemonCanPinReadsHealth:
         can_pin, why = pin._daemon_can_pin(4242, timeout=1.0)
         assert can_pin is False
         assert "stall" in why, why
-
-    def test_mint_stalled_at_wedge_boundary_is_still_can_pin(self, monkeypatch):
-        """Exactly at the wedge is not past it -- mirrors the pin's own
-        strict `>`, not `>=`."""
-        from claude_swap import pin
-
-        self._stub_urlopen(
-            monkeypatch, b'{"can_pin": true, "mint_stalled_s": 60.0}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is True
-
-    def test_mint_stalled_s_explicit_null_is_unaffected(self, monkeypatch):
-        """Every HEALTHY 0.1.262 daemon publishes `mint_stalled_s` on every
-        response, `null` when nothing is stalled -- the live common case,
-        distinct from a field genuinely absent (an old daemon)."""
-        from claude_swap import pin
-
-        self._stub_urlopen(
-            monkeypatch, b'{"can_pin": true, "mint_stalled_s": null}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is True
-
-    def test_mint_stalled_past_wedge_wins_over_a_missing_can_pin(self, monkeypatch):
-        """The wedge check runs before `can_pin` is even read, so it
-        overrides a missing field too, not only `can_pin: true`."""
-        from claude_swap import pin
-
-        self._stub_urlopen(monkeypatch, b'{"mint_stalled_s": 90.0}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is False
 
     def test_bypasses_the_environments_proxy_settings(self, monkeypatch):
         """A loopback health check must not be routed through `http_proxy`:
