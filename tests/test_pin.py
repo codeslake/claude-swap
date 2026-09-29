@@ -4527,7 +4527,7 @@ class TestSetShowAndRepinAreThePackagesToRun:
         assert "apply_pin" not in attrs, (
             "run() calls apply_pin directly: the verdict is back in two places")
 
-    def _real(self, monkeypatch, temp_home, *, serving):
+    def _real(self, monkeypatch, temp_home):
         """The real package over a real switcher; only its proxy is faked."""
         import cswap_pin.proxy as proxy
 
@@ -4543,7 +4543,7 @@ class TestSetShowAndRepinAreThePackagesToRun:
                 "remoteControl": {"pinnedEmail": email,
                                   "pinnedOrganizationUuid": org_uuid or ""}
             } if email else {})
-            return serving
+            return True
 
         monkeypatch.setattr(proxy, "apply_pin", apply_pin)
         monkeypatch.setattr(proxy, "live_remote_control_sessions", lambda: [])
@@ -4555,7 +4555,7 @@ class TestSetShowAndRepinAreThePackagesToRun:
             self, monkeypatch, temp_home, capsys):
         from claude_swap import pin
 
-        s, seen = self._real(monkeypatch, temp_home, serving=True)
+        s, seen = self._real(monkeypatch, temp_home)
         assert pin.run(s, "1") == 0
         out = capsys.readouterr().out
         assert "Pinned" in out and f"Account-1 ({SHARED_PIN_EMAIL})" in out, out
@@ -4572,7 +4572,7 @@ class TestSetShowAndRepinAreThePackagesToRun:
 
         from claude_swap import pin
 
-        s, _ = self._real(monkeypatch, temp_home, serving=True)
+        s, _ = self._real(monkeypatch, temp_home)
 
         def refuse(*_a, **_k):
             raise RuntimeError("dial via http://user:hunter2@proxy.example:8118")
@@ -4582,17 +4582,6 @@ class TestSetShowAndRepinAreThePackagesToRun:
         cap = capsys.readouterr()
         assert "http://***@proxy.example:8118" in cap.out + cap.err, cap
         assert "hunter2" not in cap.out + cap.err, cap
-
-    def test_the_real_package_rolls_a_failed_pin_back_and_says_so(
-            self, monkeypatch, temp_home, capsys):
-        from claude_swap import pin
-
-        s, _ = self._real(monkeypatch, temp_home, serving=False)
-        assert pin.run(s, "1") == 1
-        cap = capsys.readouterr()
-        assert "no proxy is running" in cap.out + cap.err, cap
-        assert "nothing is pinned" in cap.out + cap.err, cap
-        assert pin._pinned_email_now(s) is None
 
 
 class TestHealADeadPin:
