@@ -1168,18 +1168,19 @@ def _seven_day_reset_unmeasured(usage: dict | str | None) -> bool:
 
 def _probe_source_fresh(entries: dict | None, num: str, now: float) -> bool:
     """Whether ``num``'s store entry is fresh enough to admit it as a probe
-    target — the SAME predicate ``_tick_inner``'s stale-usage gate uses
-    (``entry.fresh(now)``), read here BEFORE admission instead of after, so a
-    candidate this gate would refuse can never occupy the ``ordered`` slot
-    that gate itself aborts the whole tick on. ``entries=None`` (a caller
-    with no store-entry data, e.g. a direct unit-test call predating
-    probing, or a display) skips the gate rather than refusing every
-    candidate.
+    target — narrower than ``_tick_inner``'s stale-usage gate (which also
+    accepts ``entry.held(now)``, #325): a probe exists to LEARN an unmeasured
+    weekly reset through a live fetch, and a held row refuses fetching
+    altogether (``_row_eligible``), so admitting one here would spend the
+    tick's one probe slot on a candidate that cannot resolve its reset while
+    the hold lasts. ``entries=None`` (a caller with no store-entry data, e.g.
+    a direct unit-test call predating probing, or a display) skips the gate
+    rather than refusing every candidate.
     """
     if entries is None:
         return True
     entry = entries.get(num)
-    return entry is not None and entry.fresh(now)
+    return entry is not None and entry.fresh(now) and not entry.held(now)
 
 
 def _numeric_probe_cooldown(raw: object) -> dict[str, float]:
@@ -4584,11 +4585,12 @@ class AutoSwitchEngine:
         # `select_probe_target` (below, after the loop) picks at most one,
         # so several unknown-reset peers in one tick never race each other
         # in. Membership here already carries every filter this loop ran
-        # (servability, no-return, landing-health) PLUS freshness: a
-        # candidate served from a stale store entry must never enter —
-        # admitted `-inf`, it would sort first in `ordered` and the
-        # unchanged stale-usage gate in `_tick_inner` aborts the whole tick
-        # on the first candidate whose entry is not `fresh()`.
+        # (servability, no-return, landing-health) PLUS `_probe_source_fresh`:
+        # a probe exists to LEARN an unmeasured weekly reset through a live
+        # fetch, so neither a stale store entry (untrustworthy) nor a held
+        # one (`_row_eligible` refuses to fetch it) may ever enter here —
+        # admitted `-inf`, either would sort first in `ordered` and win a
+        # switch this tick can never actually resolve.
         probe_candidates: list[str] = []
         key_axis: dict[str, str] = {}  # per candidate, set alongside its key
         any_known = False
