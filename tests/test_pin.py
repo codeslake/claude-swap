@@ -4359,7 +4359,7 @@ class TestTheLockProbeActuallyProbes:
         # confirms the probe actually waited on the held lock rather than
         # short-circuiting some other way.
         assert 0.1 <= elapsed <= 2.0, (
-            f"took {elapsed:.2f}s against a 0.1s budget — not bounded by it"
+            f"took {elapsed:.2f}s against a 0.1s budget, not bounded by it"
         )
 
         # THE CONTROL: same path, lock released, must now answer True. If a
