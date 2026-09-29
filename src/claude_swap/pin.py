@@ -1182,9 +1182,10 @@ def identity_for_config(switcher, email: str | None = None,
 
     ``email`` asks about a DIFFERENT account than the one currently recorded.
     Callers that pass it: in cswap-pin, the rollback, because by then the
-    record has already been overwritten by the pin that failed, and
+    record has already been overwritten by the pin that failed,
     ``set_pin``, because this argument is evaluated BEFORE ``apply_pin``
-    writes the record; and here, `_config_names_the_pin`,
+    writes the record, and ``repin_current``, which re-pins ``email`` and
+    must not read the record for it; and here, `_config_names_the_pin`,
     `_live_login_for_config` and `heal`, each with an address it has already
     read.
 

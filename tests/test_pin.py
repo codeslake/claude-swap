@@ -6539,7 +6539,7 @@ class TestPidIsAliveIsPortableAcrossOS:
     same call is NOT a probe -- signal 0 there IS `CTRL_C_EVENT`, so
     `os.kill(pid, 0)` calls `GenerateConsoleCtrlEvent`, which BROADCASTS a
     console-control event to the whole console process group. Reproduced on
-    `test-windows (pin-cli)`: calling it with this process's own pid inside
+    `test-windows`: calling it with this process's own pid inside
     an xdist worker that IS the console's process-group leader took the
     whole pytest run down with a stray `KeyboardInterrupt` mid-run. Windows
     goes through `OpenProcess` instead, and this class pins that `os.kill`
@@ -6617,7 +6617,7 @@ class TestPidIsAliveIsPortableAcrossOS:
         handle to it is held -- including this test's own `subprocess.Popen`,
         which never closes its handle after `.wait()`. `_pid_is_alive` read
         that open as "alive" and made `test_a_dead_pid_behind_the_record_is_
-        still_healed` fail on real `test-windows (pin-cli)` CI (a genuinely
+        still_healed` fail on real `test-windows` CI (a genuinely
         exited pid, `changed` came back False, "Nothing to heal"). A
         successful open with an exit code other than STILL_ACTIVE must read
         as dead.
