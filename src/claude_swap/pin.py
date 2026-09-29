@@ -1403,13 +1403,11 @@ _WIRE_MARK = "_cswapPinWiredKeys"
 # must not wait long. Nothing is lost by giving up — an unremoved wiring is
 # retried on the next launch, and the caller fails open either way.
 #
-# `claude_locks.proper_lockfile`'s retry sleep is clamped to whatever is left
-# of the caller's budget (`_nap`), so one acquisition no longer overruns by a
-# full jittered `0.25 + random() * 0.25` sleep the way an unclamped one used
-# to; both consumers (`_config_lock_is_free`, `clear_wiring`) inherit that
-# clamp automatically through `proper_lockfile` itself. 0.5s stays the budget
-# requested rather than a measured ceiling, since the last retry can still
-# run past a near-empty remainder before the deadline check catches it.
+# `claude_locks.proper_lockfile` checks its deadline and then sleeps a jittered
+# `0.25 + random() * 0.25`, so one acquisition can run past its budget by that
+# sleep. 0.5s is the budget requested, not a measured ceiling; `clear_wiring`
+# carves it into per-path shares so an overrun on one contended config still
+# leaves a free one its attempt.
 _LAUNCH_LOCK_BUDGET_S = 0.5
 
 # The same reasoning for the SERVING probe on that path. A refused connect on
