@@ -2013,7 +2013,10 @@ class AutoSwitchEngine:
             # This proves only that the STORED token outlives the refresh
             # buffer, never that the account is a live target — that liveness
             # gap is closed at admission (the stale-usage exclusion above
-            # `_tick_inner`'s freshen loop), not by probing here.
+            # `_tick_inner`'s freshen loop). For a HELD candidate, admission
+            # trusts the READING through the hold (`UsageEntry.held`), not a
+            # fresh fetch; the credential itself is still unproved by that,
+            # which is what this freshen step checks.
             return "ok"
         # The consume gate serializes every backup-rt POST (the recovery
         # branch in `_fetch_active_usage` is a second call site, under the
