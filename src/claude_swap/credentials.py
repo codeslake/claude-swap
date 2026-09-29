@@ -558,18 +558,9 @@ class CredentialStore:
 
         Thin wrapper over :meth:`_read_active_credentials` preserving the historic
         ``str | None`` contract the switch paths rely on: credential string if
-        found, ``""`` if not found, ``None`` on a file read error. That return
-        drops ``degraded``, so this call's own is kept per thread for the reader
-        that decides a grant POST on the value: ``_last_read_degraded``.
+        found, ``""`` if not found, ``None`` on a file read error.
         """
-        active = self._read_active_credentials()
-        self._managed_read_tls.degraded = active.degraded
-        return active.value
-
-    @property
-    def _last_read_degraded(self) -> bool:
-        """Whether THIS thread's last :meth:`_read_credentials` was degraded."""
-        return getattr(self._managed_read_tls, "degraded", False)
+        return self._read_active_credentials().value
 
     def _read_active_oauth_keychain(self) -> tuple[str | None, bool, "str | None"]:
         """Read the active profile's OAuth Keychain item(s).

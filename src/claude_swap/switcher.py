@@ -1931,6 +1931,7 @@ class ClaudeAccountSwitcher:
         """
         return self._usage_by_account()
 
+    @macos_keychain.memo_reads()
     def usage_entries_by_account(
         self, fetch: set[str] | None = None, *, scheduled: bool = False
     ) -> dict[str, UsageEntry]:
@@ -1942,10 +1943,12 @@ class ClaudeAccountSwitcher:
         future plans while still allowing due plans to beat the serve TTL.
         """
         accounts_info = self._build_accounts_info()
-        return self._collect_usage_entries(
-            accounts_info, fetch=fetch, scheduled=scheduled
-        )
+        with macos_keychain.fresh_reads():  # the collect adopts, refreshes and POSTs
+            return self._collect_usage_entries(
+                accounts_info, fetch=fetch, scheduled=scheduled
+            )
 
+    @macos_keychain.memo_reads()
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
 
@@ -1958,7 +1961,8 @@ class ClaudeAccountSwitcher:
         this pass.
         """
         accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        with macos_keychain.fresh_reads():  # the collect adopts, refreshes and POSTs
+            entries = self._collect_usage_entries(accounts_info, fetch=fetch)
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
@@ -2056,6 +2060,7 @@ class ClaudeAccountSwitcher:
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
 
+    @macos_keychain.memo_reads()
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
 
@@ -2348,9 +2353,7 @@ class ClaudeAccountSwitcher:
         )
 
         try:
-            # Never a memoized read in here: this copy may be consumed (see
-            # `macos_keychain.fresh_reads`).
-            with FileLock(self.lock_file), macos_keychain.fresh_reads():
+            with FileLock(self.lock_file):
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -2804,7 +2807,7 @@ class ClaudeAccountSwitcher:
                     "for this pass.", account_num, exc_info=True,
                 )
             try:
-                with FileLock(self.lock_file), macos_keychain.fresh_reads():
+                with FileLock(self.lock_file):
                     store_now, store_unreadable = (
                         self._read_account_credentials_ex(account_num, email)
                     )
@@ -3937,7 +3940,7 @@ class ClaudeAccountSwitcher:
         # would otherwise be overwritten by a guard that had already passed.
         # A LockError from the acquire propagates to `_resync_rotated_backup`,
         # which returns without popping the memo — so contention retries.
-        with FileLock(self.lock_file), macos_keychain.fresh_reads():
+        with FileLock(self.lock_file):
             # RE-DERIVED HERE, not trusted from the caller's pre-lock scan.
             # `swap_accounts` and `move_account` hold this lock and
             # `remove_account` holds none, so the roster can move while the
@@ -4115,8 +4118,7 @@ class ClaudeAccountSwitcher:
         ownership guard already treats that way.
         """
         try:
-            with macos_keychain.fresh_reads():
-                now = self._read_capture_credentials()
+            now = self._read_capture_credentials()
         except Exception:  # noqa: BLE001 -- unreadable is unverifiable
             return
         if not now:
@@ -4493,8 +4495,7 @@ class ClaudeAccountSwitcher:
                         f"Alias '{alias}' is already used by account {conflict}"
                     )
 
-            with macos_keychain.fresh_reads():  # captured into a backup below
-                current_creds = self._read_capture_credentials()
+            current_creds = self._read_capture_credentials()
             if current_creds is None:
                 raise CredentialReadError("Failed to read credentials for current account")
             if not current_creds:
@@ -4624,8 +4625,7 @@ class ClaudeAccountSwitcher:
                 )
 
         # Read new account credentials BEFORE any destructive operations
-        with macos_keychain.fresh_reads():  # captured into a backup below
-            current_creds = self._read_capture_credentials()
+        current_creds = self._read_capture_credentials()
         if current_creds is None:
             raise CredentialReadError("Failed to read credentials for current account")
         if not current_creds:
@@ -5065,7 +5065,10 @@ class ClaudeAccountSwitcher:
             is_active = str(num) == active_num
 
             if is_active:
-                active = self._read_active_credentials()
+                # Never the memo: this read's creds and verdict decide the
+                # refresh under `_fetch_active_usage`'s own fresh read.
+                with macos_keychain.fresh_reads():
+                    active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
             else:
@@ -5301,7 +5304,6 @@ class ClaudeAccountSwitcher:
                 FileLock(self.credentials_dir / f".consume-{account_num}.lock"),
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
-                macos_keychain.fresh_reads(),
             ):
                 live = self._read_credentials()
                 if live is None:
@@ -5310,16 +5312,6 @@ class ClaudeAccountSwitcher:
                     # cannot see; guessing here could consume a superseded
                     # grant. Defer to the next pass.
                     return _defer(force_refresh)
-                if self._store._last_read_degraded:
-                    # The collect pass's own verdict (checked above) may have
-                    # been served from the memo; THIS fresh read decides. A
-                    # Keychain that failed here reads "" (which reads as "CC
-                    # cleared the live store" below) or serves a plaintext file
-                    # that may be a superseded copy: never a grant to POST.
-                    return _defer(
-                        force_refresh
-                        or FetchRecord(sentinel=USAGE_KEYCHAIN_UNAVAILABLE)
-                    )
                 live_oauth = oauth.extract_oauth_data(live) if live else None
                 # Under-lock TOCTOU guards. A `cswap switch` or `/login`
                 # completing between the pre-lock attribution and lock
@@ -6129,7 +6121,6 @@ class ClaudeAccountSwitcher:
             with (
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
-                macos_keychain.fresh_reads(),
             ):
                 # Every refusal below logs `slot=account_num`, not `None`:
                 # `match` is True by construction to have reached this
@@ -6490,7 +6481,7 @@ class ClaudeAccountSwitcher:
             return LoginRestoreOutcome.WAITING
 
         try:
-            with FileLock(self.lock_file), macos_keychain.fresh_reads():
+            with FileLock(self.lock_file):
                 data = self._get_sequence_data() or {}
                 roster_active = data.get("activeAccountNumber")
                 if roster_active is None or str(roster_active) == d_num:
@@ -7145,9 +7136,8 @@ class ClaudeAccountSwitcher:
             record = (data.get("accounts") or {}).get(str(num)) or {}
             if (record.get("email") or "").strip() != email.strip():
                 return False
-            with macos_keychain.fresh_reads():
-                if not self._slot_token_dead(num, email):
-                    return False
+            if not self._slot_token_dead(num, email):
+                return False
             uuid = (record.get("uuid") or "").strip()
             want_email = email.strip().lower()
             ident = {num: (email, record.get("organizationUuid") or "")}
@@ -7155,8 +7145,7 @@ class ClaudeAccountSwitcher:
             struck_fp = getattr(entry, "struck_fingerprint", None)
             # No `unreadable` branch: `_slot_token_dead` above already
             # refuses on it, idle slot and active slot alike.
-            with macos_keychain.fresh_reads():
-                stored, _ = self._read_account_credentials_ex(num, email)
+            stored, _ = self._read_account_credentials_ex(num, email)
             stored_fp = oauth.credential_fingerprint(stored)
 
             try:
@@ -10295,12 +10284,7 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with (
-            FileLock(self.lock_file),
-            claude_credentials_lock(),
-            claude_config_lock(),
-            macos_keychain.fresh_reads(),
-        ):
+        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None

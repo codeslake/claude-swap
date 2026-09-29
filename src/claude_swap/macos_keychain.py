@@ -97,9 +97,10 @@ def keychain_account_name() -> str:
         return "claude-code-user"
 
 
-# In-process memo of ``security`` reads (memory only, never on disk), so a
+# Opt-in in-process memo of ``security`` reads (memory only, never on disk), so a
 # steady-state poll costs one exec per item instead of one per pass: every exec
-# is scanned by endpoint security software.
+# is scanned by endpoint security software. A read consults or fills it ONLY
+# inside ``memo_reads()``; everywhere else it execs exactly as it always did.
 #
 # The memo holds the answers of ONE keychain generation, named by a stamp of the
 # ``*.keychain*`` files under ~/Library/Keychains (so a non-login default keychain
@@ -142,15 +143,23 @@ def _stamp() -> tuple | None:
     return (root, _epoch, tuple(sorted(files))) if files else None
 
 
+def _read_stamp() -> tuple | None:
+    """The stamp a read runs under, or ``None`` when it must not touch the memo:
+    outside ``memo_reads()``, or inside ``fresh_reads()`` (which wins)."""
+    if getattr(_local, "memo", False) and not getattr(_local, "fresh", False):
+        return _stamp()
+
+
 def _recall(key, stamp):
-    """``(value,)`` when ``key`` was read under ``stamp`` and this thread may
-    use the memo, else ``None``."""
+    """``(value,)`` when ``key`` was read under ``stamp``, else ``None``."""
     global _memo_stamp
     with _lock:
+        if stamp[1] != _epoch:  # a failure came after this stamp was taken
+            return None
         if stamp != _memo_stamp:
             _memo.clear()
             _memo_stamp = stamp
-        if stamp and key in _memo and not getattr(_local, "fresh", False):
+        if key in _memo:
             return (_memo[key],)
 
 
@@ -176,29 +185,30 @@ def _invalidate() -> None:
 
 
 @contextmanager
-def fresh_reads():
-    """Reads on this thread inside the block skip the memo (and refresh it).
-
-    THE RULE: the memo serves display and snapshot reads only. Every read that
-    can lead to a grant POST or to a credential write runs inside this block,
-    under the lock that guards the write, so it sees a locked or changed
-    Keychain as it is. A refresh token is one-time-use: a POST decided on a
-    memoized read of an item that has since locked spends it, the successor
-    cannot be written back, and Claude Code keeps the spent generation.
-
-    EXEMPT by decision, writing from memoized reads: ``_adopt_session_credential``
-    (via ``_session_profile_ahead``), ``swap_accounts``/``move_account``
-    (``_read_backup_or_abort``) and ``session._bootstrap``. None reaches a grant
-    POST (the only POST sites run inside this block), the stamp keeps a memoized
-    value equal to the item, and a write under a lock falls back to the ``.enc``
-    that wins.
-    """
-    prev = getattr(_local, "fresh", False)
-    _local.fresh = True
+def _scope(flag: str):
+    prev = getattr(_local, flag, False)
+    setattr(_local, flag, True)
     try:
         yield
     finally:
-        _local.fresh = prev
+        setattr(_local, flag, prev)
+
+
+def memo_reads():
+    """Reads on this thread inside the block may be served from the memo.
+
+    For display and evaluation phases only. A switch, a refresh, a grant POST or
+    a credential write reads the Keychain as it is now: it runs outside the
+    block, or inside ``fresh_reads()``. A one-time-use refresh token POSTed on a
+    memoized read of an item that has since locked cannot have its successor
+    written back. Usable as a decorator too.
+    """
+    return _scope("memo")
+
+
+def fresh_reads():
+    """Reads inside the block skip the memo, even nested in ``memo_reads()``."""
+    return _scope("fresh")
 
 
 def _quote(value: str) -> str:
@@ -219,9 +229,9 @@ def get_password(service: str, account: str) -> str | None:
     unavailable) or a timeout, so a genuine miss is not confused with a transient
     failure. Only these two definite answers are memoized, never an error.
     """
-    stamp = _stamp()  # before the exec, see the memo note above
+    stamp = _read_stamp()  # before the exec, see the memo note above
     key = ("pw", service, account)
-    if hit := _recall(key, stamp):
+    if stamp and (hit := _recall(key, stamp)):
         return hit[0]
     try:
         result = subprocess.run(
@@ -287,9 +297,9 @@ def item_modified_at(service: str, account: str) -> float | None:
     ``None``, since this feeds a freshness comparison where "don't know"
     must never be read as a claim. Only a parsed answer is memoized.
     """
-    stamp = _stamp()
+    stamp = _read_stamp()
     key = ("mdat", service, account)
-    if hit := _recall(key, stamp):
+    if stamp and (hit := _recall(key, stamp)):
         return hit[0]
     try:
         result = subprocess.run(

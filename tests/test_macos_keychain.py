@@ -12,15 +12,19 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from claude_swap import credentials, macos_keychain, oauth
-from claude_swap.json_output import USAGE_KEYCHAIN_UNAVAILABLE
+from claude_swap import macos_keychain
+from claude_swap.autoswitch import AutoSwitchEngine, TickOutcome
+from claude_swap.exceptions import SwitchError
 from claude_swap.models import Platform
+from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.usage_store import UsageEntry
 
 # Every test here drives the *real* wrapper bodies (mocking subprocess) or runs
 # against a temp keychain on CI, so opt the whole module out of the in-memory
@@ -269,7 +273,8 @@ def test_item_modified_at_none_when_unavailable(returncode, stdout):
 
 
 # ---------------------------------------------------------------------------
-# memo -- one ``security`` exec per item until the login keychain file changes
+# memo -- opt-in: one ``security`` exec per item until the login keychain file
+# changes, for reads made inside ``memo_reads()`` only
 # ---------------------------------------------------------------------------
 
 _KEY = ("svc", "acct")
@@ -278,24 +283,31 @@ _KEY = ("svc", "acct")
 class _FakeSecurity:
     """Stands in for ``subprocess.run`` against ``security``: a dict of items,
     a forced rc for reads (36 = locked) and for writes, an OSError for a spawn
-    that fails, the services whose reads are denied, and a count of read execs."""
+    that fails, the keys whose reads are denied, the keys read and a count of
+    writes."""
 
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], str] = {}
         self.rc: int | None = None
         self.write_rc: int | None = None
         self.spawn_error: OSError | None = None
-        self.denied: set[str] = set()
-        self.execs = 0
+        self.denied: set[tuple[str, str]] = set()
+        self.reads: list[tuple[str, str]] = []
+        self.writes = 0
+
+    @property
+    def execs(self) -> int:
+        return len(self.reads)
 
     def __call__(self, args, **kwargs):
         if self.spawn_error:
             raise self.spawn_error
         if "find-generic-password" not in args:  # add / delete
+            self.writes += 1
             return _completed(self.write_rc or 0, stderr="locked")
-        self.execs += 1
         key = (args[args.index("-s") + 1], args[args.index("-a") + 1])
-        rc = 36 if key[0] in self.denied else self.rc
+        self.reads.append(key)
+        rc = 36 if key in self.denied else self.rc
         if rc is not None:
             return _completed(rc, stderr="locked")
         if key not in self.items:
@@ -343,8 +355,29 @@ def test_get_password_memo_execs_once_while_the_stat_is_unchanged(
         _make_kc_file(temp_home)
     if stored is not None:
         fake_security.items[_KEY] = stored
-    for _ in range(5):
-        assert macos_keychain.get_password(*_KEY) == stored
+    with macos_keychain.memo_reads():
+        for _ in range(5):
+            assert macos_keychain.get_password(*_KEY) == stored
+    assert fake_security.execs == execs
+
+
+@pytest.mark.parametrize("scopes, execs", [
+    ((), 6),  # the base behaviour: every read execs
+    ((macos_keychain.fresh_reads,), 6),
+    ((macos_keychain.memo_reads, macos_keychain.fresh_reads), 6),  # fresh wins
+    ((macos_keychain.fresh_reads, macos_keychain.memo_reads), 6),
+    ((macos_keychain.memo_reads,), 2),
+])
+def test_only_reads_inside_memo_reads_are_memoized(
+    fake_security, kc_file, scopes, execs
+):
+    fake_security.items[_KEY] = "secret"
+    with ExitStack() as stack:
+        for scope in scopes:
+            stack.enter_context(scope())
+        for _ in range(3):
+            macos_keychain.get_password(*_KEY)
+            macos_keychain.item_modified_at(*_KEY)
     assert fake_security.execs == execs
 
 
@@ -352,10 +385,11 @@ def test_get_password_reads_again_when_the_keychain_file_changes(
     fake_security, kc_file
 ):
     fake_security.items[_KEY] = "old"
-    assert macos_keychain.get_password(*_KEY) == "old"
-    fake_security.items[_KEY] = "new"
-    _touch(kc_file)
-    assert macos_keychain.get_password(*_KEY) == "new"
+    with macos_keychain.memo_reads():
+        assert macos_keychain.get_password(*_KEY) == "old"
+        fake_security.items[_KEY] = "new"
+        _touch(kc_file)
+        assert macos_keychain.get_password(*_KEY) == "new"
     assert fake_security.execs == 2
 
 
@@ -366,38 +400,41 @@ def test_get_password_reads_again_when_the_keychain_file_changes(
 def test_a_write_drops_only_its_own_key(fake_security, kc_file, write):
     fake_security.items[_KEY] = "old"
     fake_security.items[("svc", "other")] = "kept"
-    macos_keychain.get_password(*_KEY)
-    macos_keychain.get_password("svc", "other")
-    # Same stamp: only the write's own invalidation can make the next read exec.
-    fake_security.items[_KEY] = "new"
-    write()
-    assert macos_keychain.get_password("svc", "other") == "kept"
-    assert fake_security.execs == 2
-    assert macos_keychain.get_password(*_KEY) == "new"
+    with macos_keychain.memo_reads():
+        macos_keychain.get_password(*_KEY)
+        macos_keychain.get_password("svc", "other")
+        # Same stamp: only the write's own invalidation can make the next read exec.
+        fake_security.items[_KEY] = "new"
+        write()
+        assert macos_keychain.get_password("svc", "other") == "kept"
+        assert fake_security.execs == 2
+        assert macos_keychain.get_password(*_KEY) == "new"
     assert fake_security.execs == 3
 
 
 def test_an_error_is_never_memoized(fake_security, kc_file):
     fake_security.rc = 36
-    for _ in range(2):
-        with pytest.raises(macos_keychain.KeychainError):
-            macos_keychain.get_password(*_KEY)
-    assert fake_security.execs == 2
-    fake_security.rc = None
-    fake_security.items[_KEY] = "unlocked"
-    assert macos_keychain.get_password(*_KEY) == "unlocked"
+    with macos_keychain.memo_reads():
+        for _ in range(2):
+            with pytest.raises(macos_keychain.KeychainError):
+                macos_keychain.get_password(*_KEY)
+        assert fake_security.execs == 2
+        fake_security.rc = None
+        fake_security.items[_KEY] = "unlocked"
+        assert macos_keychain.get_password(*_KEY) == "unlocked"
 
 
 def test_item_modified_at_memoizes_a_definite_answer_only(fake_security, kc_file):
-    assert macos_keychain.item_modified_at(*_KEY) is None  # absent: not memoized
-    assert macos_keychain.item_modified_at(*_KEY) is None
-    assert fake_security.execs == 2
-    fake_security.items[_KEY] = "x"
-    first = macos_keychain.item_modified_at(*_KEY)
-    assert first is not None and macos_keychain.item_modified_at(*_KEY) == first
-    assert fake_security.execs == 3
-    _touch(kc_file)
-    macos_keychain.item_modified_at(*_KEY)
+    with macos_keychain.memo_reads():
+        assert macos_keychain.item_modified_at(*_KEY) is None  # absent: not memoized
+        assert macos_keychain.item_modified_at(*_KEY) is None
+        assert fake_security.execs == 2
+        fake_security.items[_KEY] = "x"
+        first = macos_keychain.item_modified_at(*_KEY)
+        assert first is not None and macos_keychain.item_modified_at(*_KEY) == first
+        assert fake_security.execs == 3
+        _touch(kc_file)
+        macos_keychain.item_modified_at(*_KEY)
     assert fake_security.execs == 4
 
 
@@ -419,44 +456,56 @@ def test_a_failed_exec_forgets_every_memoized_read(
     fake_security, kc_file, op, fault, raises
 ):
     fake_security.items[("svc", "other")] = "kept"
-    macos_keychain.get_password("svc", "other")
+    with macos_keychain.memo_reads():
+        macos_keychain.get_password("svc", "other")
     setattr(fake_security, *fault)
-    if raises:
+    if raises:  # seen outside any memo phase: the generation ends all the same
         with pytest.raises(raises):
             op()
     else:
         op()
     setattr(fake_security, fault[0], None)
     before = fake_security.execs
-    assert macos_keychain.get_password("svc", "other") == "kept"
+    with macos_keychain.memo_reads():
+        assert macos_keychain.get_password("svc", "other") == "kept"
     assert fake_security.execs == before + 1
 
 
 def test_any_keychain_file_moving_drops_the_whole_memo(fake_security, kc_file):
     work = kc_file.with_name("work.keychain-db")  # a non-login default keychain
     work.write_bytes(b"kc")
-    for account in "abc":
-        fake_security.items[("svc", account)] = account
-        macos_keychain.get_password("svc", account)
-    _touch(work)
-    macos_keychain.get_password("svc", "a")
+    with macos_keychain.memo_reads():
+        for account in "abc":
+            fake_security.items[("svc", account)] = account
+            macos_keychain.get_password("svc", account)
+        _touch(work)
+        macos_keychain.get_password("svc", "a")
     assert fake_security.execs == 4
     assert len(macos_keychain._memo) == 1  # one keychain generation at a time
 
 
-# The memo serves display and snapshot reads only. A read that leads to a grant
-# POST (the consume gate, the active refresh) is made on fresh reads, so it sees a
-# locked Keychain as locked, and a memo hit is never read as the Keychain answering.
+def test_a_stamp_from_before_a_failure_never_becomes_the_memo_stamp(kc_file):
+    with macos_keychain.memo_reads():
+        old = macos_keychain._stamp()
+        macos_keychain._invalidate()
+        assert macos_keychain._recall(("pw", *_KEY), old) is None
+    assert macos_keychain._memo_stamp is None
+
+
+# What reads inside ``memo_reads()`` and what does not: the accounts snapshot and
+# the auto tick's evaluation read the idle slots' backups from the memo, and
+# everything that switches, refreshes, POSTs a grant or writes a credential reads
+# the Keychain as it is now.
 
 _EMAIL = "user@example.com"
+_ACTIVE = ("Claude Code-credentials", "alice")
 
 
-def _creds(refresh: str, expires_at: int) -> str:
+def _creds(refresh: str) -> str:
     return json.dumps({"claudeAiOauth": {
         "accessToken": "at",
         "refreshToken": refresh,
-        "expiresAt": expires_at,
-        "refreshTokenExpiresAt": 1_900_000_000_000,
+        "expiresAt": 4_102_444_800_000,
     }})
 
 
@@ -469,101 +518,99 @@ def mac_switcher(temp_home, fake_security, kc_file, monkeypatch):
     return switcher
 
 
-def test_the_consume_gate_reads_the_backup_past_the_memo(mac_switcher, fake_security):
-    key = ("claude-swap", f"account-1-{_EMAIL}")
-    fake_security.items[key] = _creds("spent", 1_000)
-    mac_switcher._read_account_credentials_ex("1", _EMAIL)  # memoized
-    # Written under the SAME stat: only an exec can see it.
-    fake_security.items[key] = _creds("current", 1_000)
-    with patch(
-        "claude_swap.oauth.try_refresh_oauth_credentials",
-        return_value=oauth.RefreshOutcome(None, "transient"),
-    ) as post:
-        mac_switcher.consume_backup_grant("1", _EMAIL, _creds("spent", 1_000))
-    assert post.call_args.args[0] == _creds("current", 1_000)
+def _seed_roster(switcher, home, fake, slots=2):
+    """`slots` managed accounts in the Keychain, slot 1 live."""
+    accounts = {}
+    for n in range(1, slots + 1):
+        email = f"u{n}@example.com"
+        accounts[str(n)] = {
+            "email": email, "uuid": f"uuid-{n}", "organizationUuid": "",
+            "organizationName": "", "added": "2024-01-01T00:00:00Z",
+        }
+        fake.items[("claude-swap", f"account-{n}-{email}")] = _creds(f"rt{n}")
+    fake.items[_ACTIVE] = _creds("rt1")
+    switcher._write_json(switcher.sequence_file, {
+        "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z",
+        "sequence": list(range(1, slots + 1)), "accounts": accounts,
+    })
+    (home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "u1@example.com", "accountUuid": "uuid-1",
+    }}))
 
 
-_ACTIVE = ("Claude Code-credentials", "alice")
+def test_a_memo_hit_is_not_the_keychain_answering(mac_switcher, fake_security):
+    fake_security.items[_ACTIVE] = _creds("rt")
+    fake_security.items[("claude-swap", f"account-1-{_EMAIL}")] = _creds("rt")
+    store = mac_switcher._store
+    with macos_keychain.memo_reads():
+        store._read_active_credentials()
+        store._read_account_credentials("1", _EMAIL)
+    fake_security.rc = 36
+    store._read_active_credentials()  # outside the phase: execs, finds it locked
+    assert store._keychain_unreadable
+    with macos_keychain.memo_reads():
+        store._read_account_credentials("1", _EMAIL)  # no hit: the failure ended it
+    assert store._keychain_unreadable
 
 
-def _post_replaces(fake_security, rc):
-    """A refresh POST during which the Keychain locks (`rc` 36) or stays as is."""
-    def post(*args, **kwargs):
-        fake_security.rc = rc
-        return oauth.RefreshOutcome(_creds("next", 2_000), None)
-    return patch("claude_swap.oauth.try_refresh_oauth_credentials", side_effect=post)
-
-
-def test_the_gate_cas_reads_past_the_memo(mac_switcher, fake_security):
-    fake_security.items[("claude-swap", f"account-1-{_EMAIL}")] = _creds("spent", 1_000)
-    with _post_replaces(fake_security, 36):  # screen lock, mid-POST
-        outcome = mac_switcher.consume_backup_grant(
-            "1", _EMAIL, _creds("spent", 1_000)
-        )
-    # Unreadable, not "unchanged": the successor is stashed and nothing rewritten.
-    assert (outcome.error, outcome.stashed) == ("transient", True)
-
-
-def test_the_gate_reads_the_live_store_past_the_memo(mac_switcher, fake_security):
-    fake_security.items[("claude-swap", f"account-1-{_EMAIL}")] = _creds("spent", 1_000)
-    fake_security.items[_ACTIVE] = _creds("other", 5_000)
-    mac_switcher._read_active_credentials()
-    mac_switcher._read_account_credentials_ex("1", _EMAIL)
-    fake_security.denied.add(_ACTIVE[0])  # only the live item refuses
-    with _post_replaces(fake_security, None) as post:
-        outcome = mac_switcher.consume_backup_grant(
-            "1", _EMAIL, _creds("spent", 1_000)
-        )
-    post.assert_not_called()
-    assert outcome.error == "live-store-unreadable"
-
-
-@pytest.mark.parametrize("plaintext", [False, True])
-def test_an_expired_active_token_is_not_posted_once_the_keychain_locks(
-    mac_switcher, fake_security, temp_home, mock_claude_config,
-    sample_sequence_data, monkeypatch, plaintext,
-):
-    monkeypatch.setattr(credentials, "_ACTIVE_READ_RETRY_DELAY", 0)
-    email = "test@example.com"  # the identity mock_claude_config names as live
-    sample_sequence_data["accounts"]["1"]["email"] = email
-    mac_switcher._write_json(mac_switcher.sequence_file, sample_sequence_data)
-    expired = _creds("rt", 1_000)
-    fake_security.items[_ACTIVE] = expired
-    fake_security.items[("claude-swap", f"account-1-{email}")] = expired
-    if plaintext:
-        (temp_home / ".claude" / ".credentials.json").write_text(expired)
-    seen = mac_switcher._read_active_credentials()
-    mac_switcher._read_account_credentials_ex("1", email)
-    assert not seen.degraded  # the collect pass, served from the memo
-    fake_security.rc = 36  # locked; the keychain file is untouched
-    with _post_replaces(fake_security, 36) as post:
-        record = mac_switcher._fetch_active_usage("1", email, seen.value)
-    post.assert_not_called()
-    assert record.sentinel == USAGE_KEYCHAIN_UNAVAILABLE
-
-
-def test_a_display_read_beside_a_plaintext_file_is_memoized(
+def test_a_snapshot_pass_reads_the_live_item_live_and_idle_backups_from_the_memo(
     mac_switcher, fake_security, temp_home
 ):
-    fake_security.items[_ACTIVE] = _creds("rt", 1_000)
-    (temp_home / ".claude" / ".credentials.json").write_text(_creds("rt", 1_000))
-    reads = [mac_switcher._read_active_credentials() for _ in range(3)]
-    assert reads[0] == reads[2]
-    assert fake_security.execs == 1
+    _seed_roster(mac_switcher, temp_home, fake_security, slots=3)
+    idle = {("claude-swap", f"account-{n}-u{n}@example.com") for n in (2, 3)}
+    mac_switcher.accounts_snapshot(fetch=set())  # fills the memo
+    assert idle <= set(fake_security.reads)
+    fake_security.reads.clear()
+    mac_switcher.accounts_snapshot(fetch=set())
+    assert _ACTIVE in fake_security.reads and not idle & set(fake_security.reads)
+    fake_security.reads.clear()
+    mac_switcher.switchable_account_numbers()
+    assert fake_security.reads == []
 
 
-def test_a_memo_hit_is_not_the_keychain_answering(
-    mac_switcher, fake_security, monkeypatch
+def test_a_switch_after_a_memoized_read_finds_the_keychain_locked(
+    mac_switcher, fake_security, temp_home
 ):
-    monkeypatch.setattr(credentials, "_ACTIVE_READ_RETRY_DELAY", 0)
-    fake_security.items[_ACTIVE] = _creds("rt", 1_000)
-    fake_security.items[("claude-swap", f"account-1-{_EMAIL}")] = _creds("rt", 1_000)
-    store = mac_switcher._store
-    store._read_active_credentials()
-    store._read_account_credentials("1", _EMAIL)
-    fake_security.rc = 36
-    with macos_keychain.fresh_reads():
-        store._read_active_credentials()  # a fresh read finds it locked
-    assert store._keychain_unreadable
-    store._read_account_credentials("1", _EMAIL)  # an idle slot's backup read
-    assert store._keychain_unreadable
+    _seed_roster(mac_switcher, temp_home, fake_security)
+    with macos_keychain.memo_reads():
+        assert mac_switcher.switchable_account_numbers() == ["1", "2"]
+    # The target's item refuses (locked, denied); the keychain file is untouched.
+    fake_security.denied.add(("claude-swap", "account-2-u2@example.com"))
+    with pytest.raises(SwitchError, match="unreadable"):
+        mac_switcher.switch_to("2")
+    assert fake_security.writes == 0
+
+
+def test_the_auto_ticks_switch_reads_live(mac_switcher, fake_security, temp_home):
+    _seed_roster(mac_switcher, temp_home, fake_security)
+    target = ("claude-swap", "account-2-u2@example.com")
+    mac_switcher.switchable_account_numbers()
+    fake_security.reads.clear()
+    mac_switcher.switchable_account_numbers()
+    assert fake_security.reads == []  # the memo is warm: the tick starts on hits
+    engine = AutoSwitchEngine(
+        mac_switcher, AutoSwitchSettings(), lambda event: None,
+        state_path=temp_home / "state.json",
+    )
+    now = engine.clock()
+    entries = {
+        num: UsageEntry(
+            last_good={"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}},
+            fetched_at=now, age_s=0.0,
+        )
+        for num, pct in (("1", 100.0), ("2", 0.0))
+    }
+    execs_per_switch_read = []
+
+    def switch_to(number, **kwargs):
+        before = fake_security.execs
+        macos_keychain.get_password(*target)
+        macos_keychain.get_password(*target)
+        execs_per_switch_read.append(fake_security.execs - before)
+        return {"switched": True, "from": None, "to": {"number": number}}
+
+    with patch.object(
+        mac_switcher, "usage_entries_by_account", return_value=entries
+    ), patch.object(mac_switcher, "switch_to", side_effect=switch_to):
+        assert engine.tick() is TickOutcome.SWITCHED
+    assert execs_per_switch_read == [2]
