@@ -180,7 +180,7 @@ class TestAttributionGuardRefusesUnattributedCrossIdentityWrite:
         The plain read the guard used to call returns ``""`` for a populated
         slot it merely could not read (permission denied, EIO) exactly as it
         does for a genuinely empty slot — so on any host where a process
-        cannot read its own Keychain (ssh/launchd on macOS, per CONTEXT.md)
+        cannot read its own Keychain (ssh/launchd on macOS)
         the guard was silently off for every such write, precisely where
         the incident it exists for lives."""
         store = CredentialStore(_Host(tmp_path))
@@ -507,7 +507,7 @@ assert EXPECTED_WRITE_SITE_ROSTER.keys().isdisjoint(CROSS_PR_WRITE_SITES), (
 
 class TestWriteSiteRosterIsReviewed:
     """Every caller of the write chokepoint, derived from the AST rather
-    than hand-listed, must match a roster this round actually reviewed for
+    than hand-listed, must match a roster that was actually reviewed for
     whether it may pass ``attributed=True`` and why (see switcher.py's
     inline comments at each site). A new call site — or a second call added
     to an existing one — changes the derived roster and fails this test,
@@ -543,7 +543,7 @@ class TestWriteSiteRosterIsReviewed:
             )
             admissible.append(merged)
         assert dict(derived) in admissible, (
-            "the derived write-site roster no longer matches what this round "
+            "the derived write-site roster no longer matches what was "
             "reviewed — a writer was added, removed, or duplicated; review "
             "whether it may pass attributed=True and update the roster above "
             "(a site on neither roster is unreviewed)"

@@ -12,7 +12,7 @@ right before the POST: a CONFIRMED mismatch (a caller's own
 ``_probe_verdicts.get(_lineage_key(...)) is False``) refuses before any
 network call; absence of evidence (no ``condemned``, or ``condemned``
 answering False) never refuses — refusing a legitimate refresh is the exact
-harm this exists to prevent (R1).
+harm this exists to prevent.
 
 ``TestPostCallSitesAreReviewed`` below DERIVES its subject from the AST
 rather than naming it, per the project's own lesson that a hand-named list
@@ -97,7 +97,7 @@ def _post_call_sites(path: Path) -> list[tuple[str | None, int, bool]]:
 #   None`; no in-tree caller passes that pair today (`switcher.py`'s sole
 #   `is_active=False` caller passes `refresh_via=self.consume_backup_grant`,
 #   which routes through the guarded chokepoint instead). Genuinely
-#   unreachable residue, named rather than chased (R4).
+#   unreachable residue, named rather than chased.
 #
 #   switcher.py::_consume_backup_grant_locked — the consume gate's own POST.
 #   Guarded: `condemned=` checks this slot's `_probe_verdicts` for the exact
@@ -117,7 +117,7 @@ EXPECTED_POST_SITE_ROSTER: dict[tuple[str, str | None], tuple[int, int]] = {
 
 class TestPostCallSitesAreReviewed:
     """Every caller of the refresh-grant POST chokepoint, derived from the
-    AST rather than hand-listed, must match a roster this round actually
+    AST rather than hand-listed, must match a roster that was actually
     reviewed for whether it needs (and passes) the ``condemned`` bytes
     guard. A new call site — guarded or not — changes the derived roster and
     fails this test."""

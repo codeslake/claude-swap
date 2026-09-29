@@ -19,7 +19,6 @@ accidentally swap their default keychain by running pytest.
 from __future__ import annotations
 
 import json
-
 import os
 import subprocess
 import sys
@@ -463,8 +462,6 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         Code rotates keychain-only. Capturing it files a spent refresh token
         against the slot and `add_account` then clears the dead-token strike.
         """
-        import json
-
         from claude_swap import macos_keychain as _kc
         from claude_swap.exceptions import CredentialReadError
         from claude_swap.paths import get_credentials_path
@@ -487,7 +484,9 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
 
         with pytest.raises(CredentialReadError) as exc:
             macos_switcher._read_capture_credentials()
-        assert "superseded generation" in str(exc.value), exc.value
+        # "possibly": with no GUI Claude Code writes the plaintext file itself,
+        # so the fallback may be the current generation, not a spent one.
+        assert "possibly superseded generation" in str(exc.value), exc.value
 
     def test_a_managed_api_key_is_not_refused_by_the_degraded_guard(
         self, macos_switcher, monkeypatch
@@ -528,11 +527,12 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         cfg.parent.mkdir(parents=True, exist_ok=True)
         cfg.write_text(json.dumps({"primaryApiKey": "sk-ant-api03-EXAMPLE"}))
 
-        value = macos_switcher._read_capture_credentials()
-        assert value and value.startswith("sk-ant-api"), (
-            "premise: this arm did not produce the managed key, so it is not "
-            f"the arm under test: {value!r}"
+        active = macos_switcher._read_active_credentials()
+        assert active.degraded and active.value == "sk-ant-api03-EXAMPLE", (
+            "premise: this arm did not produce a degraded read of the managed "
+            f"key, so it is not the arm under test: {active!r}"
         )
+        assert macos_switcher._read_capture_credentials() == active.value
 
     def test_a_real_keychain_failure_still_reports_unreadable(
         self, macos_switcher, monkeypatch

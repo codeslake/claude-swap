@@ -1416,22 +1416,24 @@ class ClaudeAccountSwitcher:
         active = self._read_active_credentials()
         # A MANAGED API KEY IS NOT OURS TO REFUSE. It has no generation to
         # supersede, and its real door is `--add-token`, which
-        # `_reject_live_api_key_capture` names a few lines on. Raising here
-        # reaches the user with a remedy for a different cause AND hides the
-        # one that would work: on a session with no GUI the Keychain does not
-        # become readable inside this process, so the correct message is
-        # never printed at all.
+        # `_reject_live_api_key_capture` names when `add_account` runs it right
+        # after this read. Raising here reaches the user with a remedy for a
+        # different cause AND hides the one that would work: on a session with
+        # no GUI the Keychain does not become readable inside this process, so
+        # the correct message is never printed at all.
         if active.degraded and not looks_like_api_key(active.value or ""):
             # SAYS WHAT IS KNOWN IN EVERY ARM. Two of the reachable ones have
-            # nothing readable at all, so "whatever is readable here" was
-            # vacuous there; what holds throughout is that a capture taken
-            # from a degraded read is either empty or already superseded.
+            # nothing readable at all, so a message about a readable fallback
+            # would be vacuous there. What holds throughout is that a capture
+            # taken from a degraded read is either empty or possibly already
+            # superseded: with no GUI Claude Code writes the plaintext file
+            # itself, and then the fallback IS the live generation.
             raise CredentialReadError(
                 "The OAuth Keychain read failed, so a capture now would "
-                "either store nothing or store a superseded generation "
-                "against this slot. A locked Keychain or a session with no "
-                "GUI is the usual cause, and retrying from a GUI terminal is "
-                "what clears that one."
+                "either store nothing or store a possibly superseded "
+                "generation against this slot. A locked Keychain or a "
+                "session with no GUI is the usual cause, and retrying from "
+                "a GUI terminal is what clears that one."
             )
         return active.value
 
@@ -1618,8 +1620,8 @@ class ClaudeAccountSwitcher:
         """
         # ponytail: refuses the write that would CREATE a new duplicate, not
         # a backfill scan for one already on disk before this guard existed
-        # -- the fleet's own zero-collision reading is what makes that
-        # ceiling acceptable today.
+        # -- a census finding no existing duplicate across the managed
+        # accounts is what makes that ceiling acceptable today.
         if attributed:
             return
         fp = oauth.credential_fingerprint(credentials)
@@ -4117,8 +4119,8 @@ class ClaudeAccountSwitcher:
             # file at this exact instant raises `ConfigError` straight
             # through `try_refresh_oauth_credentials` (whose own `condemned`
             # call is likewise unguarded) and `consume_backup_grant`
-            # (try/finally, no except), killing the whole collect pass. R1:
-            # unreadable is absence of evidence, never a refusal — caught
+            # (try/finally, no except), killing the whole collect pass.
+            # Unreadable is absence of evidence, never a refusal — caught
             # here and reported as "no evidence" rather than left to raise.
             try:
                 return self._probe_verdicts.get(
@@ -7145,7 +7147,7 @@ class ClaudeAccountSwitcher:
                         # `_condemned`: this runs outside the locked `try`
                         # below, and `_lineage_key` reads `sequence.json`
                         # with `strict=True`, raising `ConfigError` on a
-                        # torn/unreadable file. R1: unreadable is absence of
+                        # torn/unreadable file. Unreadable is absence of
                         # evidence, never a refusal — caught here instead of
                         # escaping uncaught through `_fetch_active_usage`
                         # (whose caller, `_fetch_account_usage`, promises
@@ -7635,8 +7637,8 @@ class ClaudeAccountSwitcher:
                             # Same shape as `_consume_backup_grant_locked`'s
                             # `_condemned`: `_lineage_key` reads
                             # `sequence.json` with `strict=True` and raises
-                            # `ConfigError` on a torn/unreadable file. R1:
-                            # unreadable is absence of evidence, never a
+                            # `ConfigError` on a torn/unreadable file.
+                            # Unreadable is absence of evidence, never a
                             # refusal — caught here instead of escaping to
                             # this call's own blanket `except Exception`
                             # (below), which would otherwise defer a live
@@ -7715,7 +7717,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                             # too (mirrors try_fetch_usage_for_account's own
                             # retry-branch treatment) — collapsing it to the
                             # generic "refresh-failed" hides the one signal
-                            # this round exists to produce. No strike either
+                            # this branch exists to produce. No strike either
                             # way: struck_fp is only set in the branch above.
                             return FetchRecord(
                                 error=result.error
@@ -7801,13 +7803,10 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                         live_ok = False
                         self._logger.warning(
                             "Active-store write failed after a %s for "
-                            "account %s%s.",
+                            "account %s.",
                             "backup restore" if restore_source is not None
                             else "consumed refresh",
                             account_num,
-                            "" if backup_ok
-                            else "; the rotated credential was NOT persisted "
-                                 "anywhere — re-login may be required",
                         )
                     if not backup_ok:
                         # A REFRESH TOKEN IS ONE-TIME-USE, so the bytes still
