@@ -251,20 +251,41 @@ class TestImportSafeWithoutTheExtra:
         """Runs in a subprocess with cswap_pin blocked at sys.meta_path —
         importlib.import_module does not go through builtins.__import__, so a
         __import__ patch would miss that form."""
+        import ast
         import subprocess
         import textwrap
         from pathlib import Path
 
         src = Path(__file__).resolve().parent.parent / "src"
-        # ponytail: only a module that spells `cswap_pin` can fail when it is
-        # blocked, and importing it drags in whatever it imports, so the rest
-        # are left out (the full walk paid ~0.5s for the TUI and the menu bar).
-        # A module that builds the name at runtime is invisible here, and to
-        # the two static scans around this case.
+
+        def binds_the_seam(p):
+            # Module scope only: a function body runs at call time, not import.
+            todo = [source_tree(p)]
+            while todo:
+                for n in ast.iter_child_nodes(todo.pop()):
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    if isinstance(n, (ast.Import, ast.ImportFrom)) and any(
+                        s.split(".")[-1] == "pin"
+                        for s in [a.name for a in n.names] + [getattr(n, "module", None) or ""]
+                    ):
+                        return True
+                    todo.append(n)
+            return False
+
+        # ponytail: a module can fail when cswap_pin is blocked only if it
+        # spells `cswap_pin` (only pin.py may, per the next case) or binds the
+        # seam `claude_swap.pin` at import time, which is how tui/widgets.py,
+        # tui/autoview.py and tui/dashboard.py can run seam code while they
+        # load. Importing one drags in whatever it imports, so the rest are
+        # left out (the full walk paid ~0.5s for the TUI and the menu bar). A
+        # module that builds the name at runtime, or reaches the seam only
+        # through a function-scope import, is invisible here, and to the two
+        # static scans around this case.
         mods = [
             ".".join(p.relative_to(src).with_suffix("").parts).removesuffix(".__init__")
             for p in sorted((src / "claude_swap").rglob("*.py"))
-            if "cswap_pin" in source_text(p)
+            if "cswap_pin" in source_text(p) or binds_the_seam(p)
         ]
         assert mods, "no module names cswap_pin: the walk found nothing to import"
         code = textwrap.dedent(
@@ -1699,10 +1720,10 @@ class TestTheWiringCanAlwaysBeRemoved:
         import claude_swap.paths as paths
         from claude_swap import pin
 
-        # Above the 3.0s bar below: the module default (0.3s) is now faster
-        # than `wire_launch_env`'s own explicit budget, so a mutant dropping
-        # that `timeout=` kwarg would fall back to the default and still
-        # clear this assertion. Only the mutant pays this value.
+        # Above the 3.0s bar below: the fixture default (0.05s) equals
+        # `wire_launch_env`'s own explicit budget set next, so a mutant
+        # dropping that `timeout=` kwarg would fall back to the default and
+        # still clear this assertion. Only the mutant pays this value.
         monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 4.0)
         monkeypatch.setattr(pin, "_LAUNCH_LOCK_BUDGET_S", 0.05)
 
@@ -11221,13 +11242,14 @@ class TestASourceFileIsReadAsUTF8:
             text = source_text(path)
             lines = text.splitlines()
             # ponytail: an offender names one of `srcish` in its own call, and
-            # a call is a few lines, so a file with no `.read_text(` within 10
-            # lines of a marker is never parsed. The
-            # ceiling is a call whose receiver or arguments run past 10 lines
-            # with the marker only out there; the AST below is still the
-            # judge of every file this lets through.
+            # a call is a few lines, so a file with no `read_text` within 10
+            # lines of a marker is never parsed. The name alone, not `.read_text(`,
+            # because the AST below also matches `p.read_text (` and
+            # `(p.read_text)()`. The ceiling is a call whose receiver or
+            # arguments run past 10 lines with the marker only out there; the
+            # AST below is still the judge of every file this lets through.
             if not any(
-                    ".read_text(" in ln and any(
+                    "read_text" in ln and any(
                         s in "\n".join(lines[max(0, i - 10):i + 11]) for s in srcish)
                     for i, ln in enumerate(lines)):
                 continue

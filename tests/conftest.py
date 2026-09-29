@@ -470,7 +470,8 @@ def _reattach_orphaned_modules() -> list[str]:
     from types import ModuleType as _ModuleType
 
     restored: list[str] = []
-    for parent_name in [n for n in list(_sys.modules) if n.startswith("claude_swap")]:
+    parents = [n for n in list(_sys.modules) if n.startswith("claude_swap")]
+    for parent_name in parents:  # grows below: a restored subpackage's children
         parent = _sys.modules.get(parent_name)
         if parent is None:
             continue
@@ -482,6 +483,7 @@ def _reattach_orphaned_modules() -> list[str]:
             if name.startswith("claude_swap") and name not in _sys.modules:
                 _sys.modules[name] = child
                 restored.append(name)
+                parents.append(name)
     return restored
 
 
