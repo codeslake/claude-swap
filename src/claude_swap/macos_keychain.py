@@ -99,54 +99,95 @@ def keychain_account_name() -> str:
 
 # In-process memo of ``security`` reads (memory only, never on disk), so a
 # steady-state poll costs one exec per item instead of one per pass: every exec
-# is scanned by endpoint security software. An entry is valid while the login
-# keychain file's stat is what it was BEFORE the exec that produced the answer:
-# every write to the keychain (ours or Claude Code's) moves ``st_mtime_ns`` (size
-# alone does not: measured unchanged across two writes), and stat-ing first means
-# a write during the exec is stored under the old stamp and re-read next call.
-# No stat-able file, no memo.
-# ponytail: assumes the default keychain is login.keychain-db (the macOS default,
-# and where ``add-generic-password`` without a keychain argument writes); a
-# different default keychain would need its own stamp path.
-_KEYCHAIN_FILE = "~/Library/Keychains/login.keychain-db"
-_memo: dict[tuple[str, str, str], tuple[tuple, object]] = {}
+# is scanned by endpoint security software.
+#
+# The memo holds the answers of ONE keychain generation, named by a stamp of the
+# ``*.keychain*`` files under ~/Library/Keychains (so a non-login default keychain
+# counts too): every write to a keychain (ours or Claude Code's) moves
+# ``st_mtime_ns`` (size alone does not: measured unchanged across two writes). The
+# stamp is taken BEFORE the exec that produces an answer, so a write during the
+# exec leaves that answer under the old stamp, where the next call drops it. A
+# moved stamp clears the whole memo, which bounds its size and lifetime.
+#
+# A FAILED exec (locked, denied, timed out) forgets everything and ends the
+# generation too: a locked keychain leaves its files untouched, so the stamp cannot
+# say so, and once a failure has been seen every read executes until one succeeds.
+# That is also why a memo hit never stands in for the success that ends a failure
+# (``CredentialStore._kc_call`` clears its failure flag on any return): a hit only
+# exists for an answer read after the last failure.
+#
+# No stat-able keychain file, no memo.
+# ponytail: the data-protection keychain (~/Library/Keychains/<uuid>/) is not
+# stamped: ``security`` reaches it only for items stored with that flag, which this
+# tool never does. Stamp it too if that changes.
+_KEYCHAIN_DIR = "~/Library/Keychains"
+_memo: dict[tuple[str, str, str], object] = {}
+_memo_stamp: tuple | None = None  # what every entry in _memo was read under
+_epoch = 0  # bumped by every failed exec, so a straggler's answer cannot land
+_lock = threading.Lock()
 _local = threading.local()
 
 
 def _stamp() -> tuple | None:
-    path = os.path.expanduser(_KEYCHAIN_FILE)
+    root = os.path.expanduser(_KEYCHAIN_DIR)
+    files = []
     try:
-        st = os.stat(path)
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if ".keychain" in entry.name:
+                    st = entry.stat()
+                    files.append((entry.name, st.st_ino, st.st_mtime_ns, st.st_size))
     except OSError:
         return None
-    return (path, st.st_ino, st.st_mtime_ns, st.st_size)
+    return (root, _epoch, tuple(sorted(files))) if files else None
 
 
 def _recall(key, stamp):
-    hit = _memo.get(key)
-    if stamp and hit and hit[0] == stamp and not getattr(_local, "fresh", False):
-        return hit
+    """``(value,)`` when ``key`` was read under ``stamp`` and this thread may
+    use the memo, else ``None``."""
+    global _memo_stamp
+    with _lock:
+        if stamp != _memo_stamp:
+            _memo.clear()
+            _memo_stamp = stamp
+        if stamp and key in _memo and not getattr(_local, "fresh", False):
+            return (_memo[key],)
 
 
 def _remember(key, stamp, value) -> None:
-    if stamp:
-        _memo[key] = (stamp, value)
+    with _lock:
+        if stamp and stamp == _memo_stamp:  # else a write or a failure came first
+            _memo[key] = value
 
 
 def _forget(service: str, account: str) -> None:
-    for kind in ("pw", "mdat"):
-        _memo.pop((kind, service, account), None)
+    with _lock:
+        for kind in ("pw", "mdat"):
+            _memo.pop((kind, service, account), None)
+
+
+def _invalidate() -> None:
+    """A failed exec: forget every answer and end the generation (see above)."""
+    global _epoch, _memo_stamp
+    with _lock:
+        _epoch += 1
+        _memo.clear()
+        _memo_stamp = None
 
 
 @contextmanager
-def fresh_reads(when: bool = True):
+def fresh_reads():
     """Reads on this thread inside the block skip the memo (and refresh it).
 
-    For a caller that must act on what the Keychain holds NOW, e.g. the consume
-    gate, which may spend a one-time refresh token. ``when=False`` is a no-op.
+    THE RULE: the memo serves display and snapshot reads only. Every read that
+    can lead to a grant POST or to a credential write runs inside this block,
+    under the lock that guards the write, so it sees a locked or changed
+    Keychain as it is. A refresh token is one-time-use: a POST decided on a
+    memoized read of an item that has since locked spends it, the successor
+    cannot be written back, and Claude Code keeps the spent generation.
     """
     prev = getattr(_local, "fresh", False)
-    _local.fresh = prev or when
+    _local.fresh = True
     try:
         yield
     finally:
@@ -174,7 +215,7 @@ def get_password(service: str, account: str) -> str | None:
     stamp = _stamp()  # before the exec, see the memo note above
     key = ("pw", service, account)
     if hit := _recall(key, stamp):
-        return hit[1]
+        return hit[0]
     try:
         result = subprocess.run(
             [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service],
@@ -183,6 +224,7 @@ def get_password(service: str, account: str) -> str | None:
             timeout=_TIMEOUT,
         )
     except subprocess.TimeoutExpired as e:
+        _invalidate()
         raise KeychainError(
             f"security find-generic-password timed out after {_TIMEOUT}s"
         ) from e
@@ -195,6 +237,7 @@ def get_password(service: str, account: str) -> str | None:
     if result.returncode == _NOT_FOUND_RC:
         _remember(key, stamp, None)
         return None
+    _invalidate()
     raise KeychainError(
         f"security find-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"
@@ -237,7 +280,7 @@ def item_modified_at(service: str, account: str) -> float | None:
     stamp = _stamp()
     key = ("mdat", service, account)
     if hit := _recall(key, stamp):
-        return hit[1]
+        return hit[0]
     try:
         result = subprocess.run(
             [_SECURITY, "find-generic-password", "-a", account, "-s", service],
@@ -246,8 +289,11 @@ def item_modified_at(service: str, account: str) -> float | None:
             timeout=_TIMEOUT,
         )
     except (subprocess.TimeoutExpired, OSError):
+        _invalidate()
         return None
     if result.returncode != 0:
+        if result.returncode != _NOT_FOUND_RC:
+            _invalidate()
         return None
     match = _MDAT_RE.search(result.stdout)
     if not match:
@@ -299,10 +345,12 @@ def set_password(service: str, account: str, password: str) -> None:
                 timeout=_TIMEOUT,
             )
     except subprocess.TimeoutExpired as e:
+        _invalidate()
         raise KeychainError(
             f"security add-generic-password timed out after {_TIMEOUT}s"
         ) from e
     if result.returncode != 0:
+        _invalidate()
         raise KeychainError(
             f"security add-generic-password failed (rc={result.returncode}): "
             f"{result.stderr.strip()}"
@@ -323,11 +371,13 @@ def delete_password(service: str, account: str) -> None:
             timeout=_TIMEOUT,
         )
     except subprocess.TimeoutExpired as e:
+        _invalidate()
         raise KeychainError(
             f"security delete-generic-password timed out after {_TIMEOUT}s"
         ) from e
     if result.returncode in (0, _NOT_FOUND_RC):
         return
+    _invalidate()
     raise KeychainError(
         f"security delete-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"

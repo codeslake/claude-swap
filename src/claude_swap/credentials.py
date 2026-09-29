@@ -558,9 +558,18 @@ class CredentialStore:
 
         Thin wrapper over :meth:`_read_active_credentials` preserving the historic
         ``str | None`` contract the switch paths rely on: credential string if
-        found, ``""`` if not found, ``None`` on a file read error.
+        found, ``""`` if not found, ``None`` on a file read error. That return
+        drops ``degraded``, so this call's own is kept per thread for the reader
+        that decides a grant POST on the value: ``_last_read_degraded``.
         """
-        return self._read_active_credentials().value
+        active = self._read_active_credentials()
+        self._managed_read_tls.degraded = active.degraded
+        return active.value
+
+    @property
+    def _last_read_degraded(self) -> bool:
+        """Whether THIS thread's last :meth:`_read_credentials` was degraded."""
+        return getattr(self._managed_read_tls, "degraded", False)
 
     def _read_active_oauth_keychain(self) -> tuple[str | None, bool, "str | None"]:
         """Read the active profile's OAuth Keychain item(s).
@@ -773,11 +782,7 @@ class CredentialStore:
         # derivation (pinned against its source) and the delete, session-read
         # and capture paths already depend on it.
         if self._use_keychain():
-            # With a plaintext file to arbitrate against, Claude Code may have
-            # fallen back to it because the Keychain is locked, and a memoized
-            # copy would hide that (no `degraded`, no "unavailable"): read live.
-            with macos_keychain.fresh_reads(get_credentials_path().exists()):
-                val, keychain_failed, kc_service = self._read_active_oauth_keychain()
+            val, keychain_failed, kc_service = self._read_active_oauth_keychain()
             # THIS read's own verdict, kept so a later success on some OTHER
             # item cannot erase it. Sticky until this read succeeds again,
             # which is what makes it self-heal without being erasable.
