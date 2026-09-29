@@ -143,6 +143,13 @@ def _stamp() -> tuple | None:
     return (root, _epoch, tuple(sorted(files))) if files else None
 
 
+def keychain_stamp() -> tuple | None:
+    """The memo's stamp, for a caller that gates its own work on "did a keychain
+    move": it changes on every write to a keychain and on every failed exec.
+    ``None`` where there is no stat-able keychain file (not macOS, or unreadable)."""
+    return _stamp()
+
+
 def _read_stamp() -> tuple | None:
     """The stamp a read runs under, or ``None`` when it must not touch the memo:
     outside ``memo_reads()``, or inside ``fresh_reads()`` (which wins)."""
@@ -202,6 +209,11 @@ def memo_reads():
     block, or inside ``fresh_reads()``. A one-time-use refresh token POSTed on a
     memoized read of an item that has since locked cannot have its successor
     written back. Usable as a decorator too.
+
+    The one write inside such a phase is the collect's ``_sweep_unclaimed_stash``,
+    which acts on memoized slot backups (``slot_creds``). That is safe only
+    because a locked item raises instead of reading, and the stamp moves on every
+    keychain write: a hit is never older than the last write.
     """
     return _scope("memo")
 
@@ -273,6 +285,7 @@ def item_exists(service: str, account: str) -> bool:
     missing binary all return ``False``. Deliberately **non-raising**: callers use
     it for cleanup verification, not access decisions, so it must never feed the
     capability cache (a timeout here means "couldn't tell", not "Keychain works").
+    A failed exec (not rc 44) still ends the read memo's generation, like any other.
     """
     try:
         result = subprocess.run(
@@ -282,7 +295,10 @@ def item_exists(service: str, account: str) -> bool:
             timeout=_TIMEOUT,
         )
     except (subprocess.TimeoutExpired, OSError):
+        _invalidate()
         return False
+    if result.returncode not in (0, _NOT_FOUND_RC):
+        _invalidate()
     return result.returncode == 0
 
 
@@ -335,7 +351,6 @@ def set_password(service: str, account: str, password: str) -> None:
     argv only for payloads that would overflow the stdin line buffer. Raises
     :class:`KeychainError` on a non-zero exit or a timeout.
     """
-    _forget(service, account)
     hex_value = password.encode("utf-8").hex()
     # `-X` passes the value as hex, avoiding any escaping issues for the secret.
     command = (
@@ -372,6 +387,8 @@ def set_password(service: str, account: str, password: str) -> None:
     except OSError:
         _invalidate()
         raise
+    finally:
+        _forget(service, account)  # a memo reader may have re-read the old value
     if result.returncode != 0:
         _invalidate()
         raise KeychainError(
@@ -385,7 +402,6 @@ def delete_password(service: str, account: str) -> None:
 
     Raises :class:`KeychainError` on any other non-zero exit or a timeout.
     """
-    _forget(service, account)
     try:
         result = subprocess.run(
             [_SECURITY, "delete-generic-password", "-a", account, "-s", service],
@@ -401,6 +417,8 @@ def delete_password(service: str, account: str) -> None:
     except OSError:
         _invalidate()
         raise
+    finally:
+        _forget(service, account)  # a memo reader may have re-read the old value
     if result.returncode in (0, _NOT_FOUND_RC):
         return
     _invalidate()

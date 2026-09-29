@@ -213,6 +213,7 @@ class CswapApp(App):
     def request_refresh(self, *, full: bool = False) -> None:
         if full:
             self._full_next = True
+        self.source.invalidate()  # a refresh the TUI asks for always reads the store
         self._tick()
 
     def set_store_only(self, value: bool) -> None:

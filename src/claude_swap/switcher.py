@@ -6966,6 +6966,8 @@ class ClaudeAccountSwitcher:
         # call: this runs every tick, so a torn roster must not take the
         # whole collect pass down with it.
         if sweep_stash:
+            # The one write in a memo phase whose input (`slot_creds`) is memoized:
+            # safe because a locked item raises, never reads, and a write moves the stamp.
             try:
                 self._sweep_unclaimed_stash(
                     live_slots=live_slots,

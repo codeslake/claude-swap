@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import os
 import sys
 import threading
 import time
@@ -389,6 +390,12 @@ class TestFormatting:
         assert tui_data.reset_text(elapsed, now) == "resets now"
 
 
+def _bump(path: Path) -> None:
+    """A write as a stat stamp sees it: a later mtime, same size and inode."""
+    ns = path.stat().st_mtime_ns + 1_000_000
+    os.utime(path, ns=(ns, ns))
+
+
 class TestSnapshotSource:
     def _source(self, tmp_path: Path, accounts=None):
         fake = FakeSwitcher(
@@ -413,6 +420,61 @@ class TestSnapshotSource:
         fake, source = self._source(tmp_path)
         source.take(store_only=True)
         assert fake.fetch_sets == [set()]
+
+    # -- the store-only poll re-reads only when a tracked stamp moved ---------
+
+    def _stamped(self, tmp_path):
+        """A source over a macOS-shaped scratch HOME: a login keychain file, the
+        plaintext credentials file, the state dirs, and a clock the test moves."""
+        home = Path.home()
+        files = [
+            home / "Library" / "Keychains" / "login.keychain-db",
+            home / ".claude" / ".credentials.json",
+        ]
+        for path in files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")
+        (tmp_path / "cache").mkdir()
+        clock = [1000.0]
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        source = tui_data.SnapshotSource(fake, clock=lambda: clock[0])
+        return fake, source, clock, {"keychain": files[0], "plaintext": files[1],
+                                     "state": tmp_path / "cache"}
+
+    def test_store_only_polls_inside_the_floor_read_the_store_once(self, tmp_path):
+        fake, source, clock, _ = self._stamped(tmp_path)
+        first = source.take(store_only=True)
+        for _ in range(9):  # nine more 3 s polls, all inside 30 s
+            clock[0] += 3.0
+            polled = source.take(store_only=True)
+        assert fake.fetch_sets == [set()]
+        # The reused snapshot is as of now, not of the read.
+        assert polled.taken_at == 1027.0 and first.taken_at != polled.taken_at
+
+    @pytest.mark.parametrize("move, kwargs", [
+        (lambda h, c, s: _bump(h["keychain"]), {"store_only": True}),
+        (lambda h, c, s: _bump(h["plaintext"]), {"store_only": True}),
+        (lambda h, c, s: _bump(h["state"]), {"store_only": True}),
+        (lambda h, c, s: c.__setitem__(0, c[0] + 30.0), {"store_only": True}),
+        (lambda h, c, s: s.invalidate(), {"store_only": True}),  # the TUI forces one
+        (lambda h, c, s: None, {"store_only": True, "full": True}),
+        (lambda h, c, s: None, {}),  # a fetch-eligible pass is never skipped
+    ])
+    def test_a_moved_stamp_a_forced_refresh_or_the_floor_reads_again(
+        self, tmp_path, move, kwargs
+    ):
+        fake, source, clock, handles = self._stamped(tmp_path)
+        source.take(store_only=True)
+        move(handles, clock, source)
+        source.take(**kwargs)
+        assert len(fake.fetch_sets) == 2
+
+    def test_without_a_keychain_stamp_every_poll_reads(self, tmp_path):
+        fake, source, _, handles = self._stamped(tmp_path)
+        handles["keychain"].unlink()  # not macOS, or unreadable: today's cadence
+        source.take(store_only=True)
+        source.take(store_only=True)
+        assert len(fake.fetch_sets) == 2
 
     def test_expired_sentinel_retained_until_fetched_at_advances(self, tmp_path):
         # The credential is genuinely STILL the rejected bytes here (same
@@ -1236,6 +1298,16 @@ class TestDashboard:
             await pilot.press("f")
             await settle(pilot)
             assert fake.fetch_sets[-1] is None  # full on-demand pass
+
+    async def test_a_requested_refresh_makes_the_source_read(self, tmp_path, monkeypatch):
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        invalidated = []
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            monkeypatch.setattr(app.source, "invalidate", lambda: invalidated.append(1))
+            app.request_refresh()  # a switch or any user action asks for one this way
+            assert invalidated == [1]
 
     async def test_add_token_via_menu_passes_assume_yes(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)

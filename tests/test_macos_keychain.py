@@ -294,6 +294,7 @@ class _FakeSecurity:
         self.denied: set[tuple[str, str]] = set()
         self.reads: list[tuple[str, str]] = []
         self.writes = 0
+        self.during_write = None  # runs while a write's exec is in flight
 
     @property
     def execs(self) -> int:
@@ -304,6 +305,8 @@ class _FakeSecurity:
             raise self.spawn_error
         if "find-generic-password" not in args:  # add / delete
             self.writes += 1
+            if self.during_write:
+                self.during_write()
             return _completed(self.write_rc or 0, stderr="locked")
         key = (args[args.index("-s") + 1], args[args.index("-a") + 1])
         self.reads.append(key)
@@ -412,6 +415,25 @@ def test_a_write_drops_only_its_own_key(fake_security, kc_file, write):
     assert fake_security.execs == 3
 
 
+@pytest.mark.parametrize("write", [
+    lambda: macos_keychain.set_password(*_KEY, "new"),
+    lambda: macos_keychain.delete_password(*_KEY),
+])
+def test_a_read_racing_a_write_leaves_no_stale_answer(fake_security, kc_file, write):
+    fake_security.items[_KEY] = "old"
+
+    def racer():  # a memo-phase reader on another thread, after the write's forget
+        with macos_keychain.memo_reads():
+            assert macos_keychain.get_password(*_KEY) == "old"
+
+    fake_security.during_write = racer
+    write()
+    fake_security.during_write = None
+    fake_security.items[_KEY] = "new"  # the same stamp: only a forget can say so
+    with macos_keychain.memo_reads():
+        assert macos_keychain.get_password(*_KEY) == "new"
+
+
 def test_an_error_is_never_memoized(fake_security, kc_file):
     fake_security.rc = 36
     with macos_keychain.memo_reads():
@@ -447,7 +469,9 @@ _SPAWN = OSError(11, "Resource temporarily unavailable")  # EAGAIN, or a blocked
     (lambda: macos_keychain.item_modified_at(*_KEY), ("rc", 36), None),
     (lambda: macos_keychain.set_password(*_KEY, "v"), ("write_rc", 36), _KC),
     (lambda: macos_keychain.delete_password(*_KEY), ("write_rc", 36), _KC),
+    (lambda: macos_keychain.item_exists(*_KEY), ("rc", 36), None),
     (lambda: macos_keychain.get_password(*_KEY), ("spawn_error", _SPAWN), OSError),
+    (lambda: macos_keychain.item_exists(*_KEY), ("spawn_error", _SPAWN), None),
     (lambda: macos_keychain.item_modified_at(*_KEY), ("spawn_error", _SPAWN), None),
     (lambda: macos_keychain.set_password(*_KEY, "v"), ("spawn_error", _SPAWN), OSError),
     (lambda: macos_keychain.delete_password(*_KEY), ("spawn_error", _SPAWN), OSError),
@@ -558,11 +582,18 @@ def test_a_snapshot_pass_reads_the_live_item_live_and_idle_backups_from_the_memo
 ):
     _seed_roster(mac_switcher, temp_home, fake_security, slots=3)
     idle = {("claude-swap", f"account-{n}-u{n}@example.com") for n in (2, 3)}
+    active_backup = ("claude-swap", "account-1-u1@example.com")
     mac_switcher.accounts_snapshot(fetch=set())  # fills the memo
     assert idle <= set(fake_security.reads)
     fake_security.reads.clear()
     mac_switcher.accounts_snapshot(fetch=set())
     assert _ACTIVE in fake_security.reads and not idle & set(fake_security.reads)
+    # The collect's resync reads the active slot's backup, which pass 1's
+    # `_account_is_switchable` memoized: it shows up here only if read fresh.
+    assert active_backup in fake_security.reads
+    fake_security.reads.clear()
+    mac_switcher.usage_entries_by_account(fetch=set())
+    assert active_backup in fake_security.reads and not idle & set(fake_security.reads)
     fake_security.reads.clear()
     mac_switcher.switchable_account_numbers()
     assert fake_security.reads == []
