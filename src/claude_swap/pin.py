@@ -1434,6 +1434,21 @@ _LAUNCH_PROBE_S = 0.2
 def _pinned_email_now(switcher) -> tuple[str, str] | None:
     """The pin record as cswap's OWN file has it, or None. Never the package.
 
+    None while this host's clear marker stands: a settings.json shared across
+    machines keeps its record for the others (see :func:`_clear_pin_record`),
+    and every reader that decides whether to wire, heal or report goes through
+    here. :func:`_raw_pin_record` is the marker-blind read.
+    """
+    from claude_swap import settings as _s
+
+    if _s.pin_cleared_path(switcher.backup_dir).exists():
+        return None
+    return _raw_pin_record(switcher)
+
+
+def _raw_pin_record(switcher) -> tuple[str, str] | None:
+    """The record in settings.json, whether or not this host cleared it.
+
     Both the clear and set paths need this and neither can ask ``cswap_pin``
     for it: the package is precisely what may be broken, and on the set path
     ``apply_pin`` has already written the record by the time a failure is
@@ -1526,20 +1541,42 @@ def _config_still_names(email: str, instead_of: "dict | None") -> bool:
     return False
 
 
-def _clear_pin_record(switcher) -> None:
-    """Drop ``remoteControl`` from settings.json. Never raises.
+def _clear_pin_record(switcher, everywhere: bool = False) -> None:
+    """Drop the pin record from settings.json. Never raises.
 
     Only for the path where the package cannot do it — normally ``apply_pin``
     owns this file's pin section, and going around it would race the daemon's
     own writes. Here there IS no package, so nothing else can.
+
+    A settings.json that is a symlink is ONE record for every host linking it,
+    and the write goes through the link, so dropping the pair there unpins them
+    all once it is committed. Unless ``everywhere``, a recorded pair is left
+    alone and this host's marker is written in the drop's own slot. Otherwise
+    only the two pin keys go, never ``remoteControl``'s other keys, and
+    ``everywhere`` also lifts the marker.
     """
     from claude_swap import settings as _s
 
     try:
         path = _s.settings_path(switcher.backup_dir)
+        marker = _s.pin_cleared_path(switcher.backup_dir)
+        if (path.is_symlink() and not everywhere
+                and _raw_pin_record(switcher) is not None):
+            marker.touch()
+            return
         raw = _s._read_raw_for_write(path)
-        if raw.pop("remoteControl", None) is not None:
+        section = raw.pop("remoteControl", None)
+        kept = (
+            {k: v for k, v in section.items()
+             if k not in ("pinnedEmail", "pinnedOrganizationUuid")}
+            if isinstance(section, dict) else {}
+        )
+        if kept:
+            raw["remoteControl"] = kept
+        if section is not None and kept != section:
             _s.atomic_write_json(path, raw)
+        if everywhere:
+            marker.unlink(missing_ok=True)
     except Exception:  # noqa: BLE001 — the caller re-reads and reports
         pass
 
@@ -1683,15 +1720,20 @@ def wired_config_paths(_switcher=None) -> list:
 # than to forget a line.
 
 
-def clear_pin(switcher) -> tuple[bool, str]:
+def clear_pin(switcher, everywhere: bool = False) -> tuple[bool, str]:
     """Remove the pin AND its wiring. ``(ok, message)``.
 
     Both halves are re-read afterwards rather than inferred: ``apply_pin``
     cannot report on the wiring, and ``clear_wiring``'s bool is False both for
     "nothing to remove" and for "the lock was contended so this path was
     skipped" — only the second is a failure, and the skip is deliberate.
+
+    On a settings.json shared across machines this clears THIS host only (see
+    :func:`_clear_pin_record`). ``everywhere`` drops the shared record, and
+    reads it marker-blind: a host that already cleared must still be able to.
     """
-    _pinned = _pinned_email_now(switcher)
+    _record = _raw_pin_record if everywhere else _pinned_email_now
+    _pinned = _record(switcher)
     had_pin = _pinned is not None
     # Captured before the first thing that unwires, which is `apply_pin`, not
     # `clear_wiring`. Below both, the survivor check ran against a config the
@@ -1711,7 +1753,12 @@ def clear_pin(switcher) -> tuple[bool, str]:
         _back_to = None
     try:
         impl = _impl()
-        impl.apply_pin(switcher, None, None, identity=_back_to)
+        # PROBED: an `everywhere` the peer does not take is a TypeError that
+        # lands in the fallback below with the peer's own clear never tried.
+        impl.apply_pin(
+            switcher, None, None, identity=_back_to,
+            **({"everywhere": everywhere}
+               if _takes(impl.apply_pin, "everywhere") else {}))
         _unsplice = False
     except Exception:  # noqa: BLE001 — this command must work when the pin does not
         # WHOSE WRITE CAN BE LOST RUNS LAST. Killed here, the worst case is
@@ -1730,7 +1777,7 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # frees up" — advice that never converges, which is the exact wording the
     # comment above rejects. An older peer, or one whose pin backend is off,
     # does precisely this.
-    if _pinned_email_now(switcher) is not None:
+    if _record(switcher) is not None:
         _unsplice = True
     # THE SPLICE IS THE OTHER HALF OF THE SAME STATE, and only the fallback
     # leaves it: a working `apply_pin` already un-spliced with this identity.
@@ -1757,8 +1804,12 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # re-reads each config fresh, so `not survivors` is a sound "the wiring is
     # actually gone" measurement, not an inference from a return value.
     if _unsplice and not survivors:
-        _clear_pin_record(switcher)
-    still_pinned = _pinned_email_now(switcher) is not None
+        # The local clear keeps the one-argument call its peer doubles bind.
+        if everywhere:
+            _clear_pin_record(switcher, everywhere=True)
+        else:
+            _clear_pin_record(switcher)
+    still_pinned = _record(switcher) is not None
     if still_pinned or survivors:
         what = " and ".join(
             w for w, on in (("the pin", still_pinned), ("the wiring", bool(survivors)))
@@ -1924,6 +1975,32 @@ def _nothing_to_heal(switcher) -> tuple[bool, str]:
     )
 
 
+def _accepts(sig, name: str) -> bool:
+    params = sig.parameters
+    return name in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _takes(fn, name: str) -> bool:
+    """Does calling ``fn`` with the keyword ``name`` bind?
+
+    Neither signature view alone is safe -- a `wraps` wrapper that DROPS
+    keywords looks accepting when followed, a transparent `(*a, **kw)` one
+    when unfollowed. The unfollowed view wins when it NAMES the parameter,
+    because that is the signature the call binds against: a compat shim that
+    grows a keyword over an older inner accepts it. Requiring both views to
+    agree can only turn a yes into a no. Agreement still decides a wrapper
+    claiming only `**kwargs`, where the inner is the only evidence there is.
+    """
+    try:
+        outer = inspect.signature(fn, follow_wrapped=False)
+        if name in outer.parameters:
+            return True
+        return _accepts(inspect.signature(fn), name) and _accepts(outer, name)
+    except (TypeError, ValueError):
+        return False
+
+
 def heal(
     switcher, *, connect_timeout: float = 2.0,
     lock_timeout: float | None = None,
@@ -1968,34 +2045,10 @@ def heal(
             # is a peer on its own release schedule, so an impl returning True
             # while binding nothing would report success over a dead port.
             #
-            # The signature is PROBED, not assumed: a version predating the
-            # keyword raises TypeError inside this try, which would swallow
-            # heal altogether. Neither signature view alone is safe -- a
-            # `wraps` wrapper that DROPS keywords looks accepting when
-            # followed, a transparent `(*a, **kw)` one when unfollowed.
-            def _accepts(sig, name: str) -> bool:
-                params = sig.parameters
-                return name in params or any(
-                    p.kind is inspect.Parameter.VAR_KEYWORD
-                    for p in params.values())
-
-            def _both(name: str) -> bool:
-                # The unfollowed view wins when it NAMES the parameter,
-                # because that is the signature the call binds against: a
-                # compat shim that grows a keyword over an older inner accepts
-                # it. Requiring both views to agree can only turn a yes into a
-                # no. Agreement still decides a wrapper claiming only
-                # `**kwargs`, where the inner is the only evidence there is.
-                try:
-                    outer = inspect.signature(impl.heal, follow_wrapped=False)
-                    if name in outer.parameters:
-                        return True
-                    return (_accepts(inspect.signature(impl.heal), name)
-                            and _accepts(outer, name))
-                except (TypeError, ValueError):
-                    return False
-
-            _takes_identity = _both("identity")
+            # The signature is PROBED, not assumed (`_takes`): a version
+            # predating the keyword raises TypeError inside this try, which
+            # would swallow heal altogether.
+            _takes_identity = _takes(impl.heal, "identity")
             # Through `_slot_for`, like every other caller: the bare form
             # makes `identity_for_config` resolve an ADDRESS, and that raises
             # when one address names two slots (the personal+org roster this
@@ -2008,7 +2061,7 @@ def heal(
                 _kw["identity"] = identity_for_config(
                     switcher, email=_pin_id[0],
                     num=_slot_for(switcher, _pin_id[0], _pin_id[1]))
-            if lock_timeout is not None and _both("lock_timeout"):
+            if lock_timeout is not None and _takes(impl.heal, "lock_timeout"):
                 _kw["lock_timeout"] = lock_timeout
             _healed = impl.heal(switcher.backup_dir, **_kw)
             if _healed and _wired_port_is_serving(
@@ -2222,6 +2275,7 @@ def run(
     set_port: int | None = None,
     ensure: bool = False,
     state: bool = False,
+    everywhere: bool = False,
 ) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
@@ -2353,7 +2407,7 @@ def run(
         # missing package -- "installed but unusable" is the other way a user
         # ends up here. The same `clear_pin` the TUI calls: one decision, one
         # implementation, two renderings.
-        ok, msg = clear_pin(switcher)
+        ok, msg = clear_pin(switcher, everywhere=everywhere)
         if not ok:
             warning(msg)
             return 1

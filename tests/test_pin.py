@@ -4846,11 +4846,12 @@ class TestHealADeadPin:
         # caught it, and the case failed as `exit 1` — a real signal, but for
         # the wrong reason and in the wrong place.)
         def _run(switcher, account, *, clear, heal_only, get_port, get_certdir,
-                 set_port, ensure, state):
+                 set_port, ensure, state, everywhere):
             seen.update(
                 account=account, clear=clear, heal_only=heal_only,
                 get_port=get_port, get_certdir=get_certdir,
                 set_port=set_port, ensure=ensure, state=state,
+                everywhere=everywhere,
             )
             return 0
 
@@ -4972,7 +4973,7 @@ class TestHealADeadPin:
         assert seen == {
             "account": None, "clear": False, "heal_only": True,
             "get_port": False, "get_certdir": False, "set_port": None,
-            "ensure": False, "state": False,
+            "ensure": False, "state": False, "everywhere": False,
         }
 
     def test_get_port_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
@@ -11458,6 +11459,97 @@ class TestThePinFlagsAreMutuallyExclusive:
                     pass
             assert "not allowed with" not in err.getvalue(), (
                 f"--debug was refused beside {argv}: {err.getvalue()!r}")
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="needs POSIX symlink semantics without developer mode",
+)
+class TestAClearOnASharedSettingsFileIsLocal:
+    """A settings.json symlinked from a repository shared across machines is ONE
+    record for every host linking it, so a one-host `--clear` marks this host
+    (`pin-cleared`) and leaves the record for the others; `--everywhere` drops it.
+    The peer here clears nothing, so the fallback is what is under test."""
+
+    @pytest.mark.parametrize("modern", [True, False], ids=["everywhere-kw", "old-signature"])
+    def test_a_one_host_clear_leaves_the_shared_record(self, tmp_path, monkeypatch, modern):
+        import types
+
+        import claude_swap.paths as paths
+        from claude_swap import cli, pin
+        from claude_swap import settings as _s
+
+        shared = tmp_path / "shared.json"
+        shared.write_text(json.dumps({"remoteControl": {
+            "pinnedEmail": "a@b.c", "pinnedOrganizationUuid": "", "debugSlowMs": 5}}))
+        seen, heals, raising = [], [], []
+
+        def new_apply(sw, email, org, identity=None, *, everywhere=False):
+            seen.append(everywhere)
+            if raising:
+                raise RuntimeError("peer broke")
+
+        def old_apply(sw, email, org, identity=None):
+            seen.append(None)
+            if raising:
+                raise RuntimeError("peer broke")
+
+        peer = types.SimpleNamespace(
+            apply_pin=new_apply if modern else old_apply,
+            heal=lambda backup_dir: heals.append(backup_dir) or False)
+        monkeypatch.setattr(pin, "_impl", lambda: peer)
+        monkeypatch.setattr(pin, "_live_impl", lambda: peer)
+        monkeypatch.setattr(cli, "_guard_root", lambda sw: None)
+        monkeypatch.setattr(cli, "_is_refused_root", lambda sw: False)
+
+        def host(name, wired):
+            backup = tmp_path / name
+            backup.mkdir()
+            (backup / "settings.json").symlink_to(shared)
+            cfg = tmp_path / f"{name}.claude.json"
+            cfg.write_text(json.dumps(
+                {"env": {"HTTPS_PROXY": "x"}, "_cswapPinWiredKeys": ["HTTPS_PROXY"]}
+                if wired else {"env": {}}))
+            return types.SimpleNamespace(
+                backup_dir=backup, _write_json=_s.atomic_write_json), cfg
+
+        def cswap_pin(h, *argv):
+            monkeypatch.setattr(paths, "get_global_config_path", lambda: h[1])
+            monkeypatch.setattr(paths, "get_default_global_config_path", lambda: h[1])
+            monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: h[0])
+            with pytest.raises(SystemExit) as exc:
+                cli._pin_command(list(argv))
+            return exc.value.code
+
+        one, two = host("one", True), host("two", False)
+        marker = _s.pin_cleared_path(one[0].backup_dir)
+        before = shared.read_bytes()
+
+        assert cswap_pin(one, "--clear") == 0
+        assert shared.read_bytes() == before, "a one-host clear rewrote the shared record"
+        assert marker.exists()
+        assert "_cswapPinWiredKeys" not in json.loads(one[1].read_text())
+        cswap_pin(one, "--ensure")
+        assert heals == [], "the cleared host went on to heal a pin it cleared"
+        cswap_pin(two, "--ensure")
+        assert heals == [two[0].backup_dir], "a sibling host stopped honouring the pin"
+
+        assert cswap_pin(one, "--clear", "--everywhere") == 0
+        assert json.loads(shared.read_text())["remoteControl"] == {"debugSlowMs": 5}
+        assert not marker.exists()
+        # Nothing recorded: a marker would make this host ignore the next pin.
+        raising.append(1)
+        assert cswap_pin(one, "--clear") == 0
+        assert not marker.exists()
+        assert seen == ([False, True, False] if modern else [None] * 3)
+
+    def test_everywhere_without_clear_is_a_usage_error(self):
+        from claude_swap import cli
+
+        for argv in (["--everywhere"], ["--heal", "--everywhere"]):
+            with pytest.raises(SystemExit) as exc:
+                cli._pin_command(argv)
+            assert exc.value.code == 2, argv
 
 
 class TestAddAccountRefusesASplicedIdentity:

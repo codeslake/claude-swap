@@ -285,7 +285,8 @@ The pin keeps those on one account of your choosing while `cswap switch` / [`csw
 ```bash
 cswap pin 2          # Remote Control / artifacts → account 2
 cswap pin            # show the current pin
-cswap pin --clear    # remove it
+cswap pin --clear    # remove it (this host only, if settings.json is shared; see below)
+cswap pin --clear --everywhere  # ...and drop the shared pin record too
 cswap pin --heal     # restart a pin proxy that died, or unwire it
 cswap pin --get_port # the serving port, bare digits (exit 1 if none)
 cswap pin --get_certdir # the cert directory, a bare path
@@ -297,6 +298,8 @@ cswap pin --ensure   # repair a stale wiring before a launch, for rc hooks
 `HTTPS_PROXY` names the pin's own dynamic port, and without a way to ask for it
 the on-disk layout becomes a compatibility surface. It prints bare digits and
 probes the port first, so a stale record cannot report a dead daemon as live.
+
+`settings.json` may be a symlink into a repository shared across machines, so the pin record is one file for every host that links it. `cswap pin --clear` then unpins **this host only**: it unwires the host and writes a `pin-cleared` marker beside `settings.json`, leaving the shared record untouched for the other hosts (and for a commit of that repository). `cswap pin --clear --everywhere` drops the shared record and removes the marker; `cswap pin N` on a cleared host pins it again. A `settings.json` that is not a symlink has no other hosts, so `--clear` drops its record as before.
 
 The pinned account is re-read per request, so re-pinning takes effect without restarting anything. The one thing a re-pin cannot move is a Remote Control session that is **already open** — the server fixed its owner when the session was created, so reconnecting inside it (`/rc` → Disconnect → `/rc`) is what moves it.
 
