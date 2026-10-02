@@ -50,10 +50,15 @@ menubar = ["rumps>=0.4.0"]
 # <n>` and the TUI hand off to them, and a release without them raises
 # AttributeError at that call.
 #
+# 0.1.309 is where `apply_pin` takes the keyword-only `everywhere` and the
+# `pin-cleared` marker `cswap pin --clear` writes is honoured: its set arm
+# unlinks it and `load_pin` reads None while it exists. On 0.1.303-0.1.308 a
+# re-pin leaves the marker, so the host reads as cleared after a successful pin.
+#
 # NO `; sys_platform != 'win32'` MARKER (proposed twice): the dev group
 # installs this so the seam test runs on Windows too, and a marker makes that
 # test decorative instead of red.
-pin = ["cswap-pin>=0.1.303"]
+pin = ["cswap-pin>=0.1.309"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"

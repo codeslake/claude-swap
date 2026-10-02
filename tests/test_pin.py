@@ -3711,6 +3711,21 @@ class TestClearRunsWithTheExtraGone:
             "sides of --set_port have drifted apart"
         )
 
+    def test_the_installed_package_carries_the_pin_cleared_marker_contract(self):
+        """The `pin` extra's floor is the release where `apply_pin` takes the
+        keyword-only `everywhere`: only from there does the set arm unlink the
+        `pin-cleared` marker `--clear` writes. Below it a re-pin leaves the
+        marker and the host reads as cleared after a successful pin."""
+        import inspect
+
+        from cswap_pin import proxy
+
+        p = inspect.signature(proxy.apply_pin).parameters.get("everywhere")
+        assert p is not None and p.kind is p.KEYWORD_ONLY, (
+            "the installed cswap-pin predates the marker contract; the extra's "
+            "floor must name the release that has it"
+        )
+
     def test_clear_removes_the_wiring_with_cswap_pin_blocked(self, tmp_path):
         import subprocess
         import textwrap
