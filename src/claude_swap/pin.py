@@ -1804,7 +1804,9 @@ def clear_pin(switcher, everywhere: bool = False) -> tuple[bool, str]:
     # re-reads each config fresh, so `not survivors` is a sound "the wiring is
     # actually gone" measurement, not an inference from a return value.
     if _unsplice and not survivors:
-        # The local clear keeps the one-argument call its peer doubles bind.
+        # The keyword is passed only when set: test_clear_pin_converges_against_
+        # a_peer_that_silently_does_nothing patches `_clear_pin_record` as a
+        # one-argument lambda and drives the local clear through it.
         if everywhere:
             _clear_pin_record(switcher, everywhere=True)
         else:
