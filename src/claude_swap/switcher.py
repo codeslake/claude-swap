@@ -102,6 +102,7 @@ from claude_swap.process_detection import get_running_instances, scan_sessions
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
+    ClientUsageAnswer,
     FetchRecord,
     PERMANENT_AUTH_ERRORS,
     UsageEntry,
@@ -3363,6 +3364,58 @@ class ClaudeAccountSwitcher:
             return False
         identity = (info.get("email", ""), info.get("organizationUuid", "") or "")
         return self._usage_store.record_header_reading(num, {num: identity}, headers)
+
+    def _slot_identity(self, num: str) -> tuple[str, str] | None:
+        """``(email, organizationUuid)`` slot ``num`` maps to, or None for
+        a slot the roster does not hold."""
+        data = self._get_sequence_data() or {}
+        info = data.get("accounts", {}).get(num)
+        if info is None:
+            return None
+        return (info.get("email", ""), info.get("organizationUuid", "") or "")
+
+    def answer_client_usage(
+        self, num: str, variant: str
+    ) -> ClientUsageAnswer | None:
+        """Public entry point for the owner proxy: what to do with a usage
+        request Claude Code sent on slot ``num`` in form ``variant`` (a
+        ``usage_store.USAGE_VARIANT_*``, from ``usage_store.usage_variant``).
+        Serve the stored body, forward with the attempt counted, or hold;
+        see ``UsageStore.answer_client_usage``. None, deciding nothing, for
+        a slot the roster does not hold.
+        """
+        identity = self._slot_identity(num)
+        if identity is None:
+            return None
+        return self._usage_store.answer_client_usage(
+            num, {num: identity}, variant
+        )
+
+    def record_client_usage(
+        self,
+        num: str,
+        variant: str,
+        *,
+        status: int,
+        body: dict | None = None,
+        retry_after_s: float | None = None,
+    ) -> bool:
+        """Public entry point for the owner proxy: record the reply to a
+        request ``answer_client_usage`` let go. See
+        ``UsageStore.record_client_usage``. False, recording nothing, for a
+        slot the roster does not hold or a reply it does not record.
+        """
+        identity = self._slot_identity(num)
+        if identity is None:
+            return False
+        return self._usage_store.record_client_usage(
+            num,
+            {num: identity},
+            variant,
+            status=status,
+            body=body,
+            retry_after_s=retry_after_s,
+        )
 
     def set_poll_policy_inputs(
         self, threshold: float, models: tuple[str, ...]
@@ -7175,6 +7228,7 @@ class ClaudeAccountSwitcher:
                         )
                 return FetchRecord(
                     usage=outcome.usage,
+                    body=outcome.body,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
                 )
@@ -7908,6 +7962,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         )
         return FetchRecord(
             usage=outcome.usage,
+            body=outcome.body,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
         )
@@ -8812,6 +8867,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         )
         return FetchRecord(
             usage=outcome.usage,
+            body=outcome.body,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
             struck_fp=outcome.struck_fp,
@@ -8835,6 +8891,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED, rejected_fp=stamp)
         return FetchRecord(
             usage=outcome.usage,
+            body=outcome.body,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
         )
