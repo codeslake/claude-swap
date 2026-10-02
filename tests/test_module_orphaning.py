@@ -108,3 +108,34 @@ def test_the_scan_can_find_an_orphan(tmp_path):
         sys.path.remove(str(tmp_path))
         for n in [n for n in list(sys.modules) if n.startswith("orphanprobe")]:
             del sys.modules[n]
+
+
+def test_a_two_level_orphan_is_fully_reattached(tmp_path):
+    """A subpackage first imported inside the block is orphaned WITH its
+    children, and the children hang off a parent that is itself absent from
+    `sys.modules`. One re-attach call must repair every level: the conftest
+    fixture stamps after one call, so a level left for "the next teardown" is
+    left for good."""
+    from unittest.mock import patch
+
+    from tests.conftest import _reattach_orphaned_modules
+
+    pkg = tmp_path / "claude_swap_orphanprobe"
+    (pkg / "sub").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "sub" / "__init__.py").write_text("")
+    (pkg / "sub" / "leaf.py").write_text("x = 1\n")
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import claude_swap_orphanprobe  # noqa: F401  in the snapshot, like claude_swap
+
+        with patch.dict(sys.modules, {"_orphanprobe_fake": object()}):
+            import claude_swap_orphanprobe.sub.leaf  # noqa: F401
+        want = {"claude_swap_orphanprobe.sub", "claude_swap_orphanprobe.sub.leaf"}
+        assert not want & set(sys.modules), "premise: both levels are orphaned"
+        _reattach_orphaned_modules()
+        assert want <= set(sys.modules), sorted(want - set(sys.modules))
+    finally:
+        sys.path.remove(str(tmp_path))
+        for n in [n for n in list(sys.modules) if n.startswith("claude_swap_orphanprobe")]:
+            del sys.modules[n]

@@ -120,7 +120,9 @@ def _pin_command(argv: list[str]) -> None:
 Examples:
   cswap pin 2          pin Remote Control / artifacts to account 2
   cswap pin            show the current pin
-  cswap pin --clear    remove the pin
+  cswap pin --clear    remove the pin (on a settings.json symlinked from a
+                       repository shared across machines: this host only)
+  cswap pin --clear --everywhere  also drop the shared pin record
   cswap pin --heal     restart a pin proxy that died, or unwire it
   cswap pin --get_port print the serving port (for scripts), or exit 1
   cswap pin --get_certdir  print the cert directory (for scripts)
@@ -200,8 +202,21 @@ Examples:
             "stdout, detail on stderr, and always exit 0."
         ),
     )
+    # A MODIFIER OF `--clear`, so outside the group. Alone it would be a
+    # discarded flag, and a discarded flag reads as a performed action.
+    parser.add_argument(
+        "--everywhere",
+        action="store_true",
+        help=(
+            "With --clear: when settings.json is a symlink shared across "
+            "machines, also drop the shared pin record. Without it --clear "
+            "unpins this host only and leaves the record for the others"
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
+    if args.everywhere and not args.clear:
+        parser.error("--everywhere only applies to --clear")
 
     from claude_swap.pin import run as pin_run
 
@@ -240,6 +255,7 @@ Examples:
                 switcher,
                 args.account,
                 clear=args.clear,
+                everywhere=args.everywhere,
                 heal_only=args.heal,
                 get_port=args.get_port,
                 get_certdir=args.get_certdir,

@@ -14,6 +14,7 @@ import sys
 import pytest
 
 from claude_swap.exceptions import ClaudeSwitchError
+from tests.conftest import source_text, source_tree
 
 
 @pytest.fixture(autouse=True)
@@ -24,11 +25,24 @@ def _fast_default_lock_timeout(monkeypatch):
     suite 27.6% of the fork's whole-suite cost. Shrunk once, for every test,
     rather than per-test: a case that DOES need a specific value — the
     doubled-deadline arithmetic below, and two mutant-detection budgets that
-    would otherwise land inside this fixture's own 0.3s — still sets its own
-    on top of this."""
+    would otherwise land inside this fixture's own 0.05s, still sets its own
+    on top of this.
+
+    THE RETRY STEP IS SHRUNK WITH IT. `proper_lockfile` looks at its deadline
+    only at the top of the loop, so a held lock costs one sleep of 0.25-0.5s
+    whatever the budget: a 0.05s budget alone still paid 0.25s per contended
+    attempt. The tenth-second step keeps the loop's shape (check, sleep,
+    check) and only this module's clock for it: every other module keeps the
+    real `time`."""
+    import time
+    import types
+
     from claude_swap import claude_locks
 
-    monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(claude_locks, "time", types.SimpleNamespace(
+        monotonic=time.monotonic, time=time.time,
+        sleep=lambda s: time.sleep(s / 10)))
 
 
 def _pinwiring():
@@ -155,10 +169,10 @@ def _port_literal_offenders(directory, own_file, own_class_name: str) -> list:
         #
         # A source file's encoding is UTF-8 by definition (PEP 3120), so
         # the platform default is never the right answer for reading one.
-        text = path.read_text(encoding="utf-8")
+        text = source_text(path)
         if "36301" not in text:
             continue
-        tree = ast.parse(text)
+        tree = source_tree(path)
         skip = set()
         is_own_file = path.resolve() == own_file
         for n in ast.walk(tree):
@@ -214,10 +228,9 @@ class TestImportSafeWithoutTheExtra:
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
         offenders = []
         for path in root.rglob("*.py"):
-            text = path.read_text(encoding="utf-8")
-            if "cswap_pin" not in text:
+            if "cswap_pin" not in source_text(path):
                 continue
-            tree = ast.parse(text)
+            tree = source_tree(path)
             nested = set()
             for fn in ast.walk(tree):
                 if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -238,15 +251,47 @@ class TestImportSafeWithoutTheExtra:
         """Runs in a subprocess with cswap_pin blocked at sys.meta_path —
         importlib.import_module does not go through builtins.__import__, so a
         __import__ patch would miss that form."""
+        import ast
         import subprocess
         import textwrap
         from pathlib import Path
 
-        src = str(Path(__file__).resolve().parent.parent / "src")
+        src = Path(__file__).resolve().parent.parent / "src"
+
+        def binds_the_seam(p):
+            # Module scope only: a function body runs at call time, not import.
+            todo = [source_tree(p)]
+            while todo:
+                for n in ast.iter_child_nodes(todo.pop()):
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    if isinstance(n, (ast.Import, ast.ImportFrom)) and any(
+                        s.split(".")[-1] == "pin"
+                        for s in [a.name for a in n.names] + [getattr(n, "module", None) or ""]
+                    ):
+                        return True
+                    todo.append(n)
+            return False
+
+        # ponytail: a module can fail when cswap_pin is blocked only if it
+        # spells `cswap_pin` (only pin.py may, per the next case) or binds the
+        # seam `claude_swap.pin` at import time, which is how tui/widgets.py,
+        # tui/autoview.py and tui/dashboard.py can run seam code while they
+        # load. Importing one drags in whatever it imports, so the rest are
+        # left out (the full walk paid ~0.5s for the TUI and the menu bar). A
+        # module that builds the name at runtime, or reaches the seam only
+        # through a function-scope import, is invisible here, and to the two
+        # static scans around this case.
+        mods = [
+            ".".join(p.relative_to(src).with_suffix("").parts).removesuffix(".__init__")
+            for p in sorted((src / "claude_swap").rglob("*.py"))
+            if "cswap_pin" in source_text(p) or binds_the_seam(p)
+        ]
+        assert mods, "no module names cswap_pin: the walk found nothing to import"
         code = textwrap.dedent(
             f"""
-            import pkgutil, sys
-            sys.path.insert(0, {src!r})
+            import sys
+            sys.path.insert(0, {str(src)!r})
             class Block:
                 def find_spec(self, name, path=None, target=None):
                     if name.split(".")[0] == "cswap_pin":
@@ -254,8 +299,8 @@ class TestImportSafeWithoutTheExtra:
                     return None
             sys.meta_path.insert(0, Block())
             import claude_swap
-            for m in pkgutil.walk_packages(claude_swap.__path__, "claude_swap."):
-                __import__(m.name)
+            for name in {mods!r}:
+                __import__(name)
             """
         )
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
@@ -281,9 +326,9 @@ class TestImportSafeWithoutTheExtra:
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
         offenders = []
         for path in root.rglob("*.py"):
-            if path.name == "pin.py":
+            if path.name == "pin.py" or "cswap_pin" not in source_text(path):
                 continue
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            for node in ast.walk(source_tree(path)):
                 names = []
                 if isinstance(node, ast.Import):
                     names = [a.name for a in node.names]
@@ -319,8 +364,11 @@ class TestTheMissingExtraIsReported:
         from claude_swap import pin
 
         monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: None)
-        with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[pin\]"):
+        with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[pin\]") as e:
             pin._impl()
+        # The command resolves from the index, and a release that predates the
+        # extra only warns, so the hint must also say where to go then.
+        assert "cswap-pin#readme" in str(e.value)
 
     def test_a_broken_package_ROOT_is_not_reported_as_missing(
         self, posix, tmp_path, monkeypatch
@@ -1510,8 +1558,9 @@ class TestTheWiringCanAlwaysBeRemoved:
     def test_a_contended_first_path_does_not_starve_a_free_second(
         self, tmp_path, monkeypatch
     ):
-        """Only the session lock held, at the REAL
-        production budget ``_LAUNCH_LOCK_BUDGET_S = 0.5``): `clear_wiring`
+        """Only the session lock held, at a tenth of the production budget
+        (``_LAUNCH_LOCK_BUDGET_S = 0.5``, with the retry step a tenth too):
+        `clear_wiring`
         returned False with BOTH configs still wired. The first path waited
         the WHOLE budget on a lock nobody released, so `left <= 0` by the
         time the loop reached the second path — free the entire time — and
@@ -1528,8 +1577,9 @@ class TestTheWiringCanAlwaysBeRemoved:
         ``claude_swap.claude_locks.proper_lockfile`` that records every
         ``lock_dir`` it is asked to acquire.
 
-        Runs at the REAL `_LAUNCH_LOCK_BUDGET_S` (0.5s), not a test-only
-        constant, so the arithmetic under test is the arithmetic that ships.
+        Runs at a tenth of `_LAUNCH_LOCK_BUDGET_S`, against a retry step a
+        tenth as long (the autouse fixture): the fair-share arithmetic under
+        test has no unit, so the ratio is what ships.
 
         WHAT THIS DOES NOT ASSERT IS ELAPSED TIME, and the earlier wording
         here claimed it could, on the strength of a clamp in
@@ -1559,9 +1609,11 @@ class TestTheWiringCanAlwaysBeRemoved:
         # -show-red proof in the task report) starves path 2 on some runs and
         # not others: 5/5 green with the mutant in and the jitter
         # left to chance. Forcing `random.random() == 1.0` makes every retry
-        # sleep exactly 0.5s — the full budget on the FIRST path alone — so
+        # sleep exactly one step (0.5s, a tenth of that here as is the budget):
+        # the full budget on the FIRST path alone, so
         # the unclamped mutant fails every time, not by luck of the draw.
         monkeypatch.setattr(claude_locks.random, "random", lambda: 1.0)
+        monkeypatch.setattr(pin, "_LAUNCH_LOCK_BUDGET_S", 0.05)
 
         real_proper_lockfile = claude_locks.proper_lockfile
         attempted = []
@@ -1617,7 +1669,7 @@ class TestTheWiringCanAlwaysBeRemoved:
         Every other test here passes an explicit ``timeout``, so none of them
         exercises the branch that resolves ``DEFAULT_TIMEOUT_S`` itself. Fast
         by construction: ``DEFAULT_TIMEOUT_S`` is shrunk before the call, so
-        the whole test still runs in a couple of seconds rather than 9-18.
+        the whole test runs in under a second rather than 9-18.
         """
         import time
 
@@ -1633,7 +1685,7 @@ class TestTheWiringCanAlwaysBeRemoved:
         # Shrink the DEFAULT this function resolves internally when no
         # timeout is passed — the mutation under test doubles WHATEVER this
         # is, so a small value keeps the doubled case fast too.
-        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 1.0)
+        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.4)
 
         # BOTH locks live-held, for real: a stubbed lock would not exercise
         # clear_wiring's own per-path share arithmetic.
@@ -1651,11 +1703,11 @@ class TestTheWiringCanAlwaysBeRemoved:
 
         assert not changed, "fixture invalid: nothing should have been removed"
         # 1x the (shrunk) default plus slack, never 2x it — the doubled
-        # mutation reliably clears this bar (~2.2s against a 1.0s
-        # DEFAULT_TIMEOUT_S here; the fix stays under ~1.3s).
-        assert elapsed < 1.9, (
+        # mutation reliably clears this bar (0.8s and up against a 0.4s
+        # DEFAULT_TIMEOUT_S here; the fix stays under ~0.5s).
+        assert elapsed < 0.65, (
             f"the untimed deadline behaved as a PER-PATH allowance, not a "
-            f"total: {elapsed:.2f}s against a shrunk default of 1.0s"
+            f"total: {elapsed:.2f}s against a shrunk default of 0.4s"
         )
 
     def test_the_launch_path_does_not_wait_on_the_config_lock(
@@ -1671,10 +1723,10 @@ class TestTheWiringCanAlwaysBeRemoved:
         import claude_swap.paths as paths
         from claude_swap import pin
 
-        # Above the 3.0s bar below: the module default (0.3s) is now faster
-        # than `wire_launch_env`'s own explicit budget, so a mutant dropping
-        # that `timeout=` kwarg would fall back to the default and still
-        # clear this assertion. Only the mutant pays this value.
+        # Above the 3.0s bar below: the fixture default (0.05s) equals
+        # `wire_launch_env`'s own explicit budget set next, so a mutant
+        # dropping that `timeout=` kwarg would fall back to the default and
+        # still clear this assertion. Only the mutant pays this value.
         monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 4.0)
         monkeypatch.setattr(pin, "_LAUNCH_LOCK_BUDGET_S", 0.05)
 
@@ -2358,125 +2410,6 @@ class TestSafeRedaction:
         assert _safe(exc) == str(exc)
 
 
-class TestTheRollbackVerdictIsNotFooledByShape:
-    """The seam's reader and the package's writer must agree on shape.
-
-    ``_pinned_email_now`` returned the org uuid raw (None when the key is
-    absent) while ``cswap_pin.save_pin`` always writes ``org_uuid or ""``. So
-    restoring a record that had no org key produced ``(email, "")`` against a
-    ``before`` of ``(email, None)`` — unequal — and a SUCCESSFUL rollback
-    reported itself as a failure, sending the user to check a state the code
-    could already disprove. Exactly what _restore_pin was written to stop.
-    """
-
-    def test_a_record_with_no_org_key_rolls_back_cleanly(self, tmp_path):
-        import json as _json
-        import types
-
-        from claude_swap import pin
-
-        backup = tmp_path / "b"
-        backup.mkdir()
-        settings = backup / "settings.json"
-        # No org key at all — what an older writer or a hand-edit leaves.
-        settings.write_text(_json.dumps({"remoteControl": {"pinnedEmail": "old@e.com"}}))
-
-        def _apply(sw, email, org):
-            # Faithful to the package: it always writes `org_uuid or ""`.
-            raw = _json.loads(settings.read_text())
-            if email:
-                raw["remoteControl"] = {
-                    "pinnedEmail": email, "pinnedOrganizationUuid": org or "",
-                }
-            else:
-                raw.pop("remoteControl", None)
-            settings.write_text(_json.dumps(raw))
-            raise RuntimeError("pin-proxy")
-
-        sw = types.SimpleNamespace(
-            backup_dir=backup,
-            resolve_account=lambda a: ("2", "new@e.com", "org"),
-            _account_kind=lambda n: "oauth",
-        )
-        real = pin._impl
-        pin._impl = lambda: types.SimpleNamespace(apply_pin=_apply)
-        try:
-            ok, msg = pin.set_pin(sw, "new@e.com", "org", num="2")
-        finally:
-            pin._impl = real
-
-        assert not ok
-        assert pin._pinned_email_now(sw)[0] == "old@e.com", "the rollback failed"
-        # The verdict must MATCH the record it just re-read.
-        assert "may still name" not in msg, (
-            "a successful rollback was reported as a failure — the reader and "
-            f"the writer disagree on shape: {msg}"
-        )
-        assert "the previous pin is unchanged" in msg, msg
-
-    def test_a_rollback_that_does_not_land_says_so(self, tmp_path):
-        """The real case, not the shape mismatch above: the rollback
-        ATTEMPT itself fails to reach the proxy, so the record never moves
-        off the failed pin. `_restore_pin`'s verdict must come from re-reading
-        the file, not from having made the call — mutating its last line to
-        `return True` leaves the record naming `new@e.com` while the message
-        claims the previous pin is unchanged.
-        """
-        import json as _json
-        import types
-
-        from claude_swap import pin
-
-        backup = tmp_path / "b"
-        backup.mkdir()
-        settings = backup / "settings.json"
-        settings.write_text(
-            _json.dumps({"remoteControl": {"pinnedEmail": "old@e.com", "pinnedOrganizationUuid": "org"}})
-        )
-
-        class _I:
-            n = 0
-
-            def apply_pin(self, sw, email, org, **kw):
-                _I.n += 1
-                if _I.n == 1:
-                    # The ORIGINAL set_pin call: writes the new pin, then the
-                    # proxy dies.
-                    settings.write_text(
-                        _json.dumps(
-                            {"remoteControl": {"pinnedEmail": email, "pinnedOrganizationUuid": org or ""}}
-                        )
-                    )
-                    raise RuntimeError("proxy exploded")
-                # THE ROLLBACK ATTEMPT (_restore_pin calling apply_pin with
-                # `before`). It also fails to reach the proxy and must NOT be
-                # believed just because it was called — the file is untouched.
-                raise RuntimeError("rollback could not reach the proxy either")
-
-        sw = types.SimpleNamespace(
-            backup_dir=backup,
-            resolve_account=lambda a: ("2", "new@e.com", "org"),
-            _account_kind=lambda n: "oauth",
-        )
-        real = pin._impl
-        pin._impl = lambda: _I()
-        try:
-            ok, msg = pin.set_pin(sw, "new@e.com", "org", num="2")
-        finally:
-            pin._impl = real
-
-        assert not ok
-        # THE FACT the mutation hides: the record never moved off the pin
-        # that just failed.
-        assert pin._pinned_email_now(sw)[0] == "new@e.com", (
-            "fixture invalid: the rollback attempt actually wrote the file"
-        )
-        assert "the previous pin is unchanged" not in msg, (
-            f"claimed the old pin survived while the record names new@e.com: {msg}"
-        )
-        assert "may still name new@e.com" in msg, msg
-
-
 class TestTheTwoWiringPredicatesAgree:
     """"Is it wired" is asked in two places, and they must not disagree.
 
@@ -2897,50 +2830,6 @@ class TestTheUnspliceDecidesOnTheAccount:
         )
 
 
-    def test_an_already_correct_config_is_not_a_failed_rollback(self, temp_home):
-        """`splice_config_identity` returns False for a SKIPPED write and for a
-        config that already names the identity. Only the file separates them."""
-        from unittest.mock import patch
-
-        from claude_swap import pin as pin_mod
-        from claude_swap import settings as _s
-
-        s = _r37_pin_switcher(temp_home)
-        cfg = temp_home / ".claude.json"
-        cfg.write_text(json.dumps({"env": {}, "oauthAccount": {
-            "emailAddress": SHARED_PIN_EMAIL, "accountUuid": "uuid-personal",
-            "organizationUuid": ""}}))
-
-        class _NoProxy:
-            def apply_pin(self, sw, email=None, org=None, identity=None):
-                path = _s.settings_path(sw.backup_dir)
-                if email:
-                    _s.atomic_write_json(path, {"remoteControl": {"pinnedEmail": email}})
-                else:
-                    raw = _s._read_raw_for_write(path)
-                    raw.pop("remoteControl", None)
-                    _s.atomic_write_json(path, raw)
-                return False                      # no proxy running
-
-            def splice_config_identity(self, identity):
-                return False                      # the config ALREADY names it
-
-        with patch.object(pin_mod, "_impl", lambda: _NoProxy()):
-            ok, msg = pin_mod.set_pin(s, SHARED_PIN_EMAIL, None)
-
-        after = json.loads(cfg.read_text())["oauthAccount"]["emailAddress"]
-        print(f"\n[C1] ok={ok} record={pin_mod._pinned_email_now(s)!r} config={after!r}")
-        print(f"[C1] msg={msg!r}")
-        # PREMISES: the pin did not take, the record IS rolled back, and the
-        # config already carries the right identity.
-        assert ok is False
-        assert pin_mod._pinned_email_now(s) is None
-        assert after == SHARED_PIN_EMAIL
-        assert "check with" not in msg.lower(), (
-            "DEFECT: the rollback was clean and the command sent the user to "
-            f"check a state it could already disprove: {msg}"
-        )
-
 class TestTheUnspliceTouchesOnlyWhatThePinSpliced:
     """The un-splice is a repair, so it must decide on the ACCOUNT.
 
@@ -3040,68 +2929,6 @@ class TestTheUnspliceTouchesOnlyWhatThePinSpliced:
         assert now == other, (
             "DEFECT: the un-splice rewrote a config that never named the "
             f"pin; it now says {now.get('emailAddress')!r}"
-        )
-
-    def test_a_rollback_that_skipped_the_splice_must_not_report_success(
-        self, temp_home
-    ):
-        """`splice_config_identity` SKIPS and returns False on a busy lock.
-
-        Reading only the record announces a clean rollback over a config
-        that still names the pin that failed.
-        """
-        from unittest.mock import patch
-
-        from claude_swap import pin as pin_mod
-        from claude_swap import settings as _s
-
-        s = self._switcher(temp_home)
-        data = s._get_sequence_data()
-        data["accounts"]["2"] = {
-            "email": self.PINNED, "uuid": "uuid-cloud", "organizationUuid": "",
-            "organizationName": "", "added": "2024-01-01T00:00:00Z"}
-        data["sequence"] = [1, 2]
-        s._write_json(s.sequence_file, data)
-        s._write_account_credentials("2", self.PINNED, json.dumps(
-            {"claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2"}}))
-        s._write_account_config("2", self.PINNED, json.dumps(
-            {"oauthAccount": {"emailAddress": self.PINNED,
-                              "accountUuid": "uuid-cloud"}}))
-        cfg = temp_home / ".claude.json"
-        cfg.write_text(json.dumps({"env": {}, "oauthAccount": {
-            "emailAddress": self.LIVE, "accountUuid": "uuid-1"}}))
-        pinned = self.PINNED
-
-        class _PinThenSkip:
-            def apply_pin(self, sw, email=None, org=None, identity=None):
-                path = _s.settings_path(sw.backup_dir)
-                if email:
-                    _s.atomic_write_json(
-                        path, {"remoteControl": {"pinnedEmail": email}})
-                    cfg.write_text(json.dumps({"env": {}, "oauthAccount": {
-                        "emailAddress": email, "accountUuid": "uuid-cloud"}}))
-                else:
-                    raw = _s._read_raw_for_write(path)
-                    raw.pop("remoteControl", None)
-                    _s.atomic_write_json(path, raw)
-                return False
-
-            def splice_config_identity(self, identity):
-                return False
-
-        with patch.object(pin_mod, "_impl", lambda: _PinThenSkip()):
-            ok, msg = pin_mod.set_pin(s, pinned, None)
-
-        after = json.loads(cfg.read_text())["oauthAccount"]["emailAddress"]
-        # PREMISES: the pin did not take and the record was rolled back.
-        assert ok is False
-        assert pin_mod._pinned_email_now(s) is None
-        # `set_pin`'s own prefix legitimately says "nothing is pinned yet";
-        # the ROLLBACK TAIL is what must not claim a clean state.
-        assert "check with" in msg.lower(), (
-            "DEFECT: the rollback verdict reads only the record, so a "
-            "skipped un-splice is announced as a clean rollback -- the "
-            f"config still names {after!r}"
         )
 
 
@@ -3785,162 +3612,6 @@ class TestAConfigWhoseEmailIsNotAString:
                 "which clear_wiring swallows along with the env-key removal")
 
 
-class TestTheThirdReaderOfTheSameField:
-    """`_config_already_names` reads `emailAddress` with the same casefold.
-
-    The helper was added for two readers and there are three. This one is on
-    the SET path, not the clear path, and its raise is swallowed by
-    `_restore_pin`'s blanket `except` -- which is the harm, not the relief:
-    `unspliced` keeps its pre-call value, `_restore_pin` returns False, and
-    `_rollback_tail` sends the user to check a record the code just cleared.
-    """
-
-    def test_neither_side_of_the_compare_raises(self, temp_home):
-        from claude_swap import pin
-
-        cfg = temp_home / ".claude.json"
-        for bad in (42, ["a@example.com"], {"x": 1}, True):
-            # The CONFIG's half.
-            cfg.write_text(json.dumps({"oauthAccount": {
-                "emailAddress": bad, "organizationUuid": ""}}))
-            assert pin._config_already_names(
-                {"emailAddress": "me@example.com",
-                 "organizationUuid": ""}) is False, (
-                f"DEFECT: config emailAddress={bad!r} raised in the rollback "
-                "verdict, which _restore_pin swallows into a False")
-            # The IDENTITY's half, which comes from a stored account config.
-            cfg.write_text(json.dumps({"oauthAccount": {
-                "emailAddress": "me@example.com", "organizationUuid": ""}}))
-            assert pin._config_already_names(
-                {"emailAddress": bad, "organizationUuid": ""}) is False, (
-                f"DEFECT: identity emailAddress={bad!r} raised")
-
-    def test_the_accountuuid_decides_before_the_blanked_composite(
-            self, temp_home):
-        """The blank guard must not answer False about an EXACT match.
-
-        `identity_for_config` returns a stored account config's
-        `oauthAccount` VERBATIM when it has an accountUuid, so the identity
-        itself can carry a non-string address. The composite then blanks and
-        the guard declines -- about a config carrying that identity byte for
-        byte. `_restore_pin` reads that False as "the un-splice did not
-        happen" and `_rollback_tail` sends the user to check a record the
-        rollback already cleared: the exact sentence this range exists to
-        stop, recreated on the identity side.
-
-        `_config_names_the_pin`, one function over, already decides this way
-        -- accountUuid first, composite only as the fallback.
-        """
-        from claude_swap import pin
-
-        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
-            "emailAddress": 42, "accountUuid": "UUID-9",
-            "organizationUuid": "org-A"}}))
-        assert pin._config_already_names(
-            {"emailAddress": 42, "accountUuid": "UUID-9",
-             "organizationUuid": "org-A"}) is True, (
-            "DEFECT: the blank guard declined a config that carries the "
-            "identity exactly, so a clean rollback reports as a failure")
-
-    def test_a_config_with_no_accountuuid_falls_back_to_the_composite(
-            self, temp_home):
-        """The strong key decides only when the CONFIG has one too.
-
-        `cswap add --token` writes a stored config with `accountUuid: ""`
-        and a roster row with `uuid: ""`; `backfill_account_uuid` later
-        fills the ROW and never rewrites the live config. So the identity
-        can carry a uuid the config does not have -- and keying on the
-        identity's uuid alone answers False about a config that matches on
-        every field it actually holds, which `_restore_pin` reads as a
-        rollback that did not happen.
-
-        Both shapes: a blank accountUuid, and no such key at all.
-        """
-        from claude_swap import pin
-
-        for oauth in ({"emailAddress": "cloud@example.com",
-                       "accountUuid": "", "organizationUuid": ""},
-                      {"emailAddress": "cloud@example.com",
-                       "organizationUuid": ""}):
-            (temp_home / ".claude.json").write_text(
-                json.dumps({"oauthAccount": oauth}))
-            assert pin._config_already_names(
-                {"emailAddress": "cloud@example.com",
-                 "organizationUuid": "", "accountUuid": "acct-U"}) is True, (
-                f"DEFECT: config {oauth!r} matches on every field it holds, "
-                "but the identity's uuid made this answer False -- so the "
-                "rollback tail says the record may still name it")
-
-    def test_an_identity_with_no_uuid_lets_the_composite_decide(
-            self, temp_home):
-        """MIRROR of the case above: the identity is the half without a uuid.
-
-        `identity_for_config` returns a stored config verbatim when the
-        roster row's `uuid` is blank, so the identity can lack the key while
-        the live config has one. Requiring the IDENTITY's uuid alone would
-        compare `current.get("accountUuid") == None` and answer False about
-        a config the composite matches exactly.
-        """
-        from claude_swap import pin
-
-        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
-            "emailAddress": "cloud@example.com", "accountUuid": "UUID-LIVE",
-            "organizationUuid": "org-A"}}))
-        assert pin._config_already_names(
-            {"emailAddress": "cloud@example.com",
-             "organizationUuid": "org-A"}) is True, (
-            "DEFECT: the identity has no uuid, so the composite had to "
-            "decide -- and it matches")
-
-    def test_control_a_different_accountuuid_is_still_refused(self, temp_home):
-        """CONTROL: the strong key must be able to say No.
-
-        Without this, `return True` whenever an accountUuid is present kills
-        no test.
-        """
-        from claude_swap import pin
-
-        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
-            "emailAddress": "me@example.com", "accountUuid": "UUID-OTHER"}}))
-        assert pin._config_already_names(
-            {"emailAddress": "me@example.com",
-             "accountUuid": "UUID-9"}) is False
-
-    def test_control_a_matching_pair_still_answers_true(self, temp_home):
-        """CONTROL: the guard must not turn the reader off.
-
-        Without this, returning a constant False would satisfy every
-        assertion above -- and False is the answer that makes `_restore_pin`
-        report a clean rollback as a failure.
-        """
-        from claude_swap import pin
-
-        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
-            "emailAddress": "Me@Example.com", "organizationUuid": "org-A"}}))
-        assert pin._config_already_names(
-            {"emailAddress": "me@example.com",
-             "organizationUuid": "org-A"}) is True
-
-    def test_a_blank_identity_address_cannot_exempt(self, temp_home):
-        """Two unreadable addresses are not a match.
-
-        With both sides blanked to "" a broken identity and a broken config
-        compare EQUAL, and the rollback reports the config already names it
-        -- a false "already correct", which is the one answer this function
-        exists to separate from a skipped write.
-        """
-        from claude_swap import pin
-
-        # A NON-BLANK ORG on both sides, so a guard written on the org
-        # instead of the address cannot satisfy this.
-        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
-            "emailAddress": 42, "organizationUuid": "org-A"}}))
-        assert pin._config_already_names(
-            {"emailAddress": 42, "organizationUuid": "org-A"}) is False, (
-            "DEFECT: two blanked addresses matched, so a broken config read "
-            "as 'already names the identity'")
-
-
 class TestAPinnedEmailThatIsNotAString:
     """The record is a file a human can edit, and one reader casefolds it."""
 
@@ -3959,6 +3630,18 @@ class TestAPinnedEmailThatIsNotAString:
             assert pin_mod._pinned_email_now(s) is None, (
                 f"DEFECT: {bad!r} reached every consumer of pinnedEmail, and "
                 "one of them calls .casefold() on it")
+
+    def test_a_record_with_no_org_key_reads_back_as_an_empty_org(self, temp_home):
+        """`save_pin` always writes `org_uuid or ""`, and cswap-pin's
+        `_restore_pin` and `account_is_pinned` compare this tuple with `==`,
+        so a record with no org key must read as `(email, "")`, not None."""
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+
+        s = _r37_pin_switcher(temp_home)
+        _s.atomic_write_json(_s.settings_path(s.backup_dir),
+                             {"remoteControl": {"pinnedEmail": SHARED_PIN_EMAIL}})
+        assert pin_mod._pinned_email_now(s) == (SHARED_PIN_EMAIL, "")
 
 
 class TestClearRunsWithTheExtraGone:
@@ -4028,6 +3711,21 @@ class TestClearRunsWithTheExtraGone:
             "sides of --set_port have drifted apart"
         )
 
+    def test_the_installed_package_carries_the_pin_cleared_marker_contract(self):
+        """The `pin` extra's floor is the release where `apply_pin` takes the
+        keyword-only `everywhere`: only from there does the set arm unlink the
+        `pin-cleared` marker `--clear` writes. Below it a re-pin leaves the
+        marker and the host reads as cleared after a successful pin."""
+        import inspect
+
+        from cswap_pin import proxy
+
+        p = inspect.signature(proxy.apply_pin).parameters.get("everywhere")
+        assert p is not None and p.kind is p.KEYWORD_ONLY, (
+            "the installed cswap-pin predates the marker contract; the extra's "
+            "floor must name the release that has it"
+        )
+
     def test_clear_removes_the_wiring_with_cswap_pin_blocked(self, tmp_path):
         import subprocess
         import textwrap
@@ -4083,204 +3781,63 @@ class TestAFailedClearIsNotReportedAsSuccess:
     when the package is the thing that is broken.
     """
 
-    def _run(self, tmp_path, impl_src):
-        import subprocess
-        import textwrap
-        from pathlib import Path
+    def test_the_message_is_right_exactly_when_the_clear_worked(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Three packages over the same real record, one verdict each.
 
-        src = str(Path(__file__).resolve().parent.parent / "src")
+        - unusable (`_impl` raises): `--clear` must CONVERGE when the package
+          cannot help. The record is cswap's own file (settings.json ->
+          remoteControl), so an unusable package is no reason to leave it.
+          Leaving it made --clear fail, tell the user to REINSTALL the package
+          they had just removed, never converge on a re-run, and re-pin the
+          old account live the moment anything reinstalled it.
+        - `apply_pin` raises and the record cannot be cleared either: the
+          control, when the record genuinely survives, say so.
+        - a package that really clears: the message must be right exactly when
+          it worked.
+        """
+        import claude_swap.paths as paths
+        from claude_swap import pin
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
         cfg = tmp_path / ".claude.json"
         cfg.write_text(json.dumps({"env": {}}))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
         backup = tmp_path / "backup"
         backup.mkdir()
-        # A real pin record, written the way cswap writes one.
-        (backup / "settings.json").write_text(
-            json.dumps({"remoteControl": {"pinnedEmail": "cloud@example.com"}}, indent=2)
-        )
-        code = (
-            textwrap.dedent(
-                f"""
-                import sys
-                sys.path.insert(0, {src!r})
-                from pathlib import Path
-                import claude_swap.paths as paths
-                cfg = Path({str(cfg)!r})
-                paths.get_global_config_path = lambda: cfg
-                paths.get_default_global_config_path = lambda: cfg
-                from claude_swap import pin
-                """
-            )
-            + impl_src
-            + textwrap.dedent(
-                f"""
-                pin._impl = _impl_factory
-                from claude_swap.switcher import ClaudeAccountSwitcher
-                sw = ClaudeAccountSwitcher()
-                sw.backup_dir = Path({str(backup)!r})
-                sys.exit(pin.run(sw, None, clear=True))
-                """
-            )
-        )
-        return subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, text=True
-        )
+        record = backup / "settings.json"
+        sw = ClaudeAccountSwitcher()
+        sw.backup_dir = backup
+        real_clear_record = pin._clear_pin_record
 
-    def test_an_unusable_package_still_clears_the_record(self, tmp_path):
-        """`--clear` must CONVERGE when the package cannot help.
+        def unusable():
+            raise ImportError("cryptography")
 
-        The record is cswap's own file (settings.json -> remoteControl), so an
-        unusable package is no reason to leave it. Leaving it made --clear fail,
-        tell the user to REINSTALL the package they had just removed, never
-        converge on a re-run, and re-pin the old account live the moment
-        anything reinstalled it.
-        """
-        impl = (
-            "def _impl_factory():\n"
-            "    raise ImportError('cryptography')\n"
-        )
-        r = self._run(tmp_path, impl)
-        assert "Unpinned" in r.stdout, r.stdout + r.stderr[-400:]
-        assert r.returncode == 0, "a clear that converged must not exit 1"
+        class _Raises:
+            def apply_pin(self, *a, **k):
+                raise OSError("disk full")
 
-    def test_a_clear_that_leaves_the_record_is_a_failure(self, tmp_path):
-        """The control: when the record genuinely survives, say so."""
-        impl = (
-            "class _I:\n"
-            "    def apply_pin(self, *a, **k): raise OSError('disk full')\n"
-            "def _impl_factory(): return _I()\n"
-            # the record cannot be cleared either
-            "import claude_swap.pin as _p\n"
-            "_p._clear_pin_record = lambda *a: None\n"
-        )
-        r = self._run(tmp_path, impl)
-        assert "Unpinned" not in r.stdout
-        assert "Could not remove" in r.stdout, r.stdout + r.stderr[-400:]
-        assert r.returncode == 1
+        class _Clears:
+            def apply_pin(self, sw, *a, **kw):
+                (sw.backup_dir / "settings.json").write_text(json.dumps({}))
 
-    def test_a_real_clear_still_reports_success(self, tmp_path):
-        """The control: the message must be right exactly when it worked."""
-        impl = (
-            "import json as _j\n"
-            "class _I:\n"
-            "    def apply_pin(self, sw, *a, **kw):\n"
-            "        (sw.backup_dir / 'settings.json').write_text(_j.dumps({}))\n"
-            "def _impl_factory(): return _I()\n"
-        )
-        r = self._run(tmp_path, impl)
-        assert "Unpinned" in r.stdout, r.stdout + r.stderr[-400:]
-        assert r.returncode == 0
-
-
-class TestTheSetPathIsAsHonestAsTheClearPath:
-    """`cswap pin NUM` must not report a pin that is not in effect.
-
-    apply_pin writes the record BEFORE it starts the proxy, so both failures
-    here leave a pin that `cswap pin` and the TUI badge report as live while
-    nothing serves it.
-    """
-
-    def _run(self, tmp_path, impl_src):
-        import subprocess
-        import textwrap
-        from pathlib import Path
-
-        src = str(Path(__file__).resolve().parent.parent / "src")
-        backup = tmp_path / "backup"
-        backup.mkdir()
-        code = (
-            textwrap.dedent(
-                f"""
-                import sys
-                sys.path.insert(0, {src!r})
-                from pathlib import Path
-                from claude_swap import pin
-                """
-            )
-            + impl_src
-            + textwrap.dedent(
-                f"""
-                pin._impl = _impl_factory
-                class _SW:
-                    backup_dir = Path({str(backup)!r})
-                    def resolve_account(self, a):
-                        return (2, "user2@example.com", "org-uuid")
-                    def _account_kind(self, n):
-                        return "oauth"
-                sys.exit(pin.run(_SW(), "2"))
-                """
-            )
-        )
-        return subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, text=True
-        )
-
-    def test_a_raising_apply_pin_is_not_a_traceback(self, tmp_path):
-        # Real trigger, no injection: <backup>/pin-proxy as a plain FILE makes
-        # ensure_proxy's certdir.mkdir raise FileExistsError, which is not a
-        # ClaudeSwitchError and so reached the user as a traceback.
-        impl = (
-            "class _I:\n"
-            "    def apply_pin(self, *a, **k): raise FileExistsError('pin-proxy')\n"
-            "def _impl_factory(): return _I()\n"
-        )
-        r = self._run(tmp_path, impl)
-        assert "Traceback" not in r.stderr, r.stderr[-400:]
-        assert "Pinned" not in r.stdout, "reported a pin that did not happen"
-        assert "Could not pin" in r.stdout, r.stdout + r.stderr[-300:]
-        assert r.returncode == 1
-
-    def test_no_proxy_serving_is_not_unqualified_success(self, tmp_path):
-        # apply_pin returning False means no proxy is serving. Suppressing the
-        # follow-up note was the only signal; the word "Pinned" still went out.
-        impl = (
-            "class _I:\n"
-            "    def apply_pin(self, *a, **k): return False\n"
-            "def _impl_factory(): return _I()\n"
-        )
-        r = self._run(tmp_path, impl)
-        assert "nothing is pinned yet" in r.stdout, r.stdout + r.stderr[-300:]
-        assert r.returncode == 1, "a pin nothing serves must not exit 0"
-
-    def test_no_proxy_serving_ROLLS_BACK_the_record(self, tmp_path):
-        """`started == False` must undo the record, like the raise path does.
-
-        apply_pin writes ``remoteControl`` BEFORE it starts the proxy, so
-        leaving it made the two commands contradict each other: `cswap pin 2`
-        said "nothing is pinned yet" and exited 1, then `cswap pin` printed
-        the address and exited 0 with the ○ cloud badge lit.
-
-        The stub writes the record for real — a stub that only returns False
-        cannot show the bug at all.
-        """
-        impl = (
-            "import json\n"
-            "from pathlib import Path as _P\n"
-            "class _I:\n"
-            "    def apply_pin(self, sw, email, org, **kw):\n"
-            "        p = _P(sw.backup_dir) / 'settings.json'\n"
-            "        raw = json.loads(p.read_text()) if p.exists() else {}\n"
-            "        if email:\n"
-            "            raw['remoteControl'] = {'pinnedEmail': email,\n"
-            "                                    'pinnedOrganizationUuid': org or ''}\n"
-            "        else:\n"
-            "            raw.pop('remoteControl', None)\n"
-            "        p.parent.mkdir(parents=True, exist_ok=True)\n"
-            "        p.write_text(json.dumps(raw))\n"
-            "        return False\n"
-            "    def load_pin(self, *a): return None\n"
-            "def _impl_factory(): return _I()\n"
-        )
-        r = self._run(tmp_path, impl)
-        assert r.returncode == 1, r.stdout + r.stderr[-300:]
-
-        import json as _json
-
-        settings = tmp_path / "backup" / "settings.json"
-        raw = _json.loads(settings.read_text()) if settings.exists() else {}
-        assert "remoteControl" not in raw, (
-            "the failed pin left a record the badge and `cswap pin` both read "
-            f"as live: {raw.get('remoteControl')!r}"
-        )
+        for label, impl, clear_record, unpinned in (
+            ("unusable package", unusable, real_clear_record, True),
+            ("record survives", lambda: _Raises(), lambda *a: None, False),
+            ("real clear", lambda: _Clears(), real_clear_record, True),
+        ):
+            # A real pin record, written the way cswap writes one.
+            record.write_text(json.dumps(
+                {"remoteControl": {"pinnedEmail": "cloud@example.com"}}, indent=2))
+            monkeypatch.setattr(pin, "_impl", impl)
+            monkeypatch.setattr(pin, "_clear_pin_record", clear_record)
+            rc = pin.run(sw, None, clear=True)
+            out = capsys.readouterr().out
+            assert ("Unpinned" in out) is unpinned, (label, out)
+            assert rc == (0 if unpinned else 1), (label, rc, out)
+            assert ("Could not remove" in out) is (not unpinned), (label, out)
 
 
 class TestTheExtraIsGatedByOneFloorOnly:
@@ -4307,8 +3864,9 @@ class TestTheExtraIsGatedByOneFloorOnly:
 
     WIN = sys.platform == "win32"
 
-    def _probe(self, version_literal):
-        """Run `_impl()` against a synthetic cswap_pin carrying any version."""
+    def _probe(self, *version_literals):
+        """Run `_impl()` against a synthetic cswap_pin per version literal, in
+        one process. One `ACCEPTED` or `REFUSED: ...` line each."""
         import subprocess
         import textwrap
         from pathlib import Path
@@ -4318,11 +3876,7 @@ class TestTheExtraIsGatedByOneFloorOnly:
             f"""
             import sys, types
             sys.path.insert(0, {src!r})
-            pkg = types.ModuleType("cswap_pin")
-            pkg.__path__ = []
-            {version_literal}
             proxy = types.ModuleType("cswap_pin.proxy")
-            sys.modules["cswap_pin"] = pkg
             sys.modules["cswap_pin.proxy"] = proxy
             import importlib.util
             real = importlib.util.find_spec
@@ -4331,11 +3885,16 @@ class TestTheExtraIsGatedByOneFloorOnly:
             import importlib
             importlib.import_module = lambda n, *a, **k: sys.modules[n]
             from claude_swap import pin
-            try:
-                pin._impl()
-                print("ACCEPTED")
-            except Exception as e:
-                print("REFUSED:", e)
+            for literal in {version_literals!r}:
+                pkg = types.ModuleType("cswap_pin")
+                pkg.__path__ = []
+                exec(literal)
+                sys.modules["cswap_pin"] = pkg
+                try:
+                    pin._impl()
+                    print("ACCEPTED")
+                except Exception as e:
+                    print("REFUSED:", e)
             """
         )
         return subprocess.run(
@@ -4406,12 +3965,14 @@ class TestTheExtraIsGatedByOneFloorOnly:
     def test_no_version_is_refused_at_runtime(self):
         """Any installed version imports. Refusing one here would need a
         constant this project cannot keep current."""
-        for literal in (
+        literals = (
             'pkg.__version__ = "0.1.0"',
             'pkg.__version__ = "0.0.1"',
             "pass",  # a dev checkout with no __version__ at all
-        ):
-            out = self._probe(literal)
+        )
+        lines = self._probe(*literals).splitlines()
+        assert len(lines) == len(literals), lines
+        for literal, out in zip(literals, lines):
             expected = "not available on Windows" if self.WIN else "ACCEPTED"
             assert expected in out, f"{literal!r} -> {out}"
             assert "too old" not in out, f"a runtime floor came back: {out}"
@@ -4448,7 +4009,7 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
     thing it just claimed. Each drives the seam, not a stub.
     """
 
-    def _cli(self, tmp_path, impl_src, argv_account=None, clear=False, wired=True):
+    def _cli(self, tmp_path, impl_src, wired=True):
         import subprocess
         import textwrap
         from pathlib import Path
@@ -4489,11 +4050,7 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
                 pin._impl = _impl_factory
                 class _SW:
                     backup_dir = Path({str(backup)!r})
-                    def resolve_account(self, a):
-                        return (2, "user2@example.com", "org-uuid")
-                    def _account_kind(self, n):
-                        return "oauth"
-                sys.exit(pin.run(_SW(), {argv_account!r}, clear={clear!r}))
+                sys.exit(pin.run(_SW(), None, clear=True))
                 """
             )
         )
@@ -4513,81 +4070,11 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
         )
         # Make clear_wiring a no-op so the wiring survives, as a held lock does.
         impl += "pin.clear_wiring = lambda *a, **k: False\n"
-        r, cfg, _ = self._cli(tmp_path, impl, clear=True)
+        r, cfg, _ = self._cli(tmp_path, impl)
         assert "Unpinned" not in r.stdout, r.stdout
         assert "Could not remove" in r.stdout, r.stdout + r.stderr[-300:]
         assert r.returncode == 1
         assert "_cswapPinWiredKeys" in cfg.read_text(), "fixture no longer valid"
-
-    def test_a_failed_set_rolls_the_record_back(self, tmp_path):
-        # apply_pin writes the record before starting the proxy, so reporting
-        # the failure is not enough: `cswap pin` reads it back and calls it
-        # live, and the TUI badge agrees.
-        impl = (
-            "import json as _j\n"
-            "class _I:\n"
-            "    calls = []\n"
-            "    def apply_pin(self, sw, email, org, **kw):\n"
-            "        _I.calls.append(email)\n"
-            "        if email is not None and len(_I.calls) == 1:\n"
-            "            (sw.backup_dir / 'settings.json').write_text(\n"
-            "                _j.dumps({'remoteControl': {'pinnedEmail': email}}))\n"
-            "            raise FileExistsError('pin-proxy')\n"
-            "        (sw.backup_dir / 'settings.json').write_text(_j.dumps({}))\n"
-            "def _impl_factory(): return _I()\n"
-        )
-        r, _, backup = self._cli(tmp_path, impl, argv_account="2")
-        assert "Could not pin" in r.stdout, r.stdout + r.stderr[-300:]
-        assert r.returncode == 1
-        raw = json.loads((backup / "settings.json").read_text())
-        assert not raw.get("remoteControl", {}).get("pinnedEmail"), (
-            "the failed pin stayed in the record; `cswap pin` would call it live"
-        )
-
-    def test_an_api_key_account_is_refused(self, tmp_path):
-        impl = (
-            "class _I:\n"
-            "    def apply_pin(self, *a, **k): raise AssertionError('must not be reached')\n"
-            "def _impl_factory(): return _I()\n"
-        )
-        import subprocess
-        import textwrap
-        from pathlib import Path
-
-        src = str(Path(__file__).resolve().parent.parent / "src")
-        backup = tmp_path / "b"
-        backup.mkdir()
-        (backup / "settings.json").write_text("{}")
-        code = (
-            textwrap.dedent(
-                f"""
-                import sys
-                sys.path.insert(0, {src!r})
-                from pathlib import Path
-                from claude_swap import pin
-                from claude_swap.exceptions import ClaudeSwitchError
-                """
-            )
-            + impl
-            + textwrap.dedent(
-                f"""
-                pin._impl = _impl_factory
-                class _SW:
-                    backup_dir = Path({str(backup)!r})
-                    def resolve_account(self, a):
-                        return (3, "key@example.com", "org")
-                    def _account_kind(self, n):
-                        return "api_key"
-                rc = pin.run(_SW(), "3")
-                print("ACCEPTED" if rc == 0 else "REFUSED")
-                """
-            )
-        )
-        out = subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, text=True
-        ).stdout
-        assert "REFUSED" in out, f"an API-key account was pinned: {out}"
-        assert "API-key account" in out, out
 
     def test_one_place_decides_the_install_command(self):
         """A second hardcoded hint diverged from the derived one on pipx."""
@@ -4667,16 +4154,7 @@ class TestTheVerdictIsSharedNotDuplicated:
                 else {"env": {}}
             )
         )
-        # resolve_account/_account_kind are what the REAL switcher offers, and
-        # set_pin now checks the account kind before it touches the pin. A
-        # stub without them made set_pin bail at the first line, so the
-        # rollback tests below passed with apply_pin never called — green with
-        # nothing behind them (confirmed: they survived deleting _restore_pin).
-        return types.SimpleNamespace(
-            backup_dir=backup,
-            resolve_account=lambda a: ("2", "user2@example.com", "org"),
-            _account_kind=lambda n: "oauth",
-        ), cfg
+        return types.SimpleNamespace(backup_dir=backup), cfg
 
     def test_clear_pin_fails_when_the_wiring_survives(self, tmp_path, monkeypatch):
         import claude_swap.paths as paths
@@ -4790,30 +4268,6 @@ class TestTheVerdictIsSharedNotDuplicated:
         ok, msg = pin.clear_pin(sw)
         assert ok and "Unpinned" in msg, msg
 
-    def test_set_pin_rolls_back_on_failure(self, tmp_path, monkeypatch):
-        from claude_swap import pin
-
-        sw, _ = self._sw(tmp_path, pinned=None)
-
-        class _I:
-            n = 0
-
-            def apply_pin(self, s, email, org):
-                _I.n += 1
-                if _I.n == 1:
-                    (s.backup_dir / "settings.json").write_text(
-                        json.dumps({"remoteControl": {"pinnedEmail": email}})
-                    )
-                    raise FileExistsError("pin-proxy")
-                (s.backup_dir / "settings.json").write_text("{}")
-
-        monkeypatch.setattr(pin, "_impl", lambda: _I())
-        ok, msg = pin.set_pin(sw, "user2@example.com", "org")
-        assert not ok, msg
-        assert pin._pinned_email_now(sw) is None, (
-            "the failed pin stayed recorded; every read-back would call it live"
-        )
-
 
 class TestTheCliRendersABrokenPackageHonestly:
     """A broken package must reach the user as advice, not a traceback, and
@@ -4821,6 +4275,13 @@ class TestTheCliRendersABrokenPackageHonestly:
     asserts is a guard someone deletes."""
 
     def test_the_cli_renders_a_broken_package_instead_of_a_traceback(self, tmp_path):
+        """One process, both readings of the same output.
+
+        The advice printed alongside a broken package must not tell the user
+        `--clear` unconditionally 'still works and removes the wiring':
+        `clear_wiring` skips a config whose lock is contended, so that promises
+        an outcome the code cannot guarantee under a held lock.
+        """
         import subprocess
         import textwrap
         from pathlib import Path
@@ -4848,6 +4309,11 @@ class TestTheCliRendersABrokenPackageHonestly:
         assert "Traceback" not in combined, combined[-500:]
         assert "not usable" in combined, combined[-500:]
         assert "EXIT 1" in combined, combined[-300:]
+        assert "--clear" in combined, combined[-500:]
+        assert "still works and removes the wiring." not in combined, (
+            "the advice still promises an unconditional outcome: "
+            f"{combined[-500:]}"
+        )
 
     def test_the_launch_unwire_is_bounded_by_the_budget(self, monkeypatch):
         """The unwire took the package's own 5s lock, unbounded by the budget
@@ -4870,43 +4336,6 @@ class TestTheCliRendersABrokenPackageHonestly:
         monkeypatch.setattr(pin, "_config_lock_is_free", lambda b: True)
         pin.wire_launch_env(sw, {"A": "1"})
         assert calls == ["unwired"], "the unwire never runs, even when free"
-
-    def test_the_broken_package_advice_does_not_promise_an_unconditional_clear(
-        self, tmp_path
-    ):
-        """Finding 3 makes a contended config lock a reachable reason
-        `clear_wiring` skips a config it never got to try. The catch-all
-        advice printed alongside a broken-package traceback must not tell the
-        user `--clear` unconditionally 'still works and removes the wiring' —
-        that promises an outcome the code cannot guarantee under a held lock.
-        """
-        import subprocess
-        import textwrap
-        from pathlib import Path
-
-        src = str(Path(__file__).resolve().parent.parent / "src")
-        code = textwrap.dedent(
-            f"""
-            import sys
-            sys.path.insert(0, {src!r})
-            from claude_swap import pin
-            pin.run = lambda *a, **k: (_ for _ in ()).throw(
-                ImportError("No module named 'cryptography'", name="cryptography"))
-            from claude_swap import cli
-            sys.argv = ["cswap", "pin", "2"]
-            try:
-                cli._pin_command(["2"])
-            except SystemExit as e:
-                print("EXIT", e.code)
-            """
-        )
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-        combined = r.stdout + r.stderr
-        assert "--clear" in combined, combined[-500:]
-        assert "still works and removes the wiring." not in combined, (
-            "the advice still promises an unconditional outcome: "
-            f"{combined[-500:]}"
-        )
 
 
 class TestTheLockProbeActuallyProbes:
@@ -4943,8 +4372,8 @@ class TestTheLockProbeActuallyProbes:
         from claude_swap import pin
         from claude_swap.claude_locks import proper_lockfile
 
-        # Above the 2.0s bar below: the module default (0.3s) now equals this
-        # test's own 0.3s budget, so a mutant dropping `_config_lock_is_free`'s
+        # Above the 2.0s bar below: the module default (0.05s) sits inside this
+        # test's own 0.1s budget, so a mutant dropping `_config_lock_is_free`'s
         # `timeout=budget` and falling back to the default would land inside
         # the window too. Only the mutant pays this value; the probe below
         # always passes its own explicit budget.
@@ -4961,15 +4390,15 @@ class TestTheLockProbeActuallyProbes:
         lock_dir = cfg.parent / (cfg.name + ".lock")
         with proper_lockfile(lock_dir, timeout=5):
             start = _time.monotonic()
-            held_result = pin._config_lock_is_free(0.3)
+            held_result = pin._config_lock_is_free(0.1)
             elapsed = _time.monotonic() - start
 
         assert held_result is False, "answered True while the lock was held"
         # roughly `budget`, not instant and not the process default (9s) —
         # confirms the probe actually waited on the held lock rather than
         # short-circuiting some other way.
-        assert 0.2 <= elapsed <= 2.0, (
-            f"took {elapsed:.2f}s against a 0.3s budget — not bounded by it"
+        assert 0.1 <= elapsed <= 2.0, (
+            f"took {elapsed:.2f}s against a 0.1s budget, not bounded by it"
         )
 
         # THE CONTROL: same path, lock released, must now answer True. If a
@@ -5011,12 +4440,12 @@ class TestTheLockProbeActuallyProbes:
         monkeypatch.setattr(
             paths, "get_default_global_config_path", lambda: default_cfg)
 
-        assert pin._config_lock_is_free(0.3) is True, (
+        assert pin._config_lock_is_free(0.1) is True, (
             "precondition: with neither lock held the probe must say free")
 
         lock_dir = default_cfg.parent / (default_cfg.name + ".lock")
         with proper_lockfile(lock_dir, timeout=5):
-            held = pin._config_lock_is_free(0.3)
+            held = pin._config_lock_is_free(0.1)
 
         assert held is False, (
             "the DEFAULT config's lock was held and the probe said free — the "
@@ -5024,156 +4453,152 @@ class TestTheLockProbeActuallyProbes:
             "the interactive launch path")
 
 
-class TestTheVerdictHasExactlyOneImplementation:
-    """The invariant an earlier commit CLAIMED and did not have.
+class TestSetShowAndRepinAreThePackagesToRun:
+    """`set_pin`, `repin_current` and `run`'s show and set arms are cswap-pin's.
 
-    `clear_pin`/`set_pin` were added so a fix could not land on one front end
-    and miss the other — but `run()` kept its own inline copy, so the API-key
-    refusal lived in the CLI and not in the shared pair, and the TUI pinned an
-    API-key account through a stale submenu row. Asserting the structure is
-    what makes the claim true.
+    cswap keeps what must work with the package absent or broken (clear, heal,
+    the flag arms, the wiring removal). Pinning itself is
+    `cswap_pin.proxy.set_pin`, `repin_current` and `pin_run`: called once, and
+    what they return or print is what the user and the TUI get. The package
+    is faked to see the hand-off, then run for real to see that the names it
+    asks of this module answer: `identity_for_config`, `_slot_for`,
+    `_live_login_for_config`, `_pinned_email_now` and `_safe`. The sixth,
+    `_config_address`, sits behind the package's `_config_already_names`
+    fallback, which none of these runs enters.
     """
 
-    def _pin_src(self):
-        from pathlib import Path
+    class _Pkg:
+        def __init__(self):
+            self.calls = []
 
-        return (
-            Path(__file__).resolve().parent.parent / "src" / "claude_swap" / "pin.py"
-        ).read_text(encoding="utf-8")
+        def set_pin(self, sw, email, org, num=None):
+            self.calls.append(("set_pin", sw, email, org, num))
+            return True, "the package's verdict"
 
-    def test_run_delegates_to_the_shared_pair(self):
+        def repin_current(self, sw):
+            self.calls.append(("repin_current", sw))
+            return True
+
+        def pin_run(self, sw, account):
+            self.calls.append(("pin_run", sw, account))
+            return 7
+
+    def _fake(self, monkeypatch):
+        from claude_swap import pin
+
+        pkg = self._Pkg()
+        monkeypatch.setattr(pin, "_impl", lambda: pkg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: pkg)
+        return pkg
+
+    def test_set_pin_is_the_packages_verdict_reached_once(self, monkeypatch):
+        from claude_swap import pin
+
+        pkg = self._fake(monkeypatch)
+        sw = object()
+        assert pin.set_pin(sw, "a@example.com", "org", num="2") == (
+            True, "the package's verdict")
+        assert pkg.calls == [("set_pin", sw, "a@example.com", "org", "2")]
+
+    def test_repin_current_is_the_packages_and_never_raises_without_it(
+            self, monkeypatch):
+        from claude_swap import pin
+
+        pkg = self._fake(monkeypatch)
+        sw = object()
+        assert pin.repin_current(sw) is True
+        assert pkg.calls == [("repin_current", sw)]
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+        assert pin.repin_current(sw) is False
+
+    def test_repin_current_is_false_on_a_package_older_than_it(self, monkeypatch):
+        """Below the floor `repin_current` is absent: False, not AttributeError."""
+        import types
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: types.SimpleNamespace())
+        assert pin.repin_current(object()) is False
+
+    def test_run_hands_the_show_and_set_arms_to_pin_run(self, monkeypatch):
+        from claude_swap import pin
+
+        pkg = self._fake(monkeypatch)
+        sw = object()
+        assert pin.run(sw, None) == 7
+        assert pin.run(sw, "2") == 7
+        assert pkg.calls == [("pin_run", sw, None), ("pin_run", sw, "2")]
+
+    def test_run_still_reaches_the_shared_clear_and_never_apply_pin(self):
         import ast
+        import inspect
+        import textwrap
 
-        tree = ast.parse(self._pin_src())
-        run = next(
-            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run"
-        )
-        called = {
-            n.func.id
-            for n in ast.walk(run)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-        }
-        assert {"clear_pin", "set_pin"} <= called, (
-            "run() does not go through the shared verdict — it is the second "
-            f"copy the pair exists to eliminate (calls: {sorted(called)})"
-        )
-        # And it must not re-derive the outcome: apply_pin belongs to the pair.
-        attrs = {
-            n.func.attr
-            for n in ast.walk(run)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-        }
+        from claude_swap import pin
+
+        run = ast.parse(textwrap.dedent(inspect.getsource(pin.run)))
+        calls = [n.func for n in ast.walk(run) if isinstance(n, ast.Call)]
+        names = {f.id for f in calls if isinstance(f, ast.Name)}
+        attrs = {f.attr for f in calls if isinstance(f, ast.Attribute)}
+        assert "clear_pin" in names and "pin_run" in attrs, (names, attrs)
         assert "apply_pin" not in attrs, (
-            "run() calls apply_pin directly again — the verdict is back in two places"
-        )
+            "run() calls apply_pin directly: the verdict is back in two places")
 
-    def test_set_pin_refuses_an_api_key_account(self, tmp_path):
-        """The refusal must be IN set_pin, not only at a call site.
+    def _real(self, monkeypatch, temp_home):
+        """The real package over a real switcher; only its proxy is faked."""
+        import cswap_pin.proxy as proxy
 
-        The TUI's row filter is a courtesy: refresh_root_menu returns early
-        below depth 1, so an open submenu is never rebuilt while the snapshot
-        keeps updating — a row that was OAuth when drawn pins an API-key
-        account when selected.
-        """
-        import types
+        from claude_swap import pin
+        from claude_swap import settings as _s
+
+        s = _r37_pin_switcher(temp_home)
+        seen = []
+
+        def apply_pin(sw, email=None, org_uuid=None, identity=None):
+            seen.append(identity)
+            _s.atomic_write_json(_s.settings_path(sw.backup_dir), {
+                "remoteControl": {"pinnedEmail": email,
+                                  "pinnedOrganizationUuid": org_uuid or ""}
+            } if email else {})
+            return True
+
+        monkeypatch.setattr(proxy, "apply_pin", apply_pin)
+        monkeypatch.setattr(proxy, "live_remote_control_sessions", lambda: [])
+        # `_impl` refuses on Windows before it looks for the package.
+        monkeypatch.setattr(pin, "_impl", lambda: proxy)
+        return s, seen
+
+    def test_the_real_package_pins_and_repins_through_the_names_it_asks_of_cswap(
+            self, monkeypatch, temp_home, capsys):
+        from claude_swap import pin
+
+        s, seen = self._real(monkeypatch, temp_home)
+        assert pin.run(s, "1") == 0
+        out = capsys.readouterr().out
+        assert "Pinned" in out and f"Account-1 ({SHARED_PIN_EMAIL})" in out, out
+        assert seen[0]["accountUuid"] == "uuid-personal", seen
+        assert pin._pinned_email_now(s) == (SHARED_PIN_EMAIL, "")
+        # `repin_current` resolves the recorded pin's slot through `_slot_for`;
+        # a rename there is False here, not a raise.
+        assert pin.repin_current(s) is True
+        assert seen[1]["accountUuid"] == "uuid-personal", seen
+
+    def test_the_real_package_renders_a_failure_through_safe(
+            self, monkeypatch, temp_home, capsys):
+        import cswap_pin.proxy as proxy
 
         from claude_swap import pin
 
-        backup = tmp_path / "b"
-        backup.mkdir()
-        (backup / "settings.json").write_text("{}")
-        sw = types.SimpleNamespace(
-            backup_dir=backup,
-            resolve_account=lambda a: (3, "key@example.com", "org"),
-            _account_kind=lambda n: "api_key",
-        )
-        ok, msg = pin.set_pin(sw, "key@example.com", "org")
-        assert not ok, msg
-        assert "API-key account" in msg, msg
+        s, _ = self._real(monkeypatch, temp_home)
 
-    def test_a_duplicate_email_cannot_bypass_the_api_key_refusal(self, tmp_path):
-        """The slot is PASSED, not re-derived from the email.
+        def refuse(*_a, **_k):
+            raise RuntimeError("dial via http://user:hunter2@proxy.example:8118")
 
-        cswap's own documented personal+org pattern gives one address two
-        slots, so `resolve_account(email)` raises ConfigError — and swallowing
-        that skipped `_account_kind` entirely, accepting the exact account the
-        refusal exists to reject. Reproduced from the plain CLI: ok=True with
-        apply_pin called.
-        """
-        import types
-
-        from claude_swap import pin
-        from claude_swap.exceptions import ConfigError
-
-        backup = tmp_path / "b"
-        backup.mkdir()
-        (backup / "settings.json").write_text("{}")
-        applied = []
-        real_impl = pin._impl
-
-        def _resolve(a):
-            if "@" in str(a):  # ambiguous BY EMAIL, fine by number
-                raise ConfigError("multiple accounts match dup@example.com")
-            return (a, "dup@example.com", "org")
-
-        sw = types.SimpleNamespace(
-            backup_dir=backup,
-            resolve_account=_resolve,
-            _account_kind=lambda n: "api_key",
-        )
-        pin._impl = lambda: types.SimpleNamespace(
-            apply_pin=lambda *a: applied.append(a[1:]) or True
-        )
-        try:
-            ok, msg = pin.set_pin(sw, "dup@example.com", "org", num="2")
-            assert not ok, "a duplicate email got past the API-key refusal"
-            # THE DISTINGUISHING TEXT. "API-key account" alone appears in BOTH
-            # this refusal ("... is an API-key account, which the cloud pin
-            # cannot use ...") and the resolve-FAILURE message ("... so the
-            # cloud pin cannot check it is not an API-key account") — a bug
-            # that swallows the ConfigError and falls into the resolve-failure
-            # branch instead of ever reaching `_account_kind` would match the
-            # substring just as well as the real refusal does.
-            assert "which the cloud pin cannot use" in msg, msg
-            assert applied == [], "apply_pin ran for an API-key account"
-        finally:
-            pin._impl = real_impl
-
-    def test_an_unreadable_kind_refuses_rather_than_proceeding(self, tmp_path):
-        """A kind we cannot READ is not permission to pin.
-
-        Swallowing the lookup turned an unreadable sequence.json into a silent
-        skip of the refusal — indistinguishable, in effect, from having no
-        refusal at all, and invisible.
-        """
-        import types
-
-        from claude_swap import pin
-
-        backup = tmp_path / "b"
-        backup.mkdir()
-        (backup / "settings.json").write_text("{}")
-        applied = []
-        real_impl = pin._impl
-
-        def _boom(n):
-            raise OSError("sequence.json is unreadable")
-
-        sw = types.SimpleNamespace(
-            backup_dir=backup,
-            resolve_account=lambda a: ("2", "who@example.com", "org"),
-            _account_kind=_boom,
-        )
-        pin._impl = lambda: types.SimpleNamespace(
-            apply_pin=lambda *a: applied.append(a[1:]) or True
-        )
-        try:
-            ok, msg = pin.set_pin(sw, "who@example.com", "org", num="2")
-            assert not ok, "pinned an account whose kind could not be read"
-            assert "will not guess" in msg, msg
-            assert applied == [], "apply_pin ran without knowing the kind"
-        finally:
-            pin._impl = real_impl
+        monkeypatch.setattr(proxy, "apply_pin", refuse)
+        assert pin.run(s, "1") == 1
+        cap = capsys.readouterr()
+        assert "http://***@proxy.example:8118" in cap.out + cap.err, cap
+        assert "hunter2" not in cap.out + cap.err, cap
 
 
 class TestHealADeadPin:
@@ -5436,11 +4861,12 @@ class TestHealADeadPin:
         # caught it, and the case failed as `exit 1` — a real signal, but for
         # the wrong reason and in the wrong place.)
         def _run(switcher, account, *, clear, heal_only, get_port, get_certdir,
-                 set_port, ensure, state):
+                 set_port, ensure, state, everywhere):
             seen.update(
                 account=account, clear=clear, heal_only=heal_only,
                 get_port=get_port, get_certdir=get_certdir,
                 set_port=set_port, ensure=ensure, state=state,
+                everywhere=everywhere,
             )
             return 0
 
@@ -5474,7 +4900,7 @@ class TestHealADeadPin:
         # assertion below PASSES, and the only symptom is `seen == {}`: a bare
         # empty dict with nothing saying why.
         #
-        # Observed once on CI (Linux, `-n 8`) and once locally, never
+        # Observed once on CI (Linux, under xdist) and once locally, never
         # reproducibly; `-n0` over the whole suite is green, so whatever it
         # is lives in the concurrency, not in this file's ordering. This does
         # not fix that — it makes the next occurrence name itself instead of
@@ -5562,7 +4988,7 @@ class TestHealADeadPin:
         assert seen == {
             "account": None, "clear": False, "heal_only": True,
             "get_port": False, "get_certdir": False, "set_port": None,
-            "ensure": False, "state": False,
+            "ensure": False, "state": False, "everywhere": False,
         }
 
     def test_get_port_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
@@ -5665,8 +5091,8 @@ class TestHealADeadPin:
         and it is asserted against this writer in
         `TestClearRunsWithTheExtraGone` where the extra is installed.
 
-        Stated in raw JSON here so the check still runs on CI, which does not
-        install the extra (see ci.yml).
+        Stated in raw JSON here so the check runs whether or not the extra is
+        installed.
         """
         import types
 
@@ -6641,305 +6067,11 @@ class TestHealNeverTearsDownAServingPin:
 
 
 class TestANoteMustNotFailTheAction:
-    """`run()` had one unguarded call into the optional package, after the pin
-    had already been applied and "Pinned…" already printed.
+    """What the CLI prints when the package raises out of `run()`.
 
-    A raise there — from a peer on its own release schedule — turned a
-    SUCCEEDED pin into `Error: the cloud pin is installed but not usable`, exit
-    1, plus advice to run `--clear`, which would have destroyed it. The TUI's
-    sibling call already guarded the same thing, so the two front ends
-    disagreed about one outcome.
+    The note-must-not-fail-the-action cases moved with `pin_run` to cswap-pin's
+    tests/test_pin_run.py; the catch-all around it is still cswap's.
     """
-
-    def _sw(self, tmp_path):
-        import types
-
-        backup = tmp_path / "b"
-        backup.mkdir()
-        (backup / "settings.json").write_text("{}")
-        return types.SimpleNamespace(
-            backup_dir=backup,
-            resolve_account=lambda a: ("2", "user2@example.com", None),
-            _account_kind=lambda n: "oauth",
-            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
-        )
-
-    def _impl(self, backup, *, rc_raises=False, load_raises=False):
-        class _I:
-            def load_pin(self, b):
-                if load_raises:
-                    raise ValueError("settings.json is not valid JSON")
-                raw = json.loads((b / "settings.json").read_text() or "{}")
-                rc = raw.get("remoteControl") or {}
-                return (rc["pinnedEmail"], rc.get("pinnedOrganizationUuid") or "") \
-                    if rc.get("pinnedEmail") else None
-
-            def apply_pin(self, switcher, email=None, org=None, *a, **k):
-                # The REAL signature: (switcher, email, org). A stub taking a
-                # path described a call production never makes.
-                (switcher.backup_dir / "settings.json").write_text(json.dumps(
-                    {"remoteControl": {"pinnedEmail": email,
-                                       "pinnedOrganizationUuid": org}} if email else {}))
-                return True
-
-            def live_remote_control_sessions(self):
-                if rc_raises:
-                    raise RuntimeError(
-                        "GET http://svc:s3cr3t@127.0.0.1:9901/sessions failed")
-                return []
-
-        return _I()
-
-    def test_a_note_that_raises_does_not_fail_a_pin_that_worked(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        from claude_swap import pin
-
-        sw = self._sw(tmp_path)
-        monkeypatch.setattr(
-            pin, "_impl", lambda: self._impl(sw.backup_dir, rc_raises=True)
-        )
-        rc = pin.run(sw, "2")
-        out = capsys.readouterr().out
-        assert rc == 0, f"a pin that succeeded returned a failure code: {out}"
-        assert "Pinned" in out, out
-        recorded = json.loads((sw.backup_dir / "settings.json").read_text())
-        assert (recorded.get("remoteControl") or {}).get("pinnedEmail") == \
-            "user2@example.com", "the pin is on disk — reporting failure invites --clear"
-
-    def test_an_unreadable_pin_file_is_no_pin_not_a_broken_package(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        """The read-only path. The TUI badge answers None in this exact state."""
-        from claude_swap import pin
-
-        sw = self._sw(tmp_path)
-        monkeypatch.setattr(
-            pin, "_impl", lambda: self._impl(sw.backup_dir, load_raises=True)
-        )
-        rc = pin.run(sw, None)
-        out = capsys.readouterr().out
-        assert rc == 0, "a malformed pin file made a read-only command fail"
-        assert "No cloud account pinned" in out, out
-
-    def test_the_status_line_names_a_bridge_the_pin_does_not_own(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        """REPORTING THE PIN IS NOT REPORTING THE STATE.
-
-        `Cloud account (RC/artifacts): …` prints `load_pin()` — the value this
-        code wrote itself. Measured with three accounts at once:
-
-            cswap pin says      acct1@example.com     pinned, acct 1
-            the live bridge is  org da3631be…           acct 2
-            the login is        org b7e54904…           acct 3
-
-        Thirteen live bridges, zero on the pinned org, and the line said
-        "pinned" throughout — until the server answered `API Error: 500` on a
-        reattach and the user had to switch Remote Control off to recover.
-
-        The discriminator is local and free: cswap-pin >=0.1.85 exposes
-        `observed_bridge_owners()`, read from the job record beside the pointer.
-        """
-        from claude_swap import pin
-
-        sw = self._sw(tmp_path)
-        (sw.backup_dir / "settings.json").write_text(json.dumps(
-            {"remoteControl": {"pinnedEmail": "pinned@example.com",
-                               "pinnedOrganizationUuid": "org-1"}}))
-        impl = self._impl(sw.backup_dir)
-        impl.observed_bridge_owners = lambda: {"cse_a": "org-2"}
-        # The comparison is against the LITERAL config identity, which is what
-        # Claude Code compares a bridge's recorded owner to. Under a pin the
-        # config names the pin, so "org-1" here is that same value arriving by
-        # the route CC actually reads rather than from the pin file.
-        sw._get_current_account = lambda: ("pinned@example.com", "org-1")
-        monkeypatch.setattr(pin, "_impl", lambda: impl)
-
-        rc = pin.run(sw, None)
-        out = capsys.readouterr().out
-        assert rc == 0, "a status read must not fail the command"
-        assert "pinned@example.com" in out, out
-        assert "org-2" in out or "does not" in out.lower(), (
-            "the line reported the pin and said nothing about the bridge that "
-            f"is actually there: {out}")
-
-    def test_the_status_line_stays_quiet_when_the_bridges_agree(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        """THE CONTROL. Without it, "warns on a mismatch" also passes on a
-        version that warns unconditionally — and a warning on every healthy
-        machine is how the real one gets skimmed past."""
-        from claude_swap import pin
-
-        sw = self._sw(tmp_path)
-        (sw.backup_dir / "settings.json").write_text(json.dumps(
-            {"remoteControl": {"pinnedEmail": "pinned@example.com",
-                               "pinnedOrganizationUuid": "org-1"}}))
-        impl = self._impl(sw.backup_dir)
-        impl.observed_bridge_owners = lambda: {"cse_a": "org-1"}
-        sw._get_current_account = lambda: ("pinned@example.com", "org-1")
-        monkeypatch.setattr(pin, "_impl", lambda: impl)
-
-        rc = pin.run(sw, None)
-        out = capsys.readouterr().out
-        assert rc == 0 and "pinned@example.com" in out, out
-        # ASSERT ON THE WARNING'S OWN WORDS, not on the org ids it happens to
-        # interpolate. The first version checked for "org-" outside "org-1",
-        # and a mutant that removed the early return still passed it: with
-        # nothing to disagree with, the warning renders "0 other
-        # organization(s) — " and carries no org id at all. Measured — the
-        # mutation SURVIVED. The stable half of that line is the sentence.
-        assert "do not belong to it" not in out, (
-            f"a machine whose bridges agree was warned at anyway: {out}")
-
-    def test_a_carried_pointer_is_not_reported_as_foreign_ownership(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        """`bridgeOwnerAccountUuid` HAS TWO WRITERS THAT MEAN OPPOSITE THINGS.
-
-        Claude Code writes the bridge's true server-side owner while a session
-        runs. cswap-pin's `carry_live_pointers` writes the account now SIGNED
-        IN, deliberately, so CC's own comparison agrees and it REATTACHES
-        instead of minting a fresh bridge.
-
-        This warning's sentence — "the pin is in name only until those sessions
-        restart" — is about the next reattach, and CC never compares anything
-        to the pin: it compares the stored pointer to `~/.claude.json`'s
-        `oauthAccount`. So the question the sentence asks is the LOGIN's, while
-        the comparison was the PIN's. After a carry the field holds the login,
-        the pin comparison sees a difference, and we tell the user their pin is
-        in name only — describing the carry as the failure it exists to
-        prevent.
-
-        Here the login and the recorded owner AGREE (which is what a carry
-        produces) while the pin differs. Those sessions will reattach and keep
-        their history, so there is nothing to warn about.
-        """
-        from claude_swap import pin
-
-        sw = self._sw(tmp_path)
-        (sw.backup_dir / "settings.json").write_text(json.dumps(
-            {"remoteControl": {"pinnedEmail": "pinned@example.com",
-                               "pinnedOrganizationUuid": "org-pin"}}))
-        # the LITERAL config identity — what CC actually compares against
-        sw._get_current_account = lambda: ("login@example.com", "org-login")
-        impl = self._impl(sw.backup_dir)
-        impl.observed_bridge_owners = lambda: {"cse_a": "org-login"}
-        monkeypatch.setattr(pin, "_impl", lambda: impl)
-
-        rc = pin.run(sw, None)
-        out = capsys.readouterr().out
-        assert rc == 0, "a status read must not fail the command"
-        assert "do not belong to it" not in out, (
-            "the recorded owner matches the LOGIN, which is exactly what a "
-            "carried pointer looks like and exactly what makes a reattach "
-            f"succeed. Warning here reports the pin doing its job: {out}")
-
-    def test_a_pointer_that_disagrees_with_the_LOGIN_is_still_reported(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        """CONTROL for the case above, and the one that keeps the warning real.
-
-        A bridge whose recorded owner differs from the LOGIN is one CC will
-        mint over rather than reattach to — the session loses its history.
-        That is the thing worth saying, and moving the comparison must not
-        silence it.
-        """
-        from claude_swap import pin
-
-        sw = self._sw(tmp_path)
-        (sw.backup_dir / "settings.json").write_text(json.dumps(
-            {"remoteControl": {"pinnedEmail": "pinned@example.com",
-                               "pinnedOrganizationUuid": "org-pin"}}))
-        sw._get_current_account = lambda: ("login@example.com", "org-login")
-        impl = self._impl(sw.backup_dir)
-        impl.observed_bridge_owners = lambda: {"cse_a": "org-stranger"}
-        monkeypatch.setattr(pin, "_impl", lambda: impl)
-
-        rc = pin.run(sw, None)
-        out = capsys.readouterr().out
-        assert rc == 0, out
-        assert "do not belong to it" in out, (
-            f"a bridge the login does not own will be minted over: {out}")
-
-    def _oscillating(self, tmp_path, monkeypatch, *, bridge_org):
-        """The PIN PHASE of `~/.claude.json`'s oscillating `oauthAccount`.
-
-        That field carries two facts and has two writers, and it swings between
-        the pin and the active login on a minutes timescale. Every input below
-        is identical in both phases except which account the field names, so
-        anything that changes its answer between them is answering "when did
-        this run", not "will these sessions keep their history".
-        """
-        from claude_swap import pin
-
-        sw = self._sw(tmp_path)
-        (sw.backup_dir / "settings.json").write_text(json.dumps(
-            {"remoteControl": {"pinnedEmail": "pinned@example.com",
-                               "pinnedOrganizationUuid": "org-pin"}}))
-        # the field naming the PIN — one phase of the swing
-        sw._get_current_account = lambda: ("pinned@example.com", "org-pin")
-        # the roster, which does NOT oscillate: slot 2 is the active login
-        sw.current_account_number = lambda: "2"
-        sw._get_sequence_data_migrated = lambda: {"accounts": {
-            "2": {"email": "login@example.com", "organizationUuid": "org-login"}}}
-        impl = self._impl(sw.backup_dir)
-        impl.observed_bridge_owners = lambda: {"cse_a": bridge_org}
-        monkeypatch.setattr(pin, "_impl", lambda: impl)
-        return pin.run(sw, None)
-
-    def test_the_pin_phase_does_not_manufacture_a_disagreement(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        """Bridges owned by the ACTIVE LOGIN, caught in the pin phase.
-
-        This is the steady state under a working carry, and the previous
-        comparison called it a disagreement for as long as the swing sat on
-        the pin — the same bridges reading fine minutes later with nothing
-        changed. A warning that is a coin flip on when you ran the command is
-        one people stop reading.
-        """
-        rc = self._oscillating(tmp_path, monkeypatch, bridge_org="org-login")
-        out = capsys.readouterr().out
-        assert rc == 0, out
-        assert "do not belong to it" not in out, (
-            "the bridges are on the roster's ACTIVE slot, which is where a "
-            f"carried pointer sits; only the swing's phase differs: {out}")
-
-    def test_CONTROL_a_stranger_org_still_warns_in_that_same_phase(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        """The measured incident, in the phase above: bridges on an org that is
-        NEITHER the pin nor the active login. No phase of the swing makes those
-        reattach, and widening past this point would make the row unable to
-        fail."""
-        rc = self._oscillating(tmp_path, monkeypatch, bridge_org="org-stranger")
-        out = capsys.readouterr().out
-        assert rc == 0, out
-        assert "do not belong to it" in out, (
-            f"a bridge no phase of the field can name will be minted over: {out}")
-
-    def test_an_older_pin_package_without_the_reader_still_reports(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        """cswap-pin is on its own release schedule and this is the exact shape
-        that turned a working pin into `Error: … not usable` once already (see
-        this class's docstring). A host on <0.1.85 has no
-        `observed_bridge_owners`; it must lose the extra line, not the
-        command."""
-        from claude_swap import pin
-
-        sw = self._sw(tmp_path)
-        (sw.backup_dir / "settings.json").write_text(json.dumps(
-            {"remoteControl": {"pinnedEmail": "pinned@example.com",
-                               "pinnedOrganizationUuid": "org-1"}}))
-        monkeypatch.setattr(pin, "_impl", lambda: self._impl(sw.backup_dir))
-
-        rc = pin.run(sw, None)
-        out = capsys.readouterr().out
-        assert rc == 0, f"a missing optional reader failed the command: {out}"
-        assert "pinned@example.com" in out, out
 
     def test_the_cli_catch_all_scrubs_credentials(self, monkeypatch, capsys):
         """`_safe` exists for exactly this renderer, and it was the one
@@ -7414,7 +6546,7 @@ class TestPidIsAliveIsPortableAcrossOS:
     same call is NOT a probe -- signal 0 there IS `CTRL_C_EVENT`, so
     `os.kill(pid, 0)` calls `GenerateConsoleCtrlEvent`, which BROADCASTS a
     console-control event to the whole console process group. Reproduced on
-    `test-windows (pin-cli)`: calling it with this process's own pid inside
+    `test-windows`: calling it with this process's own pid inside
     an xdist worker that IS the console's process-group leader took the
     whole pytest run down with a stray `KeyboardInterrupt` mid-run. Windows
     goes through `OpenProcess` instead, and this class pins that `os.kill`
@@ -7492,7 +6624,7 @@ class TestPidIsAliveIsPortableAcrossOS:
         handle to it is held -- including this test's own `subprocess.Popen`,
         which never closes its handle after `.wait()`. `_pid_is_alive` read
         that open as "alive" and made `test_a_dead_pid_behind_the_record_is_
-        still_healed` fail on real `test-windows (pin-cli)` CI (a genuinely
+        still_healed` fail on real `test-windows` CI (a genuinely
         exited pid, `changed` came back False, "Nothing to heal"). A
         successful open with an exit code other than STILL_ACTIVE must read
         as dead.
@@ -9019,7 +8151,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         # under test: the real lock, the real `proper_lockfile` and the real
         # `heal` are all still in the loop.
         with caplog.at_level(logging.DEBUG, logger="claude-swap"):
-            changed, message = pin.heal(sw, lock_timeout=0.2)
+            changed, message = pin.heal(sw, lock_timeout=0.05)
 
         # THE LOCK DIR SURVIVING IS THE GATE, not the message. `heal` returns
         # this same `(False, "…could not be removed…")` for ANY raise inside
@@ -9969,7 +9101,11 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
         found = []
         for path in sorted(root.rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            text = source_text(path)
+            if ("_get_current_account" not in text
+                    and "_get_current_identity_triple" not in text):
+                continue
+            tree = source_tree(path)
             for fn in ast.walk(tree):
                 if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
@@ -10021,12 +9157,6 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
             # defined inside `run`; listing both is the cost of a walk that
             # does not track scope, and the inner name is the one that matters.
             "menubar.py:run",
-            # THE REATTACH QUESTION, WHICH IS THE FILE'S BY DEFINITION. Claude
-            # Code decides reattach-or-mint by comparing a bridge's recorded
-            # owner to this field LITERALLY; it has no notion of un-splicing a
-            # pin. Asking `_live_login_identity` here would answer a question CC
-            # never asks and would re-report a carried pointer as foreign.
-            "pin.py:_warn_if_bridges_disagree",
             # THE TRIPLE'S OWN THREE, one reason each.
             #
             # It IS the file reader the un-splicer is built on.
@@ -10188,173 +9318,6 @@ class TestPinnedIdentityIsWhatTheBridgeOwnerBecomes:
 
         sw._read_account_config = lambda num, email: '{"oauthAccount": {}}'
         assert pin.identity_for_config(sw) is None, "empty identity"
-
-
-class TestTheRepairPinsTheIDENTITYToo:
-    """`repin_current` is the ONLY re-pin that runs without a person, and it
-    was the only one that did not name the pin in the live config.
-
-    `set_pin` hands `apply_pin` an `identity=`; `repin_current` called the
-    same function with three positional arguments and nothing else, so the
-    parameter defaulted to None and `splice_config_identity` returned early.
-    The repair therefore restored a serving daemon while leaving
-    `~/.claude.json` naming whichever account happened to be active -- which
-    is the state every bridge minted afterwards inherits, and the exact defect
-    the splice exists to prevent.
-
-    It matters because of WHEN it runs: an `unpinnable` daemon means the pin
-    is set and the credential is unreadable, so this fires unattended, and a
-    repair that half-works reads as a repair that worked.
-    """
-
-    def _impl_recording(self, calls):
-        class _Impl:
-            @staticmethod
-            def load_pin(_backup_dir):
-                return ("pinned@example.com", "org-1")
-
-            @staticmethod
-            def apply_pin(_sw, email, org_uuid, identity=None):
-                calls.append({"email": email, "org_uuid": org_uuid,
-                              "identity": identity})
-                return True
-        return _Impl
-
-    def test_the_repair_carries_the_identity(self, monkeypatch):
-        from claude_swap import pin
-        from claude_swap import switcher as _sw
-
-        calls = []
-        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
-        sw.backup_dir = "/nowhere"
-        monkeypatch.setattr("claude_swap.pin._live_impl",
-                            lambda: self._impl_recording(calls))
-        monkeypatch.setattr("claude_swap.pin.identity_for_config",
-                            lambda s, **_k: {"accountUuid": "PIN-UUID",
-                                       "emailAddress": "pinned@example.com"})
-
-        assert pin.repin_current(sw) is True
-        assert calls, "apply_pin was never reached -- the test proves nothing"
-        assert calls[0]["identity"] == {
-            "accountUuid": "PIN-UUID",
-            "emailAddress": "pinned@example.com"}, (
-            "the unattended repair re-pinned without naming the pin in "
-            "`~/.claude.json`, so every bridge minted after it is owned by "
-            "whichever account was active and dies at the next rotation")
-
-    def test_an_unresolvable_identity_still_repairs(self, monkeypatch):
-        """None is not a reason to refuse the repair.
-
-        `identity_for_config` returns None on every doubt, and a serving
-        daemon beats a stopped one -- the splice is the better outcome, not
-        the precondition. This is the same direction `set_pin` takes: it
-        passes whatever the lookup gave, including None.
-        """
-        from claude_swap import pin
-        from claude_swap import switcher as _sw
-
-        calls = []
-        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
-        sw.backup_dir = "/nowhere"
-        monkeypatch.setattr("claude_swap.pin._live_impl",
-                            lambda: self._impl_recording(calls))
-        monkeypatch.setattr("claude_swap.pin.identity_for_config",
-                            lambda s, **_k: None)
-
-        assert pin.repin_current(sw) is True
-        assert calls[0]["identity"] is None
-
-    def test_a_lookup_that_raises_does_not_take_the_repair_down(
-            self, monkeypatch):
-        """`repin_current` promises False, never an exception -- its callers
-        are a menu render and a background watcher."""
-        from claude_swap import pin
-        from claude_swap import switcher as _sw
-
-        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
-        sw.backup_dir = "/nowhere"
-        monkeypatch.setattr("claude_swap.pin._live_impl",
-                            lambda: self._impl_recording([]))
-
-        def _boom(_s):
-            raise RuntimeError("the backup store is unreadable")
-
-        monkeypatch.setattr("claude_swap.pin.identity_for_config", _boom)
-        assert pin.repin_current(sw) is False
-
-
-class TestARolledBackPinDoesNotLeaveItsNameBehind:
-    """A FAILED `cswap pin` had already rewritten the live config.
-
-    `apply_pin` splices `~/.claude.json` and THEN starts the proxy, so by the
-    time it returns False the new account is already named there. `set_pin`
-    then calls `_restore_pin`, which put the RECORD back and left the config
-    alone -- so `cswap pin` reported failure, `cswap pin` read back the old
-    account, and every bridge minted afterwards was owned by the account that
-    failed to pin. The three states disagreed and only the invisible one was
-    driving Claude Code.
-    """
-
-    def _sw(self):
-        from claude_swap import switcher as _sw
-        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
-        sw.backup_dir = "/nowhere"
-        return sw
-
-    def test_the_config_goes_back_to_the_pin_that_is_restored(self,
-                                                              monkeypatch):
-        from claude_swap import pin
-
-        spliced = []
-
-        class _Impl:
-            @staticmethod
-            def apply_pin(_sw, email, org_uuid, identity=None):
-                return True
-
-            @staticmethod
-            def splice_config_identity(identity):
-                spliced.append(identity)
-                return True
-
-        monkeypatch.setattr("claude_swap.pin._impl", lambda: _Impl)
-        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
-                            lambda s: ("old@example.com", "org-OLD"))
-        monkeypatch.setattr(
-            "claude_swap.pin.identity_for_config",
-            lambda s, email=None, **_k: {"emailAddress": "old@example.com",
-                                   "accountUuid": "OLD-UUID"})
-
-        assert pin._restore_pin(self._sw(), ("old@example.com", "org-OLD"))
-        assert spliced, (
-            "the rollback restored the record and left `~/.claude.json` "
-            "naming the account whose pin had just failed")
-        assert spliced[-1] == {"emailAddress": "old@example.com",
-                               "accountUuid": "OLD-UUID"}
-
-    def test_a_splice_that_fails_does_not_change_the_verdict(self,
-                                                             monkeypatch):
-        """The verdict is the RECORD re-read, as it already was. Naming the
-        pin in the config is best-effort everywhere else for the same reason:
-        a config that cannot be written is a worse pin, not a failed one."""
-        from claude_swap import pin
-
-        class _Impl:
-            @staticmethod
-            def apply_pin(_sw, email, org_uuid, identity=None):
-                return True
-
-            @staticmethod
-            def splice_config_identity(identity):
-                raise OSError("read-only home")
-
-        monkeypatch.setattr("claude_swap.pin._impl", lambda: _Impl)
-        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
-                            lambda s: ("old@example.com", "org-OLD"))
-        monkeypatch.setattr("claude_swap.pin.identity_for_config",
-                            lambda s, email=None, **_k: {"emailAddress": "x"})
-
-        assert pin._restore_pin(self._sw(), ("old@example.com", "org-OLD"))
 
 
 class TestIdentityForConfigCanBeAskedAboutAnySlot:
@@ -10636,7 +9599,7 @@ class TestNoNameIsDefinedTwiceInThisModule:
         checked = 0
         problems = []
         for path in sorted(root.rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = source_tree(path)
             checked += 1
             names = collections.Counter(
                 n.name for n in tree.body
@@ -10652,77 +9615,6 @@ class TestNoNameIsDefinedTwiceInThisModule:
             "a name is defined more than once at module level; the LAST one "
             f"wins and the earlier is dead code nothing will report: {problems}"
         )
-
-
-class TestSetPinNamesTheAccountItIsPinning:
-    """`set_pin` handed `apply_pin` the identity of the PREVIOUS pin.
-
-    `identity_for_config(switcher)` with no email resolves whatever the RECORD
-    currently says, and Python evaluates that argument before `apply_pin` runs
-    -- so it reads the state from before the call it is an argument to. Two
-    ways wrong, and the first is the whole feature:
-
-        first pin ever   record empty      -> None       -> no splice at all
-        re-pin A -> B    record still A    -> A identity -> config names A
-
-    Measured on a live machine: the pin record said one account, the config
-    named a second, and all 13 live bridges were owned by a third. `cswap pin`
-    reported success throughout, because the record it prints is the one thing
-    that DID get written.
-
-    The `email` parameter this needs already exists -- it was added one commit
-    earlier for `_restore_pin`, and this call site never started using it.
-    """
-
-    def _wire(self, monkeypatch, seen, record):
-        from claude_swap import pin
-
-        class _Impl:
-            @staticmethod
-            def apply_pin(_sw, email, org_uuid, identity=None):
-                seen.append({"pinning": email, "identity": identity})
-                record["value"] = (email, org_uuid)   # apply_pin's save_pin
-                return True
-
-        monkeypatch.setattr(pin, "_impl", lambda: _Impl)
-        monkeypatch.setattr(pin, "_pinned_email_now",
-                            lambda _s: record["value"])
-        monkeypatch.setattr(pin, "_restore_pin", lambda _s, _b: True)
-        return pin
-
-    def _sw(self):
-        from claude_swap import switcher as _sw
-        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
-        sw.backup_dir = "/nowhere"
-        sw.resolve_account = lambda email: ("1",)
-        sw._account_kind = lambda num: "oauth"
-        sw._resolve_account_identifier = lambda email: {
-            "a@example.com": "1", "b@example.com": "2"}.get(email)
-        sw._read_account_config = lambda num, email: (
-            '{"oauthAccount": {"emailAddress": "%s", "accountUuid": "UUID-%s"}}'
-            % (email, num))
-        return sw
-
-    def test_the_first_pin_ever_still_names_itself(self, monkeypatch):
-        seen, record = [], {"value": None}
-        pin = self._wire(monkeypatch, seen, record)
-        ok, _msg = pin.set_pin(self._sw(), "a@example.com", "org-A", num="1")
-        assert ok
-        assert seen, "apply_pin was never reached -- the test proves nothing"
-        assert seen[0]["identity"] == {"emailAddress": "a@example.com",
-                                       "accountUuid": "UUID-1"}, (
-            "the first pin on a machine handed identity=None, so nothing "
-            "spliced and the pin was inert until some later switch")
-
-    def test_a_re_pin_names_the_new_account_not_the_old(self, monkeypatch):
-        seen, record = [], {"value": ("a@example.com", "org-A")}
-        pin = self._wire(monkeypatch, seen, record)
-        ok, _msg = pin.set_pin(self._sw(), "b@example.com", "org-B", num="2")
-        assert ok
-        assert seen[-1]["identity"] == {"emailAddress": "b@example.com",
-                                        "accountUuid": "UUID-2"}, (
-            "re-pinning to B wrote A into the config, so every bridge minted "
-            "afterwards is owned by the account that was UNPINNED")
 
 
 class TestTheUnspliceComparesOneVocabulary:
@@ -10811,7 +9703,7 @@ class TestTheUnspliceOnAnAmbiguousAddress:
     an ADDRESS and no slot, that falls through to
     `_resolve_account_identifier`, which RAISES on an address naming two slots
     -- cswap's documented personal+org pattern, the same trap
-    `TestAnAmbiguousAddressStillNamesThePin` and `set_pin`'s docstring name.
+    cswap-pin's `repin_current` and `set_pin` name.
     The raise becomes None, None drops to the composite fallback, and BOTH
     answers then invert on exactly the roster the composite was written for.
 
@@ -11117,92 +10009,6 @@ class TestTheUnspliceOnAnAmbiguousAddress:
             self.PINNED)
 
 
-class TestAnAmbiguousAddressStillNamesThePin:
-    """One address in two slots must not silence the splice.
-
-    `identity_for_config` falls back to `_resolve_account_identifier(email)`
-    when it is given no slot, and that RAISES on an address that names two
-    slots -- cswap's own documented personal+org pattern. The function-wide
-    except turns the raise into None, and None means "leave the config alone",
-    so the repair and the rollback would re-pin and silently not name
-    themselves. Nothing surfaces it: both paths report success.
-
-    Measured on one roster: 7 slots, 0 addresses in more
-    than one slot. Latent, not live -- and it goes live the first time someone
-    adds a personal account at the address of an org one, which this codebase
-    documents as supported.
-    """
-
-    def _sw(self):
-        from claude_swap import switcher as _sw
-
-        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
-        sw.backup_dir = "/nowhere"
-        # THE SHAPE: one address, two slots, different orgs.
-        roster = {"accounts": {
-            "1": {"email": "shared@example.com", "organizationUuid": "org-A"},
-            "2": {"email": "shared@example.com", "organizationUuid": "org-B"},
-        }}
-        sw._get_sequence_data = lambda: roster
-
-        def _ambiguous(_identifier):
-            from claude_swap.exceptions import ConfigError
-            raise ConfigError("matches multiple accounts")
-
-        sw._resolve_account_identifier = _ambiguous
-        sw._read_account_config = lambda num, email: (
-            '{"oauthAccount": {"emailAddress": "%s", "accountUuid": "UUID-%s"}}'
-            % (email, num))
-        return sw
-
-    def test_the_repair_names_the_right_one_of_the_two(self, monkeypatch):
-        from claude_swap import pin
-
-        seen = []
-
-        class _Impl:
-            @staticmethod
-            def load_pin(_backup_dir):
-                return ("shared@example.com", "org-B")
-
-            @staticmethod
-            def apply_pin(_sw, email, org_uuid, identity=None):
-                seen.append(identity)
-                return True
-
-        monkeypatch.setattr(pin, "_live_impl", lambda: _Impl)
-        assert pin.repin_current(self._sw()) is True
-        assert seen, "apply_pin was never reached -- the test proves nothing"
-        assert seen[0] == {"emailAddress": "shared@example.com",
-                           "accountUuid": "UUID-2"}, (
-            "the repair could not tell the two slots apart, handed None, and "
-            "left the config naming whatever was active -- while reporting "
-            f"success. got {seen[0]!r}")
-
-    def test_the_org_is_what_picks_between_them(self, monkeypatch):
-        """Same address, the OTHER org, must select the OTHER slot. Without
-        this the test above passes on any implementation that happens to
-        return the first row."""
-        from claude_swap import pin
-
-        seen = []
-
-        class _Impl:
-            @staticmethod
-            def load_pin(_backup_dir):
-                return ("shared@example.com", "org-A")
-
-            @staticmethod
-            def apply_pin(_sw, email, org_uuid, identity=None):
-                seen.append(identity)
-                return True
-
-        monkeypatch.setattr(pin, "_live_impl", lambda: _Impl)
-        assert pin.repin_current(self._sw()) is True
-        assert seen[0]["accountUuid"] == "UUID-1", (
-            f"the org did not decide which slot was meant: {seen[0]!r}")
-
-
 class TestTheDetectorSurvivesThePackageBeingGone:
     """`clear_wiring` is in cswap because the case it exists for is the package
     being broken or gone -- and it only ever runs on what `_dead_wired_configs`
@@ -11297,118 +10103,6 @@ class TestTheDetectorSurvivesThePackageBeingGone:
         assert got == Path(tmp_path) / "pin-proxy"
         assert pin.serving_port(_SW()) is None, (
             "no daemon here, so None -- but it must RETURN it, not raise")
-
-
-class TestARollbackWithNothingToRestoreStillClearsTheName:
-    """The FIRST pin on a machine, failing, was the case with no owner.
-
-    `_restore_pin(switcher, before)` puts the record back. When `before` is
-    None -- nothing was pinned before, so this is a first pin that failed --
-    `apply_pin(None, None)` CLEARS the record, and the identity lookup then has
-    nothing to resolve and returns None. None means "leave the field alone", so
-    `~/.claude.json` keeps naming the account whose pin just failed.
-
-    That field is what Claude Code reads as the owner of every bridge it mints
-    afterwards. So the failure path of `cswap pin` handed the machine to an
-    account that is not pinned, is not logged in, and that the record no longer
-    mentions -- while the command correctly reported failure.
-
-    `clear_pin` already had the answer one function away: when there is no pin
-    to name, name the LIVE LOGIN. Same question, same source.
-
-    Mutation-resistant by construction: the surviving-M2 measurement showed
-    the `before`-is-a-pin case cannot distinguish `email=before[0]` from the
-    record fallback, because `apply_pin` has already rewritten the record by
-    then. Only this case can.
-    """
-
-    def _sw(self, tmp_path, live=("serving@example.com", "org-LIVE")):
-        """THE REAL `_live_login_identity`, not a stub of it.
-
-        Stubbing it hid the whole defect: the real one un-splices only while
-        the config identity equals the PIN RECORD, and `apply_pin(None, None)`
-        destroys that record before the lookup ran. A lambda returning the
-        live login regardless passes whether the fix works or is a no-op.
-        """
-        import json
-
-        from claude_swap import switcher as _sw
-
-        root = tmp_path
-        cfg = root / "claude.json"
-        # `apply_pin` has already spliced the FAILED account here -- unless
-        # the case is "nothing is logged in", which has to mean the config
-        # names NO account. Writing one and calling it absent would model a
-        # state that cannot occur.
-        cfg.write_text(json.dumps({"oauthAccount": {
-            "emailAddress": "failed@example.com",
-            "organizationUuid": "org-F"}} if live else {}))
-        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
-        sw.backup_dir = root
-        sw._get_claude_config_path = lambda: cfg
-        sw._get_sequence_data = lambda: {
-            "activeAccountNumber": 3,
-            "accounts": {"3": {"email": live[0] if live else "",
-                               "organizationUuid": live[1] if live else "",
-                               "uuid": "UUID-3"}}} if live else {}
-        sw.current_account_number = lambda: "3"
-        sw._resolve_account_identifier = lambda email: "3"
-        # NO SECOND `_get_sequence_data`. One was left here from an earlier
-        # cut, it had no `activeAccountNumber`, and being later it WON — so the
-        # un-splice bailed and this test blamed production for the fixture.
-        # The same shape the duplicate-def guard cannot see: an assignment, not
-        # a def.
-        sw._read_account_config = lambda num, email: (
-            '{"oauthAccount": {"emailAddress": "%s", "accountUuid": "UUID-%s"}}'
-            % (email, num))
-        return sw
-
-    def _impl(self, spliced, record):
-        class _Impl:
-            @staticmethod
-            def apply_pin(_sw, email, org_uuid, identity=None):
-                record["value"] = (email, org_uuid) if email else None
-                return True
-
-            @staticmethod
-            def splice_config_identity(identity):
-                spliced.append(identity)
-                return True
-        return _Impl
-
-    def test_a_failed_first_pin_hands_the_config_to_the_live_login(
-            self, monkeypatch, tmp_path):
-        from claude_swap import pin
-
-        spliced, record = [], {"value": ("failed@example.com", "org-F")}
-        monkeypatch.setattr(pin, "_impl",
-                            lambda: self._impl(spliced, record))
-        monkeypatch.setattr(pin, "_pinned_email_now",
-                            lambda _s: record["value"])
-
-        assert pin._restore_pin(self._sw(tmp_path), None) is True
-        assert spliced, "splice_config_identity was never reached"
-        assert spliced[-1] == {"emailAddress": "serving@example.com",
-                               "accountUuid": "UUID-3"}, (
-            "the rollback left `~/.claude.json` naming the account whose pin "
-            "just failed, so every bridge minted afterwards is owned by an "
-            f"account nothing is pinned to and nobody is logged in as: "
-            f"{spliced[-1]!r}")
-
-    def test_no_live_login_leaves_the_field_alone(self, monkeypatch, tmp_path):
-        """None is not an erasure. With nothing logged in there is no correct
-        owner to write, and a blank one is worse than a stale one -- the next
-        switch rewrites it."""
-        from claude_swap import pin
-
-        spliced, record = [], {"value": ("failed@example.com", "org-F")}
-        monkeypatch.setattr(pin, "_impl",
-                            lambda: self._impl(spliced, record))
-        monkeypatch.setattr(pin, "_pinned_email_now",
-                            lambda _s: record["value"])
-
-        assert pin._restore_pin(self._sw(tmp_path, live=None), None) is True
-        assert spliced[-1] is None
 
 
 class TestTheRosterCanNameThePinWhenNoBackupCan:
@@ -11603,24 +10297,19 @@ class TestAnUnreadableConfigIsNotACleanOne:
         assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {
             cfg: ["HTTPS_PROXY"]}
 
-    def test_CONTROL_a_readable_cleared_config_is_clean(self, tmp_path):
-        """Without this, the two above pass on a function that reports
-        everything as surviving."""
-        cfg = self._config(tmp_path, '{"env": {}}')
-        assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {}
+    def test_a_config_that_no_longer_carries_the_key_is_clean(self, tmp_path):
+        """CONTROL: without the first body, the cases above pass on a function
+        that reports everything as surviving. The second: a hand-edited
+        `"env": "HTTPS_PROXY"` made `n in env` a SUBSTRING test, so the key read
+        as surviving over a config with no env block at all."""
+        for body in ('{"env": {}}', '{"env": "HTTPS_PROXY"}'):
+            cfg = self._config(tmp_path, body)
+            assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {}, body
 
     def test_a_readable_config_that_KEPT_the_key_is_named(self, tmp_path):
         cfg = self._config(tmp_path, '{"env": {"HTTPS_PROXY": "http://dead"}}')
         assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY", "GONE"]}) == {
             cfg: ["HTTPS_PROXY"]}
-
-    def test_an_env_block_that_is_not_a_dict_is_not_searched_as_a_string(
-            self, tmp_path):
-        """A hand-edited `"env": "HTTPS_PROXY"` made `n in env` a SUBSTRING
-        test, so the key read as surviving over a config with no env block at
-        all."""
-        cfg = self._config(tmp_path, '{"env": "HTTPS_PROXY"}')
-        assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {}
 
 
 
@@ -11998,19 +10687,15 @@ class TestAnAddThatRefreshesThePinnedSlotRepairsThePin:
         assert calls == [], (
             "a serving daemon was restarted under live sessions for nothing")
 
-    def test_cannot_tell_reads_as_healthy(self, monkeypatch):
-        """`None` is "no extra, no daemon record, an unreadable one"."""
-        calls = []
-        self._patch(monkeypatch, slot="1", applying=None, calls=calls)
-        self._switcher()._repin_if_pin_slot_refreshed("1")
-        assert calls == []
-
-    def test_another_slot_is_not_the_pin(self, monkeypatch):
-        """Adding slot 3 says nothing about slot 1's credential."""
-        calls = []
-        self._patch(monkeypatch, slot="1", applying=False, calls=calls)
-        self._switcher()._repin_if_pin_slot_refreshed("3")
-        assert calls == []
+    def test_a_slot_that_is_not_known_broken_is_not_repinned(self, monkeypatch):
+        """`None` is "no extra, no daemon record, an unreadable one": cannot
+        tell reads as healthy. And adding slot 3 says nothing about slot 1's
+        credential."""
+        for applying, added in ((None, "1"), (False, "3")):
+            calls = []
+            self._patch(monkeypatch, slot="1", applying=applying, calls=calls)
+            self._switcher()._repin_if_pin_slot_refreshed(added)
+            assert calls == [], (applying, added)
 
     def test_an_int_slot_still_matches(self, monkeypatch):
         """`account_num` is a str everywhere in `add_account`, but the guard
@@ -12319,25 +11004,18 @@ class TestALoginAsThePinnedAccountIsNotASplice:
         s._live_login_identity()
         assert asked == ["other-a", "other-a", "other-a"], asked
 
-    def test_CONTROL_a_real_splice_is_still_un_spliced(
+    def test_CONTROL_the_recorded_slots_own_credential_is_still_un_spliced(
             self, tmp_path, monkeypatch):
         """Same config, same pin. Only the credential differs: it is still the
-        roster's active account, which is what a splice leaves behind."""
-        s = self._switcher(
-            tmp_path, monkeypatch,
-            live_tokens={"accessToken": "login-a", "refreshToken": "login-r"},
-            stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
-        assert s._live_login_identity() == ("login@example.com", "org-login")
-
-    def test_CONTROL_a_rotated_access_token_is_still_the_same_account(
-            self, tmp_path, monkeypatch):
-        """A refresh moves one token and not the other. Matching EITHER is what
+        roster's active account, which is what a splice leaves behind. A
+        refresh moves one token and not the other, and matching EITHER is what
         keeps a refresh in flight from reading as a different account."""
-        s = self._switcher(
-            tmp_path, monkeypatch,
-            live_tokens={"accessToken": "login-a2", "refreshToken": "login-r"},
-            stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
-        assert s._live_login_identity() == ("login@example.com", "org-login")
+        for live in ({"accessToken": "login-a", "refreshToken": "login-r"},
+                     {"accessToken": "login-a2", "refreshToken": "login-r"}):
+            s = self._switcher(
+                tmp_path, monkeypatch, live_tokens=live,
+                stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
+            assert s._live_login_identity() == ("login@example.com", "org-login"), live
 
     def test_CONTROL_an_unreadable_store_is_not_a_mismatch(
             self, tmp_path, monkeypatch):
@@ -12588,9 +11266,21 @@ class TestASourceFileIsReadAsUTF8:
         for path in sorted(root.glob("*.py")) + [root / "conftest.py"]:
             if not path.exists():
                 continue
-            text = path.read_text(encoding="utf-8")
-            tree = ast.parse(text)
+            text = source_text(path)
             lines = text.splitlines()
+            # ponytail: an offender names one of `srcish` in its own call, and
+            # a call is a few lines, so a file with no `read_text` within 10
+            # lines of a marker is never parsed. The name alone, not `.read_text(`,
+            # because the AST below also matches `p.read_text (` and
+            # `(p.read_text)()`. The ceiling is a call whose receiver or
+            # arguments run past 10 lines with the marker only out there; the
+            # AST below is still the judge of every file this lets through.
+            if not any(
+                    "read_text" in ln and any(
+                        s in "\n".join(lines[max(0, i - 10):i + 11]) for s in srcish)
+                    for i, ln in enumerate(lines)):
+                continue
+            tree = source_tree(path)
             for node in ast.walk(tree):
                 if not (isinstance(node, ast.Call)
                         and isinstance(node.func, ast.Attribute)
@@ -12794,6 +11484,97 @@ class TestThePinFlagsAreMutuallyExclusive:
                 f"--debug was refused beside {argv}: {err.getvalue()!r}")
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="needs POSIX symlink semantics without developer mode",
+)
+class TestAClearOnASharedSettingsFileIsLocal:
+    """A settings.json symlinked from a repository shared across machines is ONE
+    record for every host linking it, so a one-host `--clear` marks this host
+    (`pin-cleared`) and leaves the record for the others; `--everywhere` drops it.
+    The peer here clears nothing, so the fallback is what is under test."""
+
+    @pytest.mark.parametrize("modern", [True, False], ids=["everywhere-kw", "old-signature"])
+    def test_a_one_host_clear_leaves_the_shared_record(self, tmp_path, monkeypatch, modern):
+        import types
+
+        import claude_swap.paths as paths
+        from claude_swap import cli, pin
+        from claude_swap import settings as _s
+
+        shared = tmp_path / "shared.json"
+        shared.write_text(json.dumps({"remoteControl": {
+            "pinnedEmail": "a@b.c", "pinnedOrganizationUuid": "", "debugSlowMs": 5}}))
+        seen, heals, raising = [], [], []
+
+        def new_apply(sw, email, org, identity=None, *, everywhere=False):
+            seen.append(everywhere)
+            if raising:
+                raise RuntimeError("peer broke")
+
+        def old_apply(sw, email, org, identity=None):
+            seen.append(None)
+            if raising:
+                raise RuntimeError("peer broke")
+
+        peer = types.SimpleNamespace(
+            apply_pin=new_apply if modern else old_apply,
+            heal=lambda backup_dir: heals.append(backup_dir) or False)
+        monkeypatch.setattr(pin, "_impl", lambda: peer)
+        monkeypatch.setattr(pin, "_live_impl", lambda: peer)
+        monkeypatch.setattr(cli, "_guard_root", lambda sw: None)
+        monkeypatch.setattr(cli, "_is_refused_root", lambda sw: False)
+
+        def host(name, wired):
+            backup = tmp_path / name
+            backup.mkdir()
+            (backup / "settings.json").symlink_to(shared)
+            cfg = tmp_path / f"{name}.claude.json"
+            cfg.write_text(json.dumps(
+                {"env": {"HTTPS_PROXY": "x"}, "_cswapPinWiredKeys": ["HTTPS_PROXY"]}
+                if wired else {"env": {}}))
+            return types.SimpleNamespace(
+                backup_dir=backup, _write_json=_s.atomic_write_json), cfg
+
+        def cswap_pin(h, *argv):
+            monkeypatch.setattr(paths, "get_global_config_path", lambda: h[1])
+            monkeypatch.setattr(paths, "get_default_global_config_path", lambda: h[1])
+            monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: h[0])
+            with pytest.raises(SystemExit) as exc:
+                cli._pin_command(list(argv))
+            return exc.value.code
+
+        one, two = host("one", True), host("two", False)
+        marker = _s.pin_cleared_path(one[0].backup_dir)
+        before = shared.read_bytes()
+
+        assert cswap_pin(one, "--clear") == 0
+        assert shared.read_bytes() == before, "a one-host clear rewrote the shared record"
+        assert marker.exists()
+        assert "_cswapPinWiredKeys" not in json.loads(one[1].read_text())
+        cswap_pin(one, "--ensure")
+        assert heals == [], "the cleared host went on to heal a pin it cleared"
+        cswap_pin(two, "--ensure")
+        assert heals == [two[0].backup_dir], "a sibling host stopped honouring the pin"
+
+        assert cswap_pin(one, "--clear", "--everywhere") == 0
+        assert json.loads(shared.read_text())["remoteControl"] == {"debugSlowMs": 5}
+        assert not marker.exists()
+        # Nothing recorded: a marker would make this host ignore the next pin.
+        raising.append(1)
+        assert cswap_pin(one, "--clear") == 0
+        assert not marker.exists()
+        assert seen == ([False, True, False] if modern else [None] * 3)
+
+    def test_everywhere_without_clear_is_a_usage_error(self):
+        from claude_swap import cli
+
+        for argv in (["--everywhere"], ["--heal", "--everywhere"]):
+            with pytest.raises(SystemExit) as exc:
+                cli._pin_command(argv)
+            assert exc.value.code == 2, argv
+
+
 class TestAddAccountRefusesASplicedIdentity:
     """`add_account` names every field it writes from `~/.claude.json`'s
     `oauthAccount`, and under a pin that field names the PIN, not the login.
@@ -12941,25 +11722,21 @@ class TestAddAccountUnderASpliceRegistersTheLogin:
         return sw, seen, _Past, oracle
 
     def test_the_login_is_the_account_the_server_names(self):
-        """THE SLICE: past the guard as the token's owner, not as the pin."""
+        """THE SLICE: past the guard as the token's owner, not as the pin. And
+        the CONTROL: the server naming the pin's own account is not a splice."""
         import pytest
-        sw, seen, past, oracle = self._sw(
-            {"uuid": "u-2", "email": "b@example.com", "organizationUuid": "o-2"})
-        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value=oracle), \
-                pytest.raises(past):
-            sw.add_account()
-        assert seen == [("b@example.com", "o-2")], seen
-
-    def test_the_pin_account_itself_is_still_added_as_itself(self):
-        """CONTROL: the server naming the pin's own account is not a splice."""
-        import pytest
-        sw, seen, past, oracle = self._sw(
-            {"uuid": "uuid-PIN", "email": "pinned@example.com",
-             "organizationUuid": "org-PIN"})
-        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value=oracle), \
-                pytest.raises(past):
-            sw.add_account()
-        assert seen == [("pinned@example.com", "org-PIN")], seen
+        for profile, expected in (
+            ({"uuid": "u-2", "email": "b@example.com", "organizationUuid": "o-2"},
+             ("b@example.com", "o-2")),
+            ({"uuid": "uuid-PIN", "email": "pinned@example.com",
+              "organizationUuid": "org-PIN"},
+             ("pinned@example.com", "org-PIN")),
+        ):
+            sw, seen, past, oracle = self._sw(profile)
+            with _patch("claude_swap.oauth.fetch_oauth_profile", return_value=oracle), \
+                    pytest.raises(past):
+                sw.add_account()
+            assert seen == [expected], seen
 
     def test_a_server_that_cannot_say_still_refuses(self):
         """CONTROL: no answer is not the pin's account, and it is not a login
@@ -13179,8 +11956,9 @@ class TestAPinSwingIsNotALoginInFlight:
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
         callers = []
         for path in sorted(root.rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
+            if "identity_move_is_not_a_login" not in source_text(path):
+                continue
+            for node in ast.walk(source_tree(path)):
                 if not isinstance(node, ast.Call):
                     continue
                 f = node.func
@@ -13568,16 +12346,20 @@ class TestThePinStateVerb:
         assert rc == 0
         assert capsys.readouterr().out.strip() == "OK"
 
-    def test_both_probes_ok_is_ok(self, tmp_path, monkeypatch, capsys):
-        """`no / yes / ok`: the RED test, row 1 of the brief."""
+    def test_the_daemon_half_decides_ok_or_not_ok(self, tmp_path, monkeypatch, capsys):
+        """`no / yes / ok` is the RED test, row 1 of the brief. `no / yes /
+        bad` is row 2b, the token half fails: the same word as row 2a from a
+        different probe, which is why both must be driven."""
         from claude_swap import pin
 
         monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
         monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
-        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: (True, "can_pin=true"))
-        rc = pin.run(self._sw(tmp_path), None, state=True)
-        assert rc == 0
-        assert capsys.readouterr().out.strip() == "OK"
+        for verdict, word in (((True, "can_pin=true"), "OK"),
+                              ((False, "can_pin=false"), "NOT-OK")):
+            monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, _v=verdict, **k: _v)
+            rc = pin.run(self._sw(tmp_path / word), None, state=True)
+            assert rc == 0
+            assert capsys.readouterr().out.strip() == word, verdict
 
     def test_stale_wiring_is_not_ok(self, tmp_path, monkeypatch, capsys):
         """`yes / no / none`: row 2a, the wiring half fails.
@@ -13614,18 +12396,6 @@ class TestThePinStateVerb:
             {"remoteControl": {"pinnedEmail": "a@example.com"}}))
         monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
         rc = pin.run(sw, None, state=True)
-        assert rc == 0
-        assert capsys.readouterr().out.strip() == "NOT-OK"
-
-    def test_daemon_says_cannot_pin_is_not_ok(self, tmp_path, monkeypatch, capsys):
-        """`no / yes / bad`: row 2b, the token half fails -- same word as
-        row 2a from a different probe, which is why both must be driven."""
-        from claude_swap import pin
-
-        monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
-        monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
-        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: (False, "can_pin=false"))
-        rc = pin.run(self._sw(tmp_path), None, state=True)
         assert rc == 0
         assert capsys.readouterr().out.strip() == "NOT-OK"
 
@@ -13717,24 +12487,28 @@ class TestDaemonCanPinReadsHealth:
         monkeypatch.setattr("urllib.request.build_opener", _build_opener)
         return calls
 
-    def test_can_pin_true(self, monkeypatch):
+    def test_the_health_body_decides_the_verdict(self, monkeypatch):
         from claude_swap import pin
 
-        self._stub_urlopen(monkeypatch, b'{"can_pin": true}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is True
-
-    def test_can_pin_false(self, monkeypatch):
-        from claude_swap import pin
-
-        self._stub_urlopen(monkeypatch, b'{"can_pin": false}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is False
-
-    def test_missing_field_is_no_verdict(self, monkeypatch):
-        """An old daemon whose `/health` predates the field."""
-        from claude_swap import pin
-
-        self._stub_urlopen(monkeypatch, b'{"ok": true}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is None
+        for body, verdict, why in (
+            (b'{"can_pin": true}', True, "can_pin true"),
+            (b'{"can_pin": false}', False, "can_pin false"),
+            (b'{"ok": true}', None, "an old daemon whose /health predates the field"),
+            (b"not json", None, "malformed json"),
+            (b"[1, 2, 3]", None, "valid json but not an object: no can_pin on it"),
+            # Exactly at the wedge is not past it: mirrors the pin's own strict
+            # `>`, not `>=`.
+            (b'{"can_pin": true, "mint_stalled_s": 60.0}', True, "at the wedge"),
+            # Every HEALTHY 0.1.262 daemon publishes `mint_stalled_s` on every
+            # response, `null` when nothing is stalled: the live common case,
+            # distinct from a field genuinely absent (an old daemon).
+            (b'{"can_pin": true, "mint_stalled_s": null}', True, "explicit null"),
+            # The wedge check runs before `can_pin` is even read, so it
+            # overrides a missing field too, not only `can_pin: true`.
+            (b'{"mint_stalled_s": 90.0}', False, "past the wedge, no can_pin"),
+        ):
+            self._stub_urlopen(monkeypatch, body)
+            assert pin._daemon_can_pin(4242, timeout=1.0)[0] is verdict, why
 
     def test_unreachable_is_no_verdict(self, monkeypatch):
         from claude_swap import pin
@@ -13764,19 +12538,6 @@ class TestDaemonCanPinReadsHealth:
             monkeypatch, raises=http.client.RemoteDisconnected("disconnected"))
         assert pin._daemon_can_pin(4242, timeout=1.0)[0] is False
 
-    def test_malformed_json_is_no_verdict(self, monkeypatch):
-        from claude_swap import pin
-
-        self._stub_urlopen(monkeypatch, b"not json")
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is None
-
-    def test_valid_but_non_dict_json_is_no_verdict(self, monkeypatch):
-        """Valid JSON, but not an object -- `can_pin` cannot exist on it."""
-        from claude_swap import pin
-
-        self._stub_urlopen(monkeypatch, b"[1, 2, 3]")
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is None
-
     def test_mint_stalled_past_wedge_is_not_can_pin(self, monkeypatch):
         """The pin's own consumer (`proxy.py _serving_can_pin`) reads
         `can_pin` only after checking this same wedge; a reader of the same
@@ -13789,33 +12550,6 @@ class TestDaemonCanPinReadsHealth:
         can_pin, why = pin._daemon_can_pin(4242, timeout=1.0)
         assert can_pin is False
         assert "stall" in why, why
-
-    def test_mint_stalled_at_wedge_boundary_is_still_can_pin(self, monkeypatch):
-        """Exactly at the wedge is not past it -- mirrors the pin's own
-        strict `>`, not `>=`."""
-        from claude_swap import pin
-
-        self._stub_urlopen(
-            monkeypatch, b'{"can_pin": true, "mint_stalled_s": 60.0}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is True
-
-    def test_mint_stalled_s_explicit_null_is_unaffected(self, monkeypatch):
-        """Every HEALTHY 0.1.262 daemon publishes `mint_stalled_s` on every
-        response, `null` when nothing is stalled -- the live common case,
-        distinct from a field genuinely absent (an old daemon)."""
-        from claude_swap import pin
-
-        self._stub_urlopen(
-            monkeypatch, b'{"can_pin": true, "mint_stalled_s": null}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is True
-
-    def test_mint_stalled_past_wedge_wins_over_a_missing_can_pin(self, monkeypatch):
-        """The wedge check runs before `can_pin` is even read, so it
-        overrides a missing field too, not only `can_pin: true`."""
-        from claude_swap import pin
-
-        self._stub_urlopen(monkeypatch, b'{"mint_stalled_s": 90.0}')
-        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is False
 
     def test_bypasses_the_environments_proxy_settings(self, monkeypatch):
         """A loopback health check must not be routed through `http_proxy`:

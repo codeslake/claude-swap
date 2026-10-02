@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import functools
 import ipaddress
 import json
 import os
@@ -472,7 +474,8 @@ def _reattach_orphaned_modules() -> list[str]:
     from types import ModuleType as _ModuleType
 
     restored: list[str] = []
-    for parent_name in [n for n in list(_sys.modules) if n.startswith("claude_swap")]:
+    parents = [n for n in list(_sys.modules) if n.startswith("claude_swap")]
+    for parent_name in parents:  # grows below: a restored subpackage's children
         parent = _sys.modules.get(parent_name)
         if parent is None:
             continue
@@ -484,7 +487,46 @@ def _reattach_orphaned_modules() -> list[str]:
             if name.startswith("claude_swap") and name not in _sys.modules:
                 _sys.modules[name] = child
                 restored.append(name)
+                parents.append(name)
     return restored
+
+
+@functools.lru_cache(maxsize=None)
+def source_text(path: Path) -> str:
+    """One read per source file per worker, for every scan that walks a tree."""
+    return path.read_text(encoding="utf-8")
+
+
+@functools.lru_cache(maxsize=None)
+def source_tree(path: Path) -> ast.Module:
+    """One parse per source file per worker. A scan only READS what it gets:
+    one that mutates the tree poisons every later scan in the process."""
+    return ast.parse(source_text(path), filename=str(path))
+
+
+_orphan_walk = {"modules": 0, "cs": [], "stamp": None}
+
+
+def _orphan_stamp() -> tuple[int, int]:
+    """What the orphan walk reads, as two integers: `len(sys.modules)` and the
+    attribute count of the claude_swap modules.
+
+    An orphan is born as a NEW attribute on its parent (the import binds the
+    child there), so a birth moves the second number even when `patch.dict`
+    has already put `sys.modules` back to its old size. The list of claude_swap
+    modules is rebuilt only when `len(sys.modules)` changes, which is what
+    keeps this near zero.
+
+    ponytail: a test that adds one such attribute and removes another between
+    two teardowns is not seen; hashing `sorted(vars(m))` per module is the
+    upgrade if that ever shows.
+    """
+    walk = _orphan_walk
+    if walk["modules"] != len(sys.modules):
+        walk["modules"] = len(sys.modules)
+        walk["cs"] = [m for k, m in list(sys.modules.items())
+                      if k.startswith("claude_swap")]
+    return walk["modules"], sum(len(getattr(m, "__dict__", ())) for m in walk["cs"])
 
 
 @pytest.fixture(autouse=True)
@@ -494,10 +536,13 @@ def _no_orphaned_claude_swap_modules():
     Teardown, not setup: the orphan is created inside the test that runs the
     `patch.dict` block, and the damage is done to whichever test patches that
     module afterwards. Repairing at the end of each test closes the window
-    before anything can fall into it.
+    before anything can fall into it. The walk itself repeats only when
+    `_orphan_stamp` has moved since the last one.
     """
     yield
-    _reattach_orphaned_modules()
+    if _orphan_stamp() != _orphan_walk["stamp"]:
+        _reattach_orphaned_modules()
+        _orphan_walk["stamp"] = _orphan_stamp()
 
 
 class _KeychainStore:

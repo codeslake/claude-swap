@@ -46,10 +46,19 @@ menubar = ["rumps>=0.4.0"]
 # before the seam existed. Degraded, not a TypeError -- which is what keeps
 # this floor a correctness one.
 #
+# 0.1.303 is where `set_pin`, `repin_current` and `pin_run` live: `cswap pin
+# <n>` and the TUI hand off to them, and a release without them raises
+# AttributeError at that call.
+#
+# 0.1.309 is where `apply_pin` takes the keyword-only `everywhere` and the
+# `pin-cleared` marker `cswap pin --clear` writes is honoured: its set arm
+# unlinks it and `load_pin` reads None while it exists. On 0.1.303-0.1.308 a
+# re-pin leaves the marker, so the host reads as cleared after a successful pin.
+#
 # NO `; sys_platform != 'win32'` MARKER (proposed twice): the dev group
 # installs this so the seam test runs on Windows too, and a marker makes that
 # test decorative instead of red.
-pin = ["cswap-pin>=0.1.143"]
+pin = ["cswap-pin>=0.1.309"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
@@ -110,15 +119,8 @@ filterwarnings = [
 # across the whole suite, with the top five totalling under 7 s of a 51 s run.
 # Measured here, 48 cores: 51.0s serial -> 12.1s (-n 8) -> 7.7s (-n 16), same
 # 1929 passed / 4 skipped every time, three consecutive runs, real account
-# store hash unmoved.
-#
-# `auto` here so any machine scales from the cores it has. CI OVERRIDES IT with
-# `-n 8` (see .github/workflows/ci.yml): the work is mostly WAITING, so on a
-# runner's 4 vCPUs one-worker-per-core leaves cores idle. Measured on 4 CPUs,
-# same 1995 passed: auto(=4) 16.9s, -n 6 14.1s, -n 8 14.5s, -n 10 14.7s. xdist
-# takes only `auto`, `logical` or an integer -- no multiplier spelling -- so
-# the oversubscription has to be a literal, and a literal belongs where the
-# machine is known.
+# store hash unmoved. `auto` rather than a fixed number so CI runners (2-4
+# cores) and this box both get the cores they have.
 # `--max-worker-restart=0` IS PART OF THE BACKSTOP BELOW, not a tuning
 # knob. With the faulthandler set to exit on timeout, a wedged test kills
 # its worker -- and under `loadgroup` xdist then wedges in the

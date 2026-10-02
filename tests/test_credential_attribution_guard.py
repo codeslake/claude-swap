@@ -60,6 +60,7 @@ import pytest
 from claude_swap.credentials import CredentialStore
 from claude_swap.exceptions import CredentialWriteError
 from claude_swap.models import Platform
+from tests.conftest import source_text, source_tree
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "src" / "claude_swap"
@@ -316,7 +317,9 @@ class TestAttributionGuardReadsOnlyThisSlotsOwnKey:
 def _calls_by_enclosing_function(path: Path, target_names: set[str]) -> list[tuple[str | None, int, str]]:
     """Every call to one of ``target_names`` in ``path``, with its innermost
     enclosing function (``None`` at module scope) and line number."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    if not any(n in source_text(path) for n in target_names):
+        return []
+    tree = source_tree(path)
 
     class Visitor(ast.NodeVisitor):
         def __init__(self) -> None:
