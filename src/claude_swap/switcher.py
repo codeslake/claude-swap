@@ -3271,6 +3271,7 @@ class ClaudeAccountSwitcher:
         """
         return self._usage_by_account()
 
+    @macos_keychain.memo_reads()
     def usage_entries_by_account(
         self, fetch: set[str] | None = None, *, scheduled: bool = False
     ) -> dict[str, UsageEntry]:
@@ -3282,10 +3283,12 @@ class ClaudeAccountSwitcher:
         future plans while still allowing due plans to beat the serve TTL.
         """
         accounts_info = self._build_accounts_info()
-        return self._collect_usage_entries(
-            accounts_info, fetch=fetch, scheduled=scheduled
-        )
+        with macos_keychain.fresh_reads():  # the collect adopts, refreshes and POSTs
+            return self._collect_usage_entries(
+                accounts_info, fetch=fetch, scheduled=scheduled
+            )
 
+    @macos_keychain.memo_reads()
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
 
@@ -3298,7 +3301,8 @@ class ClaudeAccountSwitcher:
         this pass.
         """
         accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        with macos_keychain.fresh_reads():  # the collect adopts, refreshes and POSTs
+            entries = self._collect_usage_entries(accounts_info, fetch=fetch)
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
@@ -3397,6 +3401,7 @@ class ClaudeAccountSwitcher:
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
 
+    @macos_keychain.memo_reads()
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
 
@@ -7016,7 +7021,10 @@ class ClaudeAccountSwitcher:
             is_active = str(num) == active_num
 
             if is_active:
-                active = self._read_active_credentials()
+                # Never the memo: this read's creds and verdict decide the
+                # refresh under `_fetch_active_usage`'s own fresh read.
+                with macos_keychain.fresh_reads():
+                    active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
             else:
@@ -9011,6 +9019,8 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         # call: this runs every tick, so a torn roster must not take the
         # whole collect pass down with it.
         if sweep_stash:
+            # The one write in a memo phase whose input (`slot_creds`) is memoized:
+            # safe because a locked item raises, never reads, and a write moves the stamp.
             try:
                 self._sweep_unclaimed_stash(
                     live_slots=live_slots,
