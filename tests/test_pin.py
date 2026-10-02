@@ -364,8 +364,11 @@ class TestTheMissingExtraIsReported:
         from claude_swap import pin
 
         monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: None)
-        with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[pin\]"):
+        with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[pin\]") as e:
             pin._impl()
+        # The command resolves from the index, and a release that predates the
+        # extra only warns, so the hint must also say where to go then.
+        assert "cswap-pin#readme" in str(e.value)
 
     def test_a_broken_package_ROOT_is_not_reported_as_missing(
         self, posix, tmp_path, monkeypatch

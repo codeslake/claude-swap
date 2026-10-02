@@ -273,6 +273,8 @@ cswap list                           # the numbers come from here
 cswap pin 2
 ```
 
+If the install warns that claude-swap has no `pin` extra, that release predates it and the pin is not installed: follow the Install section of the [cswap-pin README](https://github.com/codeslake/cswap-pin#readme) instead.
+
 Swapping accounts moves *everything*, including two things that are not inference:
 
 - **Remote Control** — a session's owner is fixed at creation by whichever bearer created it, so after a swap the phone/web loses the session and ghosts pile up on the old account.

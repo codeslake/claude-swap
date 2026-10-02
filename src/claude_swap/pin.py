@@ -841,6 +841,10 @@ def _install_hint() -> str:
     once survived beside the derived hint and diverged from it on a pipx
     machine — one screen apart, both wrong for someone.
     `test_one_place_decides_the_install_command` enforces that by name.
+
+    The README pointer is unconditional: the command resolves from the index,
+    and a release that predates the extra only warns and installs without it.
+    The installed metadata cannot speak for the index, so nothing here checks.
     """
     from claude_swap.update_check import _detect_install_method
 
@@ -848,7 +852,11 @@ def _install_hint() -> str:
         "uv": "uv tool install 'claude-swap[pin]'",
         "pipx": "pipx install 'claude-swap[pin]'",
     }.get(_detect_install_method() or "", "pip install 'claude-swap[pin]'")
-    return f"The cloud pin requires 'cswap-pin'. Install with: {how}"
+    return (
+        f"The cloud pin requires 'cswap-pin'. Install with: {how}. If that "
+        "warns that claude-swap has no 'pin' extra, the release predates it: "
+        "see the Install section of https://github.com/codeslake/cswap-pin#readme"
+    )
 
 
 def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
