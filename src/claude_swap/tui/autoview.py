@@ -613,7 +613,9 @@ class AutoScreen(Screen):
                 # healthy row's `fetched_at` is older than that for most of
                 # every poll cycle, and the engine lands on it happily.
                 if acc.usage.in_backoff(now) or acc.usage.consecutive_failures:
-                    entry.append("  stale", style=palette.sev_warn)
+                    # A lapsed plan is a permanent 403, not a poll gap.
+                    lapsed = acc.usage.last_error == "oauth_not_allowed_for_organization"
+                    entry.append("  no plan" if lapsed else "  stale", style=palette.sev_warn)
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
                 # a model-only block (the engine's fallback ranks around it)
