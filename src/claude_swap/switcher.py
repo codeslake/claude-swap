@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import errno
 import hashlib
+import hmac
 import enum
 import json
 import logging
@@ -3244,6 +3245,73 @@ class ClaudeAccountSwitcher:
     def read_account_credentials(self, account_num: str, email: str) -> str:
         """Public wrapper for session bootstrap. Empty string when missing."""
         return self._read_account_credentials(account_num, email)
+
+    def slot_for_access_token(self, access_token: str) -> str | None:
+        """Public entry point for the owner proxy: the slot whose stored
+        credential carries ``access_token``, or None when no stored
+        credential does.
+
+        A usage request Claude Code sends goes upstream on the session's own
+        bearer, which is not always the live login's token: a session that
+        read its credential before a ``cswap switch`` still holds the
+        account it started on. Its request still spends THAT account's
+        hourly budget, so the proxy names the account here to charge it.
+
+        Every token cswap stores is compared, in constant time: the live
+        login's (for the live slot) and, for every roster slot, its saved
+        credential's current and retained ``.prev`` generation. A session
+        can still hold a token older than both, after two refreshes of its
+        slot's saved credential; an access token carries no account identity
+        to match on, so that request is unmatched and the caller reports it.
+
+        Read-only: the slot file's direct read, never the renumber-following
+        one (which can copy a saved credential under a new slot number).
+        Raises ``CredentialReadError`` when no slot matched but some slot's
+        saved credential could not be read (the answer would be a guess), and
+        ``ClaudeSwitchError`` when two slots hold the token.
+        """
+        if not access_token:
+            return None
+        wanted = access_token.encode("utf-8")
+
+        def holds(credentials: str | None) -> bool:
+            token = oauth.extract_access_token(credentials) if credentials else None
+            return isinstance(token, str) and bool(token) and hmac.compare_digest(
+                token.encode("utf-8"), wanted
+            )
+
+        matches: set[str] = set()
+        live = self.current_account_number()
+        if live is not None and holds(self._read_credentials()):
+            matches.add(live)
+        unreadable: list[str] = []
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        for num, row in accounts.items():
+            email = row.get("email") if isinstance(row, dict) else None
+            if not email:
+                continue
+            failed: list = []
+            current = self._store._read_account_credentials_direct(
+                num, email, failed
+            )
+            if failed:
+                unreadable.append(num)
+            if holds(current) or holds(
+                self._store._read_previous_backup(num, email)
+            ):
+                matches.add(num)
+        if len(matches) > 1:
+            raise ClaudeSwitchError(
+                f"access token is stored under slots {sorted(matches)}"
+            )
+        if matches:
+            return matches.pop()
+        if unreadable:
+            raise CredentialReadError(
+                f"no readable slot holds the access token; the saved "
+                f"credentials of slots {sorted(unreadable)} could not be read"
+            )
+        return None
 
     def write_account_credentials(
         self, account_num: str, email: str, credentials: str
