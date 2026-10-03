@@ -283,6 +283,11 @@ ERROR_NOTES.update({
         "the slot's session profile identity could not be read — a login "
         "rewrites it, or `cswap add` replaces the stored credential"
     ),
+    "oauth_not_allowed_for_organization": (
+        "this account's organization does not allow OAuth sign-in (a lapsed "
+        "plan or an org policy), so its usage cannot be read — renewing the "
+        "plan restores it"
+    ),
 })
 
 
