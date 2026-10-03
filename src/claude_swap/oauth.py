@@ -915,6 +915,11 @@ class UsageOutcome:
     # permanent auth kind — lets the store bind the strike to that
     # generation (see usage_store.FetchRecord.struck_fp).
     struck_fp: str | None = None
+    # The response body exactly as the usage API sent it, on success only.
+    # ``usage`` is the trimmed reading cswap decides on; this is what a
+    # client that reads every field (Claude Code) needs answered back (see
+    # usage_store.UsageStore.answer_client_usage).
+    body: dict | None = None
 
 
 def fetch_usage(access_token: str) -> dict | None:
@@ -1025,7 +1030,7 @@ def try_fetch_usage_for_account(
 
     try:
         data = request_usage_data(access_token)
-        return UsageOutcome(build_usage_result(data))
+        return UsageOutcome(build_usage_result(data), body=data)
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
         if (
@@ -1089,7 +1094,7 @@ def try_fetch_usage_for_account(
 
         try:
             data = request_usage_data(new_token)
-            return UsageOutcome(build_usage_result(data))
+            return UsageOutcome(build_usage_result(data), body=data)
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)

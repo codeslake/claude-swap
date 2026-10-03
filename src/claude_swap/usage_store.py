@@ -36,6 +36,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qsl
 
 from claude_swap.locking import FileLock
 from claude_swap import oauth
@@ -69,6 +70,74 @@ STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
 # polling interval.
 CLAIM_TTL_S = 90.0  # in-flight claim window: skip just-claimed accounts
 LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
+
+# The ``/api/oauth/usage`` request forms a stored body can answer. cswap's
+# own poll sends the plain URL. Claude Code (2.1.287, its `Iie` route table)
+# sends the plain URL plus two query forms, each read by a different caller:
+# ``?at_wall=1&skip_spend=1`` by the session-limit reset offer (it reads the
+# body's ``juniper_tide`` block) and ``?cedar_ember=1&skip_spend=1`` by the
+# anytime reset offer (it reads ``cedar_ember``). Those blocks are offer
+# state that changes on the user's own claim, and ``skip_spend`` drops the
+# spend block a plain reader needs, so no form answers another, and only a
+# plain body is served from the store (see `SERVED_USAGE_VARIANTS`).
+USAGE_VARIANT_PLAIN = "plain"
+USAGE_VARIANT_AT_WALL = "at_wall"
+USAGE_VARIANT_CEDAR_EMBER = "cedar_ember"
+# A query form none of the above names: counted, never served, never stored.
+USAGE_VARIANT_UNKNOWN = "unknown"
+_USAGE_VARIANT_QUERIES: dict[frozenset[tuple[str, str]], str] = {
+    frozenset(): USAGE_VARIANT_PLAIN,
+    frozenset({("at_wall", "1"), ("skip_spend", "1")}): USAGE_VARIANT_AT_WALL,
+    frozenset({("cedar_ember", "1"), ("skip_spend", "1")}): (
+        USAGE_VARIANT_CEDAR_EMBER
+    ),
+}
+# Forms a stored body of the SAME form may answer while it is younger than
+# SERVE_TTL_S. The two reset-offer forms always go upstream (counted): an
+# offer read minutes old can show a reset already claimed as still on offer.
+SERVED_USAGE_VARIANTS = frozenset({USAGE_VARIANT_PLAIN})
+# Forms whose body is kept, for SERVE and for answering a HOLD.
+STORED_USAGE_VARIANTS = frozenset(
+    {USAGE_VARIANT_PLAIN, USAGE_VARIANT_AT_WALL, USAGE_VARIANT_CEDAR_EMBER}
+)
+
+# What :meth:`UsageStore.answer_client_usage` tells an outside client.
+CLIENT_SERVE = "serve"  # answer with ``body``; no request goes upstream
+CLIENT_FORWARD = "forward"  # attempt stamped; send it, then record the result
+CLIENT_HOLD = "hold"  # do not send; answer ``body`` if any, else a local 429
+HOLD_REASON_CAP = "cap"  # ATTEMPTS_PER_HOUR_MAX already spent this hour
+HOLD_REASON_BACKOFF = "backoff"  # an http-429 backoff is still running
+
+
+def usage_variant(query: str) -> str:
+    """The `USAGE_VARIANT_*` a request's query string (no leading ``?``)
+    names. Parameter order does not matter; anything unrecognised is
+    `USAGE_VARIANT_UNKNOWN`."""
+    params = frozenset(parse_qsl(query, keep_blank_values=True))
+    return _USAGE_VARIANT_QUERIES.get(params, USAGE_VARIANT_UNKNOWN)
+
+
+@dataclass(frozen=True)
+class ClientUsageAnswer:
+    """What an outside client (the owner proxy) does with one usage request.
+
+    - ``CLIENT_SERVE``: ``body`` is a same-form body ``body_age_s`` old,
+      under ``SERVE_TTL_S``; nothing was counted.
+    - ``CLIENT_FORWARD``: an attempt was stamped in the row's ``attempts``
+      ledger; ``attempts_in_window`` includes it. Send the request, then
+      hand the reply to :meth:`UsageStore.record_client_usage`.
+    - ``CLIENT_HOLD``: sending would break the hourly cap or re-arm a 429
+      block (``reason``). ``body`` is the last same-form body (any age) or
+      None; ``retry_after_s`` is when a request could go.
+    """
+
+    action: str
+    body: dict | None = None
+    body_age_s: float | None = None
+    retry_after_s: float | None = None
+    attempts_in_window: int = 0
+    reason: str | None = None
+
 
 # Fallback span for `UsageStore.mark_at_limit` when the walled row carries no
 # stored reading to key its expiry on (the widest ordinary window: 5h).
@@ -324,6 +393,12 @@ class FetchRecord:
     # persists: later passes skip the request while the credential still
     # carries that token, and a success clears it.
     rejected_fp: str | None = None
+    # The plain ``/api/oauth/usage`` body as received, on a success. Kept
+    # beside ``usage`` (the trimmed reading) under ``usageBodies`` so a
+    # client that reads every field can be answered from the store (see
+    # :meth:`UsageStore.answer_client_usage`). cswap's own fetch always
+    # requests the plain URL, so this is a ``USAGE_VARIANT_PLAIN`` body.
+    body: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -1373,32 +1448,16 @@ class UsageStore:
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
-                row["lastGood"] = rec.usage
-                row["fetchedAt"] = now
+                _apply_success(row, rec.usage, now)
+                if rec.body is not None:
+                    _store_body(row, USAGE_VARIANT_PLAIN, rec.body, now)
                 # Replace the old, possibly due plan in the outcome transaction
                 # so no collector can slip into a record→replan gap.
                 plan = plans.get(num) if plans is not None else None
                 if plan is not None:
                     row["nextPollAt"], row["pollIntervalS"] = plan
-                row["consecutiveFailures"] = 0
-                row["lastError"] = None
-                row["backoffUntil"] = None
-                row["rejectedFingerprint"] = None
-                row["authDeadStrikes"] = 0  # a success proves the token is alive
-                row["struckAt"] = None
             else:
-                failures = int(row.get("consecutiveFailures") or 0) + 1
-                row["consecutiveFailures"] = failures
-                row["lastError"] = rec.error
-                if rec.error == "http-429":
-                    # Kept across later successes: the poll planner floors the
-                    # cadence while a 429 is recent (see UsageEntry.last_429_at).
-                    row["last429At"] = now
-                row["backoffUntil"] = now + _failure_backoff_s(
-                    failures,
-                    rec.retry_after_s,
-                    rate_limited=rec.error == "http-429",
-                )
+                _apply_failure(row, rec.error, rec.retry_after_s, now)
                 # Only a permanent-auth failure advances the dead-token count; a
                 # transient error (429/timeout) leaves it as-is — it is no
                 # evidence either way and must not reset a real dead-token tally.
@@ -1638,6 +1697,126 @@ class UsageStore:
         self._mutate(identities, [num], apply)
         return recorded
 
+    def answer_client_usage(
+        self, num: str, identities: dict[str, Identity], variant: str
+    ) -> ClientUsageAnswer:
+        """Decide, in one locked pass, what a client's usage request does.
+
+        For a request cswap did not make (Claude Code's own, through the
+        owner proxy) on slot ``num``. A same-form body under ``SERVE_TTL_S``
+        is served when the form is in `SERVED_USAGE_VARIANTS`. Otherwise the
+        request may go upstream unless the row already holds
+        ``ATTEMPTS_PER_HOUR_MAX`` attempts in the trailing
+        ``ATTEMPT_WINDOW_S`` or an ``http-429`` backoff is running; when it
+        may, the attempt is stamped in the same ``attempts`` ledger
+        :meth:`reserve` stamps, so the hourly cap counts every request this
+        machine sends. Unlike :meth:`reserve`, nothing else refuses it: the
+        poll plan, freshness and fetch leases are cswap's own scheduling,
+        and a person asking for usage is not cswap's schedule. No lease is
+        taken, so cswap's own fetches are not fenced out.
+        """
+        now = self.clock()
+        with self._lock():
+            rows = self._read_rows()
+            row = rows.get(num)
+            if not self._matches(row, identities[num]):
+                row = self._fresh_row(identities[num])
+            assert isinstance(row, dict)
+            stored = (
+                _stored_body(row, variant)
+                if variant in STORED_USAGE_VARIANTS
+                else None
+            )
+            if (
+                stored is not None
+                and variant in SERVED_USAGE_VARIANTS
+                and now - stored[1] <= SERVE_TTL_S
+            ):
+                return ClientUsageAnswer(
+                    action=CLIENT_SERVE,
+                    body=stored[0],
+                    body_age_s=now - stored[1],
+                    attempts_in_window=len(_pruned_attempts(row, now)),
+                )
+            attempts = _pruned_attempts(row, now)
+            backoff_until = _num_or_none(row.get("backoffUntil"))
+            reason: str | None = None
+            retry_after_s: float | None = None
+            if (
+                row.get("lastError") == "http-429"
+                and backoff_until is not None
+                and now < backoff_until
+            ):
+                reason = HOLD_REASON_BACKOFF
+                retry_after_s = backoff_until - now
+            elif len(attempts) >= ATTEMPTS_PER_HOUR_MAX:
+                reason = HOLD_REASON_CAP
+                retry_after_s = max(0.0, min(attempts) + ATTEMPT_WINDOW_S - now)
+            if reason is not None:
+                return ClientUsageAnswer(
+                    action=CLIENT_HOLD,
+                    body=stored[0] if stored is not None else None,
+                    body_age_s=(now - stored[1]) if stored is not None else None,
+                    retry_after_s=retry_after_s,
+                    attempts_in_window=len(attempts),
+                    reason=reason,
+                )
+            row["attempts"] = attempts + [now]
+            rows[num] = row
+            self._write_rows(rows)
+            return ClientUsageAnswer(
+                action=CLIENT_FORWARD, attempts_in_window=len(attempts) + 1
+            )
+
+    def record_client_usage(
+        self,
+        num: str,
+        identities: dict[str, Identity],
+        variant: str,
+        *,
+        status: int,
+        body: dict | None = None,
+        retry_after_s: float | None = None,
+    ) -> bool:
+        """Record the reply to a request :meth:`answer_client_usage` let go.
+
+        A 200 with a JSON object body stores the body for its form. A plain
+        body is also a full reading: ``lastGood`` (through
+        ``oauth.build_usage_result``, exactly as cswap's own fetch stores
+        it), ``fetchedAt`` and the failure fields update as
+        :meth:`record` would. A reset-offer form lacks the spend block, so
+        it never replaces ``lastGood``. A 429 records the failure and its
+        backoff (``Retry-After`` honoured) as :meth:`record` does for
+        cswap's own 429, so neither cswap nor the client sends into the
+        block. Any other status records nothing: the attempt is already
+        counted, and a 401 on Claude Code's own token says nothing about
+        the token cswap holds. Returns whether anything was written.
+        """
+        if status == 200:
+            if not isinstance(body, dict):
+                return False
+        elif status != 429:
+            return False
+        usage = (
+            oauth.build_usage_result(body)
+            if status == 200 and variant == USAGE_VARIANT_PLAIN
+            else None
+        )
+        now = self.clock()
+
+        def apply(_num: str, row: dict) -> None:
+            if status == 429:
+                _apply_failure(row, "http-429", retry_after_s, now)
+                return
+            assert body is not None
+            if variant in STORED_USAGE_VARIANTS:
+                _store_body(row, variant, body, now)
+            if variant == USAGE_VARIANT_PLAIN:
+                _apply_success(row, usage, now)
+
+        self._mutate(identities, [num], apply)
+        return True
+
     def adopt(
         self,
         readings: dict[str, tuple[dict, float]],
@@ -1792,6 +1971,69 @@ class UsageStore:
                 row["backoffUntil"] = None
 
         self._mutate(identities, nums, apply)
+
+
+def _apply_success(row: dict, usage: dict | None, now: float) -> None:
+    """Write a successful usage read onto ``row``: the trimmed reading, its
+    time, and the failure fields a success clears. Shared by cswap's own
+    fetch (:meth:`UsageStore.record`) and a client's forwarded one
+    (:meth:`UsageStore.record_client_usage`), so the two cannot disagree on
+    what a success resets."""
+    row["lastGood"] = usage
+    row["fetchedAt"] = now
+    row["consecutiveFailures"] = 0
+    row["lastError"] = None
+    row["backoffUntil"] = None
+    row["rejectedFingerprint"] = None
+    row["authDeadStrikes"] = 0  # a success proves the token is alive
+    row["struckAt"] = None
+
+
+def _apply_failure(
+    row: dict, error: str, retry_after_s: float | None, now: float
+) -> None:
+    """Write a failed usage read's counters and backoff onto ``row``. The
+    dead-token strike that a permanent-auth error adds stays in
+    :meth:`UsageStore.record`, the one writer that sees such errors."""
+    failures = int(row.get("consecutiveFailures") or 0) + 1
+    row["consecutiveFailures"] = failures
+    row["lastError"] = error
+    if error == "http-429":
+        # Kept across later successes: the poll planner floors the
+        # cadence while a 429 is recent (see UsageEntry.last_429_at).
+        row["last429At"] = now
+    row["backoffUntil"] = now + _failure_backoff_s(
+        failures,
+        retry_after_s,
+        rate_limited=error == "http-429",
+    )
+
+
+def _store_body(row: dict, variant: str, body: dict, now: float) -> None:
+    """Keep ``body`` as received for ``variant``, stamped with its own read
+    time. ``fetchedAt`` is NOT that time: a header reading
+    (:meth:`UsageStore.record_header_reading`) moves ``fetchedAt`` and
+    carries no body, so the body's age must be measured on its own."""
+    bodies = row.get("usageBodies")
+    if not isinstance(bodies, dict):
+        bodies = {}
+    bodies[variant] = {"body": body, "fetchedAt": now}
+    row["usageBodies"] = bodies
+
+
+def _stored_body(row: dict, variant: str) -> tuple[dict, float] | None:
+    """The body last stored for ``variant`` and its read time, or None."""
+    bodies = row.get("usageBodies")
+    if not isinstance(bodies, dict):
+        return None
+    slot = bodies.get(variant)
+    if not isinstance(slot, dict):
+        return None
+    body = slot.get("body")
+    fetched_at = _num_or_none(slot.get("fetchedAt"))
+    if not isinstance(body, dict) or fetched_at is None:
+        return None
+    return body, fetched_at
 
 
 def _num_or_none(value: object) -> float | None:

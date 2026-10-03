@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import errno
 import hashlib
+import hmac
 import enum
 import json
 import logging
@@ -102,6 +103,7 @@ from claude_swap.process_detection import get_running_instances, scan_sessions
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
+    ClientUsageAnswer,
     FetchRecord,
     PERMANENT_AUTH_ERRORS,
     UsageEntry,
@@ -3244,6 +3246,73 @@ class ClaudeAccountSwitcher:
         """Public wrapper for session bootstrap. Empty string when missing."""
         return self._read_account_credentials(account_num, email)
 
+    def slot_for_access_token(self, access_token: str) -> str | None:
+        """Public entry point for the owner proxy: the slot whose stored
+        credential carries ``access_token``, or None when no stored
+        credential does.
+
+        A usage request Claude Code sends goes upstream on the session's own
+        bearer, which is not always the live login's token: a session that
+        read its credential before a ``cswap switch`` still holds the
+        account it started on. Its request still spends THAT account's
+        hourly budget, so the proxy names the account here to charge it.
+
+        Every token cswap stores is compared, in constant time: the live
+        login's (for the live slot) and, for every roster slot, its saved
+        credential's current and retained ``.prev`` generation. A session
+        can still hold a token older than both, after two refreshes of its
+        slot's saved credential; an access token carries no account identity
+        to match on, so that request is unmatched and the caller reports it.
+
+        Read-only: the slot file's direct read, never the renumber-following
+        one (which can copy a saved credential under a new slot number).
+        Raises ``CredentialReadError`` when no slot matched but some slot's
+        saved credential could not be read (the answer would be a guess), and
+        ``ClaudeSwitchError`` when two slots hold the token.
+        """
+        if not access_token:
+            return None
+        wanted = access_token.encode("utf-8")
+
+        def holds(credentials: str | None) -> bool:
+            token = oauth.extract_access_token(credentials) if credentials else None
+            return isinstance(token, str) and bool(token) and hmac.compare_digest(
+                token.encode("utf-8"), wanted
+            )
+
+        matches: set[str] = set()
+        live = self.current_account_number()
+        if live is not None and holds(self._read_credentials()):
+            matches.add(live)
+        unreadable: list[str] = []
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        for num, row in accounts.items():
+            email = row.get("email") if isinstance(row, dict) else None
+            if not email:
+                continue
+            failed: list = []
+            current = self._store._read_account_credentials_direct(
+                num, email, failed
+            )
+            if failed:
+                unreadable.append(num)
+            if holds(current) or holds(
+                self._store._read_previous_backup(num, email)
+            ):
+                matches.add(num)
+        if len(matches) > 1:
+            raise ClaudeSwitchError(
+                f"access token is stored under slots {sorted(matches)}"
+            )
+        if matches:
+            return matches.pop()
+        if unreadable:
+            raise CredentialReadError(
+                f"no readable slot holds the access token; the saved "
+                f"credentials of slots {sorted(unreadable)} could not be read"
+            )
+        return None
+
     def write_account_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
@@ -3367,6 +3436,58 @@ class ClaudeAccountSwitcher:
             return False
         identity = (info.get("email", ""), info.get("organizationUuid", "") or "")
         return self._usage_store.record_header_reading(num, {num: identity}, headers)
+
+    def _slot_identity(self, num: str) -> tuple[str, str] | None:
+        """``(email, organizationUuid)`` slot ``num`` maps to, or None for
+        a slot the roster does not hold."""
+        data = self._get_sequence_data() or {}
+        info = data.get("accounts", {}).get(num)
+        if info is None:
+            return None
+        return (info.get("email", ""), info.get("organizationUuid", "") or "")
+
+    def answer_client_usage(
+        self, num: str, variant: str
+    ) -> ClientUsageAnswer | None:
+        """Public entry point for the owner proxy: what to do with a usage
+        request Claude Code sent on slot ``num`` in form ``variant`` (a
+        ``usage_store.USAGE_VARIANT_*``, from ``usage_store.usage_variant``).
+        Serve the stored body, forward with the attempt counted, or hold;
+        see ``UsageStore.answer_client_usage``. None, deciding nothing, for
+        a slot the roster does not hold.
+        """
+        identity = self._slot_identity(num)
+        if identity is None:
+            return None
+        return self._usage_store.answer_client_usage(
+            num, {num: identity}, variant
+        )
+
+    def record_client_usage(
+        self,
+        num: str,
+        variant: str,
+        *,
+        status: int,
+        body: dict | None = None,
+        retry_after_s: float | None = None,
+    ) -> bool:
+        """Public entry point for the owner proxy: record the reply to a
+        request ``answer_client_usage`` let go. See
+        ``UsageStore.record_client_usage``. False, recording nothing, for a
+        slot the roster does not hold or a reply it does not record.
+        """
+        identity = self._slot_identity(num)
+        if identity is None:
+            return False
+        return self._usage_store.record_client_usage(
+            num,
+            {num: identity},
+            variant,
+            status=status,
+            body=body,
+            retry_after_s=retry_after_s,
+        )
 
     def set_poll_policy_inputs(
         self, threshold: float, models: tuple[str, ...]
@@ -7183,6 +7304,7 @@ class ClaudeAccountSwitcher:
                         )
                 return FetchRecord(
                     usage=outcome.usage,
+                    body=outcome.body,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
                 )
@@ -7916,6 +8038,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         )
         return FetchRecord(
             usage=outcome.usage,
+            body=outcome.body,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
         )
@@ -8820,6 +8943,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         )
         return FetchRecord(
             usage=outcome.usage,
+            body=outcome.body,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
             struck_fp=outcome.struck_fp,
@@ -8843,6 +8967,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED, rejected_fp=stamp)
         return FetchRecord(
             usage=outcome.usage,
+            body=outcome.body,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
         )
