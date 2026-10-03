@@ -2304,13 +2304,21 @@ class TestNextBestMarksStaleUsage:
         with patch.object(AutoScreen, "app", property(lambda s: app)):
             return str(v._candidates_text(snap, active_number=active))
 
-    def test_a_backed_off_candidate_is_marked(self):
+    @pytest.mark.parametrize(
+        ("last_error", "mark", "other"),
+        [
+            ("http-429", "stale", "no plan"),
+            ("oauth_not_allowed_for_organization", "no plan", "stale"),
+        ],
+        ids=["transient", "lapsed-plan"],
+    )
+    def test_a_backed_off_candidate_is_marked(self, last_error, mark, other):
         stale_entry = UsageEntry(
             last_good=make_entry(0.0, 0.0).last_good,
             fetched_at=time.time() - 1000.0,
             age_s=1000.0,
             consecutive_failures=9,
-            last_error="http-429",
+            last_error=last_error,
             backoff_until=time.time() + 400.0,
             trust_extended=True,
         )
@@ -2325,7 +2333,8 @@ class TestNextBestMarksStaleUsage:
         out = self._render(snap, active="1")
         assert "user2@example.com" in out
         row2 = out[out.index("user2@example.com"):]
-        assert "stale" in row2, f"no stale mark on the backed-off row: {out!r}"
+        assert mark in row2, f"no {mark} mark on the backed-off row: {out!r}"
+        assert other not in row2, f"{other} on the {mark} row: {out!r}"
 
     def test_a_healthy_candidate_past_the_serve_ttl_is_not_marked(self):
         """I-c: a healthy row at age 300 s (no failures, no backoff) is a
