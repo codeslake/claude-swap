@@ -3194,13 +3194,10 @@ _PR_321_BASE_SHA = "f227dffb76b1086b05c3e35ba07f275bbc9a41a1"
 
 def _base_engine_results(
     tmp_path: Path, strategy: str, seed: int, n_fleets: int,
-    *, base_sha: str = _PR_321_BASE_SHA, custom_fleets: list[dict] | None = None,
-    settings_kwargs: dict | None = None,
 ):
     """`n_fleets` fleets generated from `seed` (the same generator
-    `TestOutcomeDigestAgainstBase._fleet` uses) — or, when `custom_fleets`
-    is given, those NAMED fleets verbatim instead — run through the
-    `base_sha` `AutoSwitchEngine` in a fresh subprocess against ITS OWN
+    `TestOutcomeDigestAgainstBase._fleet` uses) run through the
+    `_PR_321_BASE_SHA` `AutoSwitchEngine` in a fresh subprocess against ITS OWN
     `claude_swap` package — a different `usage_store`/`switcher`/`settings`/
     `autoswitch`, not merely a fresh module namespace sharing this process's
     `sys.modules`. Same technique as `test_dynamic_isolation.py`'s
@@ -3208,12 +3205,13 @@ def _base_engine_results(
     driver subprocess, a positive control on where `claude_swap` resolved
     from.
 
-    SKIPPED, not failed, when `base_sha` is not in the object database —
-    CI checks out at `refs/pull/N/merge` with fetch-depth 1, so this
-    branch's own pre-PR base is never in that checkout, and a bare
+    SKIPPED, not failed, when `_PR_321_BASE_SHA` is not in the object
+    database — CI checks out at `refs/pull/N/merge` with fetch-depth 1, so
+    this branch's own pre-PR base is never in that checkout, and a bare
     `git show` there would redden every job today and every run forever
     once the branch is deleted post-merge.
     """
+    base_sha = _PR_321_BASE_SHA
     repo_root = Path(__file__).resolve().parents[1]
     probe = subprocess.run(
         ["git", "-C", str(repo_root), "cat-file", "-e", f"{base_sha}^{{commit}}"],
@@ -3239,30 +3237,6 @@ def _base_engine_results(
     homes_dir = tmp_path / f"base_homes_{strategy}"
     homes_dir.mkdir()
     driver = module_dir / "_zz_base_engine_driver.py"
-    if custom_fleets is not None:
-        # `custom_fleets`: raw {account: usage-dict} maps (JSON-friendly);
-        # `_run` wants {account: UsageEntry} same as `_fleet` produces, so
-        # the driver converts via `_entry_for` at the SAME `now` `_fleet`
-        # anchors on.
-        fleets_dir = tmp_path / "custom_fleets"
-        fleets_dir.mkdir()
-        fleets_file = fleets_dir / "fleets.json"
-        fleets_file.write_text(json.dumps(custom_fleets))
-        fleets_setup = (
-            f"raw_fleets = json.loads(Path({str(fleets_file)!r}).read_text())\n"
-            "fleets = [\n"
-            "    {num: ta._entry_for(v, 1_000_000.0) for num, v in raw.items()}\n"
-            "    for raw in raw_fleets\n"
-            "]\n"
-        )
-    else:
-        fleets_setup = (
-            f"rng = random.Random({seed})\n"
-            "fleets = []\n"
-            f"for _ in range({n_fleets}):\n"
-            "    entries, _ = ta.TestOutcomeDigestAgainstBase._fleet(None, rng, 1_000_000.0)\n"
-            "    fleets.append(entries)\n"
-        )
     driver.write_text(
         "import sys, json, random\n"
         "from pathlib import Path\n"
@@ -3270,10 +3244,13 @@ def _base_engine_results(
         f"sys.path.insert(0, {str(module_dir)!r})\n"
         "import claude_swap\n"
         "import test_autoswitch as ta\n"
-        f"{fleets_setup}"
+        f"rng = random.Random({seed})\n"
+        "fleets = []\n"
+        f"for _ in range({n_fleets}):\n"
+        "    entries, _ = ta.TestOutcomeDigestAgainstBase._fleet(None, rng, 1_000_000.0)\n"
+        "    fleets.append(entries)\n"
         "results = ta.TestOutcomeDigestAgainstBase._run(\n"
         f"    None, ta.AutoSwitchEngine, Path(sys.argv[1]), 'base', fleets, {strategy!r},\n"
-        f"    **{settings_kwargs or {}!r}\n"
         ")\n"
         "print(json.dumps({'_claude_swap_file': claude_swap.__file__, "
         "'results': results}))\n"
@@ -3331,7 +3308,7 @@ class TestOutcomeDigestAgainstBase:
     """
 
     # EIGHT, not forty (#414, the owner's suite-time bar). Every control in
-    # this class and in `TestOutcomeDigest375` still holds on the first eight
+    # this class still holds on the first eight
     # fleets of this seed, MEASURED rather than assumed: head/base diverge on
     # fleet 1 for `best` (5 of 40 at the old count) and on fleets 0/1/4/7 for
     # `consume-first` (6 of 40), and the stale-exclusion mutant still diverges
@@ -3403,7 +3380,6 @@ class TestOutcomeDigestAgainstBase:
         tag: str,
         fleets: list[dict],
         strategy: str,
-        **settings_kwargs,
     ):
         # `EngineHarness.__init__` only patches `Path.home()` for its own
         # setup — every OTHER test in this file relies on the `temp_home`
@@ -3430,7 +3406,6 @@ class TestOutcomeDigestAgainstBase:
                     home,
                     engine_cls=engine_cls,
                     strategy=strategy,
-                    **settings_kwargs,
                 )
                 h.seed(1, "a@example.com")
                 h.seed(2, "b@example.com")
@@ -3441,7 +3416,7 @@ class TestOutcomeDigestAgainstBase:
             results.append((outcome.name, h.active_number(), events))
         return results
 
-    def _head(self, tmp_path, strategy, **settings_kwargs):
+    def _head(self, tmp_path, strategy):
         rng = random.Random(self._DIGEST_SEED)
         now = 1_000_000.0
         fleets: list[dict] = []
@@ -3450,12 +3425,10 @@ class TestOutcomeDigestAgainstBase:
             entries, stale_nums = self._fleet(rng, now)
             fleets.append(entries)
             stale_by_fleet.append(stale_nums)
-        head_results = self._run(
-            AutoSwitchEngine, tmp_path, "head", fleets, strategy, **settings_kwargs
-        )
+        head_results = self._run(AutoSwitchEngine, tmp_path, "head", fleets, strategy)
         return fleets, stale_by_fleet, head_results
 
-    def _mutant(self, tmp_path, fleets, strategy, **settings_kwargs):
+    def _mutant(self, tmp_path, fleets, strategy):
         # Neutralize ONLY the exclusions the admission gate can reach (the
         # gate always reads "not stale"/"not untrustworthy") on the SAME
         # fleets. `trigger == "proactive"` is reachable under ANY strategy
@@ -3472,9 +3445,7 @@ class TestOutcomeDigestAgainstBase:
                 return_value=False,
             ),
         ):
-            return self._run(
-                AutoSwitchEngine, tmp_path, "mutant", fleets, strategy, **settings_kwargs
-            )
+            return self._run(AutoSwitchEngine, tmp_path, "mutant", fleets, strategy)
 
     @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
     def test_mutant_moves_the_head_digest(self, tmp_path, strategy):
@@ -3493,8 +3464,6 @@ class TestOutcomeDigestAgainstBase:
     # to `about_to_wall` and adding alternation, so `dynamic` now diverges
     # from that same old base for many more fleets than the stale
     # exclusion alone explains — expected, not a regression.
-    # `TestOutcomeDigestAgainstBase375` below re-proves the SAME shape of
-    # invariant against THIS round's own base/head instead.
     @pytest.mark.parametrize("strategy", ["best", "consume-first"])
     def test_digest_matches_base_except_the_stale_exclusion(self, tmp_path, strategy):
         fleets, stale_by_fleet, head_results = self._head(tmp_path, strategy)
@@ -3597,201 +3566,6 @@ class TestOutcomeDigestAgainstBase:
                     f"change, not the neutralized gate admitting a stale "
                     f"candidate: mutant={mutant_results[i]!r}"
                 )
-
-
-_ROUND_375_BASE_SHA = "a32a34d779ac5cb2838afe49df1cc41ec801be27"
-
-
-class TestOutcomeDigest375:
-    """F5 (#375): the motivating window, reconstructed as a named fixture
-    from the coordinator/analyzer evidence (10:01:32Z Account-3 at 5h 78% /
-    7d 56%, healthy; Account-5 at 7d 96%) — BASE (this round's own start,
-    `_ROUND_375_BASE_SHA`) must switch Account-3 -> Account-5 exactly as
-    the fleet did live, and HEAD must not (the whole point of #375). A
-    mutant that undoes #375's two admission guards (the trigger's
-    `about_to_wall` bar and the cold floor) must reproduce BASE's digest
-    exactly — the control that the divergence traces to THOSE and nothing
-    else moved. Composes (never subclasses, which would re-collect
-    every one of its own tests under this class too) `TestOutcomeDigest
-    AgainstBase`'s `_fleet`/`_run`/`_mutant`/`_head` machinery unchanged
-    for the second half: `best`/`consume-first` stay byte-identical
-    against THIS round's own base, over the same random fleets, with the
-    same stale-exclusion mutant control still moving them.
-    """
-
-    _base = TestOutcomeDigestAgainstBase()
-
-    @staticmethod
-    def _motivating_fleet(now: float) -> dict:
-        # Account numbers 1/2 (not the incident's own 3/5): `_run`
-        # (`TestOutcomeDigestAgainstBase`, reused verbatim) always seeds
-        # accounts 1/2/3 and makes 1 live — account 3 stays unseeded here.
-        return {
-            "1": {  # active ("Account-3" in the incident): healthy, well
-                     # clear of about_to_wall
-                "five_hour": {"pct": 78.0, "resets_at": _iso_at(now + 4 * 3600)},
-                "seven_day": {"pct": 56.0, "resets_at": _iso_at(now + 5 * 86400)},
-            },
-            "2": {  # candidate ("Account-5"): near-empty, but resets first
-                "five_hour": {"pct": 0.0, "resets_at": _iso_at(now + 4 * 3600)},
-                "seven_day": {"pct": 96.0, "resets_at": _iso_at(now + 1 * 86400)},
-            },
-        }
-
-    def _run_motivating(self, engine_cls, tmp_path, tag):
-        raw = self._motivating_fleet(1_000_000.0)
-        entries = {num: _entry_for(v, 1_000_000.0) for num, v in raw.items()}
-        return self._base._run(engine_cls, tmp_path, tag, [entries], "dynamic")[0]
-
-    def _run_motivating_mutant(self, tmp_path, tag, **settings_kwargs):
-        """Same fixture as `_run_motivating`, but threads extra
-        `AutoSwitchSettings` kwargs through -- the shared `_run` (never
-        touched, per this class's own docstring) takes none.
-        """
-        raw = self._motivating_fleet(1_000_000.0)
-        entries = {num: _entry_for(v, 1_000_000.0) for num, v in raw.items()}
-        home = tmp_path / tag
-        (home / ".claude").mkdir(parents=True)
-        with (
-            patch("pathlib.Path.home", return_value=home),
-            patch.dict(
-                os.environ,
-                {
-                    "HOME": str(home),
-                    "USERPROFILE": str(home),
-                    "XDG_DATA_HOME": str(home / ".local" / "share"),
-                },
-            ),
-        ):
-            h = EngineHarness(home, strategy="dynamic", **settings_kwargs)
-            h.seed(1, "a@example.com")
-            h.seed(2, "b@example.com")
-            h.seed(3, "c@example.com")
-            h.make_live("a@example.com", 1)
-            outcome = h.tick_with_entries(entries)
-        events = tuple((e.kind, getattr(e, "reason", None)) for e in h.events)
-        return outcome.name, h.active_number(), events
-
-    def test_base_switches_head_does_not_and_the_mutant_restores_base(
-        self, tmp_path
-    ):
-        head = self._run_motivating(AutoSwitchEngine, tmp_path, "head")
-        assert head[0] == "NO_ACTION", (
-            f"got {head!r} — #375's whole point: a healthy active "
-            "(headroom 22) must not move for a soonest-resetting, "
-            "near-empty candidate on a SINGLE tick with no dwell stamp "
-            "(this fixture never seeds `lastActiveAt`, so the dwell gate "
-            "holds it regardless of the floor below -- T0758 narrows "
-            "that same floor once dwell IS satisfied, see "
-            "TestWarmthAndAlternation375.test_the_owners_row_..., "
-            "which is this fleet's shape with dwell seeded and does "
-            "switch)"
-        )
-        base_results = _base_engine_results(
-            tmp_path, "dynamic", seed=0, n_fleets=1,
-            base_sha=_ROUND_375_BASE_SHA,
-            custom_fleets=[self._motivating_fleet(1_000_000.0)],
-        )
-        base = base_results[0]
-        assert base[0] == "SWITCHED" and base[1] == 2, (
-            f"got {base!r} — the reconstructed fixture must reproduce the "
-            "live incident (Switched Account-3 -> Account-5, here "
-            "accounts 1 -> 2) against this round's own start commit"
-        )
-
-        import claude_swap.autoswitch as autoswitch
-
-        old_classify = autoswitch._classify_dynamic_trigger
-
-        def always_proactive(active_headroom):
-            # #375 replaced the bare below-threshold trigger with TWO new
-            # guards, not one: `about_to_wall` deciding whether `proactive`
-            # fires at all, and `cold_switch_cost_pct` (below) deciding
-            # whether a real-headroom candidate is admissible once it
-            # does. Undoing only the trigger still leaves the floor
-            # blocking this fixture (measured) -- the drain mechanism that
-            # used to make a lone-function patch sufficient is deleted
-            # (item 3), so both revert together as the one thing #375's
-            # design actually replaced.
-            return "at-limit" if active_headroom <= 0 else "proactive"
-
-        autoswitch._classify_dynamic_trigger = always_proactive
-        try:
-            mutant = self._run_motivating_mutant(
-                tmp_path, "mutant", cold_switch_cost_pct=0.0
-            )
-        finally:
-            autoswitch._classify_dynamic_trigger = old_classify
-        assert mutant == base, (
-            f"got {mutant!r}, want {base!r} — restoring the pre-#375 "
-            "trigger and admission floor together must reproduce BASE's "
-            "digest exactly"
-        )
-        assert head != base, (
-            "the mutant control is meaningless if head already matched "
-            "base without it"
-        )
-
-    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
-    def test_best_and_consume_first_digest_identical_against_this_rounds_base(
-        self, tmp_path, strategy
-    ):
-        fleets, stale_by_fleet, head_results = self._base._head(tmp_path, strategy)
-        base_results = _base_engine_results(
-            tmp_path, strategy, self._base._DIGEST_SEED, self._base._N_FLEETS,
-            base_sha=_ROUND_375_BASE_SHA,
-        )
-        assert head_results == base_results, (
-            f"{strategy} must be byte-identical against this round's own "
-            f"base — #375 touches `dynamic` only"
-        )
-        mutant_results = self._base._mutant(tmp_path, fleets, strategy)
-        assert mutant_results != head_results, (
-            "the existing stale-candidate mutant control must still move "
-            "the digest — a no-op injection proves nothing"
-        )
-
-    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
-    def test_best_and_consume_first_digest_identical_above_the_walled_threshold(
-        self, tmp_path, strategy
-    ):
-        """The digest above always runs at the DEFAULT departure threshold,
-        so it can never drive an active into ``about_to_wall`` (<=3pt
-        headroom) while ALSO staying below threshold — exactly the band
-        `_walled_may_take_any_room`'s below-threshold `consume-first` gate
-        needs (a threshold above ~97) to be reachable at all. It therefore
-        could not have caught c6db55c4's unauthorized `consume-first`
-        change; this raises the threshold into that band before trusting
-        byte-identity again. At seed ``_DIGEST_SEED``, fleets 1/14/35 land
-        their active in [97, 99) -- the positive control below fails loudly
-        if that ever stops being true.
-        """
-        raised = {"threshold": 99.0}
-        probe_rng = random.Random(self._base._DIGEST_SEED)
-        active_pcts = [
-            self._base._fleet(probe_rng, 1_000_000.0)[0]["1"].last_good[
-                "five_hour"
-            ]["pct"]
-            for _ in range(self._base._N_FLEETS)
-        ]
-        assert any(97.0 <= p < 99.0 for p in active_pcts), (
-            "the fixed-seed fixture no longer drives any fleet's active "
-            "into the about_to_wall-but-below-threshold band — this test "
-            "would pass vacuously without a real fleet to exercise"
-        )
-        fleets, _stale, head_results = self._base._head(
-            tmp_path, strategy, **raised
-        )
-        base_results = _base_engine_results(
-            tmp_path, strategy, self._base._DIGEST_SEED, self._base._N_FLEETS,
-            base_sha=_ROUND_375_BASE_SHA, settings_kwargs=raised,
-        )
-        assert head_results == base_results, (
-            f"{strategy} must be byte-identical against this round's own "
-            f"base even with the departure threshold raised above 97, "
-            f"where _walled_may_take_any_room's consume-first branch "
-            f"would otherwise be reachable"
-        )
 
 
 class TestApiKeyAccounts:

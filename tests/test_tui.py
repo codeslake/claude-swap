@@ -2521,6 +2521,7 @@ class TestSharedAccountOrder:
         the read entirely, since `last_active_at={}` and `{}` agree."""
         from textual.widgets import ListView
 
+        from claude_swap.tui.dashboard import SwitchScreen, WatchScreen
         from claude_swap.tui.widgets import AccountItem, AccountsPanel
 
         (tmp_path / "settings.json").write_text(
@@ -2529,25 +2530,23 @@ class TestSharedAccountOrder:
         (tmp_path / "autoswitch_state.json").write_text(json.dumps({
             "lastActiveAt": {"2": time.time() - 20 * 60},
         }))
-        for menu_id in (None, "switch", "watch"):  # None: the dashboard itself
-            fake = FakeSwitcher(_warm_fixture_accounts(), tmp_path)
-            app = make_app(fake)
-            async with app.run_test(size=(100, 40)) as pilot:
-                await settle(pilot)
-                last_active_at = tui_data.read_last_active_at(tmp_path)
-                order = tui_data.ordered_accounts(
-                    fake.accounts_snapshot(), app.auto_settings, time.time(),
-                    last_active_at,
-                )
-                assert order[1:] == ["2", "3"], order  # warm outranks sooner cold
-                if menu_id is None:
-                    panel = app.screen.query_one(AccountsPanel).render().plain
-                    positions = [panel.index(f"user{n}@example.com") for n in order]
-                    assert positions == sorted(positions)
-                    continue
-                await menu_select(pilot, menu_id)
-                await settle(pilot)
-                listview = app.screen.query_one("#accounts", ListView)
+        fake = FakeSwitcher(_warm_fixture_accounts(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            last_active_at = tui_data.read_last_active_at(tmp_path)
+            order = tui_data.ordered_accounts(
+                fake.accounts_snapshot(), app.auto_settings, time.time(),
+                last_active_at,
+            )
+            assert order[1:] == ["2", "3"], order  # warm outranks sooner cold
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            positions = [panel.index(f"user{n}@example.com") for n in order]
+            assert positions == sorted(positions)
+            for screen in (SwitchScreen(), WatchScreen()):  # one mount, pushed in turn
+                await app.push_screen(screen)
+                await pilot.pause()
+                listview = screen.query_one("#accounts", ListView)
                 numbers = [item.number for item in listview.query(AccountItem)]
                 assert numbers == order
 

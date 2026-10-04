@@ -401,8 +401,7 @@ def _walled_may_take_any_room(about_to_wall: bool, candidate_headroom: float) ->
 def _classify_dynamic_trigger(active_headroom: float) -> str:
     """`dynamic`'s own trigger classification (#375 item 1): drop the bare
     threshold, `_about_to_wall` (SPENT_HEADROOM_PCT) is the only bar left
-    for the proactive arm; a mutant restoring the pre-#375 bare-threshold
-    shape is the digest control (`TestOutcomeDigest375`).
+    for the proactive arm.
     """
     if active_headroom <= 0:
         return "at-limit"
