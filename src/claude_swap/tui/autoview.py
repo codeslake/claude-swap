@@ -90,6 +90,8 @@ _UNMODELED_TEXT = {
     "unreadable-active": "not previewed (active status unknown)",
 }
 
+_NO_PLAN_TEXT = "no plan (subscription inactive)"
+
 
 class AutoScreen(Screen):
     BINDINGS = [
@@ -438,12 +440,14 @@ class AutoScreen(Screen):
         # `getattr` (never plain `self._last_active_at`): a test instance
         # built via `AutoScreen.__new__` skips `__init__`/`_on_snapshot`.
         last_active_at = getattr(self, "_last_active_at", None) or {}
+        reasons: dict[str, str] = {}   # the engine's own cause per refused row
         ordered, rank_axis, trigger, unmodeled = data.rank_switch_candidates(
             snap, settings, now, active_number,
             probe_cooldown=(_eng._last_probe_cooldown
                             if (_eng := getattr(self, "_engine", None)) is not None
                             else None),
             last_active_at=last_active_at,
+            reasons_out=reasons,
         )
         ordered_rank = {num: i for i, num in enumerate(ordered)}
         # Captured before the loop rebinds `now` below (per-row, for the
@@ -464,6 +468,8 @@ class AutoScreen(Screen):
                 or not acc.switchable
                 or acc.usage.sentinel is not None
                 or binding_pct(acc.usage.last_good, models) is None
+                # an unranked no-plan row draws no chips (below), so it sizes no column
+                or (data.is_no_plan(acc) and acc.number not in ordered_rank)
             ):
                 continue
             windows = oauth.relevant_windows(acc.usage.last_good, models)
@@ -520,6 +526,21 @@ class AutoScreen(Screen):
                 entry.append(f"  {note}", style=palette.sev_warn)
                 lines[acc.number] = entry
                 ranked.append(((1000.0,), acc.number))   # last: never a target
+                continue
+            no_plan = data.is_no_plan(acc)
+            if no_plan and acc.number not in ordered_rank:
+                # No subscription behind this login and the pass did not rank
+                # it: chips would read as a candidate, so the reason replaces
+                # them and the row goes behind even the unswitchable ones. A
+                # RANKED one (`decision_value()` serves `last_good` for a
+                # while after polls fail) is the engine's pick and keeps its
+                # place below, the reason a marker after the chips.
+                entry = Text()
+                entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
+                entry.append(acc.email, style=palette.muted)
+                entry.append(f"  {_NO_PLAN_TEXT}", style=palette.sev_warn)
+                lines[acc.number] = entry
+                ranked.append(((1001.0,), acc.number))
                 continue
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
@@ -630,9 +651,12 @@ class AutoScreen(Screen):
                 # healthy row's `fetched_at` is older than that for most of
                 # every poll cycle, and the engine lands on it happily.
                 if acc.usage.in_backoff(now) or acc.usage.consecutive_failures:
-                    # A lapsed plan is a permanent 403, not a poll gap.
-                    lapsed = acc.usage.last_error == "oauth_not_allowed_for_organization"
-                    entry.append("  no plan" if lapsed else "  stale", style=palette.sev_warn)
+                    # A lapsed plan is a permanent 403, not a poll gap: the no-plan
+                    # marker below says so, never "stale".
+                    if not no_plan:
+                        entry.append("  stale", style=palette.sev_warn)
+                if no_plan:
+                    entry.append(f"  {_NO_PLAN_TEXT}", style=palette.sev_warn)
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
                 # a model-only block (the engine's fallback ranks around it)
@@ -640,8 +664,8 @@ class AutoScreen(Screen):
                 # helper, `classify_candidate_block`, though the two print
                 # `kind == "full"` in different words on purpose (the elif
                 # below): the log always says "full", this panel reserves
-                # "full" for a window actually at or over 100 and names the
-                # bar it was judged against otherwise. Always on `models`,
+                # "full" for a window actually at or over 100 and says
+                # nothing otherwise. Always on `models`,
                 # the full pinned set: this label explains why the row is
                 # not simply "open" on the criteria the user actually
                 # configured, independent of whether the pass above retried
@@ -702,7 +726,11 @@ class AutoScreen(Screen):
                     # Every other excluded row already has a reason above.
                     # Never when `unmodeled`: this pass never ran, so
                     # "refused" is not a claim this row can support.
-                    entry.append("  not a candidate", style=palette.muted)
+                    why = reasons.get(acc.number)
+                    entry.append(
+                        f"  not a candidate ({why})" if why else "  not a candidate",
+                        style=palette.muted,
+                    )
                 # Position from `ordered_rank` (the engine's own pass, called
                 # once above), never a locally re-derived key -- but a row
                 # the pass never ranked at all still needs a DETERMINISTIC
