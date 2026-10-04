@@ -474,6 +474,10 @@ def _mini_body(
         cell.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
         cell.append(f" · {suffix}", style=palette.muted)
         cells[SPEND_LABEL] = cell
+        if len(cells) == 1:
+            # spend alone is the row's whole usage, like `no plan`: a note, so it starts at
+            # the 5h column and opens no `$$` column for the rows that carry windows
+            return {}, cell, ahead
     # Nothing above rendered — every source `usage_rows` draws from
     # (spend, 5h, 7d, scoped) uses the same truthiness test as the loops
     # above, so `usage_rows` is provably empty here too.
@@ -526,7 +530,9 @@ def mini_widths(
             chip[label] = max(chip.get(label, 0), at)
             rest[label] = max(rest.get(label, 0), cell.cell_len - at)
         if row_note:
-            note = max(note, min(row_note.cell_len, _MINI_NOTE_CAP))
+            # a spend note is the row's whole usage and stays whole, as the spend cell it replaced did
+            whole = row_note.plain.startswith(SPEND_LABEL)
+            note = max(note, row_note.cell_len if whole else min(row_note.cell_len, _MINI_NOTE_CAP))
     # spend is its own cell after every window, wherever it was first seen
     order = sorted(rest, key=lambda label: label == SPEND_LABEL)
     cells = {label: chip[label] + rest[label] for label in order if rest[label]}

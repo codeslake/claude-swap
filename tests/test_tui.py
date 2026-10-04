@@ -1507,9 +1507,13 @@ class TestDashboard:
             return {ln.index(token) for ln in lines if token in ln}
 
         assert "(ahead)" in panel and "⟳429" in panel
-        for token in ("login", "[", "5h(", "7d(", "Fable(", "$$ "):
+        for token in ("login", "[", "5h(", "7d(", "Fable("):
             assert len(starts(token)) == 1, (token, rows)
             assert len(starts(token, cut)) <= 1, (token, cut)  # a cut row may lose it
+        # beside windows the spend cell is a column of its own; spend alone is a note, and
+        # starts in the 5h column instead (test_a_spend_only_row_starts_at_the_first_metric_column)
+        assert len(starts("$$ ", [ln for ln in rows if "Fable(" in ln])) == 1, rows
+        assert len(starts("$$ ", [ln for ln in cut if "Fable(" in ln])) <= 1, cut  # a cut row may lose it
         # every pct of one window starts at one column, a back-off chip included:
         # the chip is padded to the widest one shown, so `7d(⟳429 30m):100%` and
         # `7d(⟳0d20h):   20%` put the `%` in the same column
@@ -1569,6 +1573,34 @@ class TestDashboard:
         marked = {str(n): f for n, f in {**fields, 12: "(disabled)"}.items()}
         assert all(out[n].endswith(f) for n, f in marked.items())
         assert len({len(out[n]) - len(f) for n, f in marked.items()}) == 1
+
+    @pytest.mark.parametrize("pct7", [10.0, None], ids=["usage-widest", "spend-widest"])
+    async def test_a_spend_only_row_starts_at_the_first_metric_column(self, pct7):
+        # Spend with no window is the row's whole usage, like `no plan`: it starts
+        # where a usage row's 5h cell does (no `$$` column pushes it right), and the
+        # marker field follows the widest metric cell, one gap on.
+        from claude_swap.tui.widgets import mini_account_text, mini_widths
+
+        now = time.time()
+        # 31 cells, one past `_MINI_NOTE_CAP`: the cap is for sentinel labels, a spend note stays whole
+        spend = {"used": 1234.56, "limit": 2000.0, "pct": 100.0, "currency": "USD"}
+        no_plan = UsageEntry(
+            last_good={}, last_error="oauth_not_allowed_for_organization",
+            fetched_at=now - 5, age_s=5.0,
+        )
+        accs = [
+            make_account(2, entry=make_entry(40.0, pct7)),
+            make_account(3, entry=make_entry(None, None, spend=spend), disabled=True),
+            make_account(4, entry=no_plan, disabled=True),
+        ]
+        widths = mini_widths(accs, now)
+        usage, only, plan = (mini_account_text(a, now, widths=widths).plain for a in accs)
+        cell = "$$ 100% · $1,234.56 / $2,000.00"
+        assert cell in only, (usage, only, plan)
+        assert only.index(cell) == plan.index("no plan") == usage.index("5h("), (usage, only, plan)
+        # the usage row carries no marker, so it ends where its last cell does
+        end = max(len(usage), only.index(cell) + len(cell))
+        assert only.index("(disabled)") == plan.index("(disabled)") == end + 2, (usage, only, plan)
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path, monkeypatch):
         # SAY WHICH WORLD THIS IS, rather than inherit it. The list below used
