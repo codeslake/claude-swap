@@ -208,8 +208,12 @@ class TestProperLockfile:
                 # and this one stayed green.
                 past = time.time() - 30
                 real(lock_dir, (past, past))
-                # Held until the failed first touch is two ticks behind us.
-                _wait_until(lambda: touches["n"] > 2)
+                # Counted from AFTER the rewind: the counter rises before
+                # `utime` runs, so `> base + 1` means a touch that began after
+                # the rewind has finished. A bare `> 2` is met by ticks that
+                # ran before it, and `age` then reads the rewound 30s.
+                base = touches["n"]
+                _wait_until(lambda: touches["n"] > max(2, base + 1))
                 # INSIDE THE HOLD: the release removes the directory, so the
                 # freshness this is about is unobservable afterwards.
                 age = time.time() - lock_dir.stat().st_mtime
@@ -312,15 +316,17 @@ class TestProperLockfile:
         assert touches["n"] > 1, "control: the toucher must have kept trying"
         assert len(said()) == 1, f"expected exactly one warning, got {len(said())}"
 
+    @pytest.mark.parametrize("errno_", [errno.ESTALE, errno.EACCES])
     def test_a_failure_that_is_not_absence_keeps_the_heartbeat(
-            self, lock_dir, monkeypatch):
+            self, lock_dir, monkeypatch, errno_):
         """Only absence may stop the toucher; every other errno is transient.
 
-        ONE ERRNO, where this was ESTALE/EACCES/EIO: all three take the single
+        TWO ERRNOS, where this was ESTALE/EACCES/EIO: all three take the single
         `except OSError` arm and nothing in the source keys on an errno, so
-        the other two differed only in a literal. ESTALE is the one kept
-        because it maps to no `OSError` subclass: EACCES is a `PermissionError`
-        and would pass a toucher narrowed to tolerate that alone.
+        EIO differed from ESTALE only in a literal and is dropped. ESTALE
+        maps to no `OSError` subclass and EACCES builds a `PermissionError`,
+        so an `except` narrowed to either one passes one case and fails the
+        other.
 
         `os.stat` fails too, because that is what these errnos mean on a real
         filesystem — a stale NFS handle or an unreadable directory does not
@@ -335,7 +341,6 @@ class TestProperLockfile:
         reads as "gone" for a lock we still hold. requires-python is >=3.12
         and CI runs 3.12, so neither half can be dismissed as theoretical.
         """
-        errno_ = errno.ESTALE
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.005)
         real_utime, real_stat = os.utime, os.stat
         touches = {"n": 0}
@@ -522,9 +527,10 @@ class TestEveryArmOfTheLoopBacksOff:
         remainder is hugely negative and `max(0.0, ...)` yields 0) took the
         attempts in a 0.3s budget from 2 to 5135, with both lock files green.
 
-        The bound is 2x the measured count, not three orders of magnitude:
-        attempts are budget/sleep, so a loaded machine yields FEWER and the
-        noise cannot push it up. A 40 tolerated a 20x shrink in silence.
+        The clock is scripted (`time.sleep` advances `monotonic`), so the count
+        is a property of the jitter draws alone, not of the machine or its
+        load. The bound is 2x the measured maximum, not three orders of
+        magnitude: a 40 tolerated a 20x shrink in silence.
         """
         lock = tmp_path / "held.lock"
         lock.mkdir()  # FRESH, so the stale-takeover arm is never entered
@@ -543,16 +549,13 @@ class TestEveryArmOfTheLoopBacksOff:
                 pass
 
         assert tries["n"] >= 1, f"the instrument, not the code: {tries['n']}"
-        # Attempts are NOT budget/sleep: the clamp is
-        # `min(sleep, deadline - now)`, so the tail sleeps shrink toward zero
-        # and the loop iterates fast as it approaches the deadline. The noise
-        # therefore runs UPWARD too, by a few iterations, and by more on a
-        # platform with a coarser timer. Measured on the sibling arm: 7 on
-        # linux (12 of 12) against 11 on the windows job, where a bound of 10
-        # refused a correct tree and blocked every deploy. A busy spin is
-        # ~50,000 attempts in the same budget, so the headroom below costs no
-        # discriminating power at all.
-        assert tries["n"] <= 12, (
+        # 2 or 3 over 3000 runs: the first draw is 0.25-0.5s against a 0.3s
+        # budget, and 3 is the draw that lands short so the clamped tail takes
+        # one more pass. The scripted clock leaves no platform or load noise
+        # to allow for. A busy spin makes tens of thousands of attempts before
+        # the clock, which steps on every read, reaches the deadline, so the
+        # headroom below costs no discriminating power.
+        assert tries["n"] <= 6, (
             f"{tries['n']} mkdir attempts in a 0.3s budget — the jittered "
             "arm is not sleeping, so a waiter pegs a core for the whole hold"
         )
@@ -628,9 +631,8 @@ class TestEveryArmOfTheLoopBacksOff:
                 pass
 
         assert tries["n"] > 1, "premise: the loop must have retried at all"
-        # 7 on linux, measured 12 of 12; 11 on the windows job, because the
-        # clamp's tail iterates fast (see the jittered arm above). A busy
-        # spin is ~50,000.
+        # 7 over 3000 of 3000 runs: the scripted clock leaves no platform or
+        # load noise. A busy spin makes tens of thousands of attempts.
         assert tries["n"] <= 20, (
             f"{tries['n']} mkdir attempts in a 0.3s budget — the arm that "
             "retries a vanished name never sleeps, so it pins a core"
