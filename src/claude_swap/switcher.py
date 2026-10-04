@@ -7722,7 +7722,11 @@ class ClaudeAccountSwitcher:
             before = pre.get(num)
             recent_429 = before is not None and before.recent_429(now)
             plans[num] = poll_policy.plan_after_fetch(
-                prev_interval_s=before.poll_interval_s if before else None,
+                # A no-plan row's day-long interval is not a cadence to halve
+                # or grow from: its first success starts from the default.
+                prev_interval_s=None
+                if before is None or before.last_error == poll_policy.NO_PLAN_ERROR
+                else before.poll_interval_s,
                 prev_usage=before.last_good if before else None,
                 new_usage=rec.usage,
                 is_active=bool(info_by_num[num][4]),

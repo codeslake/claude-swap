@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,6 +30,7 @@ from claude_swap.usage_store import (
     due_candidate,
     with_sentinel,
 )
+from claude_swap.switcher import ClaudeAccountSwitcher
 
 IDENT = {"1": ("a@x.com", ""), "2": ("b@x.com", "org-2")}
 USAGE = {"five_hour": {"pct": 25.0}, "seven_day": {"pct": 10.0}}
@@ -886,6 +888,30 @@ class TestNoPlanSlot:
         assert store.reserve(["1"], IDENT, respect_plans=False) == {}
         clock.advance(NO_PLAN_POLL_INTERVAL_S)
         assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_the_first_success_is_planned_inside_the_candidate_ceiling(
+        self, store, clock
+    ):
+        # A renewed slot whose usage moved must not halve the day-long
+        # interval (12 h): the plan after its first success starts from the
+        # candidate default, not from the no-plan one.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        pre = store.entries(IDENT)
+        assert pre["1"].poll_interval_s == NO_PLAN_POLL_INTERVAL_S
+        moved = {"five_hour": {"pct": 40.0}, "seven_day": {"pct": 10.0}}
+        stub = SimpleNamespace(
+            _usage_store=store, _poll_policy_inputs=lambda: (90.0, ())
+        )
+        plans = ClaudeAccountSwitcher._plans_after_fetch(
+            stub,
+            {"1": FetchRecord(usage=moved)},
+            pre,
+            {"1": (None, None, None, None, False)},
+        )
+        next_poll_at, interval = plans["1"]
+        assert interval <= CANDIDATE_MAX_INTERVAL_S
+        assert next_poll_at <= clock.now + CANDIDATE_MAX_INTERVAL_S
 
     def test_a_new_login_drops_the_day_long_plan(self, store, clock):
         store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
