@@ -797,37 +797,51 @@ class TestDashboard:
             return dataclasses.replace(acc, org_name=org)
 
         fable = [("Fable", 100.0)]
-        fake = FakeSwitcher(
-            [
-                make_account(1, active=True),
-                row(2, "someone@example.com's Organization",
-                    make_entry(47.0, 90.0, scoped=fable)),  # 7d ahead of pace
-                row(3, "NA - Example Electronics Co. Ltd", make_entry(92.0, 40.0)),
-                row(4, "", make_entry(5.0, None, scoped=fable)),  # no 7d window
-                row(5, "work", make_entry(100.0, 100.0, scoped=fable),
-                    alias="wk", disabled=True),  # reset suffixes
-                row(6, "work", make_entry(sentinel=USAGE_API_KEY), disabled=True),
-            ],
-            tmp_path,
-        )
-        app = make_app(fake)
-        async with app.run_test(size=(100, 32)) as pilot:
+        spend = {"used": 12.5, "limit": 50.0, "pct": 25.0, "currency": "USD"}
+        accs = [
+            make_account(1, active=True),
+            row(2, "someone@example.com's Organization",
+                make_entry(47.0, 90.0, scoped=fable)),  # 7d ahead of pace
+            row(3, "NA - Example Electronics Co. Ltd", make_entry(92.0, 40.0)),
+            row(4, "", make_entry(5.0, None, scoped=fable)),  # no 7d window
+            row(5, "work", make_entry(100.0, 100.0, scoped=fable),
+                alias="wk", disabled=True),  # reset suffixes
+            row(6, "work", make_entry(sentinel=USAGE_API_KEY), disabled=True),
+            # a note wider than the window cells, and the "usage unknown" note
+            row(7, "work", make_entry(sentinel=USAGE_TOKEN_EXPIRED), disabled=True),
+            row(8, "work", make_entry(None, None, spend=spend), disabled=True),
+        ]
+        app = make_app(FakeSwitcher(accs, tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
             await settle(pilot)
-            from claude_swap.tui.widgets import AccountsPanel
+            from claude_swap.tui.widgets import (
+                AccountsPanel, mini_account_text, mini_widths)
 
-            panel = app.screen.query_one(AccountsPanel).render().plain
+            widget = app.screen.query_one(AccountsPanel)
+            panel = widget.render().plain
+            # rows wider than the panel are clipped, never wrapped onto a second line
+            assert widget.size.height == len(panel.splitlines())
         lines = panel.splitlines()
-        rows = [next(ln for ln in lines if ln.startswith(f" {n}  ")) for n in range(2, 7)]
+        rows = [next(ln for ln in lines if ln.startswith(f" {n}  ")) for n in range(2, 9)]
 
         def starts(token):
             return {ln.index(token) for ln in rows if token in ln}
 
-        assert "(ahead)" in panel and "(resets" in panel and "personal" in panel
+        assert "(ahead)" in panel and "(resets" in panel
         for token in ("[", "5h ", "7d ", "Fable (!)", "(disabled)"):
             assert len(starts(token)) == 1, (token, rows)
         tags = [re.search(r"\[[^\]]*\]", ln).group() for ln in rows]
         assert [len(t) for t in tags[:2]] == [24, 24]  # capped, ellipsis inside
         assert all(t.endswith("…]") for t in tags[:2]) and "[work]" in tags
+        assert "[personal]" in tags
+        # under the cap the tag column is the widest tag shown, not the cap
+        now = time.time()
+        assert mini_widths(accs[3:5], now).tag == len("[personal]") < 24
+        # only note rows shown: no window grid, the notes alone set the column
+        notes = accs[5:7]
+        widths = mini_widths(notes, now)
+        assert len({mini_account_text(a, now, widths=widths).plain.index("(disabled)")
+                    for a in notes}) == 1
         for ln in rows:  # nothing between the tag and the first window cell
             if "5h " in ln:
                 assert not ln[ln.index("]") + 1 : ln.index("5h ")].strip()

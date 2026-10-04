@@ -250,6 +250,7 @@ class MiniWidths(NamedTuple):
     name: int
     tag: int
     cells: dict[str, int]  # window label -> cell width, in display order
+    note: int  # widest sentinel / "usage unknown" note shown
 
 
 def _fit(text: Text, width: int) -> Text:
@@ -315,14 +316,17 @@ def _mini_body(
 def mini_widths(accs: Iterable[AccountSnapshot], now: float) -> MiniWidths:
     """Column widths that fit every one of ``accs``, the compact rows shown."""
     palette = Palette.DARK  # widths do not depend on style
-    name = tag = 0
+    name = tag = note = 0
     cells = {"5h": 0, "7d": 0}  # fixed order; scoped windows follow as seen
     for acc in accs:
         name = max(name, _mini_name(acc, palette).cell_len)
         tag = max(tag, _mini_tag(acc, palette).cell_len)
-        for label, cell in _mini_body(acc, now, palette)[0].items():
+        row_cells, row_note = _mini_body(acc, now, palette)
+        for label, cell in row_cells.items():
             cells[label] = max(cells.get(label, 0), cell.cell_len)
-    return MiniWidths(name, tag, {k: w for k, w in cells.items() if w})
+        if row_note:
+            note = max(note, row_note.cell_len)
+    return MiniWidths(name, tag, {k: w for k, w in cells.items() if w}, note)
 
 
 def mini_account_text(
@@ -339,9 +343,10 @@ def mini_account_text(
     Pcts only, severity colored; a window at/over 100% brings its reset
     countdown along, and a maxed per-model window shows as ``Fable (!)``. A
     window the account lacks is a blank cell, and a sentinel state shows its
-    label in place of the cells (one longer than them pushes only its own
-    marker right). ``widths`` (from :func:`mini_widths` over the rows shown)
-    lines the columns up across rows; alone, a row fits itself.
+    label in place of the cells; every row's body is as wide as the wider of
+    the cells and the longest such note, so the marker keeps one column.
+    ``widths`` (from :func:`mini_widths` over the rows shown) lines the
+    columns up across rows; alone, a row fits itself.
     """
     widths = widths or mini_widths([acc], now)
     cells, note = _mini_body(acc, now, palette)
@@ -351,7 +356,7 @@ def mini_account_text(
     fields = [
         _fit(_mini_name(acc, palette), widths.name),
         _fit(_mini_tag(acc, palette), widths.tag),
-        _fit(note or grid, grid.cell_len),
+        _fit(note or grid, max(grid.cell_len, widths.note)),
     ]
     if acc.disabled:
         fields.append(Text("(disabled)", style=palette.muted))
