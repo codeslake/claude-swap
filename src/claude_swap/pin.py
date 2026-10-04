@@ -1575,8 +1575,7 @@ def _clear_pin_record(switcher, everywhere: bool = False) -> None:
             if not section:
                 del raw["remoteControl"]
         else:
-            changed = section is not None
-            raw.pop("remoteControl", None)
+            changed = raw.pop("remoteControl", None) is not None
         if changed:
             _s.atomic_write_json(path, raw)
     except Exception:  # noqa: BLE001 — the caller re-reads and reports
