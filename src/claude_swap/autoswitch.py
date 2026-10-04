@@ -3368,8 +3368,7 @@ class AutoSwitchEngine:
             # switch decision, but a decision-trusted exhausted row cannot be
             # a target. Preserve any plan at or beyond the all-exhausted wake
             # cadence (plan_after_fetch plans an exhausted row at exactly
-            # that) instead of refetching that token. A no-plan slot's
-            # day-long plan is kept the same way, whatever its headroom.
+            # that) instead of refetching that token.
             for num in tuple(escalation_fetch):
                 entry = entries.get(num)
                 value = usage.get(num)
@@ -3380,15 +3379,10 @@ class AutoSwitchEngine:
                     entry is not None
                     and entry.next_poll_at is not None
                     and now < entry.next_poll_at
-                    and (
-                        entry.last_error == poll_policy.NO_PLAN_ERROR
-                        or (
-                            (entry.poll_interval_s or 0.0)
-                            >= poll_policy.EXHAUSTED_INTERVAL_S
-                            and planned_headroom is not None
-                            and planned_headroom <= 0
-                        )
-                    )
+                    and (entry.poll_interval_s or 0.0)
+                    >= poll_policy.EXHAUSTED_INTERVAL_S
+                    and planned_headroom is not None
+                    and planned_headroom <= 0
                 ):
                     escalation_fetch.remove(num)
             if self._stop.is_set():

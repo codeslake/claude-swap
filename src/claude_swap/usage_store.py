@@ -1775,6 +1775,12 @@ def _row_eligible(
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))
     poll_due = next_poll_at is not None and now >= next_poll_at
+    if (
+        row.get("lastError") == NO_PLAN_ERROR
+        and next_poll_at is not None
+        and not poll_due
+    ):
+        return False  # its day-long plan binds in every mode, escalation included
     overslept = repair_overslept and _plan_oversleeps_interval(
         next_poll_at,
         _num_or_none(row.get("pollIntervalS")),

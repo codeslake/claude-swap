@@ -879,9 +879,11 @@ class TestNoPlanSlot:
         entry = store.entries(IDENT)["1"]
         assert entry.next_poll_at == clock.now + NO_PLAN_POLL_INTERVAL_S
         assert entry.poll_interval_s == NO_PLAN_POLL_INTERVAL_S
-        # Past the 429's backoff, the plan is what holds the row.
+        # Past the 429's backoff, the plan is what holds the row, in the
+        # scheduler's escalating mode too.
         clock.advance(entry.backoff_until - clock.now + 1)
         assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
         clock.advance(NO_PLAN_POLL_INTERVAL_S)
         assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
 
