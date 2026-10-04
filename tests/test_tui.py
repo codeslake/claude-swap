@@ -2521,17 +2521,23 @@ class TestUnswitchableRowsAreListed:
         ), active="9", settings=settings)
         lines = [line for line in out.split("\n") if line.strip().startswith(("2 ", "3 "))]
         assert len(lines) == 2, lines
-        seven_d = [line.index("7d") for line in lines]
-        fable = [line.index("Fable") for line in lines]
+        import re
+
+        def colon(window, line):
+            return re.search(re.escape(window) + r"(?:\(⟳\w+\))?:", line).end()
+
+        seven_d = [colon("7d", line) for line in lines]
+        fable = [colon("Fable", line) for line in lines]
         assert seven_d[0] == seven_d[1], f"7d chip not aligned: {seven_d} in {lines!r}"
         assert fable[0] == fable[1], f"Fable chip not aligned: {fable} in {lines!r}"
 
     def test_each_windows_percent_ends_in_one_column_across_rows(self):
         """`7d(⟳6d20h):100%` against `7d:94%` used to push the percent out of
         its column, and a row without a Fable window reserved nothing for it.
-        Each window is one column: its label text left-aligned to the widest
-        label, its pct right-aligned to the widest pct, so the `%` of a given
-        window ends in the same string column on every row, whatever the
+        Each window is one column: its label text right-aligned to the widest
+        label (the owner's 2026-09-15 rule: the `:` sits in one column), its
+        pct right-aligned to the widest pct, so the `:` and the `%` of a given
+        window end in the same string column on every row, whatever the
         other windows carry."""
         import re
         from claude_swap.settings import AutoSwitchSettings
@@ -2563,12 +2569,35 @@ class TestUnswitchableRowsAreListed:
         assert re.search(r"cccc@x\.com\s+7d:", rows["cccc@x.com"]), rows  # no leading dot
         assert "7d(⟳" in rows["aaaa@x.com"] and "7d:" in rows["bbbb@x.com"], rows  # widths differ
         for window in ("5h", "7d", "Fable"):
-            ends = {
-                m.end()
+            hits = [
+                m
                 for line in rows.values()
-                if (m := re.search(re.escape(window) + r"(?:\(⟳\w+\))?:\s*\d+%", line))
-            }
+                if (m := re.search(r"(" + re.escape(window) + r"(?:\(⟳\w+\))?:)\s*\d+%", line))
+            ]
+            colons = {m.end(1) for m in hits}
+            ends = {m.end() for m in hits}
+            assert len(colons) == 1, f"{window} colon not in one column: {colons} in {rows!r}"
             assert len(ends) == 1, f"{window} percent not in one column: {ends} in {rows!r}"
+
+    def test_5h_and_7d_columns_come_first_then_the_rest_in_first_seen_order(self):
+        """The column set is built in first-seen row order, so a first row
+        without a 5h window put 7d and its scoped windows ahead of 5h. 5h and
+        7d lead, whatever row came first; the rest keep first-seen order."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="all", threshold=99.0)
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "seven_day": {"pct": 7.0}, "scoped": [{"name": "Opus", "pct": 1.0}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 6.0},
+                "scoped": [{"name": "Fable", "pct": 2.0}, {"name": "Opus", "pct": 3.0}],
+            }),
+        ), active="9", settings=settings)
+        row = next(l for l in out.split("\n") if "bbbb@x.com" in l)
+        order = [row.index(w) for w in ("5h", "7d", "Opus", "Fable")]
+        assert order == sorted(order), f"column order: {order} in {row!r}"
 
     def test_markers_start_in_one_column_and_a_bare_row_has_no_trailing_pad(self):
         """The `-only` / `full` marker follows the chips, so it started
@@ -2576,7 +2605,8 @@ class TestUnswitchableRowsAreListed:
         on every row that has one, including a row that lacks the trailing
         window (no Fable chip, so its block is shorter), and a row with no
         marker must not carry the padding that only exists to line a marker
-        up."""
+        up: `cccc` lacks the trailing Fable window and has no marker, so its
+        blank cell is trailing padding and must not survive."""
         import re
         from claude_swap.settings import AutoSwitchSettings
 
@@ -2593,7 +2623,6 @@ class TestUnswitchableRowsAreListed:
             }),
             self._acct("4", "cccc@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 1.0}, "seven_day": {"pct": 1.0},
-                "scoped": [{"name": "Fable", "pct": 2.0}],
             }),
         ), active="9", settings=settings)
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom

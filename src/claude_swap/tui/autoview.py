@@ -442,6 +442,11 @@ class AutoScreen(Screen):
                     ))),
                     max(pct_w, len(f"{wpct:.0f}%")),
                 )
+        # 5h and 7d lead whatever row came first (sorted is stable, so the
+        # rest keep first-seen order).
+        chip_width = dict(sorted(
+            chip_width.items(), key=lambda kv: {"5h": 0, "7d": 1}.get(kv[0], 2)
+        ))
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -524,8 +529,10 @@ class AutoScreen(Screen):
                     )
                     pct_text = f"{wpct:.0f}%"
                     entry.append(sep, style=palette.muted)
+                    # Label right-aligned so the `:` shares a column (owner,
+                    # 2026-09-15); pct right-aligned so the `%` does.
                     entry.append(
-                        label_text.ljust(label_w) + " " * (pct_w - len(pct_text)),
+                        label_text.rjust(label_w) + " " * (pct_w - len(pct_text)),
                         style=palette.muted,
                     )
                     entry.append(pct_text, style=palette.severity(wpct))
@@ -550,8 +557,6 @@ class AutoScreen(Screen):
                     entry.append(f"  {blocked_model}-only", style=palette.muted)
                 elif kind == "full":
                     entry.append(f"  {blocked_model} full", style=palette.muted)
-                else:
-                    entry.rstrip()  # the block's blank cells only align a marker
                 rank_pct = binding_pct(acc.usage.last_good, rank_models)
                 key = (
                     consume_first_rank_key(
@@ -561,6 +566,9 @@ class AutoScreen(Screen):
                     else (pct if rank_pct is None else rank_pct,)
                 )
                 ranked.append((key, acc.number))
+            # The chip block's blank cells only exist to line up what follows
+            # them, so whatever ends up trailing the finished row is dropped.
+            entry.rstrip()
             lines[acc.number] = entry
 
         text = Text()
