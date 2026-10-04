@@ -8,6 +8,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -63,6 +64,26 @@ def _raising(real, path, exc):
     return stub
 
 
+def _scripted_time(monkeypatch, budget):
+    """`time.sleep` advances a scripted `monotonic`: a contended `budget` costs
+    nothing. `time.time`, which the staleness decision reads, stays real."""
+    clock = [0.0]
+    fake_sleep = _thread_scoped_sleep(claude_locks, clock, [])
+    monkeypatch.setattr(claude_locks.time, "monotonic", _advancing_clock(clock, budget))
+    monkeypatch.setattr(claude_locks.time, "sleep", fake_sleep)
+
+
+def _wait_until(pred, timeout=5.0):
+    """Poll `pred`; True once it holds. The heartbeat waits on an Event, not on
+    `time`, so its clock cannot be scripted: this takes the few ticks the
+    toucher needs instead of a fixed sleep sized to outlast them. A heartbeat
+    that never gets there pays `timeout` and fails the caller's assert."""
+    deadline = time.monotonic() + timeout
+    while not (ok := pred()) and time.monotonic() < deadline:
+        time.sleep(0.001)
+    return ok
+
+
 @pytest.fixture
 def lock_dir(tmp_path: Path) -> Path:
     return tmp_path / "target.lock"
@@ -82,9 +103,11 @@ class TestProperLockfile:
 
     def test_contention_times_out(self, lock_dir):
         lock_dir.mkdir()  # fresh mtime = live holder
+        # THE ONE CONTENTION CASE ON THE REAL CLOCK (its siblings script it):
+        # the real `sleep` and `monotonic` get one end-to-end run, 0.05s long.
         start = time.monotonic()
         with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(lock_dir, timeout=0.5):
+            with proper_lockfile(lock_dir, timeout=0.05):
                 pass
         assert time.monotonic() - start < 5.0
         assert lock_dir.is_dir()  # the holder's lock is left alone
@@ -106,12 +129,12 @@ class TestProperLockfile:
         assert not lock_dir.exists()
 
     def test_toucher_keeps_mtime_fresh(self, lock_dir, monkeypatch):
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.1)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.005)
         with proper_lockfile(lock_dir):
             past = time.time() - 30
             os.utime(lock_dir, (past, past))
-            time.sleep(0.4)
-            assert time.time() - lock_dir.stat().st_mtime < 10.0
+            assert _wait_until(
+                lambda: time.time() - lock_dir.stat().st_mtime < 10.0)
 
     def _count_touches(self, monkeypatch, lock_dir, fail_first=None, fail_all=None):
         """Patch os.utime and count only the calls aimed at OUR lock.
@@ -143,15 +166,18 @@ class TestProperLockfile:
         killed the heartbeat while the lock was still held — and after
         CONFIG_STALENESS_S any waiter legally steals it.
         """
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.005)
         touches, real = self._count_touches(
             monkeypatch, lock_dir, fail_first=OSError("transient"))
         with proper_lockfile(lock_dir):
             past = time.time() - 30
             real(lock_dir, (past, past))
-            time.sleep(0.4)
+            # POLLED ON THE MTIME, not the count: the count moves before the
+            # real `utime` runs.
+            fresh = _wait_until(
+                lambda: time.time() - lock_dir.stat().st_mtime < 10.0)
             assert touches["n"] > 1, "the toucher stopped after one failure"
-            assert time.time() - lock_dir.stat().st_mtime < 10.0, (
+            assert fresh, (
                 "the lock went stale while still held, so a waiter may steal it"
             )
 
@@ -169,20 +195,21 @@ class TestProperLockfile:
         Its sibling covers the persistent case with `fail_all`, so nothing
         stood between the two.
         """
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.005)
         touches, real = self._count_touches(
             monkeypatch, lock_dir, fail_first=OSError("transient"))
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             with proper_lockfile(lock_dir):
                 # REWOUND FIRST, like the sibling. Without it the mtime only
                 # ever moves FORWARD from the mkdir, so `age` is bounded by
-                # the hold (0.3s) whatever the toucher does and the premise
+                # the hold whatever the toucher does and the premise
                 # below cannot fail. Measured: with a toucher that calls
                 # `utime` but never advances the mtime, both siblings go red
                 # and this one stayed green.
                 past = time.time() - 30
                 real(lock_dir, (past, past))
-                time.sleep(0.3)
+                # Held until the failed first touch is two ticks behind us.
+                _wait_until(lambda: touches["n"] > 2)
                 # INSIDE THE HOLD: the release removes the directory, so the
                 # freshness this is about is unobservable afterwards.
                 age = time.time() - lock_dir.stat().st_mtime
@@ -211,36 +238,35 @@ class TestProperLockfile:
         it, the gate compares against acquisition time and the cries-wolf
         warning comes straight back.
         """
-        staleness = 0.15
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        staleness = 0.25
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.001)
+        # THE WALL CLOCK IS SCRIPTED AND MOVED BY THE TOUCHES THEMSELVES: 0.1s
+        # of it per touch. The window is then a count of ticks, so a loaded
+        # runner cannot shorten it (a real-time form ran eight ticks where ten
+        # were assumed and never injected), and one scheduler stall cannot
+        # read as a frozen `last_ok` on correct code.
+        wall = [0.0]
+        monkeypatch.setattr(claude_locks, "time", SimpleNamespace(
+            time=lambda: wall[0], monotonic=time.monotonic, sleep=time.sleep))
         real = os.utime
-        state = {"n": 0, "t0": None, "hiccuped": False}
+        state = {"n": 0, "hiccuped": False}
 
         def fail_once_past_the_window(path, *a, **k):
             if os.fspath(path) == os.fspath(lock_dir):
                 state["n"] += 1
-                if state["t0"] is None:
-                    state["t0"] = time.time()
-                # BOUND TO THE WINDOW, NOT TO A COUNT. Keyed on the tenth
-                # touch this needed the toucher to reach ten inside the hold,
-                # which is a claim about the RUNNER: a loaded one ran eight,
-                # the injection never fired, and the case failed on its own
-                # premise while the behaviour was never exercised.
-                elif not state["hiccuped"] and (
-                        time.time() - state["t0"] > staleness):
+                wall[0] += 0.1
+                if not state["hiccuped"] and wall[0] > staleness:
                     state["hiccuped"] = True
                     raise PermissionError("injected: one hiccup")
             return real(path, *a, **k)
 
         monkeypatch.setattr(claude_locks.os, "utime", fail_once_past_the_window)
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            # Below the hold, so the gate is genuinely reached -- but not so
-            # close to TOUCH_INTERVAL_S that one scheduler stall reads as a
-            # frozen `last_ok`. At 0.05 a single 30ms hiccup between two ticks
-            # cries wolf on correct code; 0.15 leaves 130ms and still catches
-            # the `last_ok` deletion, because the hold is 0.4s either way.
+            # The hiccup lands on the third touch, 0.1s after the second one
+            # succeeded: inside the 0.25s window with `last_ok` advancing,
+            # outside it against acquisition time (0.3s) without.
             with proper_lockfile(lock_dir, staleness=staleness):
-                time.sleep(0.4)
+                _wait_until(lambda: state["hiccuped"])
 
         assert state["hiccuped"], (
             f"premise: the injected hiccup never fired ({state['n']} touch(es) "
@@ -268,21 +294,33 @@ class TestProperLockfile:
         the default the failure never persists long enough and this case
         stopped discriminating the moment the arm learned to ask.
         """
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.002)
         touches, _ = self._count_touches(
             monkeypatch, lock_dir, fail_all=PermissionError("injected"))
+
+        def said():
+            return [r for r in caplog.records if "refresh" in r.getMessage()]
+
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            with proper_lockfile(lock_dir, staleness=0.05):
-                time.sleep(0.3)
+            with proper_lockfile(lock_dir, staleness=0.01):
+                # Held until it has warned AND kept failing five more ticks:
+                # a per-attempt warning would have repeated by then.
+                _wait_until(said)
+                warned_at = touches["n"]
+                _wait_until(lambda: touches["n"] > warned_at + 5)
 
         assert touches["n"] > 1, "control: the toucher must have kept trying"
-        said = [r for r in caplog.records if "refresh" in r.getMessage()]
-        assert len(said) == 1, f"expected exactly one warning, got {len(said)}"
+        assert len(said()) == 1, f"expected exactly one warning, got {len(said())}"
 
-    @pytest.mark.parametrize("errno_", [errno.ESTALE, errno.EACCES, errno.EIO])
     def test_a_failure_that_is_not_absence_keeps_the_heartbeat(
-            self, lock_dir, monkeypatch, errno_):
+            self, lock_dir, monkeypatch):
         """Only absence may stop the toucher; every other errno is transient.
+
+        ONE ERRNO, where this was ESTALE/EACCES/EIO: all three take the single
+        `except OSError` arm and nothing in the source keys on an errno, so
+        the other two differed only in a literal. ESTALE is the one kept
+        because it maps to no `OSError` subclass: EACCES is a `PermissionError`
+        and would pass a toucher narrowed to tolerate that alone.
 
         `os.stat` fails too, because that is what these errnos mean on a real
         filesystem — a stale NFS handle or an unreadable directory does not
@@ -297,7 +335,8 @@ class TestProperLockfile:
         reads as "gone" for a lock we still hold. requires-python is >=3.12
         and CI runs 3.12, so neither half can be dismissed as theoretical.
         """
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
+        errno_ = errno.ESTALE
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.005)
         real_utime, real_stat = os.utime, os.stat
         touches = {"n": 0}
         broken = {"on": False}
@@ -319,7 +358,7 @@ class TestProperLockfile:
         monkeypatch.setattr(claude_locks.os, "utime", failing_utime)
         monkeypatch.setattr(claude_locks.os, "stat", failing_stat)
         with proper_lockfile(lock_dir):
-            time.sleep(0.4)
+            _wait_until(lambda: touches["n"] > 1)
             settled = touches["n"]
         assert broken["on"], (
             "the injected failure never fired — the instrument, not the code"
@@ -337,44 +376,18 @@ class TestProperLockfile:
         create one, so `assert not lock_dir.exists()` passes for a toucher
         that never stops at all.
         """
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
-        # COUNTED ON THE TICK, not on `os.utime`. WHERE a tick notices absence
-        # is an implementation choice -- the leading stat is one syscall
-        # earlier than the refresh -- and a utime counter reads zero for a
-        # toucher that ran and correctly stopped, failing its own premise
-        # about code that is right. What this case is about is that the LOOP
-        # ends, so count the loop.
-        # BOTH SYSCALLS, because either one can be the tick's first. A
-        # heartbeat that verifies identity before refreshing notices absence
-        # at the STAT and never reaches `utime`; one that refreshes straight
-        # away notices it at the utime. Counting only the second reads zero
-        # for a toucher that ran and stopped correctly.
-        real = {"stat": os.stat, "utime": os.utime}
-        ticks = {"n": 0}
-
-        def counting(name):
-            def call(path, *a, **k):
-                if (not isinstance(path, int)
-                        and os.fspath(path) == os.fspath(lock_dir)):
-                    ticks["n"] += 1
-                return real[name](path, *a, **k)
-            return call
-
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.005)
+        before = set(threading.enumerate())
         with proper_lockfile(lock_dir):
-            # Armed INSIDE the hold, so the acquire's own calls are not ticks.
-            monkeypatch.setattr(claude_locks.os, "stat", counting("stat"))
-            monkeypatch.setattr(claude_locks.os, "utime", counting("utime"))
+            # THE LOOP ENDS, so JOIN IT. Where a tick notices absence (the
+            # stat or the utime) is an implementation choice that a syscall
+            # counter would have to cover both of; the thread exiting is not.
+            (toucher,) = {t for t in threading.enumerate()
+                          if t.name.endswith("(_touch)")} - before
             os.rmdir(lock_dir)
-            time.sleep(0.15)
-            settled = ticks["n"]
-            assert settled >= 1, (
-                "the toucher never ran in the window — the instrument, not "
-                "the code (raise the sleep or lower TOUCH_INTERVAL_S)"
-            )
-            time.sleep(0.3)
-            assert ticks["n"] == settled, (
-                f"the toucher kept going on a dead lock "
-                f"({ticks['n'] - settled} more attempts)"
+            toucher.join(2.0)
+            assert not toucher.is_alive(), (
+                "the toucher kept going on a dead lock"
             )
 
     def test_creates_missing_parent(self, tmp_path):
@@ -524,6 +537,7 @@ class TestEveryArmOfTheLoopBacksOff:
             return real_mkdir(path, *a, **k)
 
         monkeypatch.setattr(claude_locks.os, "mkdir", counting)
+        _scripted_time(monkeypatch, 0.3)
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(lock, timeout=0.3):
                 pass
@@ -608,6 +622,7 @@ class TestEveryArmOfTheLoopBacksOff:
         monkeypatch.setattr(claude_locks.os, "mkdir", counting)
         monkeypatch.setattr(claude_locks.os, "stat",
                             _raising(real_stat, target, FileNotFoundError(errno.ENOENT, "swept")))
+        _scripted_time(monkeypatch, 0.3)
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.3):
                 pass
@@ -653,6 +668,7 @@ class TestEveryArmOfTheLoopBacksOff:
             raise PermissionError(errno.EACCES, "cannot remove it either")
 
         monkeypatch.setattr(claude_locks.os, "rmdir", refusing)
+        _scripted_time(monkeypatch, 0.3)
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.3, staleness=1.0):
                 pass
@@ -766,6 +782,10 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
         t = threading.Thread(target=hold, daemon=True)
         t.start()
         assert held.wait(5), "premise: the peer must hold the guard"
+        # THE PEER'S FLOCK IS REAL, THE WAITING IS NOT: `elapsed` below is
+        # scripted time, so the clamped and unclamped forms separate exactly
+        # instead of by a margin a loaded runner can eat.
+        _scripted_time(monkeypatch, budget)
         try:
             started = time.monotonic()
             with pytest.raises(ClaudeCodeLockTimeout):
@@ -914,26 +934,33 @@ def test_a_second_freeze_after_a_recovery_is_reported_again(
     episode, and `last_ok` moving is exactly what says so.
     """
     lock = tmp_path / "target.lock"
-    monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.002)
     failing = {"on": True}
+    recovered = {"n": 0}
     real_utime = os.utime
 
     def flaky(path, *a, **k):
-        if failing["on"] and os.fspath(path) == os.fspath(lock):
-            raise OSError(errno.EIO, "injected")
+        if os.fspath(path) == os.fspath(lock):
+            if failing["on"]:
+                raise OSError(errno.EIO, "injected")
+            recovered["n"] += 1
         return real_utime(path, *a, **k)
+
+    def said():
+        return [r.getMessage() for r in caplog.records if "stops advancing" in r.getMessage()]
 
     monkeypatch.setattr(claude_locks.os, "utime", flaky)
     with caplog.at_level(logging.WARNING, logger="claude-swap"):
-        with proper_lockfile(lock, timeout=2.0, staleness=0.05):
-            time.sleep(0.2)                       # episode one, outlives staleness
+        with proper_lockfile(lock, timeout=2.0, staleness=0.01):
+            _wait_until(lambda: len(said()) == 1)  # episode one, outlives staleness
             failing["on"] = False
-            time.sleep(0.1)                       # recovery: last_ok moves again
+            # recovery: last_ok moves again. TWO touches, because the first can
+            # be preempted before it clears `warned`; the second starts after.
+            _wait_until(lambda: recovered["n"] >= 2)
             failing["on"] = True
-            time.sleep(0.2)                       # episode two
-    said = [r.getMessage() for r in caplog.records if "stops advancing" in r.getMessage()]
-    assert len(said) == 2, (
-        f"{len(said)} warning(s) for two separate freezes — a freeze that "
+            _wait_until(lambda: len(said()) == 2)  # episode two
+    assert len(said()) == 2, (
+        f"{len(said())} warning(s) for two separate freezes — a freeze that "
         "recovered and returned is the one the takeover follows, and the "
         "latch swallowed it"
     )
@@ -987,7 +1014,9 @@ class TestTheStaleTakeoverDoesNotRemoveASuccessorsLock:
         peer = FileLock(guard, timeout=0.5)
         assert peer.acquire(), "premise: the peer must hold the guard first"
         try:
-            assert claude_locks._take_over_stale(lock_dir, staleness, budget=60.0) is False, (
+            # A small `budget`: a contended guard is waited on for the smaller
+            # of it and `_TAKEOVER_GUARD_S`, and the wait is all this costs.
+            assert claude_locks._take_over_stale(lock_dir, staleness, budget=0.05) is False, (
                 "DEFECT: a second waiter entered the decide-and-remove window "
                 "while a peer was inside it. Both then remove the corpse and "
                 "the loser's fresh lock goes with it, putting two processes "
@@ -1124,6 +1153,7 @@ class TestCcRefreshLockProtocol:
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         new = temp_home / ".claude" / ".oauth_refresh.lock"
         new.mkdir(parents=True)  # fresh mtime = live CC holding its refresh lock
+        _scripted_time(monkeypatch, 0.5)
         with pytest.raises(ClaudeCodeLockTimeout):
             with claude_credentials_lock(timeout=0.5):
                 pass
@@ -1137,6 +1167,7 @@ class TestCcRefreshLockProtocol:
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         legacy = temp_home / ".claude.lock"
         legacy.mkdir()  # fresh = held
+        _scripted_time(monkeypatch, 0.5)
         with pytest.raises(ClaudeCodeLockTimeout):
             with claude_credentials_lock(timeout=0.5):
                 pass
@@ -1151,6 +1182,7 @@ class TestCcRefreshLockProtocol:
         new.mkdir(parents=True)
         past = time.time() - 30
         os.utime(new, (past, past))
+        _scripted_time(monkeypatch, 0.5)
         with pytest.raises(ClaudeCodeLockTimeout):
             with claude_credentials_lock(timeout=0.5):
                 pass
@@ -1172,6 +1204,7 @@ class TestCcRefreshLockProtocol:
         legacy.mkdir()
         past = time.time() - 30
         os.utime(legacy, (past, past))
+        _scripted_time(monkeypatch, 0.5)
         with pytest.raises(ClaudeCodeLockTimeout):
             with claude_credentials_lock(timeout=0.5):
                 pass
