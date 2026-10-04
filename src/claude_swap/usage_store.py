@@ -1646,6 +1646,40 @@ class UsageStore:
 
         self._mutate(identities, plans.keys(), apply)
 
+    def pull_in_no_plan_plans(
+        self, identities: dict[str, Identity], interval: float
+    ) -> bool:
+        """Cut the given slots' day-long no-plan plan to ``interval``.
+
+        Decided on the LOCKED row, never on a caller's earlier read: a 403
+        landing since then has already planned ``now + interval`` and a
+        success has cleared the kind, and writing from a stale decision
+        would regress the one and overwrite the other. The plan becomes
+        that row's ``lastAttemptAt + interval`` (already due when past).
+        Writes only when a row moved; returns whether one did.
+        """
+        pulled = False
+        with self._lock():
+            rows = self._read_rows()
+            for num, identity in identities.items():
+                row = rows.get(num)
+                if not self._matches(row, identity):
+                    continue
+                assert isinstance(row, dict)
+                last = _num_or_none(row.get("lastAttemptAt"))
+                due = _num_or_none(row.get("nextPollAt"))
+                if (
+                    row.get("lastError") == NO_PLAN_ERROR
+                    and last is not None
+                    and due is not None
+                    and due > last + interval
+                ):
+                    row["nextPollAt"], row["pollIntervalS"] = last + interval, interval
+                    pulled = True
+            if pulled:
+                self._write_rows(rows)
+        return pulled
+
     def clear_dead_token(
         self,
         nums: Iterable[str],

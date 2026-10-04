@@ -931,27 +931,51 @@ class TestNoPlanSlot:
         assert entry.last_error == NO_PLAN_ERROR
         assert entry.next_poll_at == clock.now + interval
 
+    @pytest.mark.parametrize(
+        "disabled, interval",
+        [(True, NO_PLAN_POLL_INTERVAL_S), (False, NO_PLAN_ENABLED_POLL_INTERVAL_S)],
+    )
     def test_a_day_long_plan_is_pulled_in_only_for_an_enabled_slot(
-        self, store, clock
+        self, store, clock, disabled, interval
     ):
         store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
         attempt = clock.now
         clock.advance(BACKOFF_CAP_S + 1)
-        stub = SimpleNamespace(_usage_store=store, is_account_disabled=lambda n: True)
+        stub = SimpleNamespace(
+            _usage_store=store,
+            _get_sequence_data=lambda: {"accounts": {"1": {"disabled": disabled}}},
+            _disabled_from_data=ClaudeAccountSwitcher._disabled_from_data,
+        )
 
         def pull():
-            return ClaudeAccountSwitcher._pull_in_enabled_no_plan_plans(
-                stub, store.entries(IDENT), IDENT
-            )
+            return ClaudeAccountSwitcher._pull_in_enabled_no_plan_plans(stub, IDENT)
 
-        assert not pull()
-        assert store.entries(IDENT)["1"].next_poll_at == attempt + NO_PLAN_POLL_INTERVAL_S
-        stub.is_account_disabled = lambda n: False
-        assert pull()
+        assert pull() is not disabled
         entry = store.entries(IDENT)["1"]
-        assert entry.next_poll_at == attempt + NO_PLAN_ENABLED_POLL_INTERVAL_S
-        assert entry.poll_interval_s == NO_PLAN_ENABLED_POLL_INTERVAL_S
+        assert (entry.next_poll_at, entry.poll_interval_s) == (
+            attempt + interval,
+            interval,
+        )
         assert not pull()  # idempotent: a read pays only the compare
+
+    @pytest.mark.parametrize("landed", ["403", "success"])
+    def test_the_pull_in_decides_on_the_locked_row_not_an_earlier_read(
+        self, store, clock, landed
+    ):
+        # A record landing after the caller's read: the 403 already planned
+        # now+interval (L_old+interval is past), the success cleared the kind.
+        # Neither may be overwritten by a plan from the old attempt.
+        step = NO_PLAN_ENABLED_POLL_INTERVAL_S
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        clock.advance(BACKOFF_CAP_S + 1)
+        if landed == "403":
+            plans = {"1": (clock.now + step, step)}
+            store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT, plans=plans)
+        else:
+            store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        before = store.entries(IDENT)["1"]
+        assert not store.pull_in_no_plan_plans(IDENT, step)
+        assert store.entries(IDENT)["1"] == before
 
     def test_the_first_success_is_planned_inside_the_candidate_ceiling(
         self, store, clock

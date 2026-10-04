@@ -2287,6 +2287,12 @@ class TestAdaptiveScheduler:
         errors = {"2": poll_policy.NO_PLAN_ERROR}
         counts: dict[str, int] = {}
         step = poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
+        store = h.switcher._usage_store
+        before = store.path.read_bytes()
+        h.switcher._collect_usage_entries(
+            h.switcher._build_accounts_info(), fetch=set(), read_only=True
+        )
+        assert store.path.read_bytes() == before  # a read-only collect writes nothing
         for advance, expected in ((step + 1, 1), (step / 2, 1), (step / 2, 2)):
             h.clock.advance(advance)
             self._tick(h, counts, usage, errors)

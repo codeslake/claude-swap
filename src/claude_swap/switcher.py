@@ -6819,30 +6819,23 @@ class ClaudeAccountSwitcher:
                 executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
             )
 
-    def _pull_in_enabled_no_plan_plans(
-        self, entries: dict[str, UsageEntry], identities: dict[str, tuple]
-    ) -> bool:
+    def _pull_in_enabled_no_plan_plans(self, identities: dict[str, tuple]) -> bool:
         """Cut an enabled no-plan slot's day-long plan to the enabled cadence.
 
         The day was written while the slot was disabled or before the enabled
-        cadence existed, and an enabled slot must not wait it out: its plan
-        becomes ``lastAttemptAt + NO_PLAN_ENABLED_POLL_INTERVAL_S`` (already
-        due when that is past). Idempotent, so a read pays only the compare.
+        cadence existed, and an enabled slot must not wait it out. The store
+        decides which rows qualify, on the locked row; this passes only the
+        enabled slots (one roster read) and the interval. Idempotent.
         """
-        interval = poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
-        pulled = {
-            num: (entry.last_attempt_at + interval, interval)
-            for num, entry in entries.items()
-            if entry.last_error == poll_policy.NO_PLAN_ERROR
-            and entry.last_attempt_at is not None
-            and entry.next_poll_at is not None
-            and entry.next_poll_at > entry.last_attempt_at + interval
-            and not self.is_account_disabled(num)
+        roster = self._get_sequence_data() or {}
+        enabled = {
+            num: ident
+            for num, ident in identities.items()
+            if not self._disabled_from_data(roster, num)
         }
-        self._usage_store.set_poll_plan(
-            pulled, {num: identities[num] for num in pulled}
+        return self._usage_store.pull_in_no_plan_plans(
+            enabled, poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
         )
-        return bool(pulled)
 
     def _collect_usage_entries(
         self,
@@ -6893,7 +6886,7 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities, models)
-        if not read_only and self._pull_in_enabled_no_plan_plans(entries, identities):
+        if not read_only and self._pull_in_enabled_no_plan_plans(identities):
             entries = store.entries(identities, models)
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
