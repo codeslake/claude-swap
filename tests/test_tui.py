@@ -1043,7 +1043,7 @@ class TestMiniAccountText:
             last_good={"five_hour": {"pct": 0.0}}, fetched_at=now, age_s=0.0,
         )
         acc = make_account(1, entry=entry)
-        assert "5h(⟳5h00m):0%" in mini_account_text(acc, now).plain
+        assert "5h(⟳5h00m):  0%" in mini_account_text(acc, now).plain  # 0%: right-aligned, width 3
 
     def test_a_live_5h_window_with_no_reported_reset_keeps_unknown_marker_on_the_dashboard(
         self,
@@ -1059,7 +1059,7 @@ class TestMiniAccountText:
             last_good={"five_hour": {"pct": 42.0}}, fetched_at=now, age_s=0.0,
         )
         acc = make_account(1, entry=entry)
-        assert "5h(⟳?):42%" in mini_account_text(acc, now).plain
+        assert "5h(⟳?): 42%" in mini_account_text(acc, now).plain  # no reset: right-aligned, width 3
 
     def test_dashboard_chip_reads_refetching_not_stale_reset_now(self):
         """Same PR #325 defect, third surface: the dashboard's inactive-row
@@ -1180,7 +1180,7 @@ class TestMiniAccountText:
             f"a scoped-only account below its cap still reads as unknown: {out!r}"
         )
         assert "Fable" in out and "99%" in out, out
-        pct_span = next(s for s in text.spans if out[s.start : s.end] == "99%")
+        pct_span = next(s for s in text.spans if out[s.start : s.end] == " 99%")  # the span carries the pad (width 3)
         assert ("dim" in str(pct_span.style)) == expect_dim, (
             f"age_s={age_s}: expected dim={expect_dim}, style={pct_span.style!r}"
         )
@@ -1205,7 +1205,8 @@ class TestMiniAccountText:
         assert "95%" in out, (
             f"a 95%-spent budget vanished behind a healthy window: {out!r}"
         )
-        assert "10% \u00b7 $$" in out, (
+        # two cells of a fixed-column row (the gap is blank), never run together
+        assert "10%  $$ 95%" in out, (
             f"the window and the spend row ran together: {out!r}"
         )
 
@@ -1219,7 +1220,7 @@ class TestMiniAccountText:
         acc = make_account(
             1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         )
-        assert "5h(⟳1h00m):42%" in mini_account_text(acc, now).plain
+        assert "5h(⟳1h00m): 42%" in mini_account_text(acc, now).plain  # below 100: right-aligned, width 3
 
     def test_scoped_window_below_100_shows_its_pct_alongside_5h_7d(self):
         """PROBE: the scoped loop only fires at/over 100 (`maxed`), so once a
@@ -1335,7 +1336,8 @@ class TestDashboard:
             tmp_path,
         )
         app = make_app(fake)
-        async with app.run_test(size=(100, 32)) as pilot:
+        # wide enough for the mini row with its right-aligned pct and `(disabled)`
+        async with app.run_test(size=(110, 32)) as pilot:
             await settle(pilot)
             from claude_swap.tui.widgets import AccountsPanel
 
@@ -1381,11 +1383,11 @@ class TestDashboard:
 
             panel = app.screen.query_one(AccountsPanel).render().plain
             mini_part = panel.split("user2@example.com", 1)[1]
-            # The window reads as one chip now — "5h(⟳1h59m):92%" — built by
+            # The window reads as one chip now — "5h(⟳1h59m): 92%" — built by
             # the same helper the auto view uses. Assert the parts that carry
             # the meaning (which window, what pct), not the spacing between
             # them, so the two surfaces can keep sharing one format.
-            assert "5h(" in mini_part and ":92%" in mini_part
+            assert "5h(" in mini_part and "92%" in mini_part
             assert "7d" not in mini_part
 
     async def test_compact_rows_share_fixed_columns(self, tmp_path, monkeypatch):

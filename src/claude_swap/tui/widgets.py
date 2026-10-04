@@ -360,7 +360,8 @@ class MiniWidths(NamedTuple):
     tag: int
     cells: dict[str, int]  # window label -> cell width, in display order
     note: int  # widest sentinel / "usage unknown" note shown, capped
-    marker: int  # widest "(ahead) (disabled)" marker field shown
+    marker: int  # widest marker field shown, whichever kinds the rows carry
+    chip: dict[str, int]  # window label -> widest chip label, so its pct starts at one column
 
 
 def _fit(text: Text, width: int) -> Text:
@@ -384,9 +385,18 @@ def _mini_tag(acc: AccountSnapshot, palette: Palette) -> Text:
     return Text.assemble("[", tag, "]", style=palette.muted)
 
 
-def _mini_marks(acc: AccountSnapshot, ahead: bool, palette: Palette) -> Text:
-    """The row's one trailing marker field: ``(ahead)`` then ``(disabled)``."""
+def _mini_marks(
+    acc: AccountSnapshot, ahead: bool, cloud_pinned: bool, palette: Palette
+) -> Text:
+    """The row's one trailing marker field: ``(ahead)``, ``○ cloud``,
+    ``(not applying)``, ``(disabled)``, whichever apply, in that order."""
     marks = [Text("(ahead)", style=palette.sev_warn)] if ahead else []
+    if cloud_pinned:
+        # Labelled, like the full card: a bare glyph sitting between the
+        # org tag and the usage figures read as decoration, not as a state.
+        marks.append(Text("○ cloud", style=f"bold {palette.sev_warn}"))
+        if pin_is_broken(acc):
+            marks.append(Text("(not applying)", style=f"bold {palette.sev_crit}"))
     if acc.disabled:
         marks.append(Text("(disabled)", style=palette.muted))
     return Text(" ").join(marks)
