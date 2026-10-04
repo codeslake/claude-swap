@@ -2291,6 +2291,35 @@ class TestAdaptiveScheduler:
         assert self._tick(h, counts, usage) is TickOutcome.BLOCKED
         assert counts["2"] == 1
 
+    def test_all_exhausted_escalation_skips_a_no_plan_slot(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        usage = {"1": _usage(100), "3": _usage(100)}
+        errors = {"2": poll_policy.NO_PLAN_ERROR}
+        counts: dict[str, int] = {}
+        assert self._tick(h, counts, usage, errors) is TickOutcome.BLOCKED
+        assert counts == {"1": 1, "2": 1, "3": 1}
+
+        # Its backoff has lapsed and every account is exhausted again: the
+        # escalation must not spend a fetch on the slot that has no plan.
+        h.clock.advance(NO_RESET_FALLBACK_S)
+        assert self._tick(h, counts, usage, errors) is TickOutcome.BLOCKED
+        assert counts["2"] == 1
+
+    def test_all_exhausted_escalation_leaves_a_row_planned_at_the_exhausted_interval(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        usage = {num: _usage(100) for num in ("1", "2", "3")}
+        counts: dict[str, int] = {}
+        assert self._tick(h, counts, usage) is TickOutcome.BLOCKED
+
+        # Stale (past the serve TTL) but not yet due on its own 600 s plan.
+        h.clock.advance(NO_RESET_FALLBACK_S)
+        assert self._tick(h, counts, usage) is TickOutcome.BLOCKED
+        assert counts == {"1": 1, "2": 1, "3": 1}
+
     def test_exhausted_candidate_keeps_a_bounded_poll_plan(
         self, temp_home, monkeypatch
     ):

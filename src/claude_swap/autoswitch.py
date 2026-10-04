@@ -5244,8 +5244,9 @@ class AutoSwitchEngine:
             escalation_fetch = {current, *candidates}
             # Escalation may beat ordinary candidate plans to obtain a fresh
             # switch decision, but a decision-trusted exhausted row cannot be
-            # a target. Preserve any wider post-429 plan instead of refetching
-            # that token at the bounded all-exhausted wake cadence.
+            # a target. Preserve any plan at or beyond the all-exhausted wake
+            # cadence (plan_after_fetch plans an exhausted row at exactly
+            # that) instead of refetching that token.
             for num in tuple(escalation_fetch):
                 entry = entries.get(num)
                 value = usage.get(num)
@@ -5257,7 +5258,7 @@ class AutoSwitchEngine:
                     and entry.next_poll_at is not None
                     and now < entry.next_poll_at
                     and (entry.poll_interval_s or 0.0)
-                    > poll_policy.EXHAUSTED_INTERVAL_S
+                    >= poll_policy.EXHAUSTED_INTERVAL_S
                     and planned_headroom is not None
                     and planned_headroom <= 0
                 ):

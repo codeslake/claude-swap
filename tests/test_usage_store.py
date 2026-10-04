@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
+from types import SimpleNamespace
 
 import pytest
 
 from claude_swap import oauth, usage_store
 from claude_swap.poll_policy import (
     CANDIDATE_MAX_INTERVAL_S,
+    NO_PLAN_ERROR,
+    NO_PLAN_POLL_INTERVAL_S,
     POST_429_MIN_INTERVAL_S,
     POST_SWITCH_REPLAN_DEFER_S,
 )
@@ -27,6 +30,7 @@ from claude_swap.usage_store import (
     due_candidate,
     with_sentinel,
 )
+from claude_swap.switcher import ClaudeAccountSwitcher
 
 IDENT = {"1": ("a@x.com", ""), "2": ("b@x.com", "org-2")}
 USAGE = {"five_hour": {"pct": 25.0}, "seven_day": {"pct": 10.0}}
@@ -901,6 +905,76 @@ class TestPollPlan:
         entry = store.entries(IDENT)["1"]
         assert entry.next_poll_at is None
         assert entry.poll_interval_s is None
+
+
+class TestNoPlanSlot:
+    """A slot whose usage answers "not allowed for this organization" has no
+    plan to read: the kind sticks through later failures, and the row is
+    planned a day out instead of every backoff."""
+
+    def test_the_kind_survives_later_failures_and_a_success_clears_it(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        for n, error in enumerate(("http-429", "timeout", "http-503"), start=2):
+            clock.advance(BACKOFF_CAP_S + 1)
+            store.record({"1": FetchRecord(error=error)}, IDENT)
+            entry = store.entries(IDENT)["1"]
+            assert entry.last_error == NO_PLAN_ERROR
+            assert entry.consecutive_failures == n
+            assert entry.backoff_until > clock.now  # the backoff still re-arms
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.entries(IDENT)["1"].last_error is None
+
+    def test_the_row_is_planned_a_day_out_from_its_latest_failure(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        clock.advance(BACKOFF_CAP_S + 1)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        entry = store.entries(IDENT)["1"]
+        assert entry.next_poll_at == clock.now + NO_PLAN_POLL_INTERVAL_S
+        assert entry.poll_interval_s == NO_PLAN_POLL_INTERVAL_S
+        # Past the 429's backoff, the plan is what holds the row, in the
+        # scheduler's escalating mode too.
+        clock.advance(entry.backoff_until - clock.now + 1)
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+        clock.advance(NO_PLAN_POLL_INTERVAL_S)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_the_first_success_is_planned_inside_the_candidate_ceiling(
+        self, store, clock
+    ):
+        # A renewed slot whose usage moved must not halve the day-long
+        # interval (12 h): the plan after its first success starts from the
+        # candidate default, not from the no-plan one.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        pre = store.entries(IDENT)
+        assert pre["1"].poll_interval_s == NO_PLAN_POLL_INTERVAL_S
+        moved = {"five_hour": {"pct": 40.0}, "seven_day": {"pct": 10.0}}
+        stub = SimpleNamespace(
+            _usage_store=store, _poll_policy_inputs=lambda: (90.0, ())
+        )
+        plans = ClaudeAccountSwitcher._plans_after_fetch(
+            stub,
+            {"1": FetchRecord(usage=moved)},
+            pre,
+            {"1": (None, None, None, None, False)},
+        )
+        next_poll_at, interval = plans["1"]
+        assert interval <= CANDIDATE_MAX_INTERVAL_S
+        assert next_poll_at <= clock.now + CANDIDATE_MAX_INTERVAL_S
+
+    def test_a_new_login_drops_the_day_long_plan(self, store, clock):
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        clock.advance(BACKOFF_CAP_S + 1)
+        store.clear_dead_token(["1"], IDENT)
+        assert store.entries(IDENT)["1"].next_poll_at is None
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
 
 
 class TestDueCandidate:

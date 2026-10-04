@@ -46,6 +46,8 @@ from claude_swap.poll_policy import (
     EDGE_BACKOFF_S,
     EXHAUSTED_INTERVAL_S,
     JITTER_FRAC,
+    NO_PLAN_ERROR,
+    NO_PLAN_POLL_INTERVAL_S,
     POST_429_MIN_INTERVAL_S,
     RECENT_429_WINDOW_S,
     RESET_SLACK_S,
@@ -1389,7 +1391,14 @@ class UsageStore:
             else:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
-                row["lastError"] = rec.error
+                # A no-plan slot keeps its kind through a later 429/timeout:
+                # only a success clears it. Its plan (below) is a day out, so
+                # the backoff is not what paces it.
+                if row.get("lastError") != NO_PLAN_ERROR:
+                    row["lastError"] = rec.error
+                if row["lastError"] == NO_PLAN_ERROR:
+                    row["nextPollAt"] = now + NO_PLAN_POLL_INTERVAL_S
+                    row["pollIntervalS"] = NO_PLAN_POLL_INTERVAL_S
                 if rec.error == "http-429":
                     # Kept across later successes: the poll planner floors the
                     # cadence while a 429 is recent (see UsageEntry.last_429_at).
@@ -1787,6 +1796,9 @@ class UsageStore:
                 # them re-opens a token still inside its own block. The
                 # unconditional copy of these three lines that the merge left
                 # below this guard defeated it entirely.
+                if row.get("lastError") == NO_PLAN_ERROR:
+                    # A new login may carry a plan: drop the day-long one.
+                    row["nextPollAt"] = row["pollIntervalS"] = None
                 row["consecutiveFailures"] = 0
                 row["lastError"] = None
                 row["backoffUntil"] = None
@@ -1846,6 +1858,12 @@ def _row_eligible(
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))
     poll_due = next_poll_at is not None and now >= next_poll_at
+    if (
+        row.get("lastError") == NO_PLAN_ERROR
+        and next_poll_at is not None
+        and not poll_due
+    ):
+        return False  # its day-long plan binds in every mode, escalation included
     overslept = repair_overslept and _plan_oversleeps_interval(
         next_poll_at,
         _num_or_none(row.get("pollIntervalS")),
