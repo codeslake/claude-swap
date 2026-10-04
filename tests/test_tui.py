@@ -2526,6 +2526,86 @@ class TestUnswitchableRowsAreListed:
         assert seven_d[0] == seven_d[1], f"7d chip not aligned: {seven_d} in {lines!r}"
         assert fable[0] == fable[1], f"Fable chip not aligned: {fable} in {lines!r}"
 
+    def test_each_windows_percent_ends_in_one_column_across_rows(self):
+        """`7d(⟳6d20h):100%` against `7d:94%` used to push the percent out of
+        its column, and a row without a Fable window reserved nothing for it.
+        Each window is one column: its label text left-aligned to the widest
+        label, its pct right-aligned to the widest pct, so the `%` of a given
+        window ends in the same string column on every row, whatever the
+        other windows carry."""
+        import re
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=99.0)
+        now = datetime.now(timezone.utc)
+
+        def at(**kw):
+            return (now + timedelta(**kw)).isoformat()
+
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 45.0, "resets_at": at(hours=4, minutes=9)},
+                "seven_day": {"pct": 100.0, "resets_at": at(days=6, hours=20, minutes=5)},
+                "scoped": [{"name": "Fable", "pct": 8.0, "resets_at": at(days=6, minutes=5)}],
+            }),
+            # No reset text, short pcts, and no Fable window at all.
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 94.0},
+            }),
+            # No 5h window: its blank cell leads the row, with no stray separator.
+            self._acct("4", "cccc@x.com", switchable=True, last_good={
+                "seven_day": {"pct": 7.0},
+                "scoped": [{"name": "Fable", "pct": 61.0}],
+            }),
+        ), active="9", settings=settings)
+        rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom
+        assert len(rows) == 3, rows
+        assert re.search(r"cccc@x\.com\s+7d:", rows["cccc@x.com"]), rows  # no leading dot
+        assert "7d(⟳" in rows["aaaa@x.com"] and "7d:" in rows["bbbb@x.com"], rows  # widths differ
+        for window in ("5h", "7d", "Fable"):
+            ends = {
+                m.end()
+                for line in rows.values()
+                if (m := re.search(re.escape(window) + r"(?:\(⟳\w+\))?:\s*\d+%", line))
+            }
+            assert len(ends) == 1, f"{window} percent not in one column: {ends} in {rows!r}"
+
+    def test_markers_start_in_one_column_and_a_bare_row_has_no_trailing_pad(self):
+        """The `-only` / `full` marker follows the chips, so it started
+        wherever the last chip happened to end. It must start at ONE column
+        on every row that has one, including a row that lacks the trailing
+        window (no Fable chip, so its block is shorter), and a row with no
+        marker must not carry the padding that only exists to line a marker
+        up."""
+        import re
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=90.0)
+        now = datetime.now(timezone.utc)
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0,
+                              "resets_at": (now + timedelta(hours=4, minutes=9)).isoformat()},
+                "seven_day": {"pct": 5.0}, "scoped": [{"name": "Fable", "pct": 95.0}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 5.0},
+            }),
+            self._acct("4", "cccc@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 1.0}, "seven_day": {"pct": 1.0},
+                "scoped": [{"name": "Fable", "pct": 2.0}],
+            }),
+        ), active="9", settings=settings)
+        rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom
+        assert len(rows) == 3, rows
+        starts = {
+            e: m.start(1) if (m := re.search(r"\s{2}(\S+-only|\S+ full)$", line)) else None
+            for e, line in rows.items()
+        }
+        assert starts["aaaa@x.com"] is not None, rows
+        assert starts["aaaa@x.com"] == starts["bbbb@x.com"], f"{starts} in {rows!r}"
+        assert starts["cccc@x.com"] is None and rows["cccc@x.com"] == rows["cccc@x.com"].rstrip(), rows
+
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach
         the panel, not just `model` — the decision log already appends

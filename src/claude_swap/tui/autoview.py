@@ -429,13 +429,19 @@ class AutoScreen(Screen):
             ):
                 continue
             row_windows[acc.number] = oauth.relevant_windows(acc.usage.last_good, models)
-        chip_width: dict[str, int] = {}
+        # The column set is the union of window names over every chip row, in
+        # first-seen order; a row without a window gets a blank cell, so no
+        # later column moves. (label text, pct text) widths per column.
+        chip_width: dict[str, tuple[int, int]] = {}
         for windows in row_windows.values():
             for label, wpct, resets_at in windows:
-                width = len(
-                    data.chip_label(label, data.reset_text({"resets_at": resets_at}, now))
-                ) + len(f"{wpct:.0f}%")
-                chip_width[label] = max(chip_width.get(label, 0), width)
+                label_w, pct_w = chip_width.get(label, (0, 0))
+                chip_width[label] = (
+                    max(label_w, len(data.chip_label(
+                        label, data.reset_text({"resets_at": resets_at}, now)
+                    ))),
+                    max(pct_w, len(f"{wpct:.0f}%")),
+                )
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -503,21 +509,27 @@ class AutoScreen(Screen):
                 # chips and the label can never disagree on which windows
                 # exist for this account.
                 windows = row_windows[acc.number]
-                for i, (label, wpct, resets_at) in enumerate(windows):
-                    entry.append("  " if i == 0 else " · ", style=palette.muted)
+                have = {label: (wpct, resets_at) for label, wpct, resets_at in windows}
+                shown = False
+                for i, (label, (label_w, pct_w)) in enumerate(
+                    chip_width.items() if windows else ()
+                ):
+                    sep = "  " if i == 0 else " · " if shown else "   "
+                    if label not in have:
+                        entry.append(" " * (len(sep) + label_w + pct_w))
+                        continue
+                    wpct, resets_at = have[label]
                     label_text = data.chip_label(
                         label, data.reset_text({"resets_at": resets_at}, now)
                     )
-                    entry.append(label_text, style=palette.muted)
                     pct_text = f"{wpct:.0f}%"
+                    entry.append(sep, style=palette.muted)
+                    entry.append(
+                        label_text.ljust(label_w) + " " * (pct_w - len(pct_text)),
+                        style=palette.muted,
+                    )
                     entry.append(pct_text, style=palette.severity(wpct))
-                    # Never on the LAST chip: nothing after it needs
-                    # aligning, and padding it would leave trailing
-                    # whitespace before end of line, the `-only`/`full`
-                    # suffix or the pin badge.
-                    if i < len(windows) - 1:
-                        pad = chip_width[label] - len(label_text) - len(pct_text)
-                        entry.append(" " * pad, style=palette.muted)
+                    shown = True
                 if not windows:  # no window data at all — keep the old reading
                     entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
@@ -529,14 +541,17 @@ class AutoScreen(Screen):
                 # row is not simply "open" on the criteria the user actually
                 # configured, independent of whether `rank_models` below has
                 # dropped to the retry's axis for ORDERING purposes.
+                kind, blocked_model = "open", None
                 if self._settings:
                     kind, blocked_model = classify_candidate_block(
                         ((label, p) for label, p, _ in windows), self._settings.threshold
                     )
-                    if kind == "model":
-                        entry.append(f"  {blocked_model}-only", style=palette.muted)
-                    elif kind == "full":
-                        entry.append(f"  {blocked_model} full", style=palette.muted)
+                if kind == "model":
+                    entry.append(f"  {blocked_model}-only", style=palette.muted)
+                elif kind == "full":
+                    entry.append(f"  {blocked_model} full", style=palette.muted)
+                else:
+                    entry.rstrip()  # the block's blank cells only align a marker
                 rank_pct = binding_pct(acc.usage.last_good, rank_models)
                 key = (
                     consume_first_rank_key(
