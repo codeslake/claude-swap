@@ -12,6 +12,7 @@ import random
 import subprocess
 import sys
 import tarfile
+import re
 import threading
 import time
 from dataclasses import replace
@@ -16580,7 +16581,10 @@ class TestDecisionLog:
         demoted._emit(NoSwitchEvent(reason="demoted", detail=""))
         h.engine.stop()
         h.engine._emit(NoSwitchEvent(reason="stopped", detail=""))
-        assert not log.exists(), "only the LIVE holder writes"
+        written = log.read_text().splitlines()
+        assert len(written) == 1 and "auto off:" in written[0], (
+            "only the LIVE holder writes, and its stop is its last line"
+        )
 
         demoted.demoted_from_live = True
         demoted._retry_live_promotion()
@@ -16588,6 +16592,38 @@ class TestDecisionLog:
         demoted._emit(NoSwitchEvent(reason="promoted", detail=""))
 
         assert "promoted" in log.read_text()
+
+    @pytest.mark.parametrize(
+        "decision_log, dry_run, in_flight, want",
+        [
+            (True, False, False, 1),
+            # A stop landing mid-switch defers its release and a second one
+            # finishes it: the re-entry sees `dry_run` already True.
+            (True, False, True, 1),
+            (False, False, False, 0),
+            (True, True, False, 0),
+        ],
+    )
+    def test_stopping_a_LIVE_engine_writes_one_auto_off_line(
+        self, temp_home, decision_log, dry_run, in_flight, want
+    ):
+        h = EngineHarness(temp_home, decision_log=decision_log)
+        engine = h._make_engine(dry_run=True) if dry_run else h.engine
+        if in_flight:
+            engine._tick_thread_id = threading.get_ident()
+            engine._switch_in_flight = True
+
+        engine.stop("view closed")
+        engine._switch_in_flight = False
+        engine.stop("again")
+
+        log = h.switcher.backup_dir / "autoswitch-decisions.log"
+        lines = log.read_text().splitlines() if log.exists() else []
+        assert len(lines) == want, lines
+        if want:
+            assert re.fullmatch(
+                r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ auto off: view closed", lines[0]
+            ), lines[0]
 
 
 class TestABrokenPipeEndsTheLoopInsteadOfOrphaningIt:

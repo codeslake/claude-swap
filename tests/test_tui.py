@@ -2597,8 +2597,8 @@ class _FakeEngine:
         self._stop.wait(30)
         return 0
 
-    def stop(self) -> None:
-        self.stopped = True
+    def stop(self, reason: str = "stopped") -> None:
+        self.stopped = reason
         self._stop.set()
 
     def apply_threshold(self, threshold: float) -> None:
@@ -2671,7 +2671,7 @@ class _ContendedFakeEngine:
                 )
         return 0
 
-    def stop(self) -> None:
+    def stop(self, reason: str = "stopped") -> None:
         self.stopped = True
         self._stop.set()
 
@@ -2784,7 +2784,7 @@ class TestAutoScreen:
             await pilot.press("y")
             await settle(pilot)
             assert len(fake_engine.instances) == 2
-            assert fake_engine.instances[0].stopped is True
+            assert fake_engine.instances[0].stopped == "switched to LIVE"
             assert fake_engine.instances[1].dry_run is False
 
     async def test_back_stops_engine_and_restores_fetching(
@@ -2801,7 +2801,7 @@ class TestAutoScreen:
             from claude_swap.tui.dashboard import DashboardScreen
 
             assert isinstance(app.screen, DashboardScreen)
-            assert fake_engine.instances[0].stopped is True
+            assert fake_engine.instances[0].stopped == "view closed"
             assert app._store_only is False
 
     async def test_threshold_adjust_is_session_only(self, tmp_path, fake_engine):

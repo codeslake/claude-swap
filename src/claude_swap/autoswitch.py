@@ -5708,10 +5708,13 @@ class AutoSwitchEngine:
 
     # -- loop -------------------------------------------------------------------
 
-    def stop(self) -> None:
+    def stop(self, reason: str = "stopped") -> None:
         """Ask ``run_loop`` to exit; wakes it from any sleep. Safe to call
         before the loop starts — the stop is never cleared, so the loop
         exits immediately (engines are single-use).
+
+        A LIVE engine's stop writes one ``<ts> auto off: <reason>`` decision-log
+        line; ``reason`` is a short caller label, never account text.
 
         Releases the LIVE lock here, not in ``run_loop``: the TUI's dry-run /
         LIVE toggle stops one engine and constructs the next in the same call,
@@ -5748,6 +5751,16 @@ class AutoSwitchEngine:
             if self._live_lock is None:
                 return          # already released; idempotent and reentrant
             lock, self._live_lock = self._live_lock, None
+            # Once: `dry_run` is the gate and flips just below, so a deferred
+            # release re-enters with it True. Not via `_emit`/`on_event` (see
+            # the stuck-tick warning below); a failed write never strands the lock.
+            if self.settings.decision_log and not self.dry_run:
+                try:
+                    if self._decisions is None:
+                        self._decisions = decision_logger(self.switcher.backup_dir)
+                    self._decisions.info("%s auto off: %s", _now_iso(), reason)
+                except Exception as exc:  # noqa: BLE001 — the lock comes first
+                    _logger.warning(f"auto-off decision line not written: {exc}")
             # A STOPPED ENGINE IS NOT LIVE. `autoview` renders the badge from
             # `not engine.dry_run`, so leaving it False makes a dead engine
             # read " LIVE " — normally masked by `_restart_engine` replacing

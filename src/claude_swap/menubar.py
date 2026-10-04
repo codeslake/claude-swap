@@ -787,15 +787,15 @@ def run(switcher) -> int:
             except Exception:
                 self.switcher._logger.debug("auto-switch engine crashed", exc_info=True)
 
-        def _stop_engine(self):
+        def _stop_engine(self, reason):
             if self._engine is not None:
-                self._engine.stop()
+                self._engine.stop(reason)
                 self._engine = None
 
         def _restart_engine(self):
             """Apply changed core settings by restarting the running engine."""
             if self._engine is not None:
-                self._stop_engine()
+                self._stop_engine("restart")
                 self._start_engine()
 
         def _on_engine_event(self, event):
@@ -1109,7 +1109,7 @@ def run(switcher) -> int:
             self.refresh_async(full=True)  # explicit user refresh → full pass
 
         def on_quit(self, _sender):
-            self._stop_engine()
+            self._stop_engine("quit")
             rumps.quit_application()
 
         def on_toggle_name(self, _sender):
@@ -1144,7 +1144,7 @@ def run(switcher) -> int:
             if self.settings.auto_switch_enabled:
                 self._start_engine()
             else:
-                self._stop_engine()
+                self._stop_engine("turned off")
             self.rebuild_menu()
 
         def _make_threshold(self, pct):
