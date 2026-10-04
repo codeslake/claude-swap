@@ -497,7 +497,9 @@ class TestProperLockfile:
         # read as a frozen `last_ok` on correct code.
         wall = [0.0]
         monkeypatch.setattr(claude_locks, "time", SimpleNamespace(
-            time=lambda: wall[0], monotonic=time.monotonic, sleep=time.sleep))
+            time=lambda: wall[0], monotonic=time.monotonic, sleep=time.sleep,
+            # the heartbeat stamps with `time_ns` (#287): the same scripted wall
+            time_ns=lambda: int(wall[0] * 1e9)))
         real = os.utime
         state = {"n": 0, "hiccuped": False}
 
