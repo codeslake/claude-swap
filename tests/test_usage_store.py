@@ -9,8 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from claude_swap import oauth, usage_store
+from claude_swap.exceptions import ConfigError
 from claude_swap.poll_policy import (
     CANDIDATE_MAX_INTERVAL_S,
+    NO_PLAN_ENABLED_POLL_INTERVAL_S,
     NO_PLAN_ERROR,
     NO_PLAN_POLL_INTERVAL_S,
     POST_429_MIN_INTERVAL_S,
@@ -944,6 +946,110 @@ class TestNoPlanSlot:
         assert store.reserve(["1"], IDENT, respect_plans=False) == {}
         clock.advance(NO_PLAN_POLL_INTERVAL_S)
         assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    @pytest.mark.parametrize(
+        "disabled, interval",
+        [(True, NO_PLAN_POLL_INTERVAL_S), (False, NO_PLAN_ENABLED_POLL_INTERVAL_S)],
+    )
+    def test_the_row_is_planned_at_the_cadence_its_slot_is_owed(
+        self, store, clock, disabled, interval
+    ):
+        # An enabled slot is re-asked on the enabled cadence, a disabled one
+        # keeps the day. The plan, not the 403's backoff (<= BACKOFF_CAP_S
+        # < interval), is what holds the row in every fetch mode.
+        stub = SimpleNamespace(
+            _usage_store=store,
+            _poll_policy_inputs=lambda: (90.0, ()),
+            is_account_disabled=lambda num: disabled,
+        )
+
+        def commit(error, claims=None, **kw):
+            records = {"1": FetchRecord(error=error, **kw)}
+            plans = ClaudeAccountSwitcher._plans_after_fetch(
+                stub, records, store.entries(IDENT), {"1": (None,) * 4 + (False,)}
+            )
+            store.record(records, IDENT, claims, plans)
+
+        commit(NO_PLAN_ERROR)
+        clock.advance(BACKOFF_CAP_S + 1)
+        commit(NO_PLAN_ERROR)
+        entry = store.entries(IDENT)["1"]
+        assert entry.next_poll_at == clock.now + interval
+        assert entry.poll_interval_s == interval
+        clock.advance(entry.backoff_until - clock.now + 1)
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+        clock.advance(interval)
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        assert set(claims) == {"1"}
+        # A later 429 keeps the kind, so it keeps the plan too.
+        commit("http-429", claims, retry_after_s=60.0)
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_error == NO_PLAN_ERROR
+        assert entry.next_poll_at == clock.now + interval
+
+    @pytest.mark.parametrize(
+        "disabled, interval",
+        [(True, NO_PLAN_POLL_INTERVAL_S), (False, NO_PLAN_ENABLED_POLL_INTERVAL_S)],
+    )
+    def test_a_day_long_plan_is_pulled_in_only_for_an_enabled_slot(
+        self, store, clock, disabled, interval
+    ):
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        attempt = clock.now
+        clock.advance(BACKOFF_CAP_S + 1)
+        stub = SimpleNamespace(
+            _usage_store=store,
+            _get_sequence_data=lambda: {"accounts": {"1": {"disabled": disabled}}},
+            _disabled_from_data=ClaudeAccountSwitcher._disabled_from_data,
+        )
+
+        def pull():
+            return ClaudeAccountSwitcher._pull_in_enabled_no_plan_plans(
+                stub, IDENT, store.entries(IDENT)
+            )
+
+        assert pull() is not disabled
+        entry = store.entries(IDENT)["1"]
+        assert (entry.next_poll_at, entry.poll_interval_s) == (
+            attempt + interval,
+            interval,
+        )
+        assert not pull()  # idempotent: a read pays only the compare
+
+    def test_a_torn_roster_skips_the_pull_in_instead_of_raising(self, store, clock):
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        before = store.entries(IDENT)["1"]
+
+        def torn():
+            raise ConfigError("sequence.json is unreadable")
+
+        stub = SimpleNamespace(
+            _usage_store=store, _get_sequence_data=torn, _logger=logging.getLogger("t")
+        )
+        assert not ClaudeAccountSwitcher._pull_in_enabled_no_plan_plans(
+            stub, IDENT, store.entries(IDENT)
+        )
+        assert store.entries(IDENT)["1"] == before
+
+    @pytest.mark.parametrize("landed", ["403", "success"])
+    def test_the_pull_in_decides_on_the_locked_row_not_an_earlier_read(
+        self, store, clock, landed
+    ):
+        # A record landing after the caller's read: the 403 already planned
+        # now+interval (L_old+interval is past), the success cleared the kind.
+        # Neither may be overwritten by a plan from the old attempt.
+        step = NO_PLAN_ENABLED_POLL_INTERVAL_S
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        clock.advance(BACKOFF_CAP_S + 1)
+        if landed == "403":
+            plans = {"1": (clock.now + step, step)}
+            store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT, plans=plans)
+        else:
+            store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        before = store.entries(IDENT)["1"]
+        assert not store.pull_in_no_plan_plans(IDENT, step)
+        assert store.entries(IDENT)["1"] == before
 
     def test_the_first_success_is_planned_inside_the_candidate_ceiling(
         self, store, clock

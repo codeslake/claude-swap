@@ -8883,6 +8883,48 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
             )
 
+    def _pull_in_enabled_no_plan_plans(
+        self, identities: dict[str, tuple], entries: dict[str, UsageEntry]
+    ) -> bool:
+        """Cut an enabled no-plan slot's day-long plan to the enabled cadence.
+
+        The day was written while the slot was disabled or before the enabled
+        cadence existed, and an enabled slot must not wait it out. ``entries``
+        is the pass's own read: with no day-planned row the roster and the
+        store lock are never touched, so a display-only refresh stays
+        lock-free. The store re-decides on the locked row; this passes only
+        the enabled slots and the interval. Idempotent, and best-effort like
+        every other store write of the collect: a lock held past its timeout
+        or an unreadable roster skips it and the next collect retries.
+        """
+        step = poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
+        planned = {
+            num: ident
+            for num, ident in identities.items()
+            if (e := entries[num]).last_error == poll_policy.NO_PLAN_ERROR
+            and e.last_attempt_at is not None
+            and e.next_poll_at is not None
+            and e.next_poll_at > e.last_attempt_at + step
+        }
+        if not planned:
+            return False
+        try:
+            roster = self._get_sequence_data() or {}
+            enabled = {
+                num: ident
+                for num, ident in planned.items()
+                if not self._disabled_from_data(roster, num)
+            }
+            return bool(enabled) and self._usage_store.pull_in_no_plan_plans(
+                enabled, step
+            )
+        except (ClaudeSwitchError, OSError) as e:
+            self._logger.warning(
+                "Could not pull in an enabled no-plan slot's day-long plan "
+                "(%s); the next collect retries.", e,
+            )
+            return False
+
     def _collect_usage_entries(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -8932,6 +8974,8 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 sentinels[num] = static
 
         entries = store.entries(identities, models)
+        if not read_only and self._pull_in_enabled_no_plan_plans(identities, entries):
+            entries = store.entries(identities, models)
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
@@ -9775,15 +9819,28 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         """Build successful-fetch cadence updates for atomic outcome commit.
 
         Failures are paced by the store's backoff and keep their past-due plan
-        for when the backoff lifts.
+        for when the backoff lifts. The one exception is a no-plan failure of
+        an enabled slot (the store has no roster): it is planned at
+        ``NO_PLAN_ENABLED_POLL_INTERVAL_S`` rather than a day.
         """
         now = self._usage_store.clock()
         threshold, models = self._poll_policy_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
-            if rec.sentinel is not None or rec.error is not None:
+            if rec.sentinel is not None:
                 continue
             before = pre.get(num)
+            if rec.error is not None:
+                # The store keeps the kind through later failures, so a row
+                # that already carried it stays no-plan whatever failed now.
+                no_plan = poll_policy.NO_PLAN_ERROR in (
+                    rec.error,
+                    before.last_error if before else None,
+                )
+                if no_plan and not self.is_account_disabled(num):
+                    interval = poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
+                    plans[num] = (now + interval, interval)
+                continue
             recent_429 = before is not None and before.recent_429(now)
             plans[num] = poll_policy.plan_after_fetch(
                 # A no-plan row's day-long interval is not a cadence to halve

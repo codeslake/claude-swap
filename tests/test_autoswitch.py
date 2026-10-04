@@ -63,6 +63,7 @@ from claude_swap.usage_store import (
     UsageEntry,
     UsageStore,
 )
+from claude_swap.exceptions import LockError
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import (
@@ -2307,6 +2308,57 @@ class TestAdaptiveScheduler:
         h.clock.advance(NO_RESET_FALLBACK_S)
         assert self._tick(h, counts, usage, errors) is TickOutcome.BLOCKED
         assert counts["2"] == 1
+
+    def test_an_enabled_no_plan_slot_is_re_asked_on_the_enabled_cadence(
+        self, temp_home, monkeypatch
+    ):
+        # The live shape: a day-long plan written before the enabled cadence
+        # existed. It is pulled in on the next read, and the slot is then
+        # re-asked every interval, no faster (the 403's backoff has lapsed).
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        h.switcher._usage_store.record(
+            {"2": FetchRecord(error=poll_policy.NO_PLAN_ERROR)},
+            {"2": ("b@example.com", "")},
+        )
+        usage = {"1": _usage(50), "2": _usage(10)}
+        errors = {"2": poll_policy.NO_PLAN_ERROR}
+        counts: dict[str, int] = {}
+        step = poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
+        store = h.switcher._usage_store
+        before = store.path.read_bytes()
+        h.switcher._collect_usage_entries(
+            h.switcher._build_accounts_info(), fetch=set(), read_only=True
+        )
+        assert store.path.read_bytes() == before  # a read-only collect writes nothing
+        for advance, expected in ((step + 1, 1), (step / 2, 1), (step / 2, 2)):
+            h.clock.advance(advance)
+            self._tick(h, counts, usage, errors)
+            assert counts["2"] == expected
+
+    @pytest.mark.parametrize("day_plan", [False, True])
+    def test_the_pull_in_reaches_the_store_only_for_a_day_planned_row(
+        self, temp_home, monkeypatch, day_plan
+    ):
+        # A display-only refresh with nothing to pull in takes no store lock;
+        # when a row qualifies, a pull-in that fails (a lock held past its
+        # timeout) is skipped and the collect still answers.
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        store = h.switcher._usage_store
+        if day_plan:
+            store.record(
+                {"2": FetchRecord(error=poll_policy.NO_PLAN_ERROR)},
+                {"2": ("b@example.com", "")},
+            )
+        calls: list[object] = []
+
+        def pull_in(*args):
+            calls.append(args)
+            raise LockError("held past its timeout")
+
+        monkeypatch.setattr(store, "pull_in_no_plan_plans", pull_in)
+        info = h.switcher._build_accounts_info()
+        assert set(h.switcher._collect_usage_entries(info, fetch=set())) == {"1", "2"}
+        assert bool(calls) is day_plan
 
     def test_all_exhausted_escalation_leaves_a_row_planned_at_the_exhausted_interval(
         self, temp_home, monkeypatch
