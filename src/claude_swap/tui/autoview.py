@@ -537,7 +537,8 @@ class AutoScreen(Screen):
                 # place below, the reason a marker after the chips.
                 entry = Text()
                 entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
-                entry.append(acc.email, style=palette.muted)
+                # padded like every other row, so the marker starts in their `login` column
+                entry.append(f"{acc.email:<{email_width}}", style=palette.muted)
                 entry.append(f"  {_NO_PLAN_TEXT}", style=palette.sev_warn)
                 lines[acc.number] = entry
                 ranked.append(((1001.0,), acc.number))

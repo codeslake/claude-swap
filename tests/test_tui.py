@@ -4628,6 +4628,32 @@ class TestUnswitchableRowsAreListed:
         assert out.rstrip().splitlines()[-1].endswith("no plan (subscription inactive)"), out
         assert row(out) == row(render()), out
 
+    def test_an_unranked_no_plan_row_pads_its_email_like_the_others(self):
+        """T1738, #323 + #392 + #371 merged: every row pads its email to the block's widest, so
+        the next field starts in one column. The unranked no-plan row is #371's own, drawn
+        before the chip branch, and `no plan` must start where the other rows' `login` does
+        (the owner's report of 2026-10-04). Its email is the shortest, or the pad is a no-op."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        no_plan = UsageEntry(
+            last_good={"five_hour": {"pct": 100.0}, "seven_day": {"pct": 5.0}},
+            fetched_at=time.time() - STALE_OK_S - 600, age_s=STALE_OK_S + 600,
+            consecutive_failures=3, last_error="oauth_not_allowed_for_organization",
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 92.0}, "seven_day": {"pct": 5.0},
+            }),
+            self._acct("2", "bbbbbbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 9.0},
+            }),
+            self._acct("3", "c@x.com", switchable=True, usage=no_plan),
+        ), active="1", settings=AutoSwitchSettings(model="all", threshold=90.0))
+        rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}
+        assert len(rows) == 2, rows
+        assert "no plan (subscription inactive)" in rows["c@x.com"], rows  # premise: unranked
+        assert rows["c@x.com"].index("no plan") == rows["bbbbbbbb@x.com"].index("login"), rows
+
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach
         the panel, not just `model` — the decision log already appends
