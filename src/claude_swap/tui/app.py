@@ -439,7 +439,7 @@ class CswapApp(App):
         if self.show_org_tag:
             return True
         accounts = self.snapshot.accounts if self.snapshot else ()
-        return sum(a.email == acc.email for a in accounts) > 1
+        return [a.email for a in accounts].count(acc.email) > 1
 
     # -- theme --------------------------------------------------------------
 

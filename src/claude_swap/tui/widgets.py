@@ -498,6 +498,7 @@ def mini_widths(
     accs: Iterable[AccountSnapshot],
     now: float,
     pinned_identity: tuple[str, str] | None = None,
+    show_tag: bool = True,  # ui.showOrgTag: False reserves no tag column
 ) -> MiniWidths:
     """Column widths that fit every one of ``accs``, the compact rows shown.
 
@@ -513,7 +514,8 @@ def mini_widths(
     rest = dict(chip)
     for acc in accs:
         name = max(name, _mini_name(acc, palette).cell_len)
-        tag = max(tag, _mini_tag(acc, palette).cell_len)
+        if show_tag:
+            tag = max(tag, _mini_tag(acc, palette).cell_len)
         row_cells, row_note, ahead = _mini_body(acc, now, palette)
         cloud = pin.account_is_pinned(pinned_identity, acc.email, acc.org_uuid)
         marker = max(marker, _mini_marks(acc, ahead, cloud, palette).cell_len)
@@ -537,6 +539,7 @@ def mini_account_text(
     cloud_pinned: bool = False,
     widths: MiniWidths | None = None,
     width: int | None = None,
+    show_tag: bool = True,  # ui.showOrgTag: False leaves out the tag field
 ) -> Text:
     """One minimized line for an inactive account, in fixed columns.
 
@@ -557,7 +560,7 @@ def mini_account_text(
     starts where the widest field shown would, so the markers still share
     one column.
     """
-    widths = widths or mini_widths([acc], now)
+    widths = widths or mini_widths([acc], now, show_tag=show_tag)
     cells, note, ahead = _mini_body(acc, now, palette)
     marks = _mini_marks(acc, ahead, cloud_pinned, palette)
     grid = Text(_MINI_GAP).join(
@@ -570,7 +573,7 @@ def mini_account_text(
         _fit(_mini_name(acc, palette), widths.name),
         # `format_login_expiry` already pads to a fixed width: one column
         Text(f"{_LOGIN_LABEL} {login_value}", style=palette.muted),
-        _fit(_mini_tag(acc, palette), widths.tag),
+        *([_fit(_mini_tag(acc, palette), widths.tag)] if show_tag else []),
         _fit(note or grid, max(grid.cell_len, widths.note)),
     ]
     text = Text(no_wrap=True, overflow="ellipsis")
@@ -636,7 +639,9 @@ class AccountsPanel(Static):
         now = time.time()
         width = (self.size.width or 80) - 2
         minis = [a for a in snap.accounts if not a.is_active and self._show_minis]
-        widths = mini_widths(minis, now, self._pinned_identity)
+        widths = mini_widths(
+            minis, now, self._pinned_identity, show_tag=app.show_org_tag
+        )
         blocks: list[Text] = []
         pinned_identity = self._pinned_identity
         by_number = {acc.number: acc for acc in snap.accounts}
