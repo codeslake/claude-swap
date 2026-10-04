@@ -390,7 +390,9 @@ def mini_account_text(
         room = width - reserve
         if room < 1:  # no room for the marker: cut the whole row
             tail, room = Text(), width
-        text.truncate(room, overflow="ellipsis")
+        # blank padding is no content: the ellipsis marks a real cut only
+        text.rstrip()
+        text.truncate(room, overflow="ellipsis", pad=True)
     return text.append(tail)
 
 

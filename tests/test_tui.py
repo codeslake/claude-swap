@@ -873,6 +873,18 @@ class TestDashboard:
         widths = mini_widths(notes, now)
         assert len({mini_account_text(a, now, widths=widths).plain.index("(disabled)")
                     for a in notes}) == 1
+        # a cut that falls in a row's blank padding hides nothing, so it shows no
+        # ellipsis, yet the marker still starts where it does on every cut row
+        lacking = row(10, "work", make_entry(5.0, None), disabled=True)  # no 7d, no Fable
+        shown = accs[1:] + [lacking]
+        widths = mini_widths(shown, now)
+        edge = max(len(mini_account_text(a, now, widths=widths).plain) for a in shown) - 1
+        out = {a.number: mini_account_text(a, now, widths=widths, width=edge).plain
+               for a in shown}
+        assert "…" not in out["10"] and "…" in out["2"]  # real content cut: ellipsis kept
+        marked = {"2": "(ahead)", "5": "(disabled)", "9": "(ahead) (disabled)", "10": "(disabled)"}
+        assert all(out[n].endswith(f) for n, f in marked.items())
+        assert len({len(out[n]) - len(f) for n, f in marked.items()}) == 1
         for ln in rows:  # nothing between the tag and the first window cell
             if "5h " in ln:
                 assert not ln[ln.index("]") + 1 : ln.index("5h ")].strip()
