@@ -48,6 +48,7 @@ from claude_swap.usage_store import (
     UsageEntry,
     UsageStore,
 )
+from claude_swap.exceptions import LockError
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import (
@@ -2297,6 +2298,31 @@ class TestAdaptiveScheduler:
             h.clock.advance(advance)
             self._tick(h, counts, usage, errors)
             assert counts["2"] == expected
+
+    @pytest.mark.parametrize("day_plan", [False, True])
+    def test_the_pull_in_reaches_the_store_only_for_a_day_planned_row(
+        self, temp_home, monkeypatch, day_plan
+    ):
+        # A display-only refresh with nothing to pull in takes no store lock;
+        # when a row qualifies, a pull-in that fails (a lock held past its
+        # timeout) is skipped and the collect still answers.
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        store = h.switcher._usage_store
+        if day_plan:
+            store.record(
+                {"2": FetchRecord(error=poll_policy.NO_PLAN_ERROR)},
+                {"2": ("b@example.com", "")},
+            )
+        calls: list[object] = []
+
+        def pull_in(*args):
+            calls.append(args)
+            raise LockError("held past its timeout")
+
+        monkeypatch.setattr(store, "pull_in_no_plan_plans", pull_in)
+        info = h.switcher._build_accounts_info()
+        assert set(h.switcher._collect_usage_entries(info, fetch=set())) == {"1", "2"}
+        assert bool(calls) is day_plan
 
     def test_all_exhausted_escalation_leaves_a_row_planned_at_the_exhausted_interval(
         self, temp_home, monkeypatch

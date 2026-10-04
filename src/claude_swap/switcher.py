@@ -6819,23 +6819,47 @@ class ClaudeAccountSwitcher:
                 executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
             )
 
-    def _pull_in_enabled_no_plan_plans(self, identities: dict[str, tuple]) -> bool:
+    def _pull_in_enabled_no_plan_plans(
+        self, identities: dict[str, tuple], entries: dict[str, UsageEntry]
+    ) -> bool:
         """Cut an enabled no-plan slot's day-long plan to the enabled cadence.
 
         The day was written while the slot was disabled or before the enabled
-        cadence existed, and an enabled slot must not wait it out. The store
-        decides which rows qualify, on the locked row; this passes only the
-        enabled slots (one roster read) and the interval. Idempotent.
+        cadence existed, and an enabled slot must not wait it out. ``entries``
+        is the pass's own read: with no day-planned row the roster and the
+        store lock are never touched, so a display-only refresh stays
+        lock-free. The store re-decides on the locked row; this passes only
+        the enabled slots and the interval. Idempotent, and best-effort like
+        every other store write of the collect: a lock held past its timeout
+        or an unreadable roster skips it and the next collect retries.
         """
-        roster = self._get_sequence_data() or {}
-        enabled = {
+        step = poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
+        planned = {
             num: ident
             for num, ident in identities.items()
-            if not self._disabled_from_data(roster, num)
+            if (e := entries[num]).last_error == poll_policy.NO_PLAN_ERROR
+            and e.last_attempt_at is not None
+            and e.next_poll_at is not None
+            and e.next_poll_at > e.last_attempt_at + step
         }
-        return self._usage_store.pull_in_no_plan_plans(
-            enabled, poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
-        )
+        if not planned:
+            return False
+        try:
+            roster = self._get_sequence_data() or {}
+            enabled = {
+                num: ident
+                for num, ident in planned.items()
+                if not self._disabled_from_data(roster, num)
+            }
+            return bool(enabled) and self._usage_store.pull_in_no_plan_plans(
+                enabled, step
+            )
+        except (ClaudeSwitchError, OSError) as e:
+            self._logger.warning(
+                "Could not pull in an enabled no-plan slot's day-long plan "
+                "(%s); the next collect retries.", e,
+            )
+            return False
 
     def _collect_usage_entries(
         self,
@@ -6886,7 +6910,7 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities, models)
-        if not read_only and self._pull_in_enabled_no_plan_plans(identities):
+        if not read_only and self._pull_in_enabled_no_plan_plans(identities, entries):
             entries = store.entries(identities, models)
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``

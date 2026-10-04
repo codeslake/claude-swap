@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from claude_swap import oauth, usage_store
+from claude_swap.exceptions import ConfigError
 from claude_swap.poll_policy import (
     CANDIDATE_MAX_INTERVAL_S,
     NO_PLAN_ENABLED_POLL_INTERVAL_S,
@@ -948,7 +949,9 @@ class TestNoPlanSlot:
         )
 
         def pull():
-            return ClaudeAccountSwitcher._pull_in_enabled_no_plan_plans(stub, IDENT)
+            return ClaudeAccountSwitcher._pull_in_enabled_no_plan_plans(
+                stub, IDENT, store.entries(IDENT)
+            )
 
         assert pull() is not disabled
         entry = store.entries(IDENT)["1"]
@@ -957,6 +960,21 @@ class TestNoPlanSlot:
             interval,
         )
         assert not pull()  # idempotent: a read pays only the compare
+
+    def test_a_torn_roster_skips_the_pull_in_instead_of_raising(self, store, clock):
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        before = store.entries(IDENT)["1"]
+
+        def torn():
+            raise ConfigError("sequence.json is unreadable")
+
+        stub = SimpleNamespace(
+            _usage_store=store, _get_sequence_data=torn, _logger=logging.getLogger("t")
+        )
+        assert not ClaudeAccountSwitcher._pull_in_enabled_no_plan_plans(
+            stub, IDENT, store.entries(IDENT)
+        )
+        assert store.entries(IDENT)["1"] == before
 
     @pytest.mark.parametrize("landed", ["403", "success"])
     def test_the_pull_in_decides_on_the_locked_row_not_an_earlier_read(
