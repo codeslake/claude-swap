@@ -741,7 +741,7 @@ Defaults live in settings.json in the backup root; flags override them.
         # write: the account switched, `lastSwitchAt` never recorded, the LIVE
         # lock still held. The next engine then sees no cooldown and can
         # switch again immediately.
-        signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+        signal.signal(signal.SIGTERM, lambda *_: engine.stop("SIGTERM"))
 
         def _interrupt(*_):
             # ESCALATE. `stop()` is idempotent, so a second Ctrl-C hits its
@@ -750,7 +750,7 @@ Defaults live in settings.json in the backup root; flags override them.
             # under a banner that says Ctrl-C stops it. Restoring the default
             # makes the second signal raise KeyboardInterrupt.
             signal.signal(signal.SIGINT, signal.default_int_handler)
-            engine.stop()
+            engine.stop("SIGINT")
 
         signal.signal(signal.SIGINT, _interrupt)
 

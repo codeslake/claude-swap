@@ -1110,7 +1110,7 @@ class TestAutoCommand:
         def run_loop(self):
             return 0
 
-        def stop(self):
+        def stop(self, reason="stopped"):
             pass
 
     @pytest.fixture(autouse=True)
@@ -1222,8 +1222,8 @@ class TestAutoCommand:
         class _Engine:
             dry_run = False
 
-            def stop(self):
-                stopped.append(True)
+            def stop(self, reason="stopped"):
+                stopped.append(reason)
 
             def run_loop(self):
                 return 0
@@ -1240,7 +1240,8 @@ class TestAutoCommand:
             "banner tells the user Ctrl-C stops it and nothing handles SIGINT"
         )
         installed[signal_mod.SIGINT]()
-        assert stopped == [True], "the SIGINT handler does not stop the engine"
+        installed[signal_mod.SIGTERM]()
+        assert stopped == ["SIGINT", "SIGTERM"], "a handler does not stop the engine"
 
     def test_a_second_ctrl_c_aborts_rather_than_doing_nothing(
         self, temp_home
@@ -1264,7 +1265,7 @@ class TestAutoCommand:
         class _Engine:
             dry_run = False
 
-            def stop(self):
+            def stop(self, reason="stopped"):
                 pass
 
             def run_loop(self):
@@ -1301,7 +1302,7 @@ class TestAutoCommand:
         class _Engine:
             dry_run = True          # demoted; no --dry-run was asked for
 
-            def stop(self):
+            def stop(self, reason="stopped"):
                 pass
 
             def run_loop(self):
@@ -1344,7 +1345,7 @@ class TestAutoCommand:
         class _Engine:
             dry_run = False
 
-            def stop(self):
+            def stop(self, reason="stopped"):
                 pass
 
             def tick(self):

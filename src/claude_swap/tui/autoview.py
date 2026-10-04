@@ -132,7 +132,7 @@ class AutoScreen(Screen):
 
     def on_unmount(self) -> None:
         if self._engine is not None:
-            self._engine.stop()
+            self._engine.stop("view closed")
         # A session threshold must not outlive the engine it steered: unpin
         # the poll planner and put the bar tick back on the file value.
         self.app.switcher.clear_poll_policy_inputs()
@@ -297,7 +297,7 @@ class AutoScreen(Screen):
 
     def _restart_engine(self, *, dry_run: bool) -> None:
         if self._engine is not None:
-            self._engine.stop()
+            self._engine.stop("switched to dry-run" if dry_run else "switched to LIVE")
         self._start_engine(dry_run=dry_run)
 
     def _update_badge(self) -> None:
