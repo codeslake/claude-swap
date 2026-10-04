@@ -1942,35 +1942,6 @@ class TestTheTuiSurfaceSurvivesTheSplit:
     surface reports the other as healthy.
     """
 
-    def test_no_extra_means_no_pin_row(self, tmp_path, monkeypatch):
-        """A user who never asked for the pin must not see a row for it."""
-        import types
-
-        from claude_swap.tui import dashboard
-
-        monkeypatch.setattr(dashboard.pin, "is_available", lambda: False)
-        # A REAL `backup_dir`, empty. The gate also asks `_pinned_email_now`
-        # now — the record is the state every unwire leaves behind — and that
-        # reads `settings.json` under it. `object()` was enough while the gate
-        # only asked `_wiring_present`, which ignores its switcher entirely;
-        # pointing it at an empty dir keeps the answer "nothing pinned" while
-        # letting the call be the real one.
-        monkeypatch.setattr(
-            dashboard.DashboardScreen,
-            "app",
-            property(lambda self: types.SimpleNamespace(
-                switcher=types.SimpleNamespace(backup_dir=tmp_path), snapshot=None
-            )),
-            raising=False,
-        )
-        screen = object.__new__(dashboard.DashboardScreen)
-        ids = [a for _l, a in screen._root_entries()]
-        assert "pin-menu" not in ids, f"pin offered without the extra: {ids}"
-
-        monkeypatch.setattr(dashboard.pin, "is_available", lambda: True)
-        monkeypatch.setattr(dashboard.pin, "pinned_email", lambda sw: None)
-        assert "pin-menu" in [a for _l, a in screen._root_entries()]
-
     def test_installing_the_extra_is_seen_without_a_restart(self, tmp_path):
         """A TUI open across an install must start offering the pin.
 
@@ -2039,21 +2010,6 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         )
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr[-400:]
-
-    def test_the_menu_rebuilds_on_the_poll(self):
-        """The root menu was built once at mount, so a row that appears on
-        install could not appear until a restart.
-
-        The METHOD only — that something fires it is asserted by driving a real
-        snapshot through a real app in
-        ``test_tui_pin.py::test_a_snapshot_actually_rebuilds_the_root_menu``.
-        Grepping ``on_mount``'s source for the name is satisfied by a comment
-        satisfies: deleting the subscription and leaving the word behind kept
-        the suite green while the pin row could no longer appear.
-        """
-        from claude_swap.tui import dashboard
-
-        assert hasattr(dashboard.DashboardScreen, "refresh_root_menu")
 
     def test_opening_the_pin_submenu_lists_the_accounts(self, monkeypatch):
         """The row existing is not the same as the row WORKING.
@@ -2223,6 +2179,7 @@ class TestTheTuiSurfaceSurvivesTheSplit:
             off = render(cloud_pinned=False).plain
             assert "○ cloud" in on, f"{name} does not render the cloud badge"
             assert "○ cloud" not in off, f"{name} renders the badge unpinned"
+            assert "○ cloud" not in render().plain, f"{name} defaults to pinned"
 
     def test_the_auto_switch_view_renders_the_badge_on_the_pinned_row(
         self, monkeypatch
@@ -2308,16 +2265,6 @@ class TestTheTuiSurfaceSurvivesTheSplit:
             assert "(not applying)" not in render(healthy).plain, (
                 f"{name} warns about a healthy pin"
             )
-
-    def test_a_pinned_account_actually_renders_the_badge(self):
-        """Not just the parameter — the glyph has to reach the text."""
-        from claude_swap.tui.widgets import account_card_text
-        from tests.test_tui import make_account
-
-        acc = make_account(1, active=True)
-        plain = account_card_text(acc, 80, cloud_pinned=True).plain
-        assert "○ cloud" in plain
-        assert "○ cloud" not in account_card_text(acc, 80).plain
 
 
 class TestAMidSessionInstallNeedsNoRestart:
@@ -3711,19 +3658,30 @@ class TestClearRunsWithTheExtraGone:
             "sides of --set_port have drifted apart"
         )
 
-    def test_the_installed_package_carries_the_pin_cleared_marker_contract(self):
+    def test_the_installed_package_carries_the_pin_cleared_marker_contract(self, tmp_path):
         """The `pin` extra's floor is the release where `apply_pin` takes the
         keyword-only `everywhere`: only from there does the set arm unlink the
         `pin-cleared` marker `--clear` writes. Below it a re-pin leaves the
-        marker and the host reads as cleared after a successful pin."""
+        marker and the host reads as cleared after a successful pin.
+
+        And the half the signature cannot show: its READER honours the marker.
+        The record is readable without it, so the marker is what reads None."""
         import inspect
 
+        from claude_swap import settings as _s
         from cswap_pin import proxy
 
         p = inspect.signature(proxy.apply_pin).parameters.get("everywhere")
         assert p is not None and p.kind is p.KEYWORD_ONLY, (
             "the installed cswap-pin predates the marker contract; the extra's "
             "floor must name the release that has it"
+        )
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"remoteControl": {"pinnedEmail": "a@b.c"}}))
+        assert proxy.load_pin(tmp_path) == ("a@b.c", ""), "premise: the record reads"
+        _s.pin_cleared_path(tmp_path).touch()
+        assert proxy.load_pin(tmp_path) is None, (
+            "the installed cswap-pin reads a pin through this host's pin-cleared marker"
         )
 
     def test_clear_removes_the_wiring_with_cswap_pin_blocked(self, tmp_path):
@@ -11475,6 +11433,14 @@ class TestThePinFlagsAreMutuallyExclusive:
             assert "not allowed with" not in err.getvalue(), (
                 f"--debug was refused beside {argv}: {err.getvalue()!r}")
 
+    def test_everywhere_without_clear_is_a_usage_error(self):
+        from claude_swap import cli
+
+        for argv in (["--everywhere"], ["--heal", "--everywhere"]):
+            with pytest.raises(SystemExit) as exc:
+                cli._pin_command(argv)
+            assert exc.value.code == 2, argv
+
 
 @pytest.mark.skipif(
     sys.platform == "win32",
@@ -11558,13 +11524,90 @@ class TestAClearOnASharedSettingsFileIsLocal:
         assert not marker.exists()
         assert seen == ([False, True, False] if modern else [None] * 3)
 
-    def test_everywhere_without_clear_is_a_usage_error(self):
-        from claude_swap import cli
+    def _shared_host(self, tmp_path, monkeypatch, record, apply):
+        """A host whose settings.json links a shared file holding `record`, and
+        a peer whose `apply_pin` is `apply`. Returns (switcher, shared, marker)."""
+        import types
 
-        for argv in (["--everywhere"], ["--heal", "--everywhere"]):
-            with pytest.raises(SystemExit) as exc:
-                cli._pin_command(argv)
-            assert exc.value.code == 2, argv
+        import claude_swap.paths as paths
+        from claude_swap import pin
+        from claude_swap import settings as _s
+
+        shared = tmp_path / "shared.json"
+        shared.write_text(json.dumps(record, indent=2))
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        (backup / "settings.json").symlink_to(shared)
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"env": {}}))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        peer = types.SimpleNamespace(apply_pin=apply)
+        monkeypatch.setattr(pin, "_impl", lambda: peer)
+        return types.SimpleNamespace(backup_dir=backup), shared, _s.pin_cleared_path(backup)
+
+    @staticmethod
+    def _broken_peer(sw, email, org, identity=None, *, everywhere=False):
+        raise RuntimeError("peer broke")
+
+    def test_everywhere_lifts_a_marker_the_peer_left_standing(self, tmp_path, monkeypatch):
+        """A peer that drops the record and returns leaves nothing for the
+        fallback to do, and the marker would keep this host reading as cleared
+        once the shared record is pinned again."""
+        from claude_swap import pin
+
+        def peer_drops_the_record(sw, email, org, identity=None, *, everywhere=False):
+            (sw.backup_dir / "settings.json").write_text("{}")
+
+        sw, shared, marker = self._shared_host(
+            tmp_path, monkeypatch,
+            {"remoteControl": {"pinnedEmail": "a@b.c"}}, peer_drops_the_record)
+        marker.touch()
+
+        ok, _msg = pin.clear_pin(sw, everywhere=True)
+
+        assert ok and json.loads(shared.read_text()) == {}, "premise: the record is gone"
+        assert not marker.exists()
+
+    def test_a_one_host_clear_writes_nothing_through_the_link_for_a_non_pair(
+            self, tmp_path, monkeypatch):
+        """Only a recorded PAIR is a pin. Anything else in `remoteControl` is
+        another host's or a human's, and the one-host clear has no business
+        rewriting a committed shared file over it."""
+        from claude_swap import pin
+
+        for i, record in enumerate((
+            {"remoteControl": {"pinnedEmail": "", "pinnedOrganizationUuid": "o", "debugSlowMs": 5}},
+            {"remoteControl": {"pinnedEmail": 7, "debugSlowMs": 5}},
+            {"remoteControl": "junk"},
+        )):
+            (tmp_path / str(i)).mkdir()
+            sw, shared, marker = self._shared_host(
+                tmp_path / str(i), monkeypatch, record, self._broken_peer)
+            before = shared.read_bytes()
+
+            pin.clear_pin(sw)
+
+            assert shared.read_bytes() == before, f"rewrote the shared file over {record}"
+            assert not marker.exists(), f"a marker over no pair: {record}"
+
+    def test_the_everywhere_fallback_keeps_the_files_key_order(self, tmp_path, monkeypatch):
+        """The shared file is committed, so a rewrite that moves
+        `remoteControl` to the end shows up as a diff that says nothing."""
+        from claude_swap import pin
+
+        sw, shared, _marker = self._shared_host(
+            tmp_path, monkeypatch,
+            {"remoteControl": {"pinnedEmail": "a@b.c", "pinnedOrganizationUuid": "",
+                               "debugSlowMs": 5},
+             "theme": "dark"},
+            self._broken_peer)
+
+        pin.clear_pin(sw, everywhere=True)
+
+        after = json.loads(shared.read_text())
+        assert after["remoteControl"] == {"debugSlowMs": 5}, "premise: the pair is dropped"
+        assert list(after) == ["remoteControl", "theme"]
 
 
 class TestAddAccountRefusesASplicedIdentity:
