@@ -2911,7 +2911,9 @@ class TestAutoScreen:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
+            from claude_swap.tui.autoview import AutoScreen
+
+            await app.push_screen(AutoScreen())
             screen = app.screen
             assert screen._settings.strategy == "consume-first"  # the default
             from textual.widgets import Static
@@ -2922,6 +2924,8 @@ class TestAutoScreen:
             # threshold — without this, the dynamic-strategy assertion below
             # would pass even if "threshold " never printed at all.
             assert "threshold 90%" in summary.render().plain
+            # the one real key press: it proves the `s` binding reaches the
+            # action; the rest of the cycle calls the action directly.
             await pilot.press("s")
             await pilot.pause()
             assert screen._settings.strategy == "dynamic"
@@ -2938,32 +2942,27 @@ class TestAutoScreen:
             # (`enter`) returns to "at rest", where dynamic's header names
             # only the bar in force, never the configured threshold, even
             # though the override still steers ranking underneath.
-            await pilot.press("t")
-            await pilot.pause()
+            screen.action_adjust_threshold()
             assert "threshold 90%" in summary.render().plain  # shown while adjusting
-            await pilot.press("right")
-            await pilot.pause()
+            screen.action_threshold_step(1)
             assert screen._settings.threshold == 91.0
-            await pilot.press("enter")
-            await pilot.pause()
+            screen.action_adjust_done()
             assert "threshold" not in summary.render().plain, (
                 f"a non-bar threshold leaked at rest under dynamic: "
                 f"{summary.render().plain!r}"
             )
             assert "switch at 97%" in summary.render().plain
-            await pilot.press("s")
-            await pilot.pause()
+            screen.action_cycle_strategy()
             assert screen._settings.strategy == "best"
-            await pilot.press("s")
-            await pilot.pause()
+            screen.action_cycle_strategy()
             assert screen._settings.strategy == "consume-first"  # wraps around
+            screen.action_cycle_strategy()  # leave a non-default value to revert
             # the override lives in memory only — nothing was persisted
             assert not (tmp_path / "settings.json").exists()
-            await pilot.press("escape")
-            await settle(pilot)
             # the session strategy does not outlive the screen: a fresh open
             # reverts to the file value, same precedent as the threshold.
-            await self._open(pilot)
+            await app.pop_screen()
+            await app.push_screen(AutoScreen())
             assert app.screen._settings.strategy == "consume-first"
 
     async def test_threshold_adjust_escape_exits_mode_not_screen(
