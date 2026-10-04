@@ -1270,6 +1270,16 @@ class TestMiniAccountText:
         assert ("[acme]" in card) is show
         assert ("[acme]" in mini) is show
 
+    def test_lapsed_plan_row_draws_no_window_chips(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        entry = dataclasses.replace(
+            make_entry(30.0, 85.0), last_error="oauth_not_allowed_for_organization"
+        )
+        row = mini_account_text(make_account(2, entry=entry), time.time()).plain
+        assert "no plan" in row
+        assert "5h" not in row and "7d" not in row
+
 
 class TestRunAction:
     def test_captures_output_and_payload(self):

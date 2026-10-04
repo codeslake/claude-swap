@@ -414,6 +414,8 @@ def _mini_body(
     if sentinel is not None:
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
         return {}, Text(data.sentinel_label(sentinel), style=style), False
+    if acc.usage.last_error == "oauth_not_allowed_for_organization":  # lapsed plan
+        return {}, Text("no plan", style=palette.sev_warn), False
     last_good = acc.usage.last_good
     if not isinstance(last_good, dict):
         last_good = {}
