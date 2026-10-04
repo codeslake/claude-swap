@@ -3732,7 +3732,11 @@ class AutoSwitchEngine:
                             or reset_ts >= active_reset_ts
                         )
                     ):
-                        reasons[num] = "weekly reset not sooner"
+                        reasons[num] = (
+                            "weekly reset unknown"
+                            if reset_ts is None or active_reset_ts is None
+                            else "weekly reset not sooner"
+                        )
                         continue
                 elif active_headroom is not None:
                     # best, and also dynamic's `proactive` trigger (over

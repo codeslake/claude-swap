@@ -87,6 +87,8 @@ _UNMODELED_TEXT = {
     "unreadable-active": "not previewed (active status unknown)",
 }
 
+_NO_PLAN_TEXT = "no plan (subscription inactive)"
+
 
 class AutoScreen(Screen):
     BINDINGS = [
@@ -439,14 +441,18 @@ class AutoScreen(Screen):
                 lines[acc.number] = entry
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
-            if acc.usage.last_error == "oauth_not_allowed_for_organization":
-                # No subscription behind this login: chips and a rank would
-                # read as a candidate, so the reason replaces them and the
-                # row goes behind even the unswitchable ones.
+            no_plan = data.is_no_plan(acc)
+            if no_plan and acc.number not in ordered_rank:
+                # No subscription behind this login and the pass did not rank
+                # it: chips would read as a candidate, so the reason replaces
+                # them and the row goes behind even the unswitchable ones. A
+                # RANKED one (`decision_value()` serves `last_good` for a
+                # while after polls fail) is the engine's pick and keeps its
+                # place below, the reason a marker after the chips.
                 entry = Text()
                 entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
                 entry.append(acc.email, style=palette.muted)
-                entry.append("  no plan (subscription inactive)", style=palette.sev_warn)
+                entry.append(f"  {_NO_PLAN_TEXT}", style=palette.sev_warn)
                 lines[acc.number] = entry
                 ranked.append(((1001.0,), acc.number))
                 continue
@@ -525,6 +531,8 @@ class AutoScreen(Screen):
                 # every poll cycle, and the engine lands on it happily.
                 if acc.usage.in_backoff(now) or acc.usage.consecutive_failures:
                     entry.append("  stale", style=palette.sev_warn)
+                if no_plan:
+                    entry.append(f"  {_NO_PLAN_TEXT}", style=palette.sev_warn)
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
                 # a model-only block (the engine's fallback ranks around it)

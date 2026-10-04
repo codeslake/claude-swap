@@ -408,6 +408,13 @@ def waiting_tail_key(usage: dict | None, models: tuple[str, ...], now: float) ->
     return (full, _binding_recovery_ts(usage, models, now))
 
 
+def is_no_plan(acc) -> bool:
+    """The usage poll answered that no subscription backs this login. An
+    unranked one sorts behind even an unswitchable slot, in ``ordered_accounts``
+    and the auto view's panel alike."""
+    return acc.usage.last_error == "oauth_not_allowed_for_organization"
+
+
 def ordered_accounts(
     snap: AccountsSnapshot,
     settings: "AutoSwitchSettings",
@@ -436,6 +443,8 @@ def ordered_accounts(
             return (4,)
         if acc.number in ordered_rank:
             return (0, ordered_rank[acc.number])
+        if is_no_plan(acc):
+            return (5,)
         # A disabled slot is a non-target -- the engine never lands on one
         # automatically, however soon its own window recovers -- so it
         # sorts with the other non-targets, never inside the waiting tier

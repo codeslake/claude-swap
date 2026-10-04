@@ -1743,6 +1743,86 @@ class TestOrderedAccounts:
             snap, "1", _WARM_ORDER_SETTINGS, last_active_at
         )
 
+    def test_an_unranked_no_plan_slot_sorts_after_an_unswitchable_one(self):
+        """A no-plan slot (`oauth_not_allowed_for_organization`) the pass did
+        not rank sinks below even an unswitchable slot, on BOTH screens: the
+        panel keys it (1001.0,), so the bucket here must put it after the
+        unswitchable (4,) one too, not in the waiting tier by its chips. Its
+        poll is stale (past `STALE_OK_S`), so `decision_value()` is None and
+        the pass drops it; "3" sorts before "4" by number, so only the tier
+        puts it last."""
+        no_plan = dataclasses.replace(
+            make_entry(10.0, 5.0, age_s=STALE_OK_S + 60),
+            last_error="oauth_not_allowed_for_organization",
+        )
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(95.0, 20.0)),
+                make_account(2, entry=make_entry(5.0, 5.0)),
+                make_account(3, entry=no_plan),
+                make_account(4, switchable=False),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        order = tui_data.ordered_accounts(snap, _ORDER_SETTINGS, time.time())
+        assert order == ["1", "2", "4", "3"], order
+        assert order[1:] == _autoview_order(snap, "1", _ORDER_SETTINGS)
+
+
+class TestRankSwitchReasons:
+    """`reasons_out` names why the engine's own pass dropped a candidate."""
+
+    @staticmethod
+    def _weekly(reset_in_s, pct=10.0):
+        window = {"pct": pct}
+        if reset_in_s is not None:
+            window["resets_at"] = _iso_in(reset_in_s)
+        return UsageEntry(
+            last_good={"five_hour": {"pct": pct}, "seven_day": window},
+            fetched_at=time.time(), age_s=0.0,
+        )
+
+    def _reasons(self, settings, *accounts):
+        snap = AccountsSnapshot(
+            accounts=list(accounts), active_number="1", taken_at=0.0
+        )
+        reasons: dict = {}
+        tui_data.rank_switch_candidates(snap, settings, time.time(), "1", None, reasons)
+        return reasons
+
+    def test_consume_first_names_a_later_or_an_unknown_weekly_reset(self):
+        """"weekly reset not sooner" claims the candidate's reset is KNOWN and
+        no sooner than the active's; an unknown reset (on either side, or
+        already past) is "weekly reset unknown", never the first wording."""
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0)
+        reasons = self._reasons(
+            settings,
+            make_account(1, active=True, entry=self._weekly(3 * 86400)),
+            make_account(2, entry=self._weekly(6 * 86400)),
+            make_account(3, entry=self._weekly(None)),
+        )
+        assert reasons == {
+            "2": "weekly reset not sooner", "3": "weekly reset unknown",
+        }, reasons
+        reasons = self._reasons(
+            settings,
+            make_account(1, active=True, entry=self._weekly(None)),
+            make_account(2, entry=self._weekly(6 * 86400)),
+        )
+        assert reasons == {"2": "weekly reset unknown"}, reasons
+
+    def test_dynamic_names_an_unreadable_and_a_spent_candidate(self):
+        reasons = self._reasons(
+            _WARM_ORDER_SETTINGS,
+            make_account(1, active=True, entry=make_entry(50.0, 50.0)),
+            make_account(2, entry=make_entry(sentinel=USAGE_TOKEN_EXPIRED)),
+            make_account(3, entry=make_entry(100.0, 5.0)),
+            make_account(4, entry=make_entry(5.0, 5.0)),
+        )
+        assert reasons == {
+            "2": "usage unreadable", "3": "no headroom left",
+        }, reasons
+
 
 @pytest.mark.asyncio
 class TestSharedAccountOrder:
@@ -3601,6 +3681,33 @@ class TestUnswitchableRowsAreListed:
         assert "noplan@x.com" in row, out
         assert row.endswith("no plan (subscription inactive)"), out
         assert "5h" not in row and "%" not in row and "stale" not in row, out
+
+    def test_a_no_plan_row_the_pass_ranked_keeps_its_ranked_place(self):
+        """`decision_value()` keeps serving `last_good` for a while after
+        polls fail, so the pass can still RANK a no-plan slot: drawing it last
+        would put the engine's actual pick below a refused row while the
+        header names its axis. It renders as a normal row, the reason a
+        marker after the chips."""
+        no_plan = UsageEntry(
+            last_good={"five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0}},
+            fetched_at=time.time(), age_s=0.0, consecutive_failures=3,
+            last_error="oauth_not_allowed_for_organization",
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 20.0},
+            }),
+            self._acct("2", "full@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 100.0},
+            }),
+            self._acct("3", "noplan@x.com", switchable=True, usage=no_plan),
+        ), active="1")
+        assert "no candidate qualifies" not in out, (
+            f"the pass ranked nothing, so this tested nothing: {out!r}"
+        )
+        assert out.index("noplan@x.com") < out.index("full@x.com"), out
+        row = next(r for r in out.splitlines() if "noplan@x.com" in r)
+        assert "5h" in row and row.endswith("no plan (subscription inactive)"), out
 
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a
