@@ -1551,32 +1551,32 @@ def _clear_pin_record(switcher, everywhere: bool = False) -> None:
     A settings.json that is a symlink is ONE record for every host linking it,
     and the write goes through the link, so dropping the pair there unpins them
     all once it is committed. Unless ``everywhere``, a recorded pair is left
-    alone and this host's marker is written in the drop's own slot. Otherwise
-    only the two pin keys go, never ``remoteControl``'s other keys, and
-    ``everywhere`` also lifts the marker.
+    alone and this host's marker is written in the drop's own slot; anything
+    else there is nobody's pin, so nothing is written through the link.
+    Otherwise only the two pin keys go, never ``remoteControl``'s other keys,
+    and in place, so a committed file keeps its key order.
     """
     from claude_swap import settings as _s
 
     try:
         path = _s.settings_path(switcher.backup_dir)
-        marker = _s.pin_cleared_path(switcher.backup_dir)
-        if (path.is_symlink() and not everywhere
-                and _raw_pin_record(switcher) is not None):
-            marker.touch()
+        if path.is_symlink() and not everywhere:
+            if _raw_pin_record(switcher) is not None:
+                _s.pin_cleared_path(switcher.backup_dir).touch()
             return
         raw = _s._read_raw_for_write(path)
-        section = raw.pop("remoteControl", None)
-        kept = (
-            {k: v for k, v in section.items()
-             if k not in ("pinnedEmail", "pinnedOrganizationUuid")}
-            if isinstance(section, dict) else {}
-        )
-        if kept:
-            raw["remoteControl"] = kept
-        if section is not None and kept != section:
+        section = raw.get("remoteControl")
+        if isinstance(section, dict):
+            n = len(section)
+            section.pop("pinnedEmail", None)
+            section.pop("pinnedOrganizationUuid", None)
+            changed = len(section) != n
+            if not section:
+                del raw["remoteControl"]
+        else:
+            changed = raw.pop("remoteControl", None) is not None
+        if changed:
             _s.atomic_write_json(path, raw)
-        if everywhere:
-            marker.unlink(missing_ok=True)
     except Exception:  # noqa: BLE001 — the caller re-reads and reports
         pass
 
@@ -1812,6 +1812,20 @@ def clear_pin(switcher, everywhere: bool = False) -> tuple[bool, str]:
         else:
             _clear_pin_record(switcher)
     still_pinned = _record(switcher) is not None
+    # THE MARKER GOES WITH THE WIRING AND THE RECORD, WHOEVER DROPPED THE RECORD.
+    # A peer that drops it and returns never reaches the fallback above, and a
+    # marker left standing keeps this host reading as cleared once the record is
+    # pinned again. Only once the record is gone: a failed read or write leaves
+    # it, and without the marker the host would read as pinned and heal re-wires.
+    if everywhere and not survivors and not still_pinned:
+        from claude_swap import settings as _s
+
+        try:
+            _s.pin_cleared_path(switcher.backup_dir).unlink(missing_ok=True)
+        except OSError as exc:
+            _logger.warning(
+                "could not remove the clear marker (%s); this host keeps "
+                "reading as unpinned until it is removed by hand", exc)
     if still_pinned or survivors:
         what = " and ".join(
             w for w, on in (("the pin", still_pinned), ("the wiring", bool(survivors)))
