@@ -9,7 +9,7 @@ auto-switch trigger line), and stale-measurement dimming.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable, NamedTuple
 
 from rich.text import Text
 from textual.widgets import ListItem, Static
@@ -240,69 +240,125 @@ def account_card_text(
     return text
 
 
-def mini_account_text(
-    acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
-) -> Text:
-    """One minimized line for an inactive account.
+_MINI_TAG_CAP = 24  # widest "[tag]" a compact row shows, brackets included
+_MINI_GAP = "  "
 
-    ``2  work@acme.dev [personal]   5h 92% · 7d 63%`` — pcts only, severity
-    colored; a window at/over 100% brings its reset countdown along, and a
-    maxed per-model window shows as ``Fable (!)``. Sentinel states show
-    their label instead.
-    """
-    text = Text(no_wrap=True, overflow="ellipsis")
-    text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
+
+class MiniWidths(NamedTuple):
+    """Column widths the compact rows share, from :func:`mini_widths`."""
+
+    name: int
+    tag: int
+    cells: dict[str, int]  # window label -> cell width, in display order
+
+
+def _fit(text: Text, width: int) -> Text:
+    text.pad_right(max(0, width - text.cell_len))
+    return text
+
+
+def _mini_name(acc: AccountSnapshot, palette: Palette) -> Text:
+    name = Text()
     if acc.alias:
-        text.append(acc.alias, style=f"bold {palette.accent}")
-        text.append(f" ({acc.email})", style=palette.foreground)
+        name.append(acc.alias, style=f"bold {palette.accent}")
+        name.append(f" ({acc.email})", style=palette.foreground)
     else:
-        text.append(acc.email, style=palette.foreground)
-    text.append(f"  [{acc.display_tag}]", style=palette.muted)
-    if acc.disabled:
-        text.append("  (disabled)", style=palette.muted)
-    text.append("   ")
+        name.append(acc.email, style=palette.foreground)
+    return name
 
+
+def _mini_tag(acc: AccountSnapshot, palette: Palette) -> Text:
+    tag = Text(acc.display_tag)
+    tag.truncate(_MINI_TAG_CAP - 2, overflow="ellipsis")
+    return Text.assemble("[", tag, "]", style=palette.muted)
+
+
+def _mini_body(
+    acc: AccountSnapshot, now: float, palette: Palette
+) -> tuple[dict[str, Text], Text | None]:
+    """A compact row's window cells (label -> cell), or the note that stands in
+    for them when it has no window to show."""
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
-        text.append(data.sentinel_label(sentinel), style=style)
-        return text
-
+        return {}, Text(data.sentinel_label(sentinel), style=style)
     last_good = acc.usage.last_good
-    fetched_at = acc.usage.fetched_at
+    if not isinstance(last_good, dict):
+        last_good = {}
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
-    parts = 0
+    cells: dict[str, Text] = {}
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
-        window = last_good.get(key) if isinstance(last_good, dict) else None
+        window = last_good.get(key)
         if not window:
             continue
         pct = float(window["pct"])
-        if parts:
-            text.append(" · ", style=palette.track)
         color = palette.severity(pct)
-        text.append(f"{label} ", style=palette.muted)
-        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        cell = Text(f"{label} ", style=palette.muted)
+        cell.append(f"{pct:3.0f}%", style=f"{color} dim" if stale else color)
+        # the reset and pace notes are mutually exclusive, so they share a slot
         if pct >= 100:
             reset = data.reset_text(window, now)
             if reset:
-                text.append(f" ({reset})", style=palette.muted)
+                cell.append(f" ({reset})", style=palette.muted)
         elif key == "seven_day":
-            result = pace.compute_pace(window, fetched_at=fetched_at)
+            result = pace.compute_pace(window, fetched_at=acc.usage.fetched_at)
             if result and result.ahead:
-                text.append(" (ahead)", style=palette.sev_warn)
-        parts += 1
-    maxed = [
-        w["name"]
-        for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else [])
-        if float(w["pct"]) >= 100
+                cell.append(" (ahead)", style=palette.sev_warn)
+        cells[label] = cell
+    for window in last_good.get("scoped") or []:
+        if float(window["pct"]) >= 100:
+            name = window["name"]
+            cells[name] = Text(f"{name} (!)", style=palette.sev_crit)
+    return cells, None if cells else Text("usage unknown", style=palette.muted)
+
+
+def mini_widths(accs: Iterable[AccountSnapshot], now: float) -> MiniWidths:
+    """Column widths that fit every one of ``accs``, the compact rows shown."""
+    palette = Palette.DARK  # widths do not depend on style
+    name = tag = 0
+    cells = {"5h": 0, "7d": 0}  # fixed order; scoped windows follow as seen
+    for acc in accs:
+        name = max(name, _mini_name(acc, palette).cell_len)
+        tag = max(tag, _mini_tag(acc, palette).cell_len)
+        for label, cell in _mini_body(acc, now, palette)[0].items():
+            cells[label] = max(cells.get(label, 0), cell.cell_len)
+    return MiniWidths(name, tag, {k: w for k, w in cells.items() if w})
+
+
+def mini_account_text(
+    acc: AccountSnapshot,
+    now: float,
+    *,
+    palette: Palette = Palette.DARK,
+    widths: MiniWidths | None = None,
+) -> Text:
+    """One minimized line for an inactive account, in fixed columns.
+
+    ``2  work@acme.dev  [personal]  5h  92%  7d  63% (ahead)  Fable (!)  (disabled)``
+    — slot, name, tag, one cell per window, then the ``(disabled)`` marker.
+    Pcts only, severity colored; a window at/over 100% brings its reset
+    countdown along, and a maxed per-model window shows as ``Fable (!)``. A
+    window the account lacks is a blank cell, and a sentinel state shows its
+    label in place of the cells (one longer than them pushes only its own
+    marker right). ``widths`` (from :func:`mini_widths` over the rows shown)
+    lines the columns up across rows; alone, a row fits itself.
+    """
+    widths = widths or mini_widths([acc], now)
+    cells, note = _mini_body(acc, now, palette)
+    grid = Text(_MINI_GAP).join(
+        _fit(cells.get(label) or Text(), width) for label, width in widths.cells.items()
+    )
+    fields = [
+        _fit(_mini_name(acc, palette), widths.name),
+        _fit(_mini_tag(acc, palette), widths.tag),
+        _fit(note or grid, grid.cell_len),
     ]
-    for name in maxed:
-        if parts:
-            text.append(" · ", style=palette.track)
-        text.append(f"{name} (!)", style=palette.sev_crit)
-        parts += 1
-    if not parts:
-        text.append("usage unknown", style=palette.muted)
+    if acc.disabled:
+        fields.append(Text("(disabled)", style=palette.muted))
+    text = Text(no_wrap=True, overflow="ellipsis")
+    text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
+    text.append(Text(_MINI_GAP).join(fields))
+    text.rstrip()
     return text
 
 
@@ -334,6 +390,8 @@ class AccountsPanel(Static):
             )
         now = time.time()
         width = (self.size.width or 80) - 2
+        minis = [a for a in snap.accounts if not a.is_active and self._show_minis]
+        widths = mini_widths(minis, now)
         blocks: list[Text] = []
         for acc in snap.accounts:
             if acc.is_active:
@@ -344,7 +402,9 @@ class AccountsPanel(Static):
                     )
                 )
             elif self._show_minis:
-                blocks.append(mini_account_text(acc, now, palette=palette))
+                blocks.append(
+                    mini_account_text(acc, now, palette=palette, widths=widths)
+                )
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()

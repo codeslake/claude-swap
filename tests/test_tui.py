@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import re
 import sys
 import threading
 import time
@@ -784,8 +785,53 @@ class TestDashboard:
 
             panel = app.screen.query_one(AccountsPanel).render().plain
             mini_part = panel.split("user2@example.com", 1)[1]
-            assert "5h 92%" in mini_part
+            assert "5h  92%" in mini_part
             assert "7d" not in mini_part
+
+    async def test_compact_rows_share_fixed_columns(self, tmp_path):
+        # No field may shift between compact rows: long org tags are capped,
+        # a missing window leaves a blank cell, and the pace / reset / disabled
+        # markers never move a later column.
+        def row(n, org, entry, **kw):
+            acc = make_account(n, entry=entry, **kw)
+            return dataclasses.replace(acc, org_name=org)
+
+        fable = [("Fable", 100.0)]
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True),
+                row(2, "someone@example.com's Organization",
+                    make_entry(47.0, 90.0, scoped=fable)),  # 7d ahead of pace
+                row(3, "NA - Example Electronics Co. Ltd", make_entry(92.0, 40.0)),
+                row(4, "", make_entry(5.0, None, scoped=fable)),  # no 7d window
+                row(5, "work", make_entry(100.0, 100.0, scoped=fable),
+                    alias="wk", disabled=True),  # reset suffixes
+                row(6, "work", make_entry(sentinel=USAGE_API_KEY), disabled=True),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountsPanel
+
+            panel = app.screen.query_one(AccountsPanel).render().plain
+        lines = panel.splitlines()
+        rows = [next(ln for ln in lines if ln.startswith(f" {n}  ")) for n in range(2, 7)]
+
+        def starts(token):
+            return {ln.index(token) for ln in rows if token in ln}
+
+        assert "(ahead)" in panel and "(resets" in panel and "personal" in panel
+        for token in ("[", "5h ", "7d ", "Fable (!)", "(disabled)"):
+            assert len(starts(token)) == 1, (token, rows)
+        tags = [re.search(r"\[[^\]]*\]", ln).group() for ln in rows]
+        assert [len(t) for t in tags[:2]] == [24, 24]  # capped, ellipsis inside
+        assert all(t.endswith("…]") for t in tags[:2]) and "[work]" in tags
+        for ln in rows:  # nothing between the tag and the first window cell
+            if "5h " in ln:
+                assert not ln[ln.index("]") + 1 : ln.index("5h ")].strip()
+        assert [ln for ln in rows if ln.endswith("(disabled)")] == rows[3:]
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
