@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import base64
 import errno
+import functools
 import json
 import logging
 import os
@@ -14373,6 +14374,30 @@ def test_write_all_finishes_a_short_write():
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _src_modules() -> tuple:
+    """`(path, text, tree)` for every module of the package, parsed ONCE.
+
+    The source scans below each re-read and re-parsed all of `src/` (about
+    0.1 s a pass) and then walked every tree ten-odd times. The trees are
+    only ever read, so sharing them is safe; the scans stay pinned to one
+    xdist worker so that the sharing happens.
+    """
+    import ast
+
+    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+    texts = {m: m.read_text(encoding="utf-8") for m in sorted(src_dir.rglob("*.py"))}
+    return tuple((m, t, ast.parse(t)) for m, t in texts.items())
+
+
+@functools.lru_cache(maxsize=None)
+def _nodes(tree) -> tuple:
+    """`ast.walk(tree)`, materialised once per tree (same BFS order)."""
+    import ast
+
+    return tuple(ast.walk(tree))
+
+
 def _os_names(tree) -> set[str]:
     """Names this module can reach the `os` module through.
 
@@ -14383,7 +14408,7 @@ def _os_names(tree) -> set[str]:
 
     names = {"os"} | {
         (a.asname or a.name)
-        for imp in ast.walk(tree) if isinstance(imp, ast.Import)
+        for imp in _nodes(tree) if isinstance(imp, ast.Import)
         for a in imp.names if a.name == "os"
     }
     # AND A PLAIN REBINDING. `import os as _o` is not the only way to get a
@@ -14393,7 +14418,7 @@ def _os_names(tree) -> set[str]:
     while True:
         grown = names | {
             t.id
-            for n in ast.walk(tree) if isinstance(n, ast.Assign)
+            for n in _nodes(tree) if isinstance(n, ast.Assign)
             for t in n.targets if isinstance(t, ast.Name)
             if isinstance(n.value, ast.Name) and n.value.id in names
         }
@@ -14526,7 +14551,7 @@ def _os_call_aliases(tree, func: str, os_names: set[str]) -> set[str]:
 
     names = {
         (a.asname or a.name)
-        for imp in ast.walk(tree) if isinstance(imp, ast.ImportFrom)
+        for imp in _nodes(tree) if isinstance(imp, ast.ImportFrom)
         and imp.module == "os"
         for a in imp.names if a.name == func
     }
@@ -14555,7 +14580,7 @@ def _os_call_aliases(tree, func: str, os_names: set[str]) -> set[str]:
     while True:
         grown = names | {
             t
-            for n in ast.walk(tree)
+            for n in _nodes(tree)
             for t in targets_of(n)
             if (isinstance(getattr(n, "value", None), ast.Attribute)
                 and n.value.attr == func
@@ -14597,7 +14622,7 @@ def _resolved_flags(tree, node) -> str:
     if not flags.isidentifier():
         return flags
     bound = [
-        ast.unparse(a.value) for a in ast.walk(tree)
+        ast.unparse(a.value) for a in _nodes(tree)
         if ((isinstance(a, ast.Assign) and len(a.targets) == 1
              and isinstance(a.targets[0], ast.Name)
              and a.targets[0].id == flags)
@@ -14631,6 +14656,7 @@ def _is_os_call(node, func: str, os_names: set[str], aliases: set[str]) -> bool:
     return isinstance(f, ast.Name) and f.id in aliases
 
 
+@pytest.mark.xdist_group("src-scan")
 def test_no_writer_calls_os_write_bare():
     """`os.write` is write(2): it may write FEWER bytes than it was given.
 
@@ -14645,17 +14671,15 @@ def test_no_writer_calls_os_write_bare():
     """
     import ast
 
-    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
     offenders = []
-    for mod in sorted(src_dir.rglob("*.py")):
-        tree = ast.parse(mod.read_text(encoding="utf-8"))
+    for mod, _, tree in _src_modules():
         # THE LOOP THAT EXISTS TO DO THIS IS THE ONE PLACE ALLOWED TO. Named
         # rather than exempting its module, so a second exemption has to be
         # written down here to take effect.
         # THE HELPER'S OWN MODULE, not any function of that name. A second
         # `def write_all` elsewhere in src/ would otherwise exempt itself.
         exempt = {
-            id(n) for f in ast.walk(tree)
+            id(n) for f in _nodes(tree)
             if mod.name == "fsutil.py"
             and isinstance(f, ast.FunctionDef) and f.name == "write_all"
             for n in ast.walk(f)
@@ -14675,7 +14699,7 @@ def test_no_writer_calls_os_write_bare():
         # in a loop.
         aliases |= {
             t.id
-            for a in ast.walk(tree) if isinstance(a, ast.Assign)
+            for a in _nodes(tree) if isinstance(a, ast.Assign)
             for t in a.targets if isinstance(t, ast.Name)
             if isinstance(a.value, ast.Attribute) and a.value.attr == "write"
             and isinstance(a.value.value, ast.Name)
@@ -14686,10 +14710,10 @@ def test_no_writer_calls_os_write_bare():
         # otherwise silently turn every scan here into a pass.
         if any(isinstance(imp, ast.ImportFrom) and imp.module == "os"
                and any(a.name == "*" for a in imp.names)
-               for imp in ast.walk(tree)):
+               for imp in _nodes(tree)):
             offenders.append(f"{mod.name}: `from os import *` hides every "
                              "bare write from this scan")
-        for node in ast.walk(tree):
+        for node in _nodes(tree):
             if not isinstance(node, ast.Call) or id(node) in exempt:
                 continue
             f = node.func
@@ -14729,16 +14753,17 @@ def test_no_writer_calls_os_write_bare():
     # with "the instrument, not the code" -- the wrong sentence about a good
     # change. That is the refactor `_write_json` itself already uses.
     users = 0
-    for mod in src_dir.rglob("*.py"):
-        tree = ast.parse(mod.read_text(encoding="utf-8"))
+    for mod, text, tree in _src_modules():
+        if "write_all" not in text:
+            continue  # no call site without the name
         named = {
             (a.asname or a.name)
-            for imp in ast.walk(tree) if isinstance(imp, ast.ImportFrom)
+            for imp in _nodes(tree) if isinstance(imp, ast.ImportFrom)
             and (imp.module or "").endswith("fsutil")
             for a in imp.names if a.name == "write_all"
         }
         users += sum(
-            1 for n in ast.walk(tree)
+            1 for n in _nodes(tree)
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
             and n.func.id in named
         )
@@ -14748,6 +14773,7 @@ def test_no_writer_calls_os_write_bare():
     )
 
 
+@pytest.mark.xdist_group("src-scan")
 def test_no_writer_chmods_after_it_publishes():
     """The try block must end AT the publish, everywhere it was moved once.
 
@@ -14766,11 +14792,11 @@ def test_no_writer_chmods_after_it_publishes():
     import re
     import ast
 
-    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
     offenders, publishes = [], 0
-    for mod in sorted(src_dir.rglob("*.py")):
-        tree = ast.parse(mod.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
+    for mod, text, tree in _src_modules():
+        if "replace_with_retry" not in text:
+            continue  # no publish, so no chmod can follow one
+        for node in _nodes(tree):
             if not isinstance(node, ast.Try):
                 continue
             pub, chmods = None, []
@@ -14839,6 +14865,7 @@ def test_a_temp_name_already_taken_is_not_deleted(temp_home: Path, monkeypatch):
     assert squatted.read_text(encoding="utf-8") == "A PEER'S IN-PROGRESS FILE"
 
 
+@pytest.mark.xdist_group("src-scan")
 def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
     """`O_EXCL` is what makes `FileExistsError` reachable, so the conversion is
     what opened this. A writer that refuses the name and then unlinks it in a
@@ -14859,10 +14886,10 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
     """
     import ast
 
-    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
     offenders, seen = [], 0
-    for mod in sorted(src_dir.rglob("*.py")):
-        tree = ast.parse(mod.read_text(encoding="utf-8"))
+    for mod, text, tree in _src_modules():
+        if "O_EXCL" not in text:
+            continue  # the scan below only reads `O_EXCL` opens
         # Every `Try` that lexically contains each node, innermost last.
         guarding: dict[int, list[ast.Try]] = {}
         def descend(node, stack):
@@ -14877,7 +14904,7 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
 
         os_names = _os_names(tree)
         open_aliases = _os_call_aliases(tree, "open", os_names)
-        for node in ast.walk(tree):
+        for node in _nodes(tree):
             if not _is_os_call(node, "open", os_names, open_aliases):
                 continue
             # THE SAME HOIST ITS SIBLING RESOLVES. A substring test on the
@@ -14951,6 +14978,7 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
     )
 
 
+@pytest.mark.xdist_group("src-scan")
 def test_every_temp_writer_opens_with_O_EXCL():
     """The invariant `_write_json`'s own docstring states, checked structurally.
 
@@ -14968,10 +14996,10 @@ def test_every_temp_writer_opens_with_O_EXCL():
     import ast
     import re
 
-    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
     offenders, unreadable, seen = [], [], 0
-    for mod in sorted(src_dir.rglob("*.py")):
-        tree = ast.parse(mod.read_text(encoding="utf-8"))
+    for mod, text, tree in _src_modules():
+        if "open" not in text:
+            continue  # no `os.open` under any spelling
         # EVERY NAME THAT REACHES THE MODULE. Its sibling scan resolves
         # `import os as _o` and this one did not, so that one alias hid an
         # `O_TRUNC` regression from BOTH -- the disown scan filters on the
@@ -14980,7 +15008,7 @@ def test_every_temp_writer_opens_with_O_EXCL():
         # calling them inside the loop is quadratic on the larger modules.
         os_names = _os_names(tree)
         open_aliases = _os_call_aliases(tree, "open", os_names)
-        for node in ast.walk(tree):
+        for node in _nodes(tree):
             if not _is_os_call(node, "open", os_names, open_aliases):
                 continue
             kw = {k.arg: k.value for k in node.keywords}
@@ -15000,7 +15028,7 @@ def test_every_temp_writer_opens_with_O_EXCL():
                 # spells its flags as a name -- and a real weakening then
                 # reports as a crashed instrument instead of an offender.
                 bound = [
-                    ast.unparse(a.value) for a in ast.walk(tree)
+                    ast.unparse(a.value) for a in _nodes(tree)
                     if ((isinstance(a, ast.Assign) and len(a.targets) == 1
                          and isinstance(a.targets[0], ast.Name)
                          and a.targets[0].id == flags)
