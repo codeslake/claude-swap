@@ -565,21 +565,14 @@ class AutoScreen(Screen):
                         # "(<window> full)" (autoswitch.py `_describe`):
                         # "full" is reserved here for actual exhaustion (the
                         # window's own pct at or over 100); a window merely
-                        # blocked at the bar names the bar it was judged
-                        # against instead (the owner's report, 92% read
-                        # "full" against a threshold of 90).
+                        # blocked at the bar prints no marker (the owner's
+                        # report, 92% read "full" against a threshold of 90).
                         window_pct = next(
                             p for label, p, _ in windows if label == blocked_model
                         )
                         if window_pct >= 100.0:
                             entry.append(
                                 f"  {blocked_model} full", style=palette.muted
-                            )
-                        else:
-                            entry.append(
-                                f"  {blocked_model} {pct_label(window_pct)}%"
-                                f" >= {pct_label(bar)}%",
-                                style=palette.muted,
                             )
                 rank_pct = binding_pct(acc.usage.last_good, rank_models)
                 key = (

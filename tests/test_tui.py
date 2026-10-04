@@ -2590,8 +2590,8 @@ class TestUnswitchableRowsAreListed:
             }),
             # Full block: 5h is genuinely exhausted (100%), no model choice
             # escapes it. `full` means nothing-left, not merely over the
-            # bar -- see the parametrized test below for the blocked-but-
-            # not-exhausted wording.
+            # bar -- see the parametrized test below: a blocked-but-not-
+            # exhausted window prints no marker.
             self._acct("3", "c@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 100.0}, "seven_day": {"pct": 5.0},
                 "scoped": [{"name": "Fable", "pct": 10.0}],
@@ -2604,18 +2604,12 @@ class TestUnswitchableRowsAreListed:
     def test_the_full_label_is_reserved_for_actual_exhaustion(self, strategy):
         """The owner's report, 2026-09-17: a 7d window at 92% printed `7d
         full` against the configured threshold of 90 -- a claim of
-        nothing-left that was false. `full` now means nothing left (pct
-        >= 100); a window merely at or over the LANDING BAR
-        (`proactive_switch_bar_pct`) names that bar instead; a window
-        under it carries no block label.
+        nothing-left that was false. `full` means nothing left (pct
+        >= 100); a window under 100 prints no marker at all, however close
+        it sits to the landing bar (owner 2026-10-04: the `98% >= 97%`
+        wording was noise).
 
-        Parametrized so the wording rule holds under every strategy.
-        `consume-first` reads the raw `settings.threshold` (90) unchanged,
-        so both #3 (92%) and #5 (98%) print the `>= 90%` wording. Under
-        `dynamic` the bar is 97 (#321): #3 (headroom 8) now sits UNDER it --
-        the same reading as 50%, no block label at all -- while #5
-        (headroom 2, still under 100) is the row that keeps the `>= 97%`
-        wording under test.
+        Parametrized so the rule holds under every strategy.
         """
         from claude_swap.settings import AutoSwitchSettings
 
@@ -2644,19 +2638,9 @@ class TestUnswitchableRowsAreListed:
             )
         }
         assert "7d full" in rows["hundred@x.com"], rows["hundred@x.com"]
-        if strategy == "dynamic":
-            assert "full" not in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
-            assert ">=" not in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
-            assert "7d 98% >= 97%" in rows["ninetyeight@x.com"], (
-                rows["ninetyeight@x.com"]
-            )
-        else:
-            assert "7d 92% >= 90%" in rows["ninetytwo@x.com"], rows["ninetytwo@x.com"]
-            assert "7d 98% >= 90%" in rows["ninetyeight@x.com"], (
-                rows["ninetyeight@x.com"]
-            )
-        assert "full" not in rows["fifty@x.com"], rows["fifty@x.com"]
-        assert ">=" not in rows["fifty@x.com"], rows["fifty@x.com"]
+        for email in ("ninetytwo@x.com", "fifty@x.com", "ninetyeight@x.com"):
+            assert "full" not in rows[email], rows[email]
+            assert ">=" not in rows[email], rows[email]
 
     def test_the_panel_admits_a_headroom_candidate_with_hours_to_reset_under_dynamic(
         self,
