@@ -4143,7 +4143,8 @@ class TestUnswitchableRowsAreListed:
         import re
 
         def colon(window, line):
-            return re.search(re.escape(window) + r"(?:\(⟳\w+\))?:", line).end()
+            # `[^)]*`, not `\w+`: a window with no reset reads `7d(⟳?):`
+            return re.search(re.escape(window) + r"(?:\(⟳[^)]*\))?:", line).end()
 
         seven_d = [colon("7d", line) for line in lines]
         fable = [colon("Fable", line) for line in lines]
@@ -4235,13 +4236,15 @@ class TestUnswitchableRowsAreListed:
         ), active="9", settings=settings)
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom
         assert len(rows) == 3, rows
-        assert re.search(r"cccc@x\.com\s+7d:", rows["cccc@x.com"]), rows  # no leading dot
-        assert "7d(⟳" in rows["aaaa@x.com"] and "7d:" in rows["bbbb@x.com"], rows  # widths differ
+        # no leading dot: only blanks between the `login` column and the first chip
+        assert re.search(r"login \S+\s+7d\(⟳\?\):", rows["cccc@x.com"]), rows
+        assert "7d(⟳" in rows["aaaa@x.com"] and "7d(⟳?):" in rows["bbbb@x.com"], rows  # widths differ (no reset: `⟳?`)
         for window in ("5h", "7d", "Fable"):
             hits = [
                 m
                 for line in rows.values()
-                if (m := re.search(r"(" + re.escape(window) + r"(?:\(⟳\w+\))?:)\s*\d+%", line))
+                # `[^)]*`, not `\w+`: a window with no reset reads `7d(⟳?):`
+                if (m := re.search(r"(" + re.escape(window) + r"(?:\(⟳[^)]*\))?:)\s*\d+%", line))
             ]
             colons = {m.end(1) for m in hits}
             ends = {m.end() for m in hits}
@@ -4288,7 +4291,7 @@ class TestUnswitchableRowsAreListed:
                 "seven_day": {"pct": 5.0}, "scoped": [{"name": "Fable", "pct": 95.0}],
             }),
             self._acct("3", "bbbb@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 5.0},
+                "five_hour": {"pct": 100.0}, "seven_day": {"pct": 5.0},  # 100: `full` is reserved for exhaustion
             }),
             self._acct("4", "cccc@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 1.0}, "seven_day": {"pct": 1.0},
@@ -4297,12 +4300,89 @@ class TestUnswitchableRowsAreListed:
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom
         assert len(rows) == 3, rows
         starts = {
-            e: m.start(1) if (m := re.search(r"\s{2}(\S+-only|\S+ full)$", line)) else None
+            e: m.start(1) if (m := re.search(r"\s{2}(\S+-walled|\S+ full)$", line)) else None  # `-walled`
             for e, line in rows.items()
         }
         assert starts["aaaa@x.com"] is not None, rows
         assert starts["aaaa@x.com"] == starts["bbbb@x.com"], f"{starts} in {rows!r}"
         assert starts["cccc@x.com"] is None and rows["cccc@x.com"] == rows["cccc@x.com"].rstrip(), rows
+
+    def test_a_backoff_chip_row_lines_up_with_a_plain_row_and_the_markers_share_a_column(self):
+        """T1738, #321 + #323 + #371 merged: a window whose reset fired before its pct was
+        measured reads `7d(⟳429 30m):` (`chip_label` over `reset_text(..., entry=)`), wider
+        than the plain `7d(⟳3d08h):` another row prints. The columns are sized from the
+        text the cells print, so that chip's `:` and `%` sit in the plain row's columns,
+        and the first marker (`stale` on the backed-off row, `Fable-walled` on the other)
+        starts at ONE column after the padded chip block, the backed-off row's missing
+        Fable cell included."""
+        import re
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=90.0)
+        now = time.time()
+        backing_off = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 10.0, "resets_at": _iso_in(3600)},
+                "seven_day": {"pct": 100.0, "resets_at": _iso_in(-60)},
+            },
+            fetched_at=now - 120, age_s=120.0, consecutive_failures=2,
+            backoff_until=now + 1800, last_error="http-429",
+        )
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0, "resets_at": _iso_in(4 * 3600)},
+                "seven_day": {"pct": 9.0, "resets_at": _iso_in(3 * 86400 + 8 * 3600)},
+                "scoped": [{"name": "Fable", "pct": 95.0}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, usage=backing_off),
+        ), active="9", settings=settings)
+        rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}
+        assert len(rows) == 2, rows
+        assert "7d(⟳429 " in rows["bbbb@x.com"], rows  # premise: the back-off chip is drawn
+        for window in ("5h", "7d"):
+            hits = [
+                m for line in rows.values()
+                if (m := re.search(r"(" + window + r"\(⟳[^)]*\):)\s*\d+%", line))
+            ]
+            assert len(hits) == 2, (window, rows)
+            assert len({m.end(1) for m in hits}) == 1, f"{window} colon not in one column: {rows!r}"
+            assert len({m.end() for m in hits}) == 1, f"{window} percent not in one column: {rows!r}"
+        starts = {
+            e: m.start(1) for e, line in rows.items()
+            if (m := re.search(r"\s{2}(stale|Fable-walled)(?:\s|$)", line))
+        }
+        assert set(starts) == set(rows), (starts, rows)
+        assert len(set(starts.values())) == 1, f"{starts} in {rows!r}"
+
+    def test_an_unranked_no_plan_slot_sizes_no_column(self):
+        """T1738, #323 + #371 merged: an unranked no-plan slot draws `no plan
+        (subscription inactive)` and no chips, so a wide window on it must not widen
+        the cells of the rows that do draw them (the column pre-pass skips it)."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        no_plan = UsageEntry(
+            last_good={"five_hour": {"pct": 100.0}, "seven_day": {"pct": 5.0}},
+            fetched_at=time.time() - STALE_OK_S - 600, age_s=STALE_OK_S + 600,
+            consecutive_failures=3, last_error="oauth_not_allowed_for_organization",
+        )
+
+        def render(*extra):
+            return self._render(self._snap(
+                self._acct("1", "a@x.com", switchable=True, last_good={
+                    "five_hour": {"pct": 92.0}, "seven_day": {"pct": 5.0},
+                }),
+                self._acct("2", "bbbb@x.com", switchable=True, last_good={
+                    "five_hour": {"pct": 5.0}, "seven_day": {"pct": 9.0},
+                }),
+                *extra,
+            ), active="1", settings=AutoSwitchSettings(model="all", threshold=90.0))
+
+        def row(out):
+            return next(l for l in out.split("\n") if "bbbb@x.com" in l)
+
+        out = render(self._acct("3", "cccc@x.com", switchable=True, usage=no_plan))
+        assert out.rstrip().splitlines()[-1].endswith("no plan (subscription inactive)"), out
+        assert row(out) == row(render()), out
 
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach
