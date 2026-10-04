@@ -2083,8 +2083,9 @@ class TestTheTuiSurfaceSurvivesTheSplit:
             property(lambda self: types.SimpleNamespace(switcher=object(), snapshot=None)),
             raising=False,
         )
-        # With the extra present — its absence hiding the row is the sibling
-        # test; this one is about the row existing at all when it should.
+        # With the extra present — the row following the wiring rather than the
+        # extra is tests/test_tui_pin.py::test_the_row_follows_the_wiring_not_the_extra;
+        # this one is about the row existing at all when it should.
         monkeypatch.setattr(dashboard.pin, "is_available", lambda: True)
         monkeypatch.setattr(dashboard.pin, "pinned_email", lambda sw: None)
         screen = object.__new__(dashboard.DashboardScreen)
@@ -11568,6 +11569,54 @@ class TestAClearOnASharedSettingsFileIsLocal:
 
         assert ok and json.loads(shared.read_text()) == {}, "premise: the record is gone"
         assert not marker.exists()
+
+    def test_everywhere_keeps_the_marker_while_the_record_stands(self, tmp_path, monkeypatch):
+        """A record write the clear swallowed leaves the record, so the marker
+        stays: lifted, this host would read as pinned and heal would re-wire it."""
+        from claude_swap import pin
+        from claude_swap import settings as _s
+
+        sw, shared, marker = self._shared_host(
+            tmp_path, monkeypatch,
+            {"remoteControl": {"pinnedEmail": "a@b.c"}}, self._broken_peer)
+        marker.touch()
+
+        def refuse(path, data):
+            raise OSError("read-only")
+
+        monkeypatch.setattr(_s, "atomic_write_json", refuse)
+
+        ok, _msg = pin.clear_pin(sw, everywhere=True)
+
+        assert not ok and "pinnedEmail" in shared.read_text(), "premise: the record stands"
+        assert marker.exists()
+
+    def test_a_refused_marker_unlink_is_logged(self, tmp_path, monkeypatch, caplog):
+        from pathlib import Path
+
+        from claude_swap import pin
+
+        def drops_the_record(sw, email, org, identity=None, *, everywhere=False):
+            (sw.backup_dir / "settings.json").write_text("{}")
+
+        sw, _shared, marker = self._shared_host(
+            tmp_path, monkeypatch,
+            {"remoteControl": {"pinnedEmail": "a@b.c"}}, drops_the_record)
+        marker.touch()
+        real = Path.unlink
+
+        def refuse(self, *a, **kw):
+            if self == marker:
+                raise PermissionError("held")
+            return real(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "unlink", refuse)
+
+        with caplog.at_level("WARNING", logger="claude-swap"):
+            ok, _msg = pin.clear_pin(sw, everywhere=True)
+
+        assert ok and marker.exists(), "premise: the unlink was refused"
+        assert any("clear marker" in r.getMessage() for r in caplog.records)
 
     def test_a_one_host_clear_writes_nothing_through_the_link_for_a_non_pair(
             self, tmp_path, monkeypatch):

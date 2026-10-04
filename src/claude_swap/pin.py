@@ -22,7 +22,6 @@ dependency is imported lazily inside the entry points, exactly as
 
 from __future__ import annotations
 
-import contextlib
 import inspect
 import json
 import logging
@@ -1812,15 +1811,21 @@ def clear_pin(switcher, everywhere: bool = False) -> tuple[bool, str]:
             _clear_pin_record(switcher, everywhere=True)
         else:
             _clear_pin_record(switcher)
-    # THE MARKER GOES WITH THE WIRING, WHOEVER DROPPED THE RECORD. A peer that
-    # drops it and returns never reaches the fallback above, and a marker left
-    # standing keeps this host reading as cleared once the record is pinned again.
-    if everywhere and not survivors:
+    still_pinned = _record(switcher) is not None
+    # THE MARKER GOES WITH THE WIRING AND THE RECORD, WHOEVER DROPPED THE RECORD.
+    # A peer that drops it and returns never reaches the fallback above, and a
+    # marker left standing keeps this host reading as cleared once the record is
+    # pinned again. Only once the record is gone: a failed read or write leaves
+    # it, and without the marker the host would read as pinned and heal re-wires.
+    if everywhere and not survivors and not still_pinned:
         from claude_swap import settings as _s
 
-        with contextlib.suppress(OSError):
+        try:
             _s.pin_cleared_path(switcher.backup_dir).unlink(missing_ok=True)
-    still_pinned = _record(switcher) is not None
+        except OSError as exc:
+            _logger.warning(
+                "could not remove the clear marker (%s); this host keeps "
+                "reading as unpinned until it is removed by hand", exc)
     if still_pinned or survivors:
         what = " and ".join(
             w for w, on in (("the pin", still_pinned), ("the wiring", bool(survivors)))
