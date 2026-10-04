@@ -835,7 +835,12 @@ class TestDashboard:
 
         rows = compact(panel)
         assert narrow_width < width
-        assert all(len(ln) <= narrow_width for ln in compact(narrow))
+        cut = compact(narrow)
+        assert all(len(ln) <= narrow_width for ln in cut)
+        # a row cut to the panel keeps its marker whole, still in one column
+        marked = [ln for ln in cut if "(disabled)" in ln]
+        assert len(marked) == 4 and all(ln.endswith("(disabled)") for ln in marked)
+        assert len({ln.index("(disabled)") for ln in marked}) == 1
         assert all(len(ln) <= width for ln in rows)  # every marker fully visible
 
         def starts(token):

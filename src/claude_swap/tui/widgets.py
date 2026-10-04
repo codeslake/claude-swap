@@ -336,6 +336,7 @@ def mini_account_text(
     *,
     palette: Palette = Palette.DARK,
     widths: MiniWidths | None = None,
+    width: int | None = None,
 ) -> Text:
     """One minimized line for an inactive account, in fixed columns.
 
@@ -349,7 +350,9 @@ def mini_account_text(
     row's body is as wide as the wider of the cells and the longest such
     note, so the marker keeps one column.
     ``widths`` (from :func:`mini_widths` over the rows shown) lines the
-    columns up across rows; alone, a row fits itself.
+    columns up across rows; alone, a row fits itself. A row wider than
+    ``width`` is ellipsized before the ``(disabled)`` marker, which stays
+    whole, so the markers still share one column.
     """
     widths = widths or mini_widths([acc], now)
     cells, note = _mini_body(acc, now, palette)
@@ -361,13 +364,18 @@ def mini_account_text(
         _fit(_mini_tag(acc, palette), widths.tag),
         _fit(note or grid, max(grid.cell_len, widths.note)),
     ]
-    if acc.disabled:
-        fields.append(Text("(disabled)", style=palette.muted))
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
     text.append(Text(_MINI_GAP).join(fields))
-    text.rstrip()
-    return text
+    tail = Text.assemble(_MINI_GAP, ("(disabled)", palette.muted)) if acc.disabled else Text()
+    if not tail:
+        text.rstrip()
+    if width is not None and text.cell_len + tail.cell_len > width:
+        room = width - tail.cell_len
+        if room < 1:  # no room for the marker: cut the whole row
+            tail, room = Text(), width
+        text.truncate(room, overflow="ellipsis")
+    return text.append(tail)
 
 
 class AccountsPanel(Static):
@@ -410,8 +418,9 @@ class AccountsPanel(Static):
                     )
                 )
             elif self._show_minis:
-                row = mini_account_text(acc, now, palette=palette, widths=widths)
-                row.truncate(width, overflow="ellipsis")  # never wraps
+                row = mini_account_text(
+                    acc, now, palette=palette, widths=widths, width=width
+                )  # never wraps
                 blocks.append(row)
         if not blocks:
             return Text("no active managed login", style=palette.muted)
