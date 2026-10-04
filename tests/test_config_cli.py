@@ -49,6 +49,7 @@ class TestConfigList:
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
+            "ui.showOrgTag",
         ):
             assert key in out
         # From the schema, not a literal: a bare count drifts every time a
