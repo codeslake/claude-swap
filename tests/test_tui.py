@@ -806,11 +806,12 @@ class TestDashboard:
             row(3, "NA - Example Electronics Co. Ltd", make_entry(92.0, 40.0)),
             row(4, "", make_entry(5.0, None, scoped=fable)),  # no 7d window
             row(5, "work", make_entry(100.0, 100.0, scoped=fable),
-                alias="wk", disabled=True),  # reset suffixes
+                alias="wk", email="u5@acme.io", disabled=True),  # reset suffixes
             row(6, "work", make_entry(sentinel=USAGE_API_KEY), disabled=True),
             # the longest note, and the "usage unknown" note
             row(7, "work", make_entry(sentinel=USAGE_RELOGIN_REQUIRED), disabled=True),
             row(8, "work", make_entry(None, None, spend=spend), disabled=True),
+            row(9, "work", make_entry(30.0, 85.0), disabled=True),  # ahead and disabled
         ]
         app = make_app(FakeSwitcher(accs, tmp_path))
         async with app.run_test(size=(140, 40)) as pilot:
@@ -831,24 +832,35 @@ class TestDashboard:
 
         def compact(text):
             lines = text.splitlines()
-            return [next(ln for ln in lines if ln.startswith(f" {n}  ")) for n in range(2, 9)]
+            return [next(ln for ln in lines if ln.startswith(f" {n}  ")) for n in range(2, 10)]
 
         rows = compact(panel)
         assert narrow_width < width
         cut = compact(narrow)
         assert all(len(ln) <= narrow_width for ln in cut)
-        # a row cut to the panel keeps its marker whole, still in one column
-        marked = [ln for ln in cut if "(disabled)" in ln]
-        assert len(marked) == 4 and all(ln.endswith("(disabled)") for ln in marked)
-        assert len({ln.index("(disabled)") for ln in marked}) == 1
         assert all(len(ln) <= width for ln in rows)  # every marker fully visible
+        # the one trailing marker field is whole and starts at one column, cut or not
+        fields = {2: "(ahead)", 5: "(disabled)", 6: "(disabled)", 7: "(disabled)",
+                  8: "(disabled)", 9: "(ahead) (disabled)"}
+        for lines in (rows, cut):
+            marked = {n: ln for n, ln in zip(range(2, 10), lines)
+                      if "(ahead)" in ln or "(disabled)" in ln}
+            assert list(marked) == list(fields)
+            assert all(ln.endswith(fields[n]) for n, ln in marked.items())
+            assert len({len(ln) - len(fields[n]) for n, ln in marked.items()}) == 1
 
-        def starts(token):
-            return {ln.index(token) for ln in rows if token in ln}
+        def starts(token, lines=rows):
+            return {ln.index(token) for ln in lines if token in ln}
 
         assert "(ahead)" in panel and "(resets" in panel
-        for token in ("[", "5h ", "7d ", "Fable (!)", "(disabled)"):
+        for token in ("[", "5h ", "7d ", "Fable (!)"):
             assert len(starts(token)) == 1, (token, rows)
+            assert len(starts(token, cut)) <= 1, (token, cut)  # a cut row may lose it
+        # the pace marker is no part of the 7d cell: ahead or not, only the pct
+        assert "Fable (!)" in rows[0] and "Fable (!)" in rows[3]  # wide rows are whole
+        s7, sf = starts("7d ").pop(), starts("Fable (!)").pop()
+        for n in (2, 3, 9):
+            assert re.fullmatch(r"7d +\d+%\s*", rows[n - 2][s7:sf]), rows[n - 2]
         tags = [re.search(r"\[[^\]]*\]", ln).group() for ln in rows]
         assert [len(t) for t in tags[:2]] == [24, 24]  # capped, ellipsis inside
         assert all(t.endswith("…]") for t in tags[:2]) and "[work]" in tags
