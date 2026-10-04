@@ -21,7 +21,8 @@ from pathlib import Path
 import pytest
 
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
-from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_API_KEY, USAGE_RELOGIN_REQUIRED, USAGE_TOKEN_EXPIRED)
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
@@ -807,22 +808,35 @@ class TestDashboard:
             row(5, "work", make_entry(100.0, 100.0, scoped=fable),
                 alias="wk", disabled=True),  # reset suffixes
             row(6, "work", make_entry(sentinel=USAGE_API_KEY), disabled=True),
-            # a note wider than the window cells, and the "usage unknown" note
-            row(7, "work", make_entry(sentinel=USAGE_TOKEN_EXPIRED), disabled=True),
+            # the longest note, and the "usage unknown" note
+            row(7, "work", make_entry(sentinel=USAGE_RELOGIN_REQUIRED), disabled=True),
             row(8, "work", make_entry(None, None, spend=spend), disabled=True),
         ]
         app = make_app(FakeSwitcher(accs, tmp_path))
-        async with app.run_test(size=(100, 40)) as pilot:
+        async with app.run_test(size=(140, 40)) as pilot:
             await settle(pilot)
             from claude_swap.tui.widgets import (
                 AccountsPanel, mini_account_text, mini_widths)
 
             widget = app.screen.query_one(AccountsPanel)
             panel = widget.render().plain
-            # rows wider than the panel are clipped, never wrapped onto a second line
+            # a row wider than the panel is ellipsized, never wrapped onto a second line
             assert widget.size.height == len(panel.splitlines())
-        lines = panel.splitlines()
-        rows = [next(ln for ln in lines if ln.startswith(f" {n}  ")) for n in range(2, 9)]
+            width = widget.size.width
+            await pilot.resize_terminal(70, 40)
+            await settle(pilot)
+            narrow = widget.render().plain
+            assert widget.size.height == len(narrow.splitlines())
+            narrow_width = widget.size.width
+
+        def compact(text):
+            lines = text.splitlines()
+            return [next(ln for ln in lines if ln.startswith(f" {n}  ")) for n in range(2, 9)]
+
+        rows = compact(panel)
+        assert narrow_width < width
+        assert all(len(ln) <= narrow_width for ln in compact(narrow))
+        assert all(len(ln) <= width for ln in rows)  # every marker fully visible
 
         def starts(token):
             return {ln.index(token) for ln in rows if token in ln}

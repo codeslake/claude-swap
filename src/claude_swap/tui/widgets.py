@@ -241,6 +241,7 @@ def account_card_text(
 
 
 _MINI_TAG_CAP = 24  # widest "[tag]" a compact row shows, brackets included
+_MINI_NOTE_CAP = 30  # widest note that widens the body column; longer is ellipsized
 _MINI_GAP = "  "
 
 
@@ -250,11 +251,11 @@ class MiniWidths(NamedTuple):
     name: int
     tag: int
     cells: dict[str, int]  # window label -> cell width, in display order
-    note: int  # widest sentinel / "usage unknown" note shown
+    note: int  # widest sentinel / "usage unknown" note shown, capped
 
 
 def _fit(text: Text, width: int) -> Text:
-    text.pad_right(max(0, width - text.cell_len))
+    text.truncate(width, overflow="ellipsis", pad=True)
     return text
 
 
@@ -325,7 +326,7 @@ def mini_widths(accs: Iterable[AccountSnapshot], now: float) -> MiniWidths:
         for label, cell in row_cells.items():
             cells[label] = max(cells.get(label, 0), cell.cell_len)
         if row_note:
-            note = max(note, row_note.cell_len)
+            note = max(note, min(row_note.cell_len, _MINI_NOTE_CAP))
     return MiniWidths(name, tag, {k: w for k, w in cells.items() if w}, note)
 
 
@@ -343,8 +344,10 @@ def mini_account_text(
     Pcts only, severity colored; a window at/over 100% brings its reset
     countdown along, and a maxed per-model window shows as ``Fable (!)``. A
     window the account lacks is a blank cell, and a sentinel state shows its
-    label in place of the cells; every row's body is as wide as the wider of
-    the cells and the longest such note, so the marker keeps one column.
+    label in place of the cells (ellipsized past ``_MINI_NOTE_CAP`` and the
+    cells' width; the expanded card and the CLI carry the full text). Every
+    row's body is as wide as the wider of the cells and the longest such
+    note, so the marker keeps one column.
     ``widths`` (from :func:`mini_widths` over the rows shown) lines the
     columns up across rows; alone, a row fits itself.
     """
@@ -407,9 +410,9 @@ class AccountsPanel(Static):
                     )
                 )
             elif self._show_minis:
-                blocks.append(
-                    mini_account_text(acc, now, palette=palette, widths=widths)
-                )
+                row = mini_account_text(acc, now, palette=palette, widths=widths)
+                row.truncate(width, overflow="ellipsis")  # never wraps
+                blocks.append(row)
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()

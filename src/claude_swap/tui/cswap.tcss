@@ -10,8 +10,6 @@ Screen {
 
 #accounts-panel {
     height: auto;
-    text-wrap: nowrap;  /* a padded compact row is clipped, never wrapped */
-    text-overflow: ellipsis;
     padding: 1 3;
     background: $background;
     border-bottom: solid $panel;
