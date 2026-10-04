@@ -351,7 +351,7 @@ def spend_row(rows: list[tuple]) -> tuple | None:
 
 
 _MINI_TAG_CAP = 24  # widest "[tag]" a compact row shows, brackets included
-_MINI_NOTE_CAP = 30  # widest note that widens the body column; longer is ellipsized
+_MINI_NOTE_CAP = 30  # widest sentinel label that widens the body column; longer is ellipsized
 _MINI_GAP = "  "
 
 
@@ -361,7 +361,7 @@ class MiniWidths(NamedTuple):
     name: int
     tag: int
     cells: dict[str, int]  # window label -> cell width, in display order
-    note: int  # widest sentinel / "usage unknown" note shown, capped
+    note: int  # widest note shown: a spend note whole, a sentinel / "usage unknown" note capped
     marker: int  # widest marker field shown, whichever kinds the rows carry
     chip: dict[str, int]  # window label -> widest chip label, so its pct starts at one column
 
