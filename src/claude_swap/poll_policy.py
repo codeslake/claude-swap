@@ -121,6 +121,13 @@ POST_SWITCH_REPLAN_DEFER_S = 30.0
 # forward.
 EXHAUSTED_INTERVAL_S = 600.0
 
+# The usage endpoint answers 403 with this kind for a slot whose organization
+# has no plan to read. Re-asking every backoff only converts those 403s into
+# an hour-long 429 on the same token, so such a row is planned once a day
+# (through the plan, not a backoff) and keeps this kind through later failures.
+NO_PLAN_ERROR = "oauth_not_allowed_for_organization"
+NO_PLAN_POLL_INTERVAL_S = 86_400.0
+
 # A window whose binding pct moved at least this much between polls is being
 # consumed somewhere (this machine, another PC, session mode) → tighten; an
 # unmoved one backs off toward its ceiling.
