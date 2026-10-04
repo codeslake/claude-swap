@@ -245,12 +245,15 @@ def rank_switch_candidates(
     now: float,
     active_number: str | None,
     last_active_at: dict | None = None,
+    reasons_out: dict | None = None,
 ) -> tuple[list[str], str | None, str, bool]:
     """(ordered, rank_axis, trigger, unmodeled): mirrors the engine's own
     admission and order. THE shared computation -- ``ordered_accounts`` and
     the auto view's "Next best" panel both read off this, never a pass of
-    their own.
+    their own. ``reasons_out``, when given, is filled with the engine's own
+    plain-words cause for each candidate the pass whose result is used dropped.
     """
+    reasons = {} if reasons_out is None else reasons_out
     models = parse_model_names(settings.model)
     consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
     usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
@@ -324,7 +327,7 @@ def rank_switch_candidates(
         headroom = _headroom_by_account(usage, axis)
         warm, cold = _rank_dynamic_candidates(
             oauth_candidates, headroom, usage, now, last_active_at or {},
-            settings.cache_ttl_seconds,
+            settings.cache_ttl_seconds, reasons,
         )
         if trigger == "proactive":
             cold_floor = settings.cold_switch_cost_pct
@@ -340,6 +343,7 @@ def rank_switch_candidates(
         return ordered, ("soonest reset" if ordered else None)
 
     def _rank_on(axis: tuple[str, ...], trigger: str) -> tuple[list[str], str | None]:
+        reasons.clear()  # a retried pass replaces the one before it
         if trigger in _UNMODELED_TRIGGERS:
             return [], None
         if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
@@ -357,6 +361,7 @@ def rank_switch_candidates(
             active_headroom=headroom.get(active_number),
             settings=settings,
             now=now,
+            reasons=reasons,
         )
         return ordered, rank_axis
 

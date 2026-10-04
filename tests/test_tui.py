@@ -3524,9 +3524,10 @@ class TestUnswitchableRowsAreListed:
         or over 100) -- never merely at or over the landing bar
         (`proactive_switch_bar_pct`, 97% at the default threshold under
         `dynamic`, #321's `SPENT_HEADROOM_PCT`). A window at or over that
-        bar but still under 100 names the bar it was judged against
-        instead, in the ">= <bar>%" form -- the same convention #325's
-        panel tests hold `dynamic` to elsewhere. A candidate under the bar
+        bar but still under 100 carries NO marker: the owner (2026-10-04)
+        found the ">= <bar>%" form noise ("97% >= 97%"), the chips already
+        show the figure and the "not a candidate" reason speaks for the
+        refusal. A candidate under the bar
         (over the raw `settings.threshold` of 90, still open on the
         engine's actual bar) reads plain "open", neither tag. CONTROL:
         a genuinely exhausted row (100%) must still read `full`, proving
@@ -3544,8 +3545,8 @@ class TestUnswitchableRowsAreListed:
             self._acct("2", "open@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 10.0}, "seven_day": {"pct": 95.0},
             }),
-            # 98%: at/over the dynamic switch bar, still under 100 -- the
-            # ">=" wording, never "full".
+            # 98%: at/over the dynamic switch bar, still under 100 -- no
+            # marker, never "full".
             self._acct("3", "between@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 10.0}, "seven_day": {"pct": 98.0},
             }),
@@ -3557,11 +3558,49 @@ class TestUnswitchableRowsAreListed:
         row2 = out[out.index("open@x.com"):out.index("between@x.com")]
         assert "full" not in row2 and ">=" not in row2, out
         row3 = out[out.index("between@x.com"):out.index("full@x.com")]
-        assert "7d 98% >= 97%" in row3, out
-        assert "full" not in row3, out
+        assert ">=" not in row3 and "full" not in row3, out
         row4 = out[out.index("full@x.com"):]
         assert "7d full" in row4, out
         assert ">=" not in row4, out
+
+    def test_a_refused_row_names_the_reason_the_pass_dropped_it(self):
+        """`not a candidate` carries the engine's own reason (the pass's
+        `reasons` side channel), never a plain refusal the owner has to
+        guess at (2026-10-04). `best`, threshold 90, hysteresis 10: the
+        active (92%) is over the bar, the 20% peer is admitted, and the 85%
+        peer (under the bar, so still "open") has 7 points more headroom
+        than the active, short of the 10-point margin."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        def windows(pct):
+            return {"five_hour": {"pct": pct}, "seven_day": {"pct": 5.0}}
+
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good=windows(92.0)),
+            self._acct("2", "open@x.com", switchable=True, last_good=windows(20.0)),
+            self._acct("3", "close@x.com", switchable=True, last_good=windows(85.0)),
+        ), active="1", settings=AutoSwitchSettings(threshold=90.0, strategy="best"))
+        assert "not a candidate" not in out[:out.index("close@x.com")], out
+        assert "not a candidate (headroom margin too small)" in out, out
+
+    def test_a_no_plan_row_names_why_and_sorts_after_every_other_row(self):
+        """A slot whose usage poll answered `oauth_not_allowed_for_
+        organization` (subscription inactive) renders that reason INSTEAD
+        of chips and `stale`, and goes behind even an unswitchable slot."""
+        no_plan = UsageEntry(
+            last_good={"five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0}},
+            fetched_at=time.time(), age_s=0.0, consecutive_failures=3,
+            last_error="oauth_not_allowed_for_organization",
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("5", "noplan@x.com", switchable=True, usage=no_plan),
+            self._acct("4", "empty@x.com", switchable=False),
+        ), active="1")
+        row = out.rstrip().splitlines()[-1]
+        assert "noplan@x.com" in row, out
+        assert row.endswith("no plan (subscription inactive)"), out
+        assert "5h" not in row and "%" not in row and "stale" not in row, out
 
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a

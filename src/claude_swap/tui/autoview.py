@@ -401,8 +401,9 @@ class AutoScreen(Screen):
         # `getattr` (never plain `self._last_active_at`): a test instance
         # built via `AutoScreen.__new__` skips `__init__`/`_on_snapshot`.
         last_active_at = getattr(self, "_last_active_at", None) or {}
+        reasons: dict[str, str] = {}   # the engine's own cause per refused row
         ordered, rank_axis, trigger, unmodeled = data.rank_switch_candidates(
-            snap, settings, now, active_number, last_active_at
+            snap, settings, now, active_number, last_active_at, reasons
         )
         ordered_rank = {num: i for i, num in enumerate(ordered)}
         # Captured before the loop rebinds `now` below (per-row, for the
@@ -437,6 +438,17 @@ class AutoScreen(Screen):
                 entry.append(f"  {note}", style=palette.sev_warn)
                 lines[acc.number] = entry
                 ranked.append(((1000.0,), acc.number))   # last: never a target
+                continue
+            if acc.usage.last_error == "oauth_not_allowed_for_organization":
+                # No subscription behind this login: chips and a rank would
+                # read as a candidate, so the reason replaces them and the
+                # row goes behind even the unswitchable ones.
+                entry = Text()
+                entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
+                entry.append(acc.email, style=palette.muted)
+                entry.append("  no plan (subscription inactive)", style=palette.sev_warn)
+                lines[acc.number] = entry
+                ranked.append(((1001.0,), acc.number))
                 continue
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
@@ -520,8 +532,8 @@ class AutoScreen(Screen):
                 # helper, `classify_candidate_block`, though the two print
                 # `kind == "full"` in different words on purpose (the elif
                 # below): the log always says "full", this panel reserves
-                # "full" for a window actually at or over 100 and names the
-                # bar it was judged against otherwise. Always on `models`,
+                # "full" for a window actually at or over 100 and says
+                # nothing otherwise. Always on `models`,
                 # the full pinned set: this label explains why the row is
                 # not simply "open" on the criteria the user actually
                 # configured, independent of whether the pass above retried
@@ -546,20 +558,14 @@ class AutoScreen(Screen):
                     elif kind == "full":
                         # "full" is reserved for actual exhaustion (the
                         # window's own pct at or over 100); a window merely
-                        # at or over the bar names the bar it was judged
-                        # against instead.
+                        # at or over the bar carries no marker (the chip
+                        # already shows the figure).
                         window_pct = next(
                             p for label, p, _ in windows if label == blocked_model
                         )
                         if window_pct >= 100.0:
                             entry.append(
                                 f"  {blocked_model} full", style=palette.muted
-                            )
-                        else:
-                            entry.append(
-                                f"  {blocked_model} {pct_label(window_pct)}%"
-                                f" >= {pct_label(bar)}%",
-                                style=palette.muted,
                             )
                 if acc.disabled:
                     entry.append("  auto-swap disabled", style=palette.muted)
@@ -575,7 +581,11 @@ class AutoScreen(Screen):
                     # Every other excluded row already has a reason above.
                     # Never when `unmodeled`: this pass never ran, so
                     # "refused" is not a claim this row can support.
-                    entry.append("  not a candidate", style=palette.muted)
+                    why = reasons.get(acc.number)
+                    entry.append(
+                        f"  not a candidate ({why})" if why else "  not a candidate",
+                        style=palette.muted,
+                    )
                 # Position from `ordered_rank` (the engine's own pass, called
                 # once above), never a locally re-derived key -- but a row
                 # the pass never ranked at all still needs a DETERMINISTIC

@@ -296,6 +296,7 @@ def _rank_dynamic_candidates(
     now: float,
     last_active_at: dict,
     cache_ttl_seconds: float,
+    reasons: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """WARM-tiered candidates for a `dynamic` proactive/alternation switch
     (#375 item 3), each tier soonest-weekly-reset first (`dynamic`'s own
@@ -321,12 +322,17 @@ def _rank_dynamic_candidates(
     never re-checks headroom (found live: A at h=3 -> B, B burns to h=3, A's
     reset alone "recovers" while its headroom never moves -> back to A ->
     repeat every cooldown).
+
+    ``reasons``, when given, receives a short plain-words cause per dropped
+    candidate (the "Next best" panel's side channel); the engine passes none.
     """
+    reasons = {} if reasons is None else reasons
     warm: list[tuple[tuple, str]] = []
     cold: list[tuple[tuple, str]] = []
     for num in oauth_candidates:
         h = headroom.get(num)
         if h is None or h <= SPENT_HEADROOM_PCT:
+            reasons[num] = "usage unreadable" if h is None else "no headroom left"
             continue
         reset_ts = _seven_day_reset_ts(usage.get(num), now)
         key = (reset_ts if reset_ts is not None else float("inf"), -h)
@@ -3384,6 +3390,7 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
+        reasons: dict[str, str] | None = None,
     ) -> tuple[list[str], bool, float | None, bool, str | None]:
         """Filter and rank OAuth candidates for this tick's trigger, on one
         window set (``models``); pure, no state writes, called at most
@@ -3393,7 +3400,10 @@ class AutoSwitchEngine:
         gets the engine's own admission instead of a second, hand-matched
         copy of it. 5th element: the axis ``ordered`` sorted on, or
         ``None`` when nothing ranked -- read off, never re-derived.
+        ``reasons``, when given, receives a short plain-words cause per
+        dropped candidate (the panel's side channel); the engine passes none.
         """
+        reasons = {} if reasons is None else reasons
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
         active_reset_ts = (
@@ -3514,6 +3524,7 @@ class AutoSwitchEngine:
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
+                reasons[num] = "usage unreadable"
                 continue
             any_known = True          # it EXISTS and is readable either way
             recovery_ts = (
@@ -3559,8 +3570,10 @@ class AutoSwitchEngine:
                     and active_recovery_ts != float("inf")
                     and recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
                 ):
+                    reasons[num] = "at its limit"
                     continue  # itself at its limit — never a target
             if num == no_return:
+                reasons[num] = "just left"
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
@@ -3604,6 +3617,7 @@ class AutoSwitchEngine:
                 if (100.0 - h) >= settings.threshold and not (
                     all_above and not dynamic_landing
                 ):
+                    reasons[num] = "over the switch threshold"
                     continue
                 if all_above and not dynamic_landing:
                     # Checked before the strategies, because with nothing below
@@ -3650,6 +3664,7 @@ class AutoSwitchEngine:
                                 recovery_ts
                                 >= active_recovery_ts - RECOVERY_HYSTERESIS_S
                             ):
+                                reasons[num] = "recovers no sooner"
                                 continue
                     else:
                         # Headroom axis, with a RATIO margin. Also a rate bound,
@@ -3666,6 +3681,7 @@ class AutoSwitchEngine:
                             ):
                                 fallback.append(((0, recovery_ts, -h), num))
                                 key_axis[num] = "soonest to recover"
+                            reasons[num] = "headroom margin too small"
                             continue
                 elif (
                     trigger in CONSUME_FIRST_STRATEGIES
@@ -3716,6 +3732,7 @@ class AutoSwitchEngine:
                             or reset_ts >= active_reset_ts
                         )
                     ):
+                        reasons[num] = "weekly reset not sooner"
                         continue
                 elif active_headroom is not None:
                     # best, and also dynamic's `proactive` trigger (over
@@ -3727,6 +3744,7 @@ class AutoSwitchEngine:
                     # [current]` on the 5h/7d retry — so a landing is always
                     # an improvement on the axis that admitted it.
                     if h - active_headroom < settings.hysteresis_pct:
+                        reasons[num] = "headroom margin too small"
                         continue
             if by_recovery_axis:
                 # Ranked on the axis its own gate decided, and TIERED so the two
