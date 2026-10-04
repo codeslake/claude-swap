@@ -124,9 +124,18 @@ EXHAUSTED_INTERVAL_S = 600.0
 # The usage endpoint answers 403 with this kind for a slot whose organization
 # has no plan to read. Re-asking every backoff only converts those 403s into
 # an hour-long 429 on the same token, so such a row is planned once a day
-# (through the plan, not a backoff) and keeps this kind through later failures.
+# (through the plan, not a backoff; an enabled slot: see below) and keeps this
+# kind through later failures.
 NO_PLAN_ERROR = "oauth_not_allowed_for_organization"
 NO_PLAN_POLL_INTERVAL_S = 86_400.0
+# A slot still in the auto-switch rotation is checked on a cadence of its own,
+# not the day: a re-subscription must show within one interval. It cannot
+# reuse the candidate cadence (CANDIDATE_DEFAULT 300 / MAX 600): ed67405c
+# measured that a no-plan token re-asked at 600 s (6/h) draws 429 Retry-After
+# 3600 after about five 403s an hour. 900 s (4/h) stays under that trigger. It
+# is a PLAN (nextPollAt), never the failure backoff, and ATTEMPTS_PER_HOUR_MAX
+# still binds.
+NO_PLAN_ENABLED_POLL_INTERVAL_S = 900.0
 
 # A window whose binding pct moved at least this much between polls is being
 # consumed somewhere (this machine, another PC, session mode) → tighten; an

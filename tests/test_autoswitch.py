@@ -2272,6 +2272,26 @@ class TestAdaptiveScheduler:
         assert self._tick(h, counts, usage, errors) is TickOutcome.BLOCKED
         assert counts["2"] == 1
 
+    def test_an_enabled_no_plan_slot_is_re_asked_on_the_enabled_cadence(
+        self, temp_home, monkeypatch
+    ):
+        # The live shape: a day-long plan written before the enabled cadence
+        # existed. It is pulled in on the next read, and the slot is then
+        # re-asked every interval, no faster (the 403's backoff has lapsed).
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        h.switcher._usage_store.record(
+            {"2": FetchRecord(error=poll_policy.NO_PLAN_ERROR)},
+            {"2": ("b@example.com", "")},
+        )
+        usage = {"1": _usage(50), "2": _usage(10)}
+        errors = {"2": poll_policy.NO_PLAN_ERROR}
+        counts: dict[str, int] = {}
+        step = poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
+        for advance, expected in ((step + 1, 1), (step / 2, 1), (step / 2, 2)):
+            h.clock.advance(advance)
+            self._tick(h, counts, usage, errors)
+            assert counts["2"] == expected
+
     def test_all_exhausted_escalation_leaves_a_row_planned_at_the_exhausted_interval(
         self, temp_home, monkeypatch
     ):

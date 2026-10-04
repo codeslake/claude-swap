@@ -11,6 +11,7 @@ import pytest
 from claude_swap import oauth, usage_store
 from claude_swap.poll_policy import (
     CANDIDATE_MAX_INTERVAL_S,
+    NO_PLAN_ENABLED_POLL_INTERVAL_S,
     NO_PLAN_ERROR,
     NO_PLAN_POLL_INTERVAL_S,
     POST_429_MIN_INTERVAL_S,
@@ -888,6 +889,69 @@ class TestNoPlanSlot:
         assert store.reserve(["1"], IDENT, respect_plans=False) == {}
         clock.advance(NO_PLAN_POLL_INTERVAL_S)
         assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    @pytest.mark.parametrize(
+        "disabled, interval",
+        [(True, NO_PLAN_POLL_INTERVAL_S), (False, NO_PLAN_ENABLED_POLL_INTERVAL_S)],
+    )
+    def test_the_row_is_planned_at_the_cadence_its_slot_is_owed(
+        self, store, clock, disabled, interval
+    ):
+        # An enabled slot is re-asked on the enabled cadence, a disabled one
+        # keeps the day. The plan, not the 403's backoff (<= BACKOFF_CAP_S
+        # < interval), is what holds the row in every fetch mode.
+        stub = SimpleNamespace(
+            _usage_store=store,
+            _poll_policy_inputs=lambda: (90.0, ()),
+            is_account_disabled=lambda num: disabled,
+        )
+
+        def commit(error, claims=None, **kw):
+            records = {"1": FetchRecord(error=error, **kw)}
+            plans = ClaudeAccountSwitcher._plans_after_fetch(
+                stub, records, store.entries(IDENT), {"1": (None,) * 4 + (False,)}
+            )
+            store.record(records, IDENT, claims, plans)
+
+        commit(NO_PLAN_ERROR)
+        clock.advance(BACKOFF_CAP_S + 1)
+        commit(NO_PLAN_ERROR)
+        entry = store.entries(IDENT)["1"]
+        assert entry.next_poll_at == clock.now + interval
+        assert entry.poll_interval_s == interval
+        clock.advance(entry.backoff_until - clock.now + 1)
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+        clock.advance(interval)
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        assert set(claims) == {"1"}
+        # A later 429 keeps the kind, so it keeps the plan too.
+        commit("http-429", claims, retry_after_s=60.0)
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_error == NO_PLAN_ERROR
+        assert entry.next_poll_at == clock.now + interval
+
+    def test_a_day_long_plan_is_pulled_in_only_for_an_enabled_slot(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        attempt = clock.now
+        clock.advance(BACKOFF_CAP_S + 1)
+        stub = SimpleNamespace(_usage_store=store, is_account_disabled=lambda n: True)
+
+        def pull():
+            return ClaudeAccountSwitcher._pull_in_enabled_no_plan_plans(
+                stub, store.entries(IDENT), IDENT
+            )
+
+        assert not pull()
+        assert store.entries(IDENT)["1"].next_poll_at == attempt + NO_PLAN_POLL_INTERVAL_S
+        stub.is_account_disabled = lambda n: False
+        assert pull()
+        entry = store.entries(IDENT)["1"]
+        assert entry.next_poll_at == attempt + NO_PLAN_ENABLED_POLL_INTERVAL_S
+        assert entry.poll_interval_s == NO_PLAN_ENABLED_POLL_INTERVAL_S
+        assert not pull()  # idempotent: a read pays only the compare
 
     def test_the_first_success_is_planned_inside_the_candidate_ceiling(
         self, store, clock

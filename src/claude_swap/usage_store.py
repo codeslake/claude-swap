@@ -1270,9 +1270,11 @@ class UsageStore:
         without touching the newer row. Success and failure are mutually
         exclusive writers: success resets the failure fields, failure never
         touches ``lastGood``/``fetchedAt``. A supplied success plan commits
-        in the same transaction as its measurement. Sentinel records clear
-        only the claim and are otherwise never persisted, save the refused
-        credential stamp one may carry. Unfenced callers
+        in the same transaction as its measurement; a failure takes the
+        supplied plan only on a no-plan row (the caller knows the roster, the
+        store does not), else that row is planned a day out. Sentinel records
+        clear only the claim and are otherwise never persisted, save the
+        refused credential stamp one may carry. Unfenced callers
         (no ``claims``) defer to a live lease but never to an expired one.
         Returns the accepted slots.
         """
@@ -1291,12 +1293,12 @@ class UsageStore:
                     row["rejectedFingerprint"] = rec.rejected_fp
                 return
             row["lastAttemptAt"] = now
+            plan = plans.get(num) if plans is not None else None
             if rec.error is None:
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction
                 # so no collector can slip into a record→replan gap.
-                plan = plans.get(num) if plans is not None else None
                 if plan is not None:
                     row["nextPollAt"], row["pollIntervalS"] = plan
                 row["consecutiveFailures"] = 0
@@ -1309,13 +1311,15 @@ class UsageStore:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
                 # A no-plan slot keeps its kind through a later 429/timeout:
-                # only a success clears it. Its plan (below) is a day out, so
-                # the backoff is not what paces it.
+                # only a success clears it. Its plan is the supplied one (an
+                # enabled slot's cadence) or a day out, never the backoff.
                 if row.get("lastError") != NO_PLAN_ERROR:
                     row["lastError"] = rec.error
                 if row["lastError"] == NO_PLAN_ERROR:
-                    row["nextPollAt"] = now + NO_PLAN_POLL_INTERVAL_S
-                    row["pollIntervalS"] = NO_PLAN_POLL_INTERVAL_S
+                    row["nextPollAt"], row["pollIntervalS"] = plan or (
+                        now + NO_PLAN_POLL_INTERVAL_S,
+                        NO_PLAN_POLL_INTERVAL_S,
+                    )
                 if rec.error == "http-429":
                     # Kept across later successes: the poll planner floors the
                     # cadence while a 429 is recent (see UsageEntry.last_429_at).

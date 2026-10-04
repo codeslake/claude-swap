@@ -6819,6 +6819,31 @@ class ClaudeAccountSwitcher:
                 executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
             )
 
+    def _pull_in_enabled_no_plan_plans(
+        self, entries: dict[str, UsageEntry], identities: dict[str, tuple]
+    ) -> bool:
+        """Cut an enabled no-plan slot's day-long plan to the enabled cadence.
+
+        The day was written while the slot was disabled or before the enabled
+        cadence existed, and an enabled slot must not wait it out: its plan
+        becomes ``lastAttemptAt + NO_PLAN_ENABLED_POLL_INTERVAL_S`` (already
+        due when that is past). Idempotent, so a read pays only the compare.
+        """
+        interval = poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
+        pulled = {
+            num: (entry.last_attempt_at + interval, interval)
+            for num, entry in entries.items()
+            if entry.last_error == poll_policy.NO_PLAN_ERROR
+            and entry.last_attempt_at is not None
+            and entry.next_poll_at is not None
+            and entry.next_poll_at > entry.last_attempt_at + interval
+            and not self.is_account_disabled(num)
+        }
+        self._usage_store.set_poll_plan(
+            pulled, {num: identities[num] for num in pulled}
+        )
+        return bool(pulled)
+
     def _collect_usage_entries(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -6868,6 +6893,8 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities, models)
+        if not read_only and self._pull_in_enabled_no_plan_plans(entries, identities):
+            entries = store.entries(identities, models)
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
@@ -7711,15 +7738,28 @@ class ClaudeAccountSwitcher:
         """Build successful-fetch cadence updates for atomic outcome commit.
 
         Failures are paced by the store's backoff and keep their past-due plan
-        for when the backoff lifts.
+        for when the backoff lifts. The one exception is a no-plan failure of
+        an enabled slot (the store has no roster): it is planned at
+        ``NO_PLAN_ENABLED_POLL_INTERVAL_S`` rather than a day.
         """
         now = self._usage_store.clock()
         threshold, models = self._poll_policy_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
-            if rec.sentinel is not None or rec.error is not None:
+            if rec.sentinel is not None:
                 continue
             before = pre.get(num)
+            if rec.error is not None:
+                # The store keeps the kind through later failures, so a row
+                # that already carried it stays no-plan whatever failed now.
+                no_plan = poll_policy.NO_PLAN_ERROR in (
+                    rec.error,
+                    before.last_error if before else None,
+                )
+                if no_plan and not self.is_account_disabled(num):
+                    interval = poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
+                    plans[num] = (now + interval, interval)
+                continue
             recent_429 = before is not None and before.recent_429(now)
             plans[num] = poll_policy.plan_after_fetch(
                 # A no-plan row's day-long interval is not a cadence to halve
