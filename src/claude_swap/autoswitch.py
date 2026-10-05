@@ -5158,7 +5158,8 @@ class AutoSwitchEngine:
         # the engine's own scheduled cadence must not honor it, or a reading
         # already stale at switch time stays decision-trusted for the whole
         # window (T1102). `record_header_reading` pushes `nextPollAt` out the
-        # same way (to `lastAttemptAt + CANDIDATE_MAX_INTERVAL_S`), but that
+        # same way (to `lastAttemptAt + CANDIDATE_MAX_INTERVAL_S`; a row never
+        # attempted keeps a plan in place, and with none is given `now`), but that
         # is the intended cadence for a row fed by free readings, not a stuck
         # defer, so the `next_poll_at - now <= POST_SWITCH_REPLAN_DEFER_S`
         # check below keeps this scoped to a plan still inside the post-switch
@@ -6029,10 +6030,11 @@ class AutoSwitchEngine:
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it.
 
-        `finally` drops the LIVE lock and announces the exit for every path
-        but `stop()`'s own — that one already released it under `_stop_lock`
-        and decided `dry_run`; releasing here too would race it for
-        `_live_lock` and can make it skip that flip.
+        `finally` marks the engine off (`dry_run = True`), drops the LIVE lock
+        and announces the exit for every path but `stop()`'s own — that one
+        already released it under `_stop_lock` and decided `dry_run`;
+        releasing here too would race it for `_live_lock` and can make it skip
+        that flip.
         """
         try:
             while True:
@@ -6069,10 +6071,24 @@ class AutoSwitchEngine:
         finally:
             if not self._stop.is_set():
                 reason = "consumer gone" if self._consumer_gone else "unhandled error"
-                self._release_live()
-                self._emit(
-                    ErrorEvent(message=f"engine stopped: {reason}", transient=False)
-                )
+                event = ErrorEvent(message=f"engine stopped: {reason}", transient=False)
+                # THE LINE FIRST, THEN THE FLIP: `_emit` logs only while
+                # `dry_run` is False, and the badge (`not engine.dry_run`)
+                # redraws on this very event. So write the line here, flip,
+                # and `_emit` writes nothing. `auto off:` stays `stop()`'s;
+                # the watchers read a crash by this line. A failed write never
+                # strands the lock.
+                try:
+                    if self.settings.decision_log and not self.dry_run:
+                        if self._decisions is None:
+                            self._decisions = decision_logger(self.switcher.backup_dir)
+                        self._decisions.info("%s %s", event.ts, event.human())
+                except Exception as exc:  # noqa: BLE001 — the lock comes first
+                    _logger.warning(f"engine-stopped decision line not written: {exc}")
+                finally:
+                    self.dry_run = True
+                    self._release_live()
+                self._emit(event)
             # UNCONDITIONALLY, on both exit paths. This runs on the
             # worker's own thread, after its last tick, so it never races
             # `stop()` (which never touches this thread-local flag at all
