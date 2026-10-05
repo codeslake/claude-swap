@@ -1204,6 +1204,28 @@ class ClaudeAccountSwitcher:
             )
         return creds
 
+    def _move_usage_row(self, old: str, new: str) -> None:
+        """Carry a renumbered account's usage row to its new slot. Called after
+        the roster commit and best effort, like the old-key cleanup: a failure
+        costs the cached reading (the identity guard keeps a stray row from
+        being served), never the move."""
+        try:
+            self._usage_store.relocate(old, new)
+        except Exception as e:
+            self._logger.warning(f"Usage row {old} -> {new} not carried: {e}")
+
+    def _prune_usage_rows(self) -> None:
+        """Drop usage rows for slots the roster no longer has. Keyed on the
+        roster itself, not a pass's accounts_info: `--status` collects one slot."""
+        try:
+            roster = self._get_sequence_data()
+            dropped = self._usage_store.prune(roster["accounts"]) if roster else []
+        except Exception as e:
+            self._logger.warning(f"Usage row prune skipped: {e}")
+            return
+        if dropped:
+            self._logger.info(f"Dropped usage rows for freed slots: {dropped}")
+
     def _swap_accounts_locked(self, first: str, second: str) -> tuple[str, str]:
         """Body of :meth:`swap_accounts`; the caller holds ``self.lock_file``.
 
@@ -1341,6 +1363,8 @@ class ClaudeAccountSwitcher:
                 staging, moved, wrote_backups,
             )
             raise
+
+        self._move_usage_row(num_a, num_b)
 
         # Post-commit cleanup, all best-effort: the records already reference
         # the new keys only. A failure here leaks a stale file, never a wrong
@@ -2146,6 +2170,8 @@ class ClaudeAccountSwitcher:
             except Exception as e:
                 self._logger.error(f"Cleanup after failed move incomplete: {e}")
             raise
+
+        self._move_usage_row(num_src, target)
 
         # Post-commit: clear the old keys, best effort — the records now
         # reference the target slot only. _delete_account_files drops the
@@ -4218,6 +4244,7 @@ class ClaudeAccountSwitcher:
             del data["accounts"][d_num]
             self._write_json(self.sequence_file, data)
             self._prune_mappings(d_email, d_org)
+            self._prune_usage_rows()
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -4227,6 +4254,7 @@ class ClaudeAccountSwitcher:
                 data["sequence"].remove(int(migrate_from))
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
+            self._move_usage_row(migrate_from, account_num)
 
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
@@ -4424,6 +4452,7 @@ class ClaudeAccountSwitcher:
             del data["accounts"][d_num]
             self._write_json(self.sequence_file, data)
             self._prune_mappings(d_email, d_org)
+            self._prune_usage_rows()
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -4433,6 +4462,7 @@ class ClaudeAccountSwitcher:
                 data["sequence"].remove(int(migrate_from))
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
+            self._move_usage_row(migrate_from, account_num)
 
         self._write_account_credentials(account_num, email, credentials)
         self._write_account_config(account_num, email, config)
@@ -4551,6 +4581,7 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
+        self._prune_usage_rows()
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
@@ -5496,6 +5527,7 @@ class ClaudeAccountSwitcher:
         fields, so the last-good measurement keeps being served
         (stale-on-error).
         """
+        self._prune_usage_rows()
         store = self._usage_store
         identities = {
             str(num): (email, org_uuid or "")
