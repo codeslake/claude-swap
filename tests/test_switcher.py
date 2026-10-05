@@ -30506,3 +30506,124 @@ def test_an_unreadable_destination_before_the_copy_is_left_alone(
         "cannot tell a partial from what was already there, and emptying is "
         "the destructive answer to that question"
     )
+
+
+class TestUsageRowsFollowTheRoster:
+    """cache/usage.json is keyed by slot number, so a move, an add that
+    relocates, or a removal must not leave the old slot's row for whatever
+    account lands there next to inherit."""
+
+    def _switcher(self, sample_sequence_data):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        return switcher
+
+    @staticmethod
+    def _seed(switcher, num, email, pct):
+        switcher._usage_store.record(
+            {num: FetchRecord(usage={"five_hour": {"pct": pct}})},
+            {num: (email, "")},
+        )
+
+    @staticmethod
+    def _rows(switcher):
+        raw = json.loads(switcher._usage_store.path.read_text(encoding="utf-8"))
+        return {n: (r["email"], (r.get("lastGood") or {}).get("five_hour", {}).get("pct"))
+                for n, r in raw["accounts"].items()}
+
+    def test_move_to_empty_slot_carries_the_row(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(switcher, "2", "account2@example.com", 20.0)
+
+        switcher.move_account("2", "5")
+
+        assert self._rows(switcher) == {"5": ("account2@example.com", 20.0)}
+
+    def test_move_onto_an_occupied_slot_exchanges_the_rows(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(switcher, "1", "account1@example.com", 10.0)
+        self._seed(switcher, "2", "account2@example.com", 20.0)
+
+        switcher.move_account("1", "2")
+
+        assert self._rows(switcher) == {
+            "1": ("account2@example.com", 20.0),
+            "2": ("account1@example.com", 10.0),
+        }
+
+    def test_remove_drops_the_row(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(switcher, "1", "account1@example.com", 10.0)
+        self._seed(switcher, "2", "account2@example.com", 20.0)
+
+        switcher.remove_account("2", assume_yes=True)
+
+        assert self._rows(switcher) == {"1": ("account1@example.com", 10.0)}
+
+    @pytest.mark.parametrize("target_occupied", [False, True])
+    def test_add_that_relocates_an_account_leaves_one_row(
+        self, temp_home: Path, target_occupied: bool
+    ):
+        make = TestAddAccountSlot()._make_switcher
+        active = ActiveCredentials(
+            json.dumps({"claudeAiOauth": {"accessToken": "tok"}}), False
+        )
+
+        def add(switcher, **kw):
+            with patch.object(switcher, "_read_active_credentials", return_value=active), \
+                 patch.object(switcher, "_write_account_credentials"), \
+                 patch.object(switcher, "_delete_account_credentials"), \
+                 patch("builtins.input", return_value="y"):
+                switcher.add_account(**kw)
+
+        if target_occupied:  # the move displaces another account's row too
+            other = make(temp_home, email="other@example.com")
+            add(other, slot=5)
+            self._seed(other, "5", "other@example.com", 50.0)
+        switcher = make(temp_home, email="user@example.com")
+        add(switcher, slot=1)
+        self._seed(switcher, "1", "user@example.com", 30.0)
+        switcher._usage_store.record(  # a strike the re-add's fresh credential lifts
+            {"1": FetchRecord(error="invalid_grant")}, {"1": ("user@example.com", "")}
+        )
+
+        add(switcher, slot=5)
+
+        assert self._rows(switcher) == {"5": ("user@example.com", 30.0)}
+        row = json.loads(switcher._usage_store.path.read_text(encoding="utf-8"))
+        assert row["accounts"]["5"]["authDeadStrikes"] == 0
+
+    def test_collect_drops_rows_the_roster_no_longer_has(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(switcher, "1", "account1@example.com", 10.0)
+        self._seed(switcher, "2", "account2@example.com", 20.0)
+        self._seed(switcher, "9", "gone@example.com", 90.0)
+        info = [(1, "account1@example.com", "", "", False, "", "")]
+
+        # A one-slot pass (`--status`) must not take the other live slots' rows.
+        switcher._collect_usage_entries(info, fetch=set())
+
+        assert set(self._rows(switcher)) == {"1", "2"}
+
+    def test_collect_keeps_the_row_of_a_slot_it_was_handed(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(switcher, "2", "account2@example.com", 20.0)
+        self._seed(switcher, "8", "handed@example.com", 80.0)
+        self._seed(switcher, "9", "gone@example.com", 90.0)
+        info = [(8, "handed@example.com", "", "", False, "", "")]
+
+        # Slot 8 is not in the roster but is being collected: not an orphan.
+        switcher._collect_usage_entries(info, fetch=set())
+
+        assert set(self._rows(switcher)) == {"2", "8"}

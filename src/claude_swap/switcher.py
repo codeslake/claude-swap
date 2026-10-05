@@ -2193,6 +2193,33 @@ class ClaudeAccountSwitcher:
             )
         return creds
 
+    def _move_usage_row(self, old: str, new: str) -> None:
+        """Carry a renumbered account's usage row to its new slot. Called after
+        the roster commit and best effort, like the old-key cleanup: a failure
+        costs the cached reading (the identity guard keeps a stray row from
+        being served), never the move."""
+        try:
+            self._usage_store.relocate(old, new)
+        except Exception as e:
+            self._logger.warning(f"Usage row {old} -> {new} not carried: {e}")
+
+    def _prune_usage_rows(self, collecting: tuple[str, ...] = ()) -> None:
+        """Drop usage rows for slots the roster no longer has. Keyed on the
+        roster itself, not a pass's accounts_info: `--status` collects one slot.
+        A slot being collected right now (``collecting``) is never an orphan."""
+        try:
+            roster = self._get_sequence_data()
+            dropped = (
+                self._usage_store.prune({*roster["accounts"], *collecting})
+                if roster
+                else []
+            )
+        except Exception as e:
+            self._logger.warning(f"Usage row prune skipped: {e}")
+            return
+        if dropped:
+            self._logger.info(f"Dropped usage rows for freed slots: {dropped}")
+
     def _swap_accounts_locked(self, first: str, second: str) -> tuple[str, str]:
         """Body of :meth:`swap_accounts`; the caller holds ``self.lock_file``.
 
@@ -2339,6 +2366,8 @@ class ClaudeAccountSwitcher:
                 staging, moved, wrote_backups,
             )
             raise
+
+        self._move_usage_row(num_a, num_b)
 
         # Post-commit cleanup, all best-effort: the records already reference
         # the new keys only. A failure here leaks a stale file, never a wrong
@@ -3179,6 +3208,8 @@ class ClaudeAccountSwitcher:
             except Exception as e:
                 self._logger.error(f"Cleanup after failed move incomplete: {e}")
             raise
+
+        self._move_usage_row(num_src, target)
 
         # Post-commit: clear the old keys, best effort — the records now
         # reference the target slot only. _delete_account_files drops the
@@ -6564,6 +6595,7 @@ class ClaudeAccountSwitcher:
             # another slot, and the pin is matched on the identity, not the
             # number, so it stays valid.
             self._clear_pin_if_removed(d_email, d_org)
+            self._prune_usage_rows()
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -6573,6 +6605,7 @@ class ClaudeAccountSwitcher:
                 data["sequence"].remove(int(migrate_from))
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
+            self._move_usage_row(migrate_from, account_num)
 
         # Store backups
         #
@@ -6801,6 +6834,7 @@ class ClaudeAccountSwitcher:
             # another slot, and the pin is matched on the identity, not the
             # number, so it stays valid.
             self._clear_pin_if_removed(d_email, d_org)
+            self._prune_usage_rows()
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -6810,6 +6844,7 @@ class ClaudeAccountSwitcher:
                 data["sequence"].remove(int(migrate_from))
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
+            self._move_usage_row(migrate_from, account_num)
 
         # attributed=True: `account_num` is either auto-assigned (a fresh
         # slot) or the exact slot the caller named via ``--slot`` (displaced/
@@ -6984,6 +7019,7 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
+        self._prune_usage_rows()
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
@@ -9116,6 +9152,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             for num in info_by_num
             if num not in sentinels and (fetch is None or num in fetch)
         ]
+        self._prune_usage_rows(tuple(str(info[0]) for info in accounts_info))
         if fetch is None:
             # Repair reset-parked plans written by releases that stopped
             # polling exhausted accounts until their advertised reset. The
