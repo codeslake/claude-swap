@@ -4056,14 +4056,14 @@ class TestRunLoop:
         )
 
     def test_lock_drops_even_if_the_exit_announcement_raises(self, temp_home):
-        """The `auto off` line is written BEFORE the release, so a raise out
-        of it must not skip the release -- a process that cannot log its own
-        death would keep `.auto-live.lock` forever, which is the exact bug
-        this exit cleanup exists to close. (The exit's `_emit` can no longer
-        raise: the flip to `dry_run` ahead of it gates its decision-log write
-        off.) Faked here (today's `RotatingFileHandler` swallows its own write
-        errors via `Handler.handleError`) as a pin against a future logger
-        that does not."""
+        """The exit's decision-log write sits ahead of the release -- nothing
+        that can raise may sit between the exit and the release, or a process
+        that cannot log its own death keeps `.auto-live.lock` forever, which is
+        the exact bug this exit cleanup exists to close. The write is
+        swallowed, so the loop still returns 0. Faked here (today's
+        `RotatingFileHandler` swallows its own write errors via
+        `Handler.handleError`) as an ordering pin against a future logger that
+        does not."""
         h = EngineHarness(temp_home, decision_log=True)
         engine = h.engine
         assert engine._live_lock is not None, "premise: this engine is LIVE"
@@ -12293,8 +12293,11 @@ class TestABrokenPipeEndsTheLoopInsteadOfOrphaningIt:
     ):
         """An exit that is not a `stop()` leaves a dead engine all the same:
         `autoview` badges from `not engine.dry_run` and redraws on the very
-        event the exit emits, so the flip must land BEFORE that event, and the
-        decision log must say why the engine ended."""
+        event the exit emits, so the flip must land BEFORE that event. The
+        decision log still says `error: engine stopped: <reason>` and nothing
+        else: `auto off:` is `stop()`'s line, the owner's switch, and the
+        verify and autoswitch watchers read an engine crash by the error line
+        and the owner's switch by `auto off:`."""
         h = EngineHarness(temp_home, decision_log=True)
         engine = h.engine
         self._no_waiting(engine, monkeypatch)
@@ -12309,10 +12312,13 @@ class TestABrokenPipeEndsTheLoopInsteadOfOrphaningIt:
         engine.on_event = on_event
         assert engine.run_loop() == 0
 
-        log = h.switcher.backup_dir / "autoswitch-decisions.log"
-        auto_off = [ln for ln in log.read_text().splitlines() if " auto off: " in ln]
+        lines = (h.switcher.backup_dir / "autoswitch-decisions.log").read_text().splitlines()
+        stopped = [ln for ln in lines if "error: engine stopped:" in ln]
         assert engine.dry_run is True
-        assert len(auto_off) == 1 and auto_off[0].endswith(" auto off: consumer gone")
+        assert len(stopped) == 1 and stopped[0].endswith(
+            " error: engine stopped: consumer gone"
+        )
+        assert [ln for ln in lines if "auto off" in ln] == []
         assert engine._live_lock is None
         assert at_announce == [True], "the exit event reached the badge as LIVE"
 

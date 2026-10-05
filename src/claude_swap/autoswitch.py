@@ -3709,30 +3709,6 @@ class AutoSwitchEngine:
 
     # -- loop -------------------------------------------------------------------
 
-    def _mark_stopped(self, reason: str) -> None:
-        """Say the engine is off: the ``auto off`` line, then ``dry_run = True``.
-
-        The caller holds ``_stop_lock``, so a ``stop()`` and ``run_loop``'s
-        ``finally`` landing together cannot both pass the gate and write the
-        line twice.
-        """
-        # Once: `dry_run` is the gate and flips just below, so a deferred
-        # release re-enters with it True. Not via `_emit`/`on_event` (see the
-        # stuck-tick warning in `stop()`); a failed write never strands the lock.
-        if self.settings.decision_log and not self.dry_run:
-            try:
-                if self._decisions is None:
-                    self._decisions = decision_logger(self.switcher.backup_dir)
-                self._decisions.info("%s auto off: %s", _now_iso(), reason)
-            except Exception as exc:  # noqa: BLE001 — the lock comes first
-                _logger.warning(f"auto-off decision line not written: {exc}")
-        # A STOPPED ENGINE IS NOT LIVE. `autoview` renders the badge from
-        # `not engine.dry_run`, so leaving it False makes a dead engine
-        # read " LIVE " — normally masked by `_restart_engine` replacing
-        # `_engine` at once, except when `_start_engine` raises and the
-        # screen still points at the stopped one.
-        self.dry_run = True
-
     def stop(self, reason: str = "stopped") -> None:
         """Ask ``run_loop`` to exit; wakes it from any sleep. Safe to call
         before the loop starts — the stop is never cleared, so the loop
@@ -3740,8 +3716,6 @@ class AutoSwitchEngine:
 
         A LIVE engine's stop writes one ``<ts> auto off: <reason>`` decision-log
         line; ``reason`` is a short caller label, never account text.
-        ``run_loop``'s ``finally`` writes the same line for the exits that are
-        not a stop.
 
         Releases the LIVE lock here, not in ``run_loop``: the TUI's dry-run /
         LIVE toggle stops one engine and constructs the next in the same call,
@@ -3778,7 +3752,22 @@ class AutoSwitchEngine:
             if self._live_lock is None:
                 return          # already released; idempotent and reentrant
             lock, self._live_lock = self._live_lock, None
-            self._mark_stopped(reason)
+            # Once: `dry_run` is the gate and flips just below, so a deferred
+            # release re-enters with it True. Not via `_emit`/`on_event` (see
+            # the stuck-tick warning below); a failed write never strands the lock.
+            if self.settings.decision_log and not self.dry_run:
+                try:
+                    if self._decisions is None:
+                        self._decisions = decision_logger(self.switcher.backup_dir)
+                    self._decisions.info("%s auto off: %s", _now_iso(), reason)
+                except Exception as exc:  # noqa: BLE001 — the lock comes first
+                    _logger.warning(f"auto-off decision line not written: {exc}")
+            # A STOPPED ENGINE IS NOT LIVE. `autoview` renders the badge from
+            # `not engine.dry_run`, so leaving it False makes a dead engine
+            # read " LIVE " — normally masked by `_restart_engine` replacing
+            # `_engine` at once, except when `_start_engine` raises and the
+            # screen still points at the stopped one.
+            self.dry_run = True
             # Waiting on the tick's OWN thread can never be satisfied: the
             # flag is set by the frame this call is standing on.
             own_tick = self._tick_thread_id == threading.get_ident()
@@ -4026,11 +4015,11 @@ class AutoSwitchEngine:
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it.
 
-        `finally` marks the engine off (the `auto off` line, `dry_run = True`),
-        drops the LIVE lock and announces the exit, for every path but
-        `stop()`'s own — that one already did the first two under
-        `_stop_lock`; releasing here too would race it for `_live_lock`. The
-        flip lands before the announcement because the badge redraws on it.
+        `finally` marks the engine off (`dry_run = True`), drops the LIVE lock
+        and announces the exit for every path but `stop()`'s own — that one
+        already released it under `_stop_lock` and decided `dry_run`;
+        releasing here too would race it for `_live_lock` and can make it skip
+        that flip.
         """
         try:
             while True:
@@ -4067,12 +4056,23 @@ class AutoSwitchEngine:
         finally:
             if not self._stop.is_set():
                 reason = "consumer gone" if self._consumer_gone else "unhandled error"
-                with self._stop_lock:
-                    self._mark_stopped(reason)
-                    self._release_live()
-                self._emit(
-                    ErrorEvent(message=f"engine stopped: {reason}", transient=False)
-                )
+                event = ErrorEvent(message=f"engine stopped: {reason}", transient=False)
+                # THE LINE FIRST, THEN THE FLIP: `_emit` logs only while
+                # `dry_run` is False, and the badge (`not engine.dry_run`)
+                # redraws on this very event. So write the line here, flip,
+                # and `_emit` writes nothing. `auto off:` stays `stop()`'s;
+                # the watchers read a crash by this line. A failed write never
+                # strands the lock.
+                if self.settings.decision_log and not self.dry_run:
+                    try:
+                        if self._decisions is None:
+                            self._decisions = decision_logger(self.switcher.backup_dir)
+                        self._decisions.info("%s %s", event.ts, event.human())
+                    except Exception as exc:  # noqa: BLE001 — the lock comes first
+                        _logger.warning(f"engine-stopped decision line not written: {exc}")
+                self.dry_run = True
+                self._release_live()
+                self._emit(event)
             # UNCONDITIONALLY, on both exit paths. This runs on the
             # worker's own thread, after its last tick, so it never races
             # `stop()` (which never touches this thread-local flag at all
