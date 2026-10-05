@@ -641,7 +641,8 @@ class TestAddAccountKeepsOrgName:
     def test_move_to_other_slot_keeps_stored_name(self, temp_home: Path):
         switcher = self._seeded(temp_home, "Stored Org")
 
-        self._add(temp_home, switcher, "Server Org", slot=2)
+        # #199 asks before a move out of another slot: answer it
+        self._add(temp_home, switcher, "Server Org", slot=2, assume_yes=True)
 
         accounts = switcher._get_sequence_data()["accounts"]
         assert list(accounts) == ["2"]
