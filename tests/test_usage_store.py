@@ -1823,8 +1823,15 @@ class TestHeaderReading:
             assert store.record_header_reading("1", IDENT, headers) is True
             due = due_candidate(["1"], store.entries(IDENT), clock.now)
             assert due == ("1" if clock.now >= plan else None)
+            if clock.now < plan:  # the engine's own fetch gate agrees
+                assert not store.reserve(
+                    ["1"], IDENT, respect_plans=False, repair_overslept=True
+                )
         row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["1"]
         assert (row["nextPollAt"], row["pollIntervalS"]) == (plan, 180.0)
+        assert store.reserve(
+            ["1"], IDENT, respect_plans=False, repair_overslept=True
+        )
 
     def test_does_not_join_the_attempt_ledger(self, store, clock):
         headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}

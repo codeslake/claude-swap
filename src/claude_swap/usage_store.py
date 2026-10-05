@@ -1600,10 +1600,8 @@ class UsageStore:
                 last_good["seven_day"] = seven_entry
             row["lastGood"] = last_good
             row["fetchedAt"] = now
-            # Never attempted: nothing to defer, so `nextPollAt` stays as it is
-            # (absent reads as due; a plan in place comes due when it passes).
-            # Pushing it out slides the first fetch away on every reading, and
-            # writing `now` reads to an outside reader as a missed cycle.
+            # Never attempted: leave `nextPollAt` as it is (pushing it out slides
+            # the first fetch away, writing `now` reads as a missed cycle).
             last = _num_or_none(row.get("lastAttemptAt"))
             if last is not None:
                 floor = last + CANDIDATE_MAX_INTERVAL_S
