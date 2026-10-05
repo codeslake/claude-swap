@@ -3059,6 +3059,13 @@ class TestActiveAccountRefresh:
         run_fetches.assert_not_called()  # premise: the backoff blocked it
         write_backup.assert_called_once_with("1", "test@example.com", fresh_login)
 
+    @staticmethod
+    def _login_blob(refresh: str, ends_at: int) -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-" + refresh, "refreshToken": refresh,
+            "expiresAt": 9999999999000, "refreshTokenExpiresAt": ends_at,
+        }})
+
     @pytest.mark.parametrize("login", [True, False], ids=["login", "rotation"])
     def test_an_adopted_login_clears_the_row_but_a_rotation_keeps_its_backoff(
         self, temp_home: Path, mock_claude_config: Path,
@@ -3071,15 +3078,8 @@ class TestActiveAccountRefresh:
         switcher = self._switcher(sample_sequence_data)
         store = switcher._usage_store
         identity = {"1": ("test@example.com", "")}
-
-        def blob(refresh: str, ends_at: int) -> str:
-            return json.dumps({"claudeAiOauth": {
-                "accessToken": "sk-" + refresh, "refreshToken": refresh,
-                "expiresAt": 9999999999000, "refreshTokenExpiresAt": ends_at,
-            }})
-
         switcher._write_account_credentials(
-            "1", "test@example.com", blob("rt-old", 1_000_000)
+            "1", "test@example.com", self._login_blob("rt-old", 1_000_000)
         )
         store.record({"1": FetchRecord(error=poll_policy.NO_PLAN_ERROR)}, identity)
         store.record(
@@ -3094,7 +3094,7 @@ class TestActiveAccountRefresh:
         assert before[0] == poll_policy.NO_PLAN_ERROR  # premise
         assert before[1] > store.clock()  # premise: the backoff is live
         # A refresh lifetime ending later than the jitter band is a login.
-        live = blob("rt-new", 1_000_000 + (10_000 if login else 1_000))
+        live = self._login_blob("rt-new", 1_000_000 + (10_000 if login else 1_000))
         with patch.object(
             switcher, "_read_credentials", return_value=live
         ), patch(
@@ -3110,6 +3110,35 @@ class TestActiveAccountRefresh:
             assert set(store.reserve(["1"], identity, respect_plans=True)) == {"1"}
         else:
             assert state() == before
+
+    def test_the_fetch_that_served_an_adopted_login_still_records_its_reading(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The resync runs inside the claimed fetch that served the login, and
+        `record()` fences that fetch's outcome on the row's claim: a clear that
+        revoked the claim would discard the reading the login just earned."""
+        switcher = self._switcher(sample_sequence_data)
+        identity = {"1": ("test@example.com", "")}
+        switcher._write_account_credentials(
+            "1", "test@example.com", self._login_blob("rt-old", 1_000_000)
+        )
+        live = self._login_blob("rt-new", 1_010_000)
+        info = [(1, "test@example.com", "", "", True, live, "")]
+        with patch.object(
+            switcher, "_read_credentials", return_value=live
+        ), patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._PROFILE_SELF,
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}}),
+        ):
+            switcher._collect_usage_entries(info)
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        entry = switcher._usage_store.entries(identity)["1"]
+        assert entry.last_good == {"five_hour": {"pct": 3}}
 
     # -- a hold (``cswap import-usage``) must not also block adopting a
     # fresh login --
@@ -13629,8 +13658,9 @@ class TestRemoveAccountPrunesMappings:
 
         with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch.object(switcher, "_delete_account_credentials"):
-            switcher.add_account(slot=5, assume_yes=True)  # same identity, new slot
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
+            switcher.add_account(slot=5)  # same identity, new slot
 
         assert store.get(temp_home) is not None
         assert switcher.slot_for_directory(str(temp_home)) == ("5", "a@x.com")
@@ -13759,9 +13789,10 @@ class TestAddAccountAlias:
         switcher = self._config_switcher(temp_home, "a@x.com")
         with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch.object(switcher, "_delete_account_credentials"):
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
             switcher.add_account(alias="dev")  # lands in slot 1
-            switcher.add_account(slot=5, assume_yes=True)  # same identity, new slot, no alias passed
+            switcher.add_account(slot=5)  # same identity, new slot, no alias passed
 
         data = switcher._get_sequence_data()
         assert "1" not in data["accounts"]
