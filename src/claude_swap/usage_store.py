@@ -1631,12 +1631,27 @@ class UsageStore:
         plans: dict[str, tuple[float | None, float | None]],
         identities: dict[str, Identity],
     ) -> None:
-        """Persist the scheduler's per-slot ``(nextPollAt, pollIntervalS)``."""
+        """Persist the scheduler's per-slot ``(nextPollAt, pollIntervalS)``.
+
+        A no-plan row's day-long plan is never pulled earlier here: the
+        switch-time replan targets ``now`` for any row with a failure count,
+        which would ask a no-plan token once per switch-in. Only a later plan
+        replaces it; `clear_dead_token` is the one way to drop it. Neither
+        field touched here is ``backoffUntil``, so a live 429 wall is never
+        shortened by a replan.
+        """
         if not plans:
             return
 
         def apply(num: str, row: dict) -> None:
             next_poll_at, interval = plans[num]
+            held = _num_or_none(row.get("nextPollAt"))
+            if (
+                row.get("lastError") == NO_PLAN_ERROR
+                and held is not None
+                and (next_poll_at is None or next_poll_at < held)
+            ):
+                return
             row["nextPollAt"] = next_poll_at
             row["pollIntervalS"] = interval
 

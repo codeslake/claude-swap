@@ -889,14 +889,11 @@ class TestNoPlanSlot:
         clock.advance(NO_PLAN_POLL_INTERVAL_S)
         assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
 
-    @pytest.fixture(params=[True, False], ids=["disabled", "enabled"])
-    def commit(self, request, store):
-        """Commit a fetch outcome with the plan the switcher computes for it,
-        whatever the roster says about the slot."""
+    @pytest.fixture
+    def commit(self, store):
+        """Commit a fetch outcome with the plan the switcher computes for it."""
         stub = SimpleNamespace(
-            _usage_store=store,
-            _poll_policy_inputs=lambda: (90.0, ()),
-            is_account_disabled=lambda num: request.param,
+            _usage_store=store, _poll_policy_inputs=lambda: (90.0, ())
         )
 
         def commit(error, claims=None, **kw):
@@ -908,7 +905,7 @@ class TestNoPlanSlot:
 
         return commit
 
-    def test_a_no_plan_row_is_asked_once_a_day_enabled_or_not(
+    def test_a_no_plan_row_is_asked_once_a_day(
         self, store, clock, commit
     ):
         # Measured on three hosts: an enabled slot re-asked every 900 s drew
@@ -979,6 +976,40 @@ class TestNoPlanSlot:
         clock.advance(BACKOFF_CAP_S + 1)
         store.clear_dead_token(["1"], IDENT)
         assert store.entries(IDENT)["1"].next_poll_at is None
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_a_replan_never_pulls_a_no_plan_row_earlier(self, store, clock):
+        # A slot that once read fine and then lapsed to no plan carries a
+        # failure count, so the switch-time replan lands on `now`: one ask per
+        # switch-in, which is the storm the day-long plan exists to prevent.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(SERVE_TTL_S + 1)
+        store.record({"1": FetchRecord(error=NO_PLAN_ERROR)}, IDENT)
+        day = store.entries(IDENT)["1"].next_poll_at
+        clock.advance(BACKOFF_CAP_S + 1)
+        for plan in ((clock.now, 15.0), (None, None)):
+            store.set_poll_plan({"1": plan}, IDENT)
+            assert store.entries(IDENT)["1"].next_poll_at == day
+            assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+            assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+        store.set_poll_plan({"1": (day + 60.0, 60.0)}, IDENT)  # later is fine
+        assert store.entries(IDENT)["1"].next_poll_at == day + 60.0
+
+    def test_a_replan_still_pulls_a_failed_row_to_now_and_leaves_its_429(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan({"1": (clock.now + 600.0, 600.0)}, IDENT)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        backoff = store.entries(IDENT)["1"].backoff_until
+
+        store.set_poll_plan({"1": (clock.now, 180.0)}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert (entry.next_poll_at, entry.backoff_until) == (clock.now, backoff)
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}  # still walled
+        clock.advance(backoff - clock.now + 1)
         assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
 
 
