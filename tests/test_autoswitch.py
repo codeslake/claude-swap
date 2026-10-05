@@ -4077,6 +4077,24 @@ class TestRunLoop:
         assert engine.run_loop() == 0
         assert engine._live_lock is None
 
+    def test_lock_drops_even_if_the_exit_announcement_is_interrupted(self, temp_home):
+        """`except Exception` does not catch a KeyboardInterrupt in the exit's
+        decision-log write; the flip and the release still run."""
+        h = EngineHarness(temp_home, decision_log=True)
+        engine = h.engine
+        assert engine._live_lock is not None, "premise: this engine is LIVE"
+
+        class _InterruptLogger:
+            def info(self, *a, **kw):
+                raise KeyboardInterrupt
+
+        engine._decisions = _InterruptLogger()
+        engine._consumer_gone = True
+        with pytest.raises(KeyboardInterrupt):
+            engine.run_loop()
+        assert engine._live_lock is None
+        assert engine.dry_run is True
+
     def test_stop_initiated_exit_does_not_also_touch_the_live_lock(
         self, harness, monkeypatch
     ):

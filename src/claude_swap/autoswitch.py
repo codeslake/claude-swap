@@ -4063,15 +4063,16 @@ class AutoSwitchEngine:
                 # and `_emit` writes nothing. `auto off:` stays `stop()`'s;
                 # the watchers read a crash by this line. A failed write never
                 # strands the lock.
-                if self.settings.decision_log and not self.dry_run:
-                    try:
+                try:
+                    if self.settings.decision_log and not self.dry_run:
                         if self._decisions is None:
                             self._decisions = decision_logger(self.switcher.backup_dir)
                         self._decisions.info("%s %s", event.ts, event.human())
-                    except Exception as exc:  # noqa: BLE001 — the lock comes first
-                        _logger.warning(f"engine-stopped decision line not written: {exc}")
-                self.dry_run = True
-                self._release_live()
+                except Exception as exc:  # noqa: BLE001 — the lock comes first
+                    _logger.warning(f"engine-stopped decision line not written: {exc}")
+                finally:
+                    self.dry_run = True
+                    self._release_live()
                 self._emit(event)
             # UNCONDITIONALLY, on both exit paths. This runs on the
             # worker's own thread, after its last tick, so it never races
