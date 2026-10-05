@@ -960,19 +960,6 @@ def _perishes_before_active(
     return active_ts is not None and candidate_ts < active_ts
 
 
-def _headroom_off_the_7d_window(
-    usage: dict | str | None, models: Sequence[str]
-) -> float:
-    """Headroom over every window but the 7-day one (T1850): the room a
-    perishing candidate keeps once its perishing window is waived. `models`
-    is the axis the caller's floor headroom was built on."""
-    pcts = [
-        pct for label, pct, _ in oauth.relevant_windows(usage, models)
-        if label != "7d"
-    ]
-    return 100.0 - max(pcts, default=0.0)
-
-
 def consume_first_rank_key(
     usage: dict | str | None,
     threshold: float,
@@ -2394,13 +2381,14 @@ class AutoSwitchEngine:
             # window resets BEFORE the active's, since its remaining room
             # expires unspent regardless. T1850: false for THAT WINDOW
             # ONLY. A perishing candidate is waived on its 7-day headroom
-            # and no other: its 5h and pinned-model-window headroom
-            # (`_headroom_off_the_7d_window`) must still clear the same
-            # per-tier floor below (measured 2026-10-05: a warm 5h 86 / 7d
-            # 61 candidate, headroom 14 and 5h-bound, was admitted because
-            # its 7d reset sooner -- the 5h window does not perish). It
-            # may still come from `cold_ordered`, and still had to clear
-            # `SPENT_HEADROOM_PCT` to reach either list at all.
+            # and no other: its 5h and pinned-model-window headroom (every
+            # window but the 7d, read on the axis `floor_headroom` is on)
+            # must still clear the same per-tier floor below (measured
+            # 2026-10-05: a warm 5h 86 / 7d 61 candidate, headroom 14 and
+            # 5h-bound, was admitted because its 7d reset sooner -- the 5h
+            # window does not perish). It may still come from
+            # `cold_ordered`, and still had to clear `SPENT_HEADROOM_PCT`
+            # to reach either list at all.
             #
             # T0758 follow-up: `warm_ordered + cold_ordered`, warm first, so
             # a lapsed rotation (no partner has switched inside the TTL,
@@ -2428,8 +2416,15 @@ class AutoSwitchEngine:
             def _clears_the_landing_floor(n):
                 h = floor_headroom.get(n, 0.0)
                 if _perishes_before_active(usage.get(n), usage.get(current), now):
-                    h = _headroom_off_the_7d_window(
-                        usage.get(n), () if model_window_dropped else self._models
+                    h = 100.0 - max(
+                        (
+                            pct for label, pct, _ in oauth.relevant_windows(
+                                usage.get(n),
+                                () if model_window_dropped else self._models,
+                            )
+                            if label != "7d"
+                        ),
+                        default=0.0,
                     )
                 if n in cold_set:
                     return h - settings.cold_switch_cost_pct > SPENT_HEADROOM_PCT
