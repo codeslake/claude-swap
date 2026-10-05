@@ -5532,7 +5532,6 @@ class ClaudeAccountSwitcher:
         fields, so the last-good measurement keeps being served
         (stale-on-error).
         """
-        self._prune_usage_rows(tuple(str(info[0]) for info in accounts_info))
         store = self._usage_store
         identities = {
             str(num): (email, org_uuid or "")
@@ -5574,6 +5573,7 @@ class ClaudeAccountSwitcher:
             for num in info_by_num
             if num not in sentinels and (fetch is None or num in fetch)
         ]
+        self._prune_usage_rows(tuple(str(info[0]) for info in accounts_info))
         if fetch is None:
             # Repair reset-parked plans written by releases that stopped
             # polling exhausted accounts until their advertised reset. The
