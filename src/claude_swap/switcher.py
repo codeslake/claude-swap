@@ -7790,9 +7790,13 @@ class ClaudeAccountSwitcher:
             recent_429 = before is not None and before.recent_429(now)
             plans[num] = poll_policy.plan_after_fetch(
                 # A no-plan row's day-long interval is not a cadence to halve
-                # or grow from: its first success starts from the default.
+                # or grow from: its first success starts from the default. So
+                # is the 600s a header reading seeds on a never-fetched row:
+                # a deadline for an outside reader, not a cadence.
                 prev_interval_s=None
-                if before is None or before.last_error == poll_policy.NO_PLAN_ERROR
+                if before is None
+                or before.last_error == poll_policy.NO_PLAN_ERROR
+                or before.last_attempt_at is None
                 else before.poll_interval_s,
                 prev_usage=before.last_good if before else None,
                 new_usage=rec.usage,

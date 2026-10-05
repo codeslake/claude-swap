@@ -1538,10 +1538,12 @@ class UsageStore:
         instead of on every scheduled tick -- except an http-429 row, which
         stays un-probed until ``backoffUntil`` regardless of ``nextPollAt``.
         A row with no ``lastAttemptAt`` (never fetched) has no attempt to
-        defer from: a reading leaves its ``nextPollAt`` exactly as it is
-        (absent stays absent, a plan in place stays as written), so the first
-        fetch is never pushed and no ``now`` is written for an outside reader
-        to take as a missed cycle.
+        defer from. With no ``nextPollAt`` it is given ``now`` (and
+        ``pollIntervalS = CANDIDATE_MAX_INTERVAL_S`` if it has none): due for
+        the engine's own gate, which an absent plan never is while readings
+        keep the row fresh, and read by an outside reader (``now >
+        nextPollAt + pollIntervalS``) as a missed cycle only after 600s with
+        no fetch. A ``nextPollAt`` already in place is left as written.
 
         Callers must throttle themselves — the pin calls this at most once
         per 30s per slot; a hot path replying every request would otherwise
@@ -1600,15 +1602,19 @@ class UsageStore:
                 last_good["seven_day"] = seven_entry
             row["lastGood"] = last_good
             row["fetchedAt"] = now
-            # Never attempted: leave `nextPollAt` as it is (pushing it out slides
-            # the first fetch away, writing `now` reads as a missed cycle).
+            existing_next = _num_or_none(row.get("nextPollAt"))
             last = _num_or_none(row.get("lastAttemptAt"))
             if last is not None:
                 floor = last + CANDIDATE_MAX_INTERVAL_S
-                existing_next = _num_or_none(row.get("nextPollAt"))
                 row["nextPollAt"] = (
                     floor if existing_next is None else max(existing_next, floor)
                 )
+            elif existing_next is None:
+                # Never attempted, no plan: due now for the engine's gate; the
+                # interval is a deadline for an outside reader, not a cadence.
+                row["nextPollAt"] = now
+                if _num_or_none(row.get("pollIntervalS")) is None:
+                    row["pollIntervalS"] = CANDIDATE_MAX_INTERVAL_S
 
         self._mutate(identities, [num], apply)
         return recorded
