@@ -6244,7 +6244,8 @@ class ClaudeAccountSwitcher:
             slot: Specify the slot number to store the account in.
                   When None, auto-assigns the next available number.
                   When specified, prompts for confirmation if the slot
-                  is already occupied by a different account.
+                  is already occupied by a different account, or the
+                  account already lives in another slot (which it empties).
             assume_yes: Skip that overwrite prompt (callers with their own
                   confirmation UI, e.g. the TUI, confirm before calling).
             alias: Optional short display alias to set on this account.
@@ -6432,6 +6433,7 @@ class ClaudeAccountSwitcher:
                     migrate_from = old_num
 
             # Check if target slot is occupied by a different account
+            occupant = None
             if account_num in data.get("accounts", {}):
                 existing = data["accounts"][account_num]
                 existing_email = existing.get("email", "unknown")
@@ -6443,24 +6445,49 @@ class ClaudeAccountSwitcher:
                         existing.get("organizationName", ""),
                         existing.get("organizationUuid", ""),
                     )
+                    occupant = f"{existing_email} [{existing_tag}]"
                     warning(f"Slot {slot} already occupied")
                     print(
                         f"{existing_email} {muted(f'[{existing_tag}]')}"
                     )
-                    if not assume_yes:
-                        try:
-                            answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
-                        except (EOFError, KeyboardInterrupt):
-                            print(f"\n{dimmed('Cancelled')}")
-                            return
-                        if answer not in ("y", "yes"):
-                            print(dimmed("Cancelled"))
-                            return
                     displace_slot = (
                         account_num,
                         existing_email,
                         existing.get("organizationUuid", "") or "",
                     )
+
+            # One prompt for everything this add removes. It names the account
+            # being added: the live login is not always the one the caller had
+            # in mind, and a move out of another slot is as destructive as an
+            # overwrite.
+            if (occupant or migrate_from) and not assume_yes:
+                oauth_account = (
+                    self._read_json(self._get_claude_config_path()) or {}
+                ).get("oauthAccount") or {}
+                incoming_tag = self._get_display_tag(
+                    current_email,
+                    oauth_account.get("organizationName", "") or "",
+                    current_org_uuid,
+                )
+                notes = []
+                if migrate_from:
+                    notes.append(
+                        f"It lives in slot {migrate_from} now; "
+                        f"slot {migrate_from} will be emptied."
+                    )
+                if occupant:
+                    notes.append(f"Slot {slot} holds {occupant}; it will be removed.")
+                try:
+                    answer = input(
+                        f"Add {current_email} [{incoming_tag}] to slot {slot}? "
+                        f"{' '.join(notes)} [y/N] "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print(f"\n{dimmed('Cancelled')}")
+                    return
+                if answer not in ("y", "yes"):
+                    print(dimmed("Cancelled"))
+                    return
         else:
             account_num = str(self._get_next_account_number())
 
@@ -7982,7 +8009,8 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             raise
 
     def _resync_rotated_backup(
-        self, account_num: str, email: str, org_uuid: str, creds: str
+        self, account_num: str, email: str, org_uuid: str, creds: str,
+        *, revoke_claim: bool = False,
     ) -> None:
         """Resync the slot backup after a rotation that completed elsewhere.
 
@@ -8010,6 +8038,9 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         Best-effort: any failure (lock contention, read error, identity
         moved, oracle unreachable) just leaves the backup stale — the
         recovery branch consumes nothing it cannot attribute. Never raises.
+
+        ``revoke_claim``: a caller that holds no fetch claim on the row passes
+        True, so an adopted login's clear also ends a rival's lease.
         """
         # T1312: whether ownership of `creds` as `account_num`'s own login
         # was ever settled (a fresh oracle match, or a memoized verdict) --
@@ -8250,9 +8281,43 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                         email=email, uuid=own_uuid,
                     )
                     return
+                # No stored backup (absent, not merely unreadable) leaves no
+                # rotation to protect: the seed is a login. Both present, the
+                # refresh-expiry stamps are the only evidence of a login, and
+                # an undated side is none (the fingerprint differs for a
+                # rotation too, and `backup_exp` above only refuses an older
+                # credential).
+                is_login = (
+                    not backup_now
+                    and not self._read_account_credentials_ex(account_num, email)[1]
+                ) or self._live_is_a_newer_login(live, backup_now, False)
                 self._write_account_credentials(
                     account_num, email, live, attributed=True
                 )
+                if is_login:
+                    # A /login, not a rotation: the strike, backoff and no-plan
+                    # plan describe the credential it replaced. A rotation keeps
+                    # them (its token may still be inside its own block). After
+                    # the write, as `_adopt_login_into_slot` does: a write that
+                    # raised leaves the old lineage in the backup, and a clear
+                    # ahead of it would erase the row on every retry. The claim
+                    # stays when this runs inside the fetch `record()` fences
+                    # on; a pass that holds none revokes it, so another
+                    # collector's outcome on the old token is not recorded over
+                    # the cleared row.
+                    try:
+                        self._usage_store.clear_dead_token(
+                            [account_num],
+                            {account_num: (email, org_uuid or "")},
+                            revoke_claim=revoke_claim,
+                        )
+                    except (OSError, LockError) as e:
+                        self._logger.warning(
+                            "Adopted a login into Account-%s's backup but "
+                            "could not clear its usage row (%s); the row "
+                            "keeps its failure state until a fetch replaces "
+                            "it.", account_num, e,
+                        )
                 self._store._sync_active_credentials_file_to_adopted_login(
                     live, slot=account_num, email=email,
                 )
@@ -8883,48 +8948,6 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
             )
 
-    def _pull_in_enabled_no_plan_plans(
-        self, identities: dict[str, tuple], entries: dict[str, UsageEntry]
-    ) -> bool:
-        """Cut an enabled no-plan slot's day-long plan to the enabled cadence.
-
-        The day was written while the slot was disabled or before the enabled
-        cadence existed, and an enabled slot must not wait it out. ``entries``
-        is the pass's own read: with no day-planned row the roster and the
-        store lock are never touched, so a display-only refresh stays
-        lock-free. The store re-decides on the locked row; this passes only
-        the enabled slots and the interval. Idempotent, and best-effort like
-        every other store write of the collect: a lock held past its timeout
-        or an unreadable roster skips it and the next collect retries.
-        """
-        step = poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
-        planned = {
-            num: ident
-            for num, ident in identities.items()
-            if (e := entries[num]).last_error == poll_policy.NO_PLAN_ERROR
-            and e.last_attempt_at is not None
-            and e.next_poll_at is not None
-            and e.next_poll_at > e.last_attempt_at + step
-        }
-        if not planned:
-            return False
-        try:
-            roster = self._get_sequence_data() or {}
-            enabled = {
-                num: ident
-                for num, ident in planned.items()
-                if not self._disabled_from_data(roster, num)
-            }
-            return bool(enabled) and self._usage_store.pull_in_no_plan_plans(
-                enabled, step
-            )
-        except (ClaudeSwitchError, OSError) as e:
-            self._logger.warning(
-                "Could not pull in an enabled no-plan slot's day-long plan "
-                "(%s); the next collect retries.", e,
-            )
-            return False
-
     def _collect_usage_entries(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -8974,8 +8997,6 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 sentinels[num] = static
 
         entries = store.entries(identities, models)
-        if not read_only and self._pull_in_enabled_no_plan_plans(identities, entries):
-            entries = store.entries(identities, models)
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
@@ -9156,7 +9177,9 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 # `_resync_rotated_backup`'s own docstring assumes a fresh
                 # access token, and the held reading, not a resync, is what
                 # the row reports for the hold's span.
-                self._resync_rotated_backup(num, info[1], info[3], info[5])
+                self._resync_rotated_backup(
+                    num, info[1], info[3], info[5], revoke_claim=True
+                )
             elif active_oauth and not expired:
                 # Same "would have resynced but degraded" case as
                 # `_fetch_active_usage`'s success branch -- see
@@ -9819,28 +9842,15 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         """Build successful-fetch cadence updates for atomic outcome commit.
 
         Failures are paced by the store's backoff and keep their past-due plan
-        for when the backoff lifts. The one exception is a no-plan failure of
-        an enabled slot (the store has no roster): it is planned at
-        ``NO_PLAN_ENABLED_POLL_INTERVAL_S`` rather than a day.
+        for when the backoff lifts.
         """
         now = self._usage_store.clock()
         threshold, models = self._poll_policy_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
-            if rec.sentinel is not None:
+            if rec.sentinel is not None or rec.error is not None:
                 continue
             before = pre.get(num)
-            if rec.error is not None:
-                # The store keeps the kind through later failures, so a row
-                # that already carried it stays no-plan whatever failed now.
-                no_plan = poll_policy.NO_PLAN_ERROR in (
-                    rec.error,
-                    before.last_error if before else None,
-                )
-                if no_plan and not self.is_account_disabled(num):
-                    interval = poll_policy.NO_PLAN_ENABLED_POLL_INTERVAL_S
-                    plans[num] = (now + interval, interval)
-                continue
             recent_429 = before is not None and before.recent_429(now)
             plans[num] = poll_policy.plan_after_fetch(
                 # A no-plan row's day-long interval is not a cadence to halve
@@ -10856,7 +10866,10 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 for num in excluded_slots:
                     identity = roster.get(num)
                     if identity is not None:
-                        self._usage_store.mark_at_limit(num, {num: identity}, models)
+                        self._usage_store.mark_at_limit(
+                            num, {num: identity}, models,
+                            account_uuid=data["accounts"][num].get("uuid"),
+                        )
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(

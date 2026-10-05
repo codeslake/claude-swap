@@ -3446,6 +3446,234 @@ class TestActiveAccountRefresh:
             "1", "test@example.com", fresh_login, attributed=True,
         )
 
+    @staticmethod
+    def _login_blob(refresh: str, ends_at: "int | None") -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-" + refresh, "refreshToken": refresh,
+            "expiresAt": 9999999999000,
+            **({} if ends_at is None else {"refreshTokenExpiresAt": ends_at}),
+        }})
+
+    def _no_plan_row_behind_a_429(self, switcher):
+        """Slot 1's row as a no-plan 403 then a 429 leave it: a day-long plan
+        and a live backoff. Returns a reader of (lastError, backoffUntil,
+        nextPollAt) for it."""
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        store.record({"1": FetchRecord(error=poll_policy.NO_PLAN_ERROR)}, identity)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+        )
+
+        def state():
+            e = store.entries(identity)["1"]
+            return (e.last_error, e.backoff_until, e.next_poll_at)
+
+        assert state()[0] == poll_policy.NO_PLAN_ERROR  # premise
+        assert state()[1] > store.clock()  # premise: the backoff is live
+        return state
+
+    def _resync(self, switcher, live: str) -> None:
+        with patch.object(
+            switcher, "_read_credentials", return_value=live
+        ), patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._PROFILE_SELF,
+        ):
+            switcher._resync_rotated_backup("1", "test@example.com", "", live)
+
+    def test_a_failed_backup_write_leaves_the_row_for_the_retry(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The clear ran ahead of the write, so a write that raised left the
+        old lineage in the backup AND an erased row: every later pass saw a
+        newer login again, wiped the row again, and the next fetch re-asked
+        a no-plan token inside its own Retry-After."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials(
+            "1", "test@example.com", self._login_blob("rt-old", 1_000_000)
+        )
+        state = self._no_plan_row_behind_a_429(switcher)
+        before = state()
+        live = self._login_blob("rt-new", 1_010_000)
+
+        with patch.object(
+            switcher, "_write_account_credentials", side_effect=OSError("disk full")
+        ):
+            self._resync(switcher, live)
+        assert state() == before
+
+        self._resync(switcher, live)  # the retry: the drift is still there
+        assert state() == (None, None, None)
+
+    def test_a_clear_that_raises_does_not_undo_the_adoption(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials(
+            "1", "test@example.com", self._login_blob("rt-old", 1_000_000)
+        )
+        live = self._login_blob("rt-new", 1_010_000)
+
+        with patch.object(
+            switcher._usage_store, "clear_dead_token", side_effect=OSError("full")
+        ), patch.object(
+            switcher._store, "_sync_active_credentials_file_to_adopted_login"
+        ) as sync:
+            self._resync(switcher, live)
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        sync.assert_called_once()
+
+    @pytest.mark.parametrize("unreadable", [False, True], ids=["absent", "unreadable"])
+    def test_a_login_seeding_an_empty_backup_clears_the_row(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, unreadable: bool,
+    ):
+        """With no stored backup there is no rotation to protect, so the seed
+        is a login and clears what described the credential it replaces. A
+        backup that merely could not be read is not an absent one."""
+        switcher = self._switcher(sample_sequence_data)
+        state = self._no_plan_row_behind_a_429(switcher)
+        before = state()
+        assert not switcher._read_account_credentials("1", "test@example.com")
+
+        with patch.object(
+            switcher, "_read_account_credentials_ex", return_value=("", unreadable)
+        ):
+            self._resync(switcher, self._login_blob("rt-new", 1_010_000))
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        assert state() == (before if unreadable else (None, None, None))
+
+    @pytest.mark.parametrize(
+        "backup_at,live_at", [(None, 1_010_000), (1_000_000, None)],
+        ids=["backup-undated", "live-undated"],
+    )
+    def test_an_undated_side_is_no_evidence_of_a_login(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, backup_at, live_at,
+    ):
+        """Fingerprints differ for a login and a rotation alike, and the
+        expiry ordering only refuses an older credential, so neither says
+        which this is: the row keeps its failure state."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials(
+            "1", "test@example.com", self._login_blob("rt-old", backup_at)
+        )
+        state = self._no_plan_row_behind_a_429(switcher)
+        before = state()
+
+        self._resync(switcher, self._login_blob("rt-new", live_at))
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        assert state() == before
+
+    def test_a_pass_without_the_claim_revokes_it_when_it_adopts_a_login(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Another collector mid-fetch on the pre-login token must not record
+        its outcome over the cleared row: only the pass that holds the fetch
+        claim itself may keep it."""
+        switcher = self._switcher(sample_sequence_data)
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        switcher._write_account_credentials(
+            "1", "test@example.com", self._login_blob("rt-old", 1_000_000)
+        )
+        assert store.reserve(["1"], identity, respect_plans=False)  # theirs
+        live = self._login_blob("rt-new", 1_010_000)
+        info = [(1, "test@example.com", "", "", True, live, "")]
+
+        with patch.object(
+            switcher, "_read_credentials", return_value=live
+        ), patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._PROFILE_SELF,
+        ):
+            switcher._collect_usage_entries(info)
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        assert store.entries(identity)["1"].claim_until == 0.0
+
+    @pytest.mark.parametrize("login", [True, False], ids=["login", "rotation"])
+    def test_an_adopted_login_clears_the_row_but_a_rotation_keeps_its_backoff(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, login: bool,
+    ):
+        """Every other login adoption clears the row's failure state; this
+        one left a no-plan kind and its 429 backoff standing after a real
+        `/login`. A same-lineage rotation is not a login: clearing there
+        would re-ask a token that is still inside its own block."""
+        switcher = self._switcher(sample_sequence_data)
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        switcher._write_account_credentials(
+            "1", "test@example.com", self._login_blob("rt-old", 1_000_000)
+        )
+        store.record({"1": FetchRecord(error=poll_policy.NO_PLAN_ERROR)}, identity)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+        )
+
+        def state():
+            e = store.entries(identity)["1"]
+            return (e.last_error, e.backoff_until, e.next_poll_at)
+
+        before = state()
+        assert before[0] == poll_policy.NO_PLAN_ERROR  # premise
+        assert before[1] > store.clock()  # premise: the backoff is live
+        # A refresh lifetime ending later than the jitter band is a login.
+        live = self._login_blob("rt-new", 1_000_000 + (10_000 if login else 1_000))
+        with patch.object(
+            switcher, "_read_credentials", return_value=live
+        ), patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._PROFILE_SELF,
+        ):
+            switcher._resync_rotated_backup("1", "test@example.com", "", live)
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        if login:
+            assert state() == (None, None, None)
+            assert set(store.reserve(["1"], identity, respect_plans=True)) == {"1"}
+        else:
+            assert state() == before
+
+    def test_the_fetch_that_served_an_adopted_login_still_records_its_reading(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The resync runs inside the claimed fetch that served the login, and
+        `record()` fences that fetch's outcome on the row's claim: a clear that
+        revoked the claim would discard the reading the login just earned."""
+        switcher = self._switcher(sample_sequence_data)
+        identity = {"1": ("test@example.com", "")}
+        switcher._write_account_credentials(
+            "1", "test@example.com", self._login_blob("rt-old", 1_000_000)
+        )
+        live = self._login_blob("rt-new", 1_010_000)
+        info = [(1, "test@example.com", "", "", True, live, "")]
+        with patch.object(
+            switcher, "_read_credentials", return_value=live
+        ), patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._PROFILE_SELF,
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}}),
+        ):
+            switcher._collect_usage_entries(info)
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        entry = switcher._usage_store.entries(identity)["1"]
+        assert entry.last_good == {"five_hour": {"pct": 3}}
+
     # -- a hold (``cswap import-usage``) must not also block adopting a
     # fresh login --
     #
@@ -7348,16 +7576,21 @@ class TestAddAccountSlot:
             switcher.add_account(slot=3)
 
         # Try to add account B to slot 3, answer "n"
-        switcher = self._make_switcher(temp_home, email="b@example.com")
+        switcher = self._make_switcher(temp_home, email="b@example.com", org_name="Beta")
+        ask = MagicMock(return_value="n")
         with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch("builtins.input", return_value="n"):
+             patch("builtins.input", ask):
             switcher.add_account(slot=3)
 
         # Slot 3 should still be account A
         data = switcher._get_sequence_data()
         assert data["accounts"]["3"]["email"] == "a@example.com"
         assert "Cancelled" in capsys.readouterr().out
+        # The prompt names the account being added and the one it removes.
+        prompt = ask.call_args.args[0]
+        assert "b@example.com [Beta]" in prompt
+        assert "slot 3" in prompt and "a@example.com" in prompt
 
     def test_slot_occupied_overwrite(self, temp_home, capsys):
         """When slot is occupied and user confirms, should overwrite."""
@@ -7398,11 +7631,14 @@ class TestAddAccountSlot:
         assert "1" in data["accounts"]
 
         # Move to slot 5
+        ask = MagicMock(return_value="y")
         with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch.object(switcher, "_delete_account_credentials"):
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", ask):
             switcher.add_account(slot=5)
 
+        ask.assert_called_once()  # a move empties slot 1, so it is asked
         data = switcher._get_sequence_data()
         assert "1" not in data["accounts"]
         assert "5" in data["accounts"]
@@ -7529,9 +7765,10 @@ class TestAddAccountSlot:
 
         # Try to move A from slot 1 → slot 3, cancel
         switcher = self._make_switcher(temp_home, email="a@example.com")
+        ask = MagicMock(return_value="n")
         with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch("builtins.input", return_value="n"):
+             patch("builtins.input", ask):
             switcher.add_account(slot=3)
 
         # Both slots should be untouched
@@ -7539,6 +7776,36 @@ class TestAddAccountSlot:
         assert data["accounts"]["1"]["email"] == "a@example.com"
         assert data["accounts"]["3"]["email"] == "b@example.com"
         assert "Cancelled" in capsys.readouterr().out
+        # One prompt names the incoming account with its slot, and the occupant.
+        ask.assert_called_once()
+        prompt = ask.call_args.args[0]
+        assert "a@example.com [personal]" in prompt and "b@example.com" in prompt
+        assert "slot 1" in prompt and "slot 3" in prompt
+
+    def test_a_no_to_moving_an_account_into_an_empty_slot_writes_nothing(
+        self, temp_home, capsys
+    ):
+        """`add --slot 5` read slot 2's account (the live login) and emptied
+        slot 2 with no question: a move into a FREE slot is asked too."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        switcher = self._make_switcher(temp_home, email="a@example.com", org_name="Acme")
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=2)
+        before = switcher._get_sequence_data()
+
+        ask = MagicMock(return_value="n")
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials") as write, \
+             patch("builtins.input", ask):
+            switcher.add_account(slot=5)
+
+        assert switcher._get_sequence_data() == before
+        write.assert_not_called()
+        assert "Cancelled" in capsys.readouterr().out
+        prompt = ask.call_args.args[0]
+        assert "a@example.com [Acme]" in prompt
+        assert "slot 2" in prompt and "slot 5" in prompt and "emptied" in prompt
 
     def test_slot_must_be_positive(self, temp_home):
         """Slot number must be >= 1."""
@@ -17238,7 +17505,8 @@ class TestRemoveAccountPrunesMappings:
 
         with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch.object(switcher, "_delete_account_credentials"):
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
             switcher.add_account(slot=5)  # same identity, new slot
 
         assert store.get(temp_home) is not None
@@ -17368,7 +17636,8 @@ class TestAddAccountAlias:
         switcher = self._config_switcher(temp_home, "a@x.com")
         with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch.object(switcher, "_delete_account_credentials"):
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
             switcher.add_account(alias="dev")  # lands in slot 1
             switcher.add_account(slot=5)  # same identity, new slot, no alias passed
 
@@ -26133,6 +26402,46 @@ class TestFailedReadingLosesToAFresherWorseReading:
         assert s._select_best_switchable("1", usage=usage) == ("2", "")
 
 
+class TestLegacyWallMarkYieldsToAMeasuredReading:
+    """A wall mark written before marks recorded their account (no
+    `walledUuid`) can belong to another account's 429 (lmd42 slot 5,
+    2026-10-05: walled until 07:30Z at 86% / 23%). Through the real
+    selection path, such a slot is a candidate while its own good poll reads
+    under the wall, and still is not one when the poll agrees with the mark
+    or the mark carries the account that drew it."""
+
+    _setup = TestFailedReadingLosesToAFresherWorseReading._setup
+    _IDENT = TestFailedReadingLosesToAFresherWorseReading._IDENT
+    _usage = staticmethod(TestFailedReadingLosesToAFresherWorseReading._usage)
+
+    def _walled_two(self, s, two_pct, *, stamped):
+        for num, pct in (("1", 90.0), ("2", two_pct), ("3", 70.0)):
+            s._usage_store.record(
+                {num: FetchRecord(usage=self._usage(pct))}, self._IDENT
+            )
+        if stamped:
+            s._usage_store.mark_at_limit("2", self._IDENT, account_uuid="uuid-2")
+        else:
+            rows = json.loads(s._usage_store.path.read_text())
+            rows["accounts"]["2"]["walledUntil"] = time.time() + 4200.0
+            s._usage_store.path.write_text(json.dumps(rows))
+        entries = s._usage_store.entries(self._IDENT)
+        return {num: e.decision_value() for num, e in entries.items()}
+
+    def test_a_legacy_mark_under_a_good_reading_is_a_candidate(self, temp_home):
+        s = self._setup(temp_home)
+        usage = self._walled_two(s, 30.0, stamped=False)
+        assert usage["2"] == self._usage(30.0)
+        assert s._select_best_switchable("1", usage=usage) == ("2", "")
+
+    @pytest.mark.parametrize("two_pct,stamped", [(100.0, False), (30.0, True)])
+    def test_a_walled_slot_stays_out(self, temp_home, two_pct, stamped):
+        s = self._setup(temp_home)
+        usage = self._walled_two(s, two_pct, stamped=stamped)
+        assert usage["2"]["five_hour"]["pct"] == 100.0
+        assert s._select_best_switchable("1", usage=usage) == ("3", "")
+
+
 class TestSwitchPersistsTheAtLimitMark:
     """Rule 2 (T1102) wiring, interface updated for I3 (pass 2): `switch(
     current_at_limit=True, exclude={...})` calls `UsageStore.mark_at_limit`
@@ -26176,6 +26485,9 @@ class TestSwitchPersistsTheAtLimitMark:
         entry = s._usage_store.entries(ident)["1"]
         assert entry.walled
         assert entry.decision_value()["five_hour"]["pct"] == 100.0
+        # The mark names the account the roster holds on that slot.
+        stored = json.loads(s._usage_store.path.read_text())["accounts"]["1"]
+        assert stored["walledUuid"] == "uuid-1"
 
         # A fresh poll reading a healthy 58% afterwards does not clear the
         # mark early -- decision_value() still reports the slot full.

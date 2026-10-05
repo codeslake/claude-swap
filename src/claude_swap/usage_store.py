@@ -380,7 +380,9 @@ class UsageEntry:
     # An out-of-band signal (the pin's own 429 on /v1/messages, not this
     # poller) marked this slot at-limit until a persisted deadline that has
     # not yet passed — see UsageStore.mark_at_limit. Overrides last_good for
-    # DECISIONS only; display still reads last_good/age_s as measured.
+    # DECISIONS only; display still reads last_good/age_s as measured. A
+    # LEGACY mark (no ``walledUuid``) is not walled while the row's own good
+    # poll reads every window under 100% — see _legacy_wall_is_contradicted.
     walled: bool = False
     # The mark's own deadline (epoch seconds), while `walled` -- the synthetic
     # reading `decision_value()` builds keys its `resets_at` on this, not the
@@ -756,6 +758,26 @@ def _header_reset(headers: Mapping[str, str], key: str) -> str | None:
         return _reset_ts_to_resets_at(ts)
     except (OverflowError, ValueError, OSError):
         return None
+
+
+def _legacy_wall_is_contradicted(
+    last_good: object, consecutive_failures: int
+) -> bool:
+    """Whether the row's own reading shows a LEGACY wall mark is not that
+    account's: its last poll succeeded and every window it reports (5h, 7d,
+    every per-model one, the pin's ``all`` basis) reads under 100%.
+
+    A mark written before marks recorded their account (no ``walledUuid``)
+    can be another account's 429, attributed to this slot by a wall memo
+    keyed on the slot number (lmd42 slot 5, 2026-10-05). It records no write
+    time and no account, so nothing but the row's own measurement can answer
+    for it. A window the reading lacks is not a window at the wall, and a
+    failed last poll is not a measurement, so neither voids the mark.
+    """
+    if consecutive_failures:
+        return False
+    pcts = [pct for _, pct, _ in oauth.relevant_windows(last_good, ("all",))]
+    return bool(pcts) and max(pcts) < 100.0
 
 
 def _walled_decision_value(last_good: dict | None, walled_until: float | None) -> dict:
@@ -1150,7 +1172,9 @@ class UsageStore:
         ``models`` is accepted for call-site symmetry with ``mark_at_limit``
         (which does consume it, to pick the earliest relevant-window reset a
         wall mark expires at) but is not itself read here: the walled flag on
-        each row is a plain deadline comparison against ``now``."""
+        each row is a deadline comparison against ``now``, which a LEGACY
+        mark (no ``walledUuid``) also needs the row's own reading to leave
+        standing (see ``_legacy_wall_is_contradicted``)."""
         now = self.clock()
         rows = self._read_rows()
         out: dict[str, UsageEntry] = {}
@@ -1222,7 +1246,14 @@ class UsageStore:
                 rejected_fingerprint=row.get("rejectedFingerprint"),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
-                walled=walled_until is not None and now < walled_until,
+                walled=walled_until is not None
+                and now < walled_until
+                and (
+                    "walledUuid" in row
+                    or not _legacy_wall_is_contradicted(
+                        last_good, consecutive_failures
+                    )
+                ),
                 walled_until=walled_until,
                 attempts_in_window=len(_pruned_attempts(row, now)),
                 held_until=held_until,
@@ -1353,11 +1384,9 @@ class UsageStore:
         without touching the newer row. Success and failure are mutually
         exclusive writers: success resets the failure fields, failure never
         touches ``lastGood``/``fetchedAt``. A supplied success plan commits
-        in the same transaction as its measurement; a failure takes the
-        supplied plan only on a no-plan row (the caller knows the roster, the
-        store does not), else that row is planned a day out. Sentinel records
-        clear only the claim and are otherwise never persisted, save the
-        refused credential stamp one may carry. Unfenced callers
+        in the same transaction as its measurement. Sentinel records clear
+        only the claim and are otherwise never persisted, save the refused
+        credential stamp one may carry. Unfenced callers
         (no ``claims``) defer to a live lease but never to an expired one.
         Returns the accepted slots.
         """
@@ -1376,12 +1405,12 @@ class UsageStore:
                     row["rejectedFingerprint"] = rec.rejected_fp
                 return
             row["lastAttemptAt"] = now
-            plan = plans.get(num) if plans is not None else None
             if rec.error is None:
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction
                 # so no collector can slip into a record→replan gap.
+                plan = plans.get(num) if plans is not None else None
                 if plan is not None:
                     row["nextPollAt"], row["pollIntervalS"] = plan
                 row["consecutiveFailures"] = 0
@@ -1394,15 +1423,13 @@ class UsageStore:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
                 # A no-plan slot keeps its kind through a later 429/timeout:
-                # only a success clears it. Its plan is the supplied one (an
-                # enabled slot's cadence) or a day out, never the backoff.
+                # only a success clears it. Its plan (below) is a day out, so
+                # the backoff is not what paces it.
                 if row.get("lastError") != NO_PLAN_ERROR:
                     row["lastError"] = rec.error
                 if row["lastError"] == NO_PLAN_ERROR:
-                    row["nextPollAt"], row["pollIntervalS"] = plan or (
-                        now + NO_PLAN_POLL_INTERVAL_S,
-                        NO_PLAN_POLL_INTERVAL_S,
-                    )
+                    row["nextPollAt"] = now + NO_PLAN_POLL_INTERVAL_S
+                    row["pollIntervalS"] = NO_PLAN_POLL_INTERVAL_S
                 if rec.error == "http-429":
                     # Kept across later successes: the poll planner floors the
                     # cadence while a 429 is recent (see UsageEntry.last_429_at).
@@ -1531,9 +1558,19 @@ class UsageStore:
         num: str,
         identities: dict[str, Identity],
         models: tuple[str, ...] = (),
+        account_uuid: str | None = None,
     ) -> None:
         """Persist that ``num`` is at its limit, per a signal the poller
         cannot see (the pin's own 429 on ``/v1/messages``, not a fetch).
+
+        ``account_uuid`` is the roster's account on ``num`` when the caller
+        names it, stored as ``walledUuid``. The key's presence (a null value
+        when the uuid is unknown) is what makes the mark trusted for its
+        whole span; a mark without it is LEGACY and yields to the row's own
+        reading (see ``_legacy_wall_is_contradicted``). A mark kept past an
+        account change needs no check of its own: the row's
+        (email, organizationUuid) guard already reads another account's row
+        as empty and replaces it on the next write.
 
         Expires at ``min(`` the row's OWN stored reading's earliest future
         relevant-window reset, ``now + WALL_FALLBACK_S)`` — a 5h window's
@@ -1557,6 +1594,7 @@ class UsageStore:
                 min(reset, fallback) if reset is not None and reset > now
                 else fallback
             )
+            row["walledUuid"] = account_uuid
 
         self._mutate(identities, [num], apply)
 
@@ -1718,50 +1756,31 @@ class UsageStore:
         plans: dict[str, tuple[float | None, float | None]],
         identities: dict[str, Identity],
     ) -> None:
-        """Persist the scheduler's per-slot ``(nextPollAt, pollIntervalS)``."""
+        """Persist the scheduler's per-slot ``(nextPollAt, pollIntervalS)``.
+
+        A no-plan row's day-long plan is never pulled earlier here: the
+        switch-time replan targets ``now`` for any row with a failure count,
+        which would ask a no-plan token once per switch-in. Only a later plan
+        replaces it; `clear_dead_token` is the one way to drop it. Neither
+        field touched here is ``backoffUntil``, so a live 429 wall is never
+        shortened by a replan.
+        """
         if not plans:
             return
 
         def apply(num: str, row: dict) -> None:
             next_poll_at, interval = plans[num]
+            held = _num_or_none(row.get("nextPollAt"))
+            if (
+                row.get("lastError") == NO_PLAN_ERROR
+                and held is not None
+                and (next_poll_at is None or next_poll_at < held)
+            ):
+                return
             row["nextPollAt"] = next_poll_at
             row["pollIntervalS"] = interval
 
         self._mutate(identities, plans.keys(), apply)
-
-    def pull_in_no_plan_plans(
-        self, identities: dict[str, Identity], interval: float
-    ) -> bool:
-        """Cut the given slots' day-long no-plan plan to ``interval``.
-
-        Decided on the LOCKED row, never on a caller's earlier read: a 403
-        landing since then has already planned ``now + interval`` and a
-        success has cleared the kind, and writing from a stale decision
-        would regress the one and overwrite the other. The plan becomes
-        that row's ``lastAttemptAt + interval`` (already due when past).
-        Writes only when a row moved; returns whether one did.
-        """
-        pulled = False
-        with self._lock():
-            rows = self._read_rows()
-            for num, identity in identities.items():
-                row = rows.get(num)
-                if not self._matches(row, identity):
-                    continue
-                assert isinstance(row, dict)
-                last = _num_or_none(row.get("lastAttemptAt"))
-                due = _num_or_none(row.get("nextPollAt"))
-                if (
-                    row.get("lastError") == NO_PLAN_ERROR
-                    and last is not None
-                    and due is not None
-                    and due > last + interval
-                ):
-                    row["nextPollAt"], row["pollIntervalS"] = last + interval, interval
-                    pulled = True
-            if pulled:
-                self._write_rows(rows)
-        return pulled
 
     def clear_dead_token(
         self,
