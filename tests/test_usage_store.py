@@ -1771,6 +1771,39 @@ class TestHeaderReading:
         entry = store.entries(IDENT)["1"]
         assert entry.next_poll_at > deferred  # pushed past now+30
 
+    def test_a_never_attempted_row_fed_only_by_headers_still_comes_due(
+        self, store, clock
+    ):
+        # A fresh row (the slot a `cswap move` or a new `cswap add` lands on)
+        # has no lastAttemptAt. Anchoring the floor on `now` slid it +600s on
+        # every reading, so the fetch that carries the per-model `scoped`
+        # window (the headers carry only 5h and 7d) never came due while the
+        # slot stayed active.
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+
+        def due():
+            return due_candidate(["1"], store.entries(IDENT), clock.now)
+
+        for _ in range(40):  # 20 minutes of replies, one reading per 30s
+            clock.advance(30.0)
+            assert store.record_header_reading("1", IDENT, headers) is True
+        assert due() == "1"
+
+        scoped = [{"name": "fable", "pct": 0.0}]
+        store.record({"1": FetchRecord(usage={**USAGE, "scoped": scoped})}, IDENT)
+        attempt = clock.now
+        # Control: once attempted, readings still defer the endpoint until
+        # lastAttemptAt + CANDIDATE_MAX_INTERVAL_S.
+        while clock.now + 30.0 < attempt + CANDIDATE_MAX_INTERVAL_S:
+            clock.advance(30.0)
+            store.record_header_reading("1", IDENT, headers)
+            assert due() is None
+            assert store.entries(IDENT)["1"].last_good["scoped"] == scoped
+        clock.advance(30.0)
+        store.record_header_reading("1", IDENT, headers)
+        assert clock.now == attempt + CANDIDATE_MAX_INTERVAL_S
+        assert due() == "1"
+
     def test_does_not_join_the_attempt_ledger(self, store, clock):
         headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
         store.record_header_reading("1", IDENT, headers)

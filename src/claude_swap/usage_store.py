@@ -1537,6 +1537,8 @@ class UsageStore:
         ``CANDIDATE_MAX_INTERVAL_S`` for what these headers don't carry,
         instead of on every scheduled tick -- except an http-429 row, which
         stays un-probed until ``backoffUntil`` regardless of ``nextPollAt``.
+        A row with no ``lastAttemptAt`` (never fetched) has no attempt to
+        defer from: its floor is ``now``, so the first fetch is never pushed.
 
         Callers must throttle themselves — the pin calls this at most once
         per 30s per slot; a hot path replying every request would otherwise
@@ -1595,9 +1597,10 @@ class UsageStore:
                 last_good["seven_day"] = seven_entry
             row["lastGood"] = last_good
             row["fetchedAt"] = now
-            floor = (
-                _num_or_none(row.get("lastAttemptAt")) or now
-            ) + CANDIDATE_MAX_INTERVAL_S
+            # Never attempted: nothing to defer (else each reading slides the
+            # first fetch out again and `scoped` never arrives).
+            last = _num_or_none(row.get("lastAttemptAt"))
+            floor = now if last is None else last + CANDIDATE_MAX_INTERVAL_S
             existing_next = _num_or_none(row.get("nextPollAt"))
             row["nextPollAt"] = (
                 floor if existing_next is None else max(existing_next, floor)
