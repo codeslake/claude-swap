@@ -4056,13 +4056,14 @@ class TestRunLoop:
         )
 
     def test_lock_drops_even_if_the_exit_announcement_raises(self, temp_home):
-        """`_emit`'s decision-log write sits outside `_emit`'s own try (only
-        `on_event` is guarded) -- nothing that can raise may sit between the
-        exit and the release, or a process that cannot log its own death
-        keeps `.auto-live.lock` forever, which is the exact bug this exit
-        cleanup exists to close. Faked here (today's `RotatingFileHandler`
-        swallows its own write errors via `Handler.handleError`) as an
-        ordering pin against a future logger that does not."""
+        """The `auto off` line is written BEFORE the release, so a raise out
+        of it must not skip the release -- a process that cannot log its own
+        death would keep `.auto-live.lock` forever, which is the exact bug
+        this exit cleanup exists to close. (The exit's `_emit` can no longer
+        raise: the flip to `dry_run` ahead of it gates its decision-log write
+        off.) Faked here (today's `RotatingFileHandler` swallows its own write
+        errors via `Handler.handleError`) as a pin against a future logger
+        that does not."""
         h = EngineHarness(temp_home, decision_log=True)
         engine = h.engine
         assert engine._live_lock is not None, "premise: this engine is LIVE"
@@ -4073,8 +4074,7 @@ class TestRunLoop:
 
         engine._decisions = _BoomLogger()
         engine._consumer_gone = True
-        with pytest.raises(OSError):
-            engine.run_loop()
+        assert engine.run_loop() == 0
         assert engine._live_lock is None
 
     def test_stop_initiated_exit_does_not_also_touch_the_live_lock(
@@ -12287,6 +12287,34 @@ class TestABrokenPipeEndsTheLoopInsteadOfOrphaningIt:
         )
         assert engine.run_loop() == 0
         assert engine._live_lock is None
+
+    def test_a_broken_pipe_exit_marks_the_engine_off_before_announcing_it(
+        self, temp_home, monkeypatch
+    ):
+        """An exit that is not a `stop()` leaves a dead engine all the same:
+        `autoview` badges from `not engine.dry_run` and redraws on the very
+        event the exit emits, so the flip must land BEFORE that event, and the
+        decision log must say why the engine ended."""
+        h = EngineHarness(temp_home, decision_log=True)
+        engine = h.engine
+        self._no_waiting(engine, monkeypatch)
+        assert engine._live_lock is not None, "premise: this engine is LIVE"
+        at_announce: list[bool] = []
+
+        def on_event(ev):
+            if isinstance(ev, ErrorEvent) and ev.message.startswith("engine stopped:"):
+                at_announce.append(engine.dry_run)
+            raise BrokenPipeError(32, "Broken pipe")
+
+        engine.on_event = on_event
+        assert engine.run_loop() == 0
+
+        log = h.switcher.backup_dir / "autoswitch-decisions.log"
+        auto_off = [ln for ln in log.read_text().splitlines() if " auto off: " in ln]
+        assert engine.dry_run is True
+        assert len(auto_off) == 1 and auto_off[0].endswith(" auto off: consumer gone")
+        assert engine._live_lock is None
+        assert at_announce == [True], "the exit event reached the badge as LIVE"
 
     def test_an_epipe_oserror_is_the_same_exception(self):
         """Not a second path -- a PREMISE, and it is why the check is one

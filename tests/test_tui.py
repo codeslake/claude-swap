@@ -1730,6 +1730,47 @@ class TestAutoScreen:
                 "LIVE and switching accounts"
             )
 
+    async def test_a_dead_engine_does_not_keep_the_live_badge(
+        self, tmp_path, monkeypatch
+    ):
+        """The REAL engine, ending by a gone consumer, not by `stop()`.
+
+        The badge reads `not engine.dry_run` and redraws on the very event the
+        exit emits, so it only turns DRY-RUN if the engine flips before that
+        event. A fake engine preset to `dry_run=True` would prove nothing.
+        """
+        from textual.widgets import Static
+
+        from claude_swap.autoswitch import AutoSwitchEngine, TickOutcome
+        from claude_swap.tui.app import CswapApp
+
+        go = threading.Event()
+
+        def tick(engine):
+            go.wait(5)
+            engine._consumer_gone = True
+            engine._wake.set()
+            return TickOutcome.NO_ACTION
+
+        monkeypatch.setattr(AutoSwitchEngine, "tick", tick)
+        app = CswapApp(
+            FakeSwitcher([make_account(1, active=True)], tmp_path), start="auto"
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            badge = app.screen.query_one("#mode-badge", Static)
+            assert badge.has_class("live"), "premise: --auto starts LIVE"
+
+            go.set()
+            await app.workers.wait_for_complete(
+                [w for w in app.workers if w.group == "engine"]
+            )
+            await pilot.pause()
+
+            assert badge.has_class("dry"), (
+                "the engine is dead and the badge still reads LIVE"
+            )
+
     async def test_go_live_requires_confirmation(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
