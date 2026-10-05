@@ -6392,16 +6392,21 @@ class TestAddAccountSlot:
             switcher.add_account(slot=3)
 
         # Try to add account B to slot 3, answer "n"
-        switcher = self._make_switcher(temp_home, email="b@example.com")
+        switcher = self._make_switcher(temp_home, email="b@example.com", org_name="Beta")
+        ask = MagicMock(return_value="n")
         with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch("builtins.input", return_value="n"):
+             patch("builtins.input", ask):
             switcher.add_account(slot=3)
 
         # Slot 3 should still be account A
         data = switcher._get_sequence_data()
         assert data["accounts"]["3"]["email"] == "a@example.com"
         assert "Cancelled" in capsys.readouterr().out
+        # The prompt names the account being added and the one it removes.
+        prompt = ask.call_args.args[0]
+        assert "b@example.com [Beta]" in prompt
+        assert "slot 3" in prompt and "a@example.com" in prompt
 
     def test_slot_occupied_overwrite(self, temp_home, capsys):
         """When slot is occupied and user confirms, should overwrite."""
@@ -6442,11 +6447,14 @@ class TestAddAccountSlot:
         assert "1" in data["accounts"]
 
         # Move to slot 5
+        ask = MagicMock(return_value="y")
         with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch.object(switcher, "_delete_account_credentials"):
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", ask):
             switcher.add_account(slot=5)
 
+        ask.assert_called_once()  # a move empties slot 1, so it is asked
         data = switcher._get_sequence_data()
         assert "1" not in data["accounts"]
         assert "5" in data["accounts"]
@@ -6474,9 +6482,10 @@ class TestAddAccountSlot:
 
         # Try to move A from slot 1 → slot 3, cancel
         switcher = self._make_switcher(temp_home, email="a@example.com")
+        ask = MagicMock(return_value="n")
         with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
-             patch("builtins.input", return_value="n"):
+             patch("builtins.input", ask):
             switcher.add_account(slot=3)
 
         # Both slots should be untouched
@@ -6484,6 +6493,36 @@ class TestAddAccountSlot:
         assert data["accounts"]["1"]["email"] == "a@example.com"
         assert data["accounts"]["3"]["email"] == "b@example.com"
         assert "Cancelled" in capsys.readouterr().out
+        # One prompt names the incoming account with its slot, and the occupant.
+        ask.assert_called_once()
+        prompt = ask.call_args.args[0]
+        assert "a@example.com [personal]" in prompt and "b@example.com" in prompt
+        assert "slot 1" in prompt and "slot 3" in prompt
+
+    def test_a_no_to_moving_an_account_into_an_empty_slot_writes_nothing(
+        self, temp_home, capsys
+    ):
+        """`add --slot 5` read slot 2's account (the live login) and emptied
+        slot 2 with no question: a move into a FREE slot is asked too."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        switcher = self._make_switcher(temp_home, email="a@example.com", org_name="Acme")
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=2)
+        before = switcher._get_sequence_data()
+
+        ask = MagicMock(return_value="n")
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials") as write, \
+             patch("builtins.input", ask):
+            switcher.add_account(slot=5)
+
+        assert switcher._get_sequence_data() == before
+        write.assert_not_called()
+        assert "Cancelled" in capsys.readouterr().out
+        prompt = ask.call_args.args[0]
+        assert "a@example.com [Acme]" in prompt
+        assert "slot 2" in prompt and "slot 5" in prompt and "emptied" in prompt
 
     def test_slot_must_be_positive(self, temp_home):
         """Slot number must be >= 1."""
@@ -13591,7 +13630,7 @@ class TestRemoveAccountPrunesMappings:
         with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
-            switcher.add_account(slot=5)  # same identity, new slot
+            switcher.add_account(slot=5, assume_yes=True)  # same identity, new slot
 
         assert store.get(temp_home) is not None
         assert switcher.slot_for_directory(str(temp_home)) == ("5", "a@x.com")
@@ -13722,7 +13761,7 @@ class TestAddAccountAlias:
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             switcher.add_account(alias="dev")  # lands in slot 1
-            switcher.add_account(slot=5)  # same identity, new slot, no alias passed
+            switcher.add_account(slot=5, assume_yes=True)  # same identity, new slot, no alias passed
 
         data = switcher._get_sequence_data()
         assert "1" not in data["accounts"]

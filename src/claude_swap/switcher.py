@@ -4460,7 +4460,8 @@ class ClaudeAccountSwitcher:
             slot: Specify the slot number to store the account in.
                   When None, auto-assigns the next available number.
                   When specified, prompts for confirmation if the slot
-                  is already occupied by a different account.
+                  is already occupied by a different account, or the
+                  account already lives in another slot (which it empties).
             assume_yes: Skip that overwrite prompt (callers with their own
                   confirmation UI, e.g. the TUI, confirm before calling).
             alias: Optional short display alias to set on this account.
@@ -4572,6 +4573,7 @@ class ClaudeAccountSwitcher:
                     migrate_from = old_num
 
             # Check if target slot is occupied by a different account
+            occupant = None
             if account_num in data.get("accounts", {}):
                 existing = data["accounts"][account_num]
                 existing_email = existing.get("email", "unknown")
@@ -4583,24 +4585,49 @@ class ClaudeAccountSwitcher:
                         existing.get("organizationName", ""),
                         existing.get("organizationUuid", ""),
                     )
+                    occupant = f"{existing_email} [{existing_tag}]"
                     warning(f"Slot {slot} already occupied")
                     print(
                         f"{existing_email} {muted(f'[{existing_tag}]')}"
                     )
-                    if not assume_yes:
-                        try:
-                            answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
-                        except (EOFError, KeyboardInterrupt):
-                            print(f"\n{dimmed('Cancelled')}")
-                            return
-                        if answer not in ("y", "yes"):
-                            print(dimmed("Cancelled"))
-                            return
                     displace_slot = (
                         account_num,
                         existing_email,
                         existing.get("organizationUuid", "") or "",
                     )
+
+            # One prompt for everything this add removes. It names the account
+            # being added: the live login is not always the one the caller had
+            # in mind, and a move out of another slot is as destructive as an
+            # overwrite.
+            if (occupant or migrate_from) and not assume_yes:
+                oauth_account = (
+                    self._read_json(self._get_claude_config_path()) or {}
+                ).get("oauthAccount") or {}
+                incoming_tag = self._get_display_tag(
+                    current_email,
+                    oauth_account.get("organizationName", "") or "",
+                    current_org_uuid,
+                )
+                notes = []
+                if migrate_from:
+                    notes.append(
+                        f"It lives in slot {migrate_from} now; "
+                        f"slot {migrate_from} will be emptied."
+                    )
+                if occupant:
+                    notes.append(f"Slot {slot} holds {occupant}; it will be removed.")
+                try:
+                    answer = input(
+                        f"Add {current_email} [{incoming_tag}] to slot {slot}? "
+                        f"{' '.join(notes)} [y/N] "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print(f"\n{dimmed('Cancelled')}")
+                    return
+                if answer not in ("y", "yes"):
+                    print(dimmed("Cancelled"))
+                    return
         else:
             account_num = str(self._get_next_account_number())
 
