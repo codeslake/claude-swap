@@ -7677,7 +7677,9 @@ class TestWarmthAndAlternation375:
 
         set_setting(backup, "autoswitch.decisionLog", "true")
         h.switcher.switch_to("3", manual_source="cli")  # already on 3: nothing moves
-        assert "no switch: already-active (manual: cli)" in log.read_text()
+        assert log.read_text().count("no switch: already-active (manual: cli)") == 1
+        h.switcher.switch_to("3", force=True, manual_source="cli")  # a rewrite, not that
+        assert log.read_text().count("no switch: already-active (manual: cli)") == 1
 
 
 class TestConsumeFirstStrategy:

@@ -7171,7 +7171,8 @@ class ClaudeAccountSwitcher:
             force_activate=force,
             provenance=provenance,
         )
-        self._record_manual_switch(manual_source, op["from"], op["to"])
+        if not (force and op["from"] == op["to"]):  # a forced rewrite is no "already-active"
+            self._record_manual_switch(manual_source, op["from"], op["to"])
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
