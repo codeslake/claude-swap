@@ -1538,7 +1538,10 @@ class UsageStore:
         instead of on every scheduled tick -- except an http-429 row, which
         stays un-probed until ``backoffUntil`` regardless of ``nextPollAt``.
         A row with no ``lastAttemptAt`` (never fetched) has no attempt to
-        defer from: its floor is ``now``, so the first fetch is never pushed.
+        defer from: a reading leaves its ``nextPollAt`` exactly as it is
+        (absent stays absent, a plan in place stays as written), so the first
+        fetch is never pushed and no ``now`` is written for an outside reader
+        to take as a missed cycle.
 
         Callers must throttle themselves — the pin calls this at most once
         per 30s per slot; a hot path replying every request would otherwise
@@ -1597,14 +1600,17 @@ class UsageStore:
                 last_good["seven_day"] = seven_entry
             row["lastGood"] = last_good
             row["fetchedAt"] = now
-            # Never attempted: nothing to defer (else each reading slides the
-            # first fetch out again and `scoped` never arrives).
+            # Never attempted: nothing to defer, so `nextPollAt` stays as it is
+            # (absent reads as due; a plan in place comes due when it passes).
+            # Pushing it out slides the first fetch away on every reading, and
+            # writing `now` reads to an outside reader as a missed cycle.
             last = _num_or_none(row.get("lastAttemptAt"))
-            floor = now if last is None else last + CANDIDATE_MAX_INTERVAL_S
-            existing_next = _num_or_none(row.get("nextPollAt"))
-            row["nextPollAt"] = (
-                floor if existing_next is None else max(existing_next, floor)
-            )
+            if last is not None:
+                floor = last + CANDIDATE_MAX_INTERVAL_S
+                existing_next = _num_or_none(row.get("nextPollAt"))
+                row["nextPollAt"] = (
+                    floor if existing_next is None else max(existing_next, floor)
+                )
 
         self._mutate(identities, [num], apply)
         return recorded

@@ -1788,6 +1788,11 @@ class TestHeaderReading:
             clock.advance(30.0)
             assert store.record_header_reading("1", IDENT, headers) is True
         assert due() == "1"
+        # No plan was written for it: an absent plan reads as due, whereas a
+        # `nextPollAt` of "now" with no `pollIntervalS` reads to an outside
+        # reader as a whole missed cycle.
+        row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["1"]
+        assert row.get("nextPollAt") is None
 
         scoped = [{"name": "fable", "pct": 0.0}]
         store.record({"1": FetchRecord(usage={**USAGE, "scoped": scoped})}, IDENT)
@@ -1803,6 +1808,23 @@ class TestHeaderReading:
         store.record_header_reading("1", IDENT, headers)
         assert clock.now == attempt + CANDIDATE_MAX_INTERVAL_S
         assert due() == "1"
+
+    def test_a_never_attempted_row_keeps_the_plan_it_carries(self, store, clock):
+        # The post-switch replan's shape (a short `nextPollAt` with its
+        # `pollIntervalS`) on a row never fetched: readings neither push it
+        # out nor rewrite it once it has passed, so the row comes due exactly
+        # when that plan does.
+        plan = clock.now + 300.0
+        store.set_poll_plan({"1": (plan, 180.0)}, IDENT)
+        headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
+
+        for _ in range(11):  # one reading per 30s; the last lands past the plan
+            clock.advance(30.0)
+            assert store.record_header_reading("1", IDENT, headers) is True
+            due = due_candidate(["1"], store.entries(IDENT), clock.now)
+            assert due == ("1" if clock.now >= plan else None)
+        row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["1"]
+        assert (row["nextPollAt"], row["pollIntervalS"]) == (plan, 180.0)
 
     def test_does_not_join_the_attempt_ledger(self, store, clock):
         headers = {usage_store.USAGE_HEADER_5H_PCT: "0.5"}
