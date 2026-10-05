@@ -524,7 +524,17 @@ def test_arbitrary_claude_config_dir_is_not_dropped_by_the_hint_prefilter(
     ran, so the write went through even though the root IS in
     ``_REAL_STORE_SPECS``.
     """
-    root_dir = Path(tempfile.mkdtemp(prefix="cswap-c2-noclaude-"))
+    old_hints = (".claude", "claude-swap")
+    # A $TMPDIR under `~/.claude` (an agent's job dir) carries a hint itself,
+    # so the premise below could never hold; take the first hint-free base.
+    base = next(
+        (d for d in (tempfile.gettempdir(), "/tmp", "/var/tmp")
+         if os.path.isdir(d) and not any(h in d for h in old_hints)),
+        None,
+    )
+    if base is None:
+        pytest.skip("no temp dir free of the old hardcoded hints")
+    root_dir = Path(tempfile.mkdtemp(prefix="cswap-c2-noclaude-", dir=base))
     try:
         home = root_dir / "home"
         home.mkdir()
@@ -549,7 +559,7 @@ def test_arbitrary_claude_config_dir_is_not_dropped_by_the_hint_prefilter(
 
         target = work_profile / ".credentials.json"
         assert not any(
-            hint in str(target) for hint in (".claude", "claude-swap")
+            hint in str(target) for hint in old_hints
         ), "premise: the target must miss BOTH of the old hardcoded hints"
 
         with pytest.raises(conftest.RealStoreWriteBlocked):
