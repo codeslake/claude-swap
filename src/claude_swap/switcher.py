@@ -6644,6 +6644,18 @@ class ClaudeAccountSwitcher:
             "warnings": warnings or [],
         }
 
+    def _record_manual_switch(
+        self, manual_source: str | None, from_ref: dict | None, to_ref: dict | None
+    ) -> None:
+        """Leave a hand switch's trace for the engine (T1850). Only a hand
+        caller names a ``manual_source``; the engine's own switches stamp for
+        themselves under the state lock and record nothing here."""
+        if manual_source:
+            # Function-local: autoswitch imports this module at load.
+            from claude_swap.autoswitch import record_manual_switch
+
+            record_manual_switch(self, manual_source, from_ref, to_ref)
+
     def switch(
         self,
         strategy: str | None = None,
@@ -6651,6 +6663,7 @@ class ClaudeAccountSwitcher:
         models: tuple[str, ...] = (),
         model_source: str | None = None,
         current_at_limit: bool = False,
+        manual_source: str | None = None,
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -6667,6 +6680,9 @@ class ClaudeAccountSwitcher:
             model_source: Where ``models`` came from (``"cli"`` or
                   ``"autoswitch.model"``) — announced up front so a config
                   fallback silently steering the pick is impossible.
+            manual_source: A hand caller's name (``"tui"``, ``"cli"``,
+                  ``"menubar"``): a real switch is then recorded for the engine
+                  (:meth:`_record_manual_switch`). ``None`` records nothing.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -6745,6 +6761,7 @@ class ClaudeAccountSwitcher:
                     )
                 target = fallback
             op = self._perform_switch(target, emit_output=not json_output)
+            self._record_manual_switch(manual_source, op["from"], op["to"])
             return (
                 self._switch_result_from_op(op, strategy_label, warnings)
                 if json_output else None
@@ -6811,6 +6828,7 @@ class ClaudeAccountSwitcher:
             )
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
+                self._record_manual_switch(manual_source, op["from"], op["to"])
                 return (
                     self._switch_result_from_op(op, strategy_label, warnings)
                     if json_output else None
@@ -7031,19 +7049,28 @@ class ClaudeAccountSwitcher:
         op = self._perform_switch(
             next_account, emit_output=not json_output, provenance=provenance
         )
+        self._record_manual_switch(manual_source, op["from"], op["to"])
         return (
             self._switch_result_from_op(op, strategy_label, warnings)
             if json_output else None
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        manual_source: str | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+        ``manual_source`` names a hand caller (``"tui"``, ``"cli"``,
+        ``"menubar"``) so the switch, or the already-active no-op, is
+        recorded for the engine (:meth:`_record_manual_switch`); the engine's
+        own call passes none.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -7119,6 +7146,7 @@ class ClaudeAccountSwitcher:
                         data.get("accounts", {}).get(target_account, {}).get("email", "")
                     )
                     ref = account_ref(int(target_account), email)
+                    self._record_manual_switch(manual_source, ref, ref)
                     if not json_output:
                         print(
                             f"{accent('Already on')} Account-{target_account} ({email})"
@@ -7143,6 +7171,7 @@ class ClaudeAccountSwitcher:
             force_activate=force,
             provenance=provenance,
         )
+        self._record_manual_switch(manual_source, op["from"], op["to"])
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.

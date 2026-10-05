@@ -7497,9 +7497,8 @@ class TestWarmthAndAlternation375:
     ):
         """The exemption is not cold-only: a WARM candidate that fails
         the ordinary floor is admitted too once it perishes sooner --
-        `alternation_admissible`'s single `or _perishes_before_active(...)`
-        clause covers `warm_ordered + cold_ordered` alike, not a warm-only
-        carve-out."""
+        `_clears_the_landing_floor`'s perishing branch covers
+        `warm_ordered + cold_ordered` alike, not a warm-only carve-out."""
         h = self._harness(temp_home, threshold=90.0)
         chunk = h.engine.settings.alternation_chunk_seconds
         now = h.clock.now
@@ -7587,6 +7586,98 @@ class TestWarmthAndAlternation375:
             "elapses on the still-warm departed account"
         )
         assert h.active_number() == 1
+
+    # -- T1850: the waiver covers the perishing window only ---------------
+
+    def test_t1850_a_perishing_candidate_must_still_clear_the_floor_on_its_5h_window(
+        self, temp_home
+    ):
+        """Measured 2026-10-05 17:15:54Z: active 49% headroom, warm partner
+        5h 86 / 7d 61 (headroom 14, 5h-bound) whose 7d resets before the
+        active's. The waiver's rationale is that the PERISHING (7d) room
+        expires unspent; here 7d held 39 points and the sub-floor 14 was
+        the 5h window, which does not perish. The floor still binds on the
+        non-perishing windows."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0, "2": now - 10.0})
+        outcome = h.tick_with_usage({
+            "1": _usage7(51.0, 50.0, _iso_at(now + 5 * 86400)),
+            "2": _usage7(86.0, 61.0, _iso_at(now + 3 * 86400)),
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} -- the 5h window (headroom 14) is under the "
+            "floor and does not perish, so the 7d waiver must not admit it"
+        )
+        assert h.active_number() == 1
+
+    # -- T1850: a hand switch is recorded and restarts the dwell ----------
+
+    def test_t1850_a_hand_switch_restarts_the_dwell_and_logs_itself(self, temp_home):
+        """Owner trace 2026-10-05: the engine stamped #5 at T, the owner
+        switched 2 -> 5 by hand at T+270 s (nothing stamped), and the dwell
+        read the engine's stale T (662 s), moving the owner off their
+        choice. A hand switch stamps both accounts at its own time, logs
+        itself, and leaves the no-return family (`lastSwitchTo`) alone."""
+        from claude_swap.settings import set_setting
+
+        h = self._harness(temp_home)
+        set_setting(h.switcher.backup_dir, "autoswitch.decisionLog", "true")
+        chunk = h.engine.settings.alternation_chunk_seconds
+        # The engine's own 1 -> 2 at T stamps both; 2 is live.
+        assert h.tick_with_usage(
+            {"1": _usage(97.0), "2": _usage(10.0)}
+        ) is TickOutcome.SWITCHED
+        assert h.engine._read_state()["lastSwitchTo"] == "2"
+        h.clock.advance(270.0)
+        h.switcher.switch_to("1", json_output=True, manual_source="tui")  # the hand 2 -> 1
+        assert h.engine._read_state()["lastSwitchTo"] == "2", (
+            "a hand switch must not write the no-return family"
+        )
+        log = (h.switcher.backup_dir / "autoswitch-decisions.log").read_text()
+        assert (
+            "Switched Account-2 -> Account-1 (acct1@example.invalid) (manual: tui)"
+            in log
+        ), log
+
+        usage = {"1": _usage(30.0), "2": _usage(30.0)}
+        h.clock.advance(392.0)  # T+662: the engine's stale stamp reads 662 s
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION, (
+            "the dwell must count from the hand arrival (392 s), not the "
+            "engine's stale stamp (662 s)"
+        )
+        h.clock.advance(chunk - 392.0)  # a full chunk after the hand arrival
+        h.events.clear()
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+
+    def test_t1850_a_hand_record_is_opt_in_and_never_the_engines(self, temp_home):
+        """Controls: the engine's own call (no `manual_source`) writes no hand line
+        and stamps nothing of its own accord; decisionLog off keeps the file
+        away but the stamp still lands; an already-active hand Enter logs
+        itself (non-JSON, as `cswap switch 1` runs) and stamps nothing."""
+        from claude_swap.settings import set_setting
+
+        h = self._harness(temp_home)
+        backup = h.switcher.backup_dir
+        log = backup / "autoswitch-decisions.log"
+        set_setting(backup, "autoswitch.decisionLog", "true")
+
+        h.switcher.switch_to("2", json_output=True)  # no source: the engine's shape
+        assert not log.exists() and "lastActiveAt" not in h.engine._read_state()
+
+        set_setting(backup, "autoswitch.decisionLog", "false")
+        h.switcher.switch(json_output=True, manual_source="menubar")  # rotates 2 -> 3
+        assert not log.exists(), "decisionLog off must not create the file"
+        assert set(h.engine._read_state()["lastActiveAt"]) == {"2", "3"}, (
+            "the stamp is not gated on decisionLog"
+        )
+
+        set_setting(backup, "autoswitch.decisionLog", "true")
+        h.switcher.switch_to("3", manual_source="cli")  # already on 3: nothing moves
+        assert "no switch: already-active (manual: cli)" in log.read_text()
 
 
 class TestConsumeFirstStrategy:

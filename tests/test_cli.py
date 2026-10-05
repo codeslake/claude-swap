@@ -199,7 +199,8 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy="best", json_output=False, models=(), model_source=None
+            strategy="best", json_output=False, models=(), model_source=None,
+            manual_source="cli",
         )
 
     def test_switch_strategy_falls_back_to_configured_model(self):
@@ -218,6 +219,7 @@ class TestCLI:
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy="best", json_output=False,
             models=("Fable",), model_source="autoswitch.model",
+            manual_source="cli",
         )
 
     def test_switch_model_flag_overrides_setting(self):
@@ -237,7 +239,7 @@ class TestCLI:
 
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy="next-available", json_output=False,
-            models=("Opus", "Fable"), model_source="cli",
+            models=("Opus", "Fable"), model_source="cli", manual_source="cli",
         )
 
     def test_switch_model_without_strategy_is_rejected(self, capsys):
@@ -257,7 +259,8 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy=None, json_output=False, models=(), model_source=None
+            strategy=None, json_output=False, models=(), model_source=None,
+            manual_source="cli",
         )
 
     def test_slot_flag_requires_add_account(self, capsys):
@@ -309,7 +312,7 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=True
+            "2", json_output=False, force=True, manual_source="cli"
         )
 
     def test_switch_to_without_force_forwards_false(self):
@@ -321,7 +324,7 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=False
+            "2", json_output=False, force=False, manual_source="cli"
         )
 
     def test_export_and_import_are_mutually_exclusive(self):
@@ -901,7 +904,7 @@ class TestSubcommandAliases:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=False
+            "2", json_output=False, force=False, manual_source="cli"
         )
 
     def test_bare_switch_subcommand_dispatches_switch(self):
@@ -912,7 +915,8 @@ class TestSubcommandAliases:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy=None, json_output=False, models=(), model_source=None
+            strategy=None, json_output=False, models=(), model_source=None,
+            manual_source="cli",
         )
 
     def test_list_subcommand_with_json(self):
@@ -1011,6 +1015,7 @@ class TestJsonOutputCli:
 
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy=None, json_output=True, models=(), model_source=None,
+            manual_source="cli",
         )
         assert json.loads(capsys.readouterr().out) == payload
 

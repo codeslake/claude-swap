@@ -306,13 +306,20 @@ class CswapApp(App):
     def do_switch(self, number: str) -> None:
         self._start_action(
             f"Switch to account {number}",
-            partial(self.switcher.switch_to, number, json_output=True),
+            partial(
+                self.switcher.switch_to, number, json_output=True, manual_source="tui"
+            ),
         )
 
     def action_switch_best(self) -> None:
         self._start_action(
             "Switch (best)",
-            partial(self.switcher.switch, strategy="best", json_output=True),
+            partial(
+                self.switcher.switch,
+                strategy="best",
+                json_output=True,
+                manual_source="tui",
+            ),
         )
 
     def do_toggle_disabled(self, number: str) -> None:

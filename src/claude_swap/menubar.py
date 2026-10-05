@@ -937,7 +937,9 @@ def run(switcher) -> int:
             def cb(_sender):
                 payload: dict = {}
                 if self._guard(lambda: payload.update(
-                    self.switcher.switch_to(str(num), json_output=True) or {}
+                    self.switcher.switch_to(
+                        str(num), json_output=True, manual_source="menubar"
+                    ) or {}
                 )):
                     self._notify_switched(payload)
                     self.refresh_async()
@@ -945,7 +947,9 @@ def run(switcher) -> int:
 
         def _switch(self, strategy):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch(strategy=strategy)):
+                if self._guard(lambda: self.switcher.switch(
+                    strategy=strategy, manual_source="menubar"
+                )):
                     self._notify_switched()
                     self.refresh_async()
             return cb
