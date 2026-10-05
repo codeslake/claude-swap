@@ -3722,7 +3722,7 @@ class TestUnswitchableRowsAreListed:
         )
         return a
 
-    def _render(self, snap, active, *, settings=None, engine=None, backup_dir=None):
+    def _render(self, snap, active, *, settings=None, engine=None, backup_dir=None, text=False):
         from unittest.mock import MagicMock, patch
         from claude_swap.tui.autoview import AutoScreen
         from claude_swap.settings import AutoSwitchSettings
@@ -3739,7 +3739,8 @@ class TestUnswitchableRowsAreListed:
         app = MagicMock()
         app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
         with patch.object(AutoScreen, "app", property(lambda s: app)):
-            return str(v._candidates_text(snap, active_number=active))
+            out = v._candidates_text(snap, active_number=active)
+            return out if text else str(out)
 
     def test_a_credential_less_slot_is_shown_with_what_to_do(self):
         out = self._render(self._snap(
@@ -4481,7 +4482,8 @@ class TestUnswitchableRowsAreListed:
 
         def colon(window, line):
             # `[^)]*`, not `\w+`: a window with no reset reads `7d(⟳?):`
-            return re.search(re.escape(window) + r"(?:\(⟳[^)]*\))?:", line).end()
+            # where the pct starts: past the chip's `:` and the blanks that pad it
+            return re.search(re.escape(window) + r"(?:\(⟳[^)]*\))?:\s*", line).end()
 
         seven_d = [colon("7d", line) for line in lines]
         fable = [colon("Fable", line) for line in lines]
@@ -4541,10 +4543,10 @@ class TestUnswitchableRowsAreListed:
     def test_each_windows_percent_ends_in_one_column_across_rows(self):
         """`7d(⟳6d20h):100%` against `7d:94%` used to push the percent out of
         its column, and a row without a Fable window reserved nothing for it.
-        Each window is one column: its label text right-aligned to the widest
-        label (the owner's 2026-09-15 rule: the `:` sits in one column), its
-        pct right-aligned to the widest pct, so the `:` and the `%` of a given
-        window end in the same string column on every row, whatever the
+        Each window is one column: its chip left-aligned (the owner's 2026-10-05
+        rule: it STARTS in one column, whatever its countdown reads), its pct
+        right-aligned to the widest pct, so the chip's start and the `%` of a
+        given window sit in the same string column on every row, whatever the
         other windows carry."""
         import re
         from claude_swap.settings import AutoSwitchSettings
@@ -4583,9 +4585,9 @@ class TestUnswitchableRowsAreListed:
                 # `[^)]*`, not `\w+`: a window with no reset reads `7d(⟳?):`
                 if (m := re.search(r"(" + re.escape(window) + r"(?:\(⟳[^)]*\))?:)\s*\d+%", line))
             ]
-            colons = {m.end(1) for m in hits}
+            starts = {m.start(1) for m in hits}
             ends = {m.end() for m in hits}
-            assert len(colons) == 1, f"{window} colon not in one column: {colons} in {rows!r}"
+            assert len(starts) == 1, f"{window} chip not in one column: {starts} in {rows!r}"
             assert len(ends) == 1, f"{window} percent not in one column: {ends} in {rows!r}"
 
     def test_5h_and_7d_columns_come_first_then_the_rest_in_first_seen_order(self):
@@ -4642,13 +4644,14 @@ class TestUnswitchableRowsAreListed:
         }
         assert starts["aaaa@x.com"] is not None, rows
         assert starts["aaaa@x.com"] == starts["bbbb@x.com"], f"{starts} in {rows!r}"
-        assert starts["cccc@x.com"] is None and rows["cccc@x.com"] == rows["cccc@x.com"].rstrip(), rows
+        assert starts["cccc@x.com"] is None, rows
+        assert rows["cccc@x.com"] == rows["cccc@x.com"].rstrip(), rows  # no tag, so no trailing pad
 
     def test_a_backoff_chip_row_lines_up_with_a_plain_row_and_the_markers_share_a_column(self):
         """T1738, #321 + #323 + #371 merged: a window whose reset fired before its pct was
         measured reads `7d(⟳429 30m):` (`chip_label` over `reset_text(..., entry=)`), wider
         than the plain `7d(⟳3d08h):` another row prints. The columns are sized from the
-        text the cells print, so that chip's `:` and `%` sit in the plain row's columns,
+        text the cells print, so that chip starts and its `%` ends in the plain row's columns,
         and the first marker (`stale` on the backed-off row, `Fable-walled` on the other)
         starts at ONE column after the padded chip block, the backed-off row's missing
         Fable cell included."""
@@ -4682,7 +4685,7 @@ class TestUnswitchableRowsAreListed:
                 if (m := re.search(r"(" + window + r"\(⟳[^)]*\):)\s*\d+%", line))
             ]
             assert len(hits) == 2, (window, rows)
-            assert len({m.end(1) for m in hits}) == 1, f"{window} colon not in one column: {rows!r}"
+            assert len({m.start(1) for m in hits}) == 1, f"{window} chip not in one column: {rows!r}"
             assert len({m.end() for m in hits}) == 1, f"{window} percent not in one column: {rows!r}"
         starts = {
             e: m.start(1) for e, line in rows.items()
@@ -4719,13 +4722,15 @@ class TestUnswitchableRowsAreListed:
 
         out = render(self._acct("3", "cccc@x.com", switchable=True, usage=no_plan))
         assert out.rstrip().splitlines()[-1].endswith("no plan (subscription inactive)"), out
-        assert row(out) == row(render()), out
+        assert row(out) == row(render()), out  # a note carries no tag, so it sizes no column
 
     def test_an_unranked_no_plan_row_pads_its_email_like_the_others(self):
         """T1738, #323 + #392 + #371 merged: every row pads its email to the block's widest, so
         the next field starts in one column. The unranked no-plan row is #371's own, drawn
-        before the chip branch, and `no plan` must start where the other rows' `login` does
-        (the owner's report of 2026-10-04). Its email is the shortest, or the pad is a no-op."""
+        before the chip branch, and `no plan` starts where the other rows' first window (5h)
+        cell does: T1738 had it start at their `login` (the owner's report of 2026-10-04), and
+        the owner reversed that on 2026-10-05, so it carries a blank login cell. Its email is
+        the shortest, or the pad is a no-op."""
         from claude_swap.settings import AutoSwitchSettings
 
         no_plan = UsageEntry(
@@ -4745,7 +4750,78 @@ class TestUnswitchableRowsAreListed:
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}
         assert len(rows) == 2, rows
         assert "no plan (subscription inactive)" in rows["c@x.com"], rows  # premise: unranked
-        assert rows["c@x.com"].index("no plan") == rows["bbbbbbbb@x.com"].index("login"), rows
+        assert rows["c@x.com"].index("no plan") == rows["bbbbbbbb@x.com"].index("5h("), rows
+
+    def test_every_cell_of_a_next_best_row_starts_in_one_column(self):
+        """T1795, the owner's report of 2026-10-05: `5h(⟳retry 3m):59%` started left of
+        `5h(⟳5h00m):` (the chips were right-aligned), the spend row and its `auto-swap
+        disabled` tag started elsewhere, and the pct beside a retry label read as live
+        usage. One plain row, one retry-label row, a spend-only row and an unranked no-plan
+        row (the last two are notes): login, 5h and 7d cells and the tags each start in one
+        column, both notes start in the 5h column, and a pct that predates its window's reset
+        is dim while a live one is not."""
+        import re
+        from claude_swap.settings import AutoSwitchSettings
+
+        now = time.time()
+        retrying = UsageEntry(  # the 5h reset fired before its pct was measured: `retry 5m`
+            last_good={
+                "five_hour": {"pct": 59.0, "resets_at": _iso_in(-60)},
+                "seven_day": {"pct": 9.0, "resets_at": _iso_in(86400)},
+            },
+            fetched_at=now - 120, age_s=120.0, consecutive_failures=1, next_poll_at=now + 330,
+        )
+        no_plan = UsageEntry(
+            last_good={"five_hour": {"pct": 100.0}}, fetched_at=now - STALE_OK_S - 600,
+            age_s=STALE_OK_S + 600, consecutive_failures=3,
+            last_error="oauth_not_allowed_for_organization",
+        )
+        spend = {"used": 466.17, "limit": 466.0, "pct": 100.0, "currency": "USD"}
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "plain@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0, "resets_at": _iso_in(4 * 3600)},
+                "seven_day": {"pct": 9.0, "resets_at": _iso_in(3 * 86400)},
+                "scoped": [{"name": "Fable", "pct": 95.0}],
+            }),
+            self._acct("3", "retry@x.com", switchable=True, usage=retrying),
+            self._acct("4", "spend@x.com", switchable=True, disabled=True, last_good={"spend": spend}),
+            self._acct("5", "noplan@x.com", switchable=True, usage=no_plan),
+        ), active="1", settings=AutoSwitchSettings(model="Fable", threshold=90.0), text=True)
+        rows = {ln.plain.split()[1]: ln for ln in out.split("\n") if "@x.com" in ln.plain}
+        assert len(rows) == 4 and "5h(⟳retry 5m):" in rows["retry@x.com"].plain, out.plain  # premise
+
+        def column(token, *emails):
+            cols = {rows[e].plain.index(token) for e in emails}
+            assert len(cols) == 1, (token, cols, out.plain)
+            return cols.pop()
+
+        five = column("5h(", "plain@x.com", "retry@x.com")
+        column("login", "plain@x.com", "retry@x.com", "spend@x.com")
+        column("7d(", "plain@x.com", "retry@x.com")
+        assert column("$$ ", "spend@x.com") == column("no plan", "noplan@x.com") == five, out.plain
+        tags = {
+            e: re.search(r"Fable-walled|stale|auto-swap disabled", rows[e].plain).start()
+            for e in ("plain@x.com", "retry@x.com", "spend@x.com")
+        }
+        assert len(set(tags.values())) == 1, (tags, out.plain)
+
+        def dim(email, pct):
+            row = rows[email]
+            return "dim" in next(str(s.style) for s in row.spans if row.plain[s.start : s.end] == pct)
+
+        assert dim("retry@x.com", "59%") and not dim("retry@x.com", "9%"), out.plain
+        assert not dim("plain@x.com", "5%"), out.plain
+
+        # the body is as wide as its widest note, not only the chips: a no-plan note wider than a lone 5h
+        # chip pushes the tag field past itself
+        narrow = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "five@x.com", switchable=True, disabled=True, last_good={"five_hour": {"pct": 5.0}}),
+            self._acct("5", "noplan@x.com", switchable=True, usage=no_plan),
+        ), active="1", settings=AutoSwitchSettings(model="Fable", threshold=90.0))
+        note, tag = (next(ln for ln in narrow.split("\n") if e in ln) for e in ("noplan@", "five@"))
+        assert tag.index("auto-swap disabled") == note.index("no plan") + len("no plan (subscription inactive)") + 2, narrow
 
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach

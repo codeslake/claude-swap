@@ -418,6 +418,9 @@ class AutoScreen(Screen):
         )
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
+        # row -> (body, tags): a tag field starts where the widest body ends, so it is joined below
+        bodies: dict[str, tuple[Text, list[Text]]] = {}
+        body_w = 0
         # The badge rides on that account's own row rather than the summary
         # line: naming the pin separately makes you match an email against the
         # list directly below it instead of just reading the list.
@@ -537,14 +540,17 @@ class AutoScreen(Screen):
                 # place below, the reason a marker after the chips.
                 entry = Text()
                 entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
-                # padded like every other row, so the marker starts in their `login` column
+                # padded like every other row, then a blank login cell: the note starts in their 5h column
                 entry.append(f"{acc.email:<{email_width}}", style=palette.muted)
+                entry.append(" " * len(f"  login {oauth.format_login_expiry(None, False)}"))
                 entry.append(f"  {_NO_PLAN_TEXT}", style=palette.sev_warn)
-                lines[acc.number] = entry
+                bodies[acc.number] = (entry, [])  # no tag, but a note the tag field is padded past
+                body_w = max(body_w, entry.cell_len)
                 ranked.append(((1001.0,), acc.number))
                 continue
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
+            tags: list[Text] = []
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
             entry.append(f"{acc.email:<{email_width}}", style=palette.foreground)
             quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
@@ -590,7 +596,7 @@ class AutoScreen(Screen):
                 # `_rank` can't see it) -- but every OTHER row here says why
                 # it is never chosen, and this was the one silent exception.
                 if acc.disabled:
-                    entry.append("  auto-swap disabled", style=palette.muted)
+                    tags.append(Text("auto-swap disabled", style=palette.muted))
                 # RANKED LAST, UNLESS THE API-KEY LAST RESORT NAMED IT:
                 # spend is not headroom, so folding it into the sort key
                 # would change which account the engine picks -- but when
@@ -636,13 +642,18 @@ class AutoScreen(Screen):
                     label_text = data.chip_label(label, reset, wpct)
                     pct_text = f"{wpct:.0f}%"
                     entry.append(sep, style=palette.muted)
-                    # Label right-aligned so the `:` shares a column (owner,
-                    # 2026-09-15); pct right-aligned so the `%` does.
+                    # Chip left-aligned so it starts in one column (owner, 2026-10-05); pct
+                    # right-aligned so the `%` ends in one. A pct that predates its window's
+                    # reset (`retry 3m`, `refetching`: the filter below) reads dim, not live.
                     entry.append(
-                        label_text.rjust(label_w) + " " * (pct_w - len(pct_text)),
+                        label_text.ljust(label_w) + " " * (pct_w - len(pct_text)),
                         style=palette.muted,
                     )
-                    entry.append(pct_text, style=palette.severity(wpct))
+                    live = reset is None or reset.startswith("resets ")
+                    entry.append(
+                        pct_text,
+                        style=palette.severity(wpct) if live else f"{palette.severity(wpct)} dim",
+                    )
                     shown = True
                 if not windows:  # no window data at all — keep the old reading
                     entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
@@ -655,9 +666,9 @@ class AutoScreen(Screen):
                     # A lapsed plan is a permanent 403, not a poll gap: the no-plan
                     # marker below says so, never "stale".
                     if not no_plan:
-                        entry.append("  stale", style=palette.sev_warn)
+                        tags.append(Text("stale", style=palette.sev_warn))
                 if no_plan:
-                    entry.append(f"  {_NO_PLAN_TEXT}", style=palette.sev_warn)
+                    tags.append(Text(_NO_PLAN_TEXT, style=palette.sev_warn))
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
                 # a model-only block (the engine's fallback ranks around it)
@@ -694,9 +705,8 @@ class AutoScreen(Screen):
                         bar,
                     )
                     if kind == "model":
-                        entry.append(
-                            f"  {model_block_label(blocked_model)}",
-                            style=palette.muted,
+                        tags.append(
+                            Text(model_block_label(blocked_model), style=palette.muted)
                         )
                     elif kind == "full":
                         # The WORDING, unlike the classification, does not
@@ -710,11 +720,11 @@ class AutoScreen(Screen):
                             p for label, p, _ in chips if label == blocked_model
                         )
                         if window_pct >= 100.0:
-                            entry.append(
-                                f"  {blocked_model} full", style=palette.muted
+                            tags.append(
+                                Text(f"{blocked_model} full", style=palette.muted)
                             )
                 if acc.disabled:
-                    entry.append("  auto-swap disabled", style=palette.muted)
+                    tags.append(Text("auto-swap disabled", style=palette.muted))
                 elif (
                     acc.number not in ordered_rank
                     and kind == "open"
@@ -728,10 +738,10 @@ class AutoScreen(Screen):
                     # Never when `unmodeled`: this pass never ran, so
                     # "refused" is not a claim this row can support.
                     why = reasons.get(acc.number)
-                    entry.append(
-                        f"  not a candidate ({why})" if why else "  not a candidate",
+                    tags.append(Text(
+                        f"not a candidate ({why})" if why else "not a candidate",
                         style=palette.muted,
-                    )
+                    ))
                 # Position from `ordered_rank` (the engine's own pass, called
                 # once above), never a locally re-derived key -- but a row
                 # the pass never ranked at all still needs a DETERMINISTIC
@@ -755,7 +765,7 @@ class AutoScreen(Screen):
             # unknown still owns the claude.ai side, so the badge must not hang
             # off whichever branch happened to run.
             if pin.account_is_pinned(pinned_identity, acc.email, acc.org_uuid):
-                entry.append("  · ", style=palette.muted)
+                badge = Text("· ", style=palette.muted)
                 # SET IS NOT APPLYING. This badge used to be lit by
                 # the pin's presence alone, so it stayed green while the daemon
                 # could not mint the pinned token and every request went out
@@ -765,13 +775,23 @@ class AutoScreen(Screen):
                 # tell" and must read as healthy here, same rule as
                 # `pin_is_broken`.
                 if pin_applying is False:
-                    entry.append("⚠ cloud UNPINNED", style=f"bold {palette.sev_crit}")
+                    badge.append("⚠ cloud UNPINNED", style=f"bold {palette.sev_crit}")
                 else:
-                    entry.append("○ cloud", style=f"bold {palette.sev_warn}")
-            # The chip block's blank cells only exist to line up what follows
-            # them, so whatever ends up trailing the finished row is dropped.
-            entry.rstrip()
-            lines[acc.number] = entry
+                    badge.append("○ cloud", style=f"bold {palette.sev_warn}")
+                tags.append(badge)
+            bodies[acc.number] = (entry, tags)
+            if acc.usage.sentinel is None:  # a sentinel note is free text: it sizes no column
+                body_w = max(body_w, entry.cell_len)
+
+        for number, (entry, tags) in bodies.items():
+            if tags:
+                entry.pad_right(body_w - entry.cell_len)
+                entry.append("  ")
+                entry.append(Text("  ").join(tags))
+            else:
+                # the chip block's blank cells only exist to line up the tags after them
+                entry.rstrip()
+            lines[number] = entry
 
         text = Text()
         # `rank_axis`: the engine's own report, never re-derived here.
