@@ -491,6 +491,7 @@ class TestStatusJson:
             {"1": FetchRecord(usage={"five_hour": {"pct": 25.0}})},
             {"1": ("test@example.com", "")},
         )
+        before = switcher._usage_store.path.read_bytes()
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
@@ -498,6 +499,7 @@ class TestStatusJson:
             payload = switcher.status(json_output=True, read_only=True)
 
         fetch_mock.assert_not_called()
+        assert switcher._usage_store.path.read_bytes() == before  # writes nothing
         active = payload["active"]
         assert active["number"] == 1
         assert active["managed"] is True
