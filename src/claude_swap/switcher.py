@@ -6202,6 +6202,16 @@ class ClaudeAccountSwitcher:
                         email=email, uuid=own_uuid,
                     )
                     return
+                if self._live_is_a_newer_login(live, backup_now, False):
+                    # A /login, not a rotation: the strike, the 429 backoff and
+                    # the no-plan plan describe the credential it replaced, and
+                    # every other login adoption lifts them. A rotation keeps
+                    # them: its token may still be inside its own block. Ahead
+                    # of the write, so a failure here leaves the drift for the
+                    # next pass instead of a backup that now matches live.
+                    self._usage_store.clear_dead_token(
+                        [account_num], {account_num: (email, org_uuid or "")}
+                    )
                 self._write_account_credentials(account_num, email, live)
                 self._store._sync_active_credentials_file_to_adopted_login(
                     live, slot=account_num, email=email,

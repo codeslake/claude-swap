@@ -3059,6 +3059,58 @@ class TestActiveAccountRefresh:
         run_fetches.assert_not_called()  # premise: the backoff blocked it
         write_backup.assert_called_once_with("1", "test@example.com", fresh_login)
 
+    @pytest.mark.parametrize("login", [True, False], ids=["login", "rotation"])
+    def test_an_adopted_login_clears_the_row_but_a_rotation_keeps_its_backoff(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, login: bool,
+    ):
+        """Every other login adoption clears the row's failure state; this
+        one left a no-plan kind and its 429 backoff standing after a real
+        `/login`. A same-lineage rotation is not a login: clearing there
+        would re-ask a token that is still inside its own block."""
+        switcher = self._switcher(sample_sequence_data)
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+
+        def blob(refresh: str, ends_at: int) -> str:
+            return json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-" + refresh, "refreshToken": refresh,
+                "expiresAt": 9999999999000, "refreshTokenExpiresAt": ends_at,
+            }})
+
+        switcher._write_account_credentials(
+            "1", "test@example.com", blob("rt-old", 1_000_000)
+        )
+        store.record({"1": FetchRecord(error=poll_policy.NO_PLAN_ERROR)}, identity)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+        )
+
+        def state():
+            e = store.entries(identity)["1"]
+            return (e.last_error, e.backoff_until, e.next_poll_at)
+
+        before = state()
+        assert before[0] == poll_policy.NO_PLAN_ERROR  # premise
+        assert before[1] > store.clock()  # premise: the backoff is live
+        # A refresh lifetime ending later than the jitter band is a login.
+        live = blob("rt-new", 1_000_000 + (10_000 if login else 1_000))
+        with patch.object(
+            switcher, "_read_credentials", return_value=live
+        ), patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._PROFILE_SELF,
+        ):
+            switcher._resync_rotated_backup("1", "test@example.com", "", live)
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        if login:
+            assert state() == (None, None, None)
+            assert set(store.reserve(["1"], identity, respect_plans=True)) == {"1"}
+        else:
+            assert state() == before
+
     # -- a hold (``cswap import-usage``) must not also block adopting a
     # fresh login --
     #
