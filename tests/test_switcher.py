@@ -22318,6 +22318,46 @@ class TestFailedReadingLosesToAFresherWorseReading:
         assert s._select_best_switchable("1", usage=usage) == ("2", "")
 
 
+class TestLegacyWallMarkYieldsToAMeasuredReading:
+    """A wall mark written before marks recorded their account (no
+    `walledUuid`) can belong to another account's 429 (lmd42 slot 5,
+    2026-10-05: walled until 07:30Z at 86% / 23%). Through the real
+    selection path, such a slot is a candidate while its own good poll reads
+    under the wall, and still is not one when the poll agrees with the mark
+    or the mark carries the account that drew it."""
+
+    _setup = TestFailedReadingLosesToAFresherWorseReading._setup
+    _IDENT = TestFailedReadingLosesToAFresherWorseReading._IDENT
+    _usage = staticmethod(TestFailedReadingLosesToAFresherWorseReading._usage)
+
+    def _walled_two(self, s, two_pct, *, stamped):
+        for num, pct in (("1", 90.0), ("2", two_pct), ("3", 70.0)):
+            s._usage_store.record(
+                {num: FetchRecord(usage=self._usage(pct))}, self._IDENT
+            )
+        if stamped:
+            s._usage_store.mark_at_limit("2", self._IDENT, account_uuid="uuid-2")
+        else:
+            rows = json.loads(s._usage_store.path.read_text())
+            rows["accounts"]["2"]["walledUntil"] = time.time() + 4200.0
+            s._usage_store.path.write_text(json.dumps(rows))
+        entries = s._usage_store.entries(self._IDENT)
+        return {num: e.decision_value() for num, e in entries.items()}
+
+    def test_a_legacy_mark_under_a_good_reading_is_a_candidate(self, temp_home):
+        s = self._setup(temp_home)
+        usage = self._walled_two(s, 30.0, stamped=False)
+        assert usage["2"] == self._usage(30.0)
+        assert s._select_best_switchable("1", usage=usage) == ("2", "")
+
+    @pytest.mark.parametrize("two_pct,stamped", [(100.0, False), (30.0, True)])
+    def test_a_walled_slot_stays_out(self, temp_home, two_pct, stamped):
+        s = self._setup(temp_home)
+        usage = self._walled_two(s, two_pct, stamped=stamped)
+        assert usage["2"]["five_hour"]["pct"] == 100.0
+        assert s._select_best_switchable("1", usage=usage) == ("3", "")
+
+
 class TestSwitchPersistsTheAtLimitMark:
     """Rule 2 (T1102) wiring, interface updated for I3 (pass 2): `switch(
     current_at_limit=True, exclude={...})` calls `UsageStore.mark_at_limit`
@@ -22361,6 +22401,9 @@ class TestSwitchPersistsTheAtLimitMark:
         entry = s._usage_store.entries(ident)["1"]
         assert entry.walled
         assert entry.decision_value()["five_hour"]["pct"] == 100.0
+        # The mark names the account the roster holds on that slot.
+        stored = json.loads(s._usage_store.path.read_text())["accounts"]["1"]
+        assert stored["walledUuid"] == "uuid-1"
 
         # A fresh poll reading a healthy 58% afterwards does not clear the
         # mark early -- decision_value() still reports the slot full.

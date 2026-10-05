@@ -380,7 +380,9 @@ class UsageEntry:
     # An out-of-band signal (the pin's own 429 on /v1/messages, not this
     # poller) marked this slot at-limit until a persisted deadline that has
     # not yet passed — see UsageStore.mark_at_limit. Overrides last_good for
-    # DECISIONS only; display still reads last_good/age_s as measured.
+    # DECISIONS only; display still reads last_good/age_s as measured. A
+    # LEGACY mark (no ``walledUuid``) is not walled while the row's own good
+    # poll reads every window under 100% — see _legacy_wall_is_contradicted.
     walled: bool = False
     # The mark's own deadline (epoch seconds), while `walled` -- the synthetic
     # reading `decision_value()` builds keys its `resets_at` on this, not the
@@ -673,6 +675,26 @@ def _header_reset(headers: Mapping[str, str], key: str) -> str | None:
         return _reset_ts_to_resets_at(ts)
     except (OverflowError, ValueError, OSError):
         return None
+
+
+def _legacy_wall_is_contradicted(
+    last_good: object, consecutive_failures: int
+) -> bool:
+    """Whether the row's own reading shows a LEGACY wall mark is not that
+    account's: its last poll succeeded and every window it reports (5h, 7d,
+    every per-model one, the pin's ``all`` basis) reads under 100%.
+
+    A mark written before marks recorded their account (no ``walledUuid``)
+    can be another account's 429, attributed to this slot by a wall memo
+    keyed on the slot number (lmd42 slot 5, 2026-10-05). It records no write
+    time and no account, so nothing but the row's own measurement can answer
+    for it. A window the reading lacks is not a window at the wall, and a
+    failed last poll is not a measurement, so neither voids the mark.
+    """
+    if consecutive_failures:
+        return False
+    pcts = [pct for _, pct, _ in oauth.relevant_windows(last_good, ("all",))]
+    return bool(pcts) and max(pcts) < 100.0
 
 
 def _walled_decision_value(last_good: dict | None, walled_until: float | None) -> dict:
@@ -1139,7 +1161,14 @@ class UsageStore:
                 rejected_fingerprint=row.get("rejectedFingerprint"),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
-                walled=walled_until is not None and now < walled_until,
+                walled=walled_until is not None
+                and now < walled_until
+                and (
+                    "walledUuid" in row
+                    or not _legacy_wall_is_contradicted(
+                        last_good, consecutive_failures
+                    )
+                ),
                 walled_until=walled_until,
                 attempts_in_window=len(_pruned_attempts(row, now)),
                 held_until=held_until,
@@ -1444,9 +1473,19 @@ class UsageStore:
         num: str,
         identities: dict[str, Identity],
         models: tuple[str, ...] = (),
+        account_uuid: str | None = None,
     ) -> None:
         """Persist that ``num`` is at its limit, per a signal the poller
         cannot see (the pin's own 429 on ``/v1/messages``, not a fetch).
+
+        ``account_uuid`` is the roster's account on ``num`` when the caller
+        names it, stored as ``walledUuid``. The key's presence (a null value
+        when the uuid is unknown) is what makes the mark trusted for its
+        whole span; a mark without it is LEGACY and yields to the row's own
+        reading (see ``_legacy_wall_is_contradicted``). A mark kept past an
+        account change needs no check of its own: the row's
+        (email, organizationUuid) guard already reads another account's row
+        as empty and replaces it on the next write.
 
         Expires at ``min(`` the row's OWN stored reading's earliest future
         relevant-window reset, ``now + WALL_FALLBACK_S)`` — a 5h window's
@@ -1470,6 +1509,7 @@ class UsageStore:
                 min(reset, fallback) if reset is not None and reset > now
                 else fallback
             )
+            row["walledUuid"] = account_uuid
 
         self._mutate(identities, [num], apply)
 

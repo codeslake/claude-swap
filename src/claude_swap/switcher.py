@@ -8773,7 +8773,10 @@ class ClaudeAccountSwitcher:
                 for num in excluded_slots:
                     identity = roster.get(num)
                     if identity is not None:
-                        self._usage_store.mark_at_limit(num, {num: identity}, models)
+                        self._usage_store.mark_at_limit(
+                            num, {num: identity}, models,
+                            account_uuid=data["accounts"][num].get("uuid"),
+                        )
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(
