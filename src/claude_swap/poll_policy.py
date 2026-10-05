@@ -103,8 +103,8 @@ CANDIDATE_MAX_INTERVAL_S = 600.0
 # so this window is only a chance for that reply's traffic to arrive before
 # an on-demand caller is allowed to poll on its own; a header reading only
 # ever pushes ``nextPollAt`` OUT (``max(existing, lastAttemptAt +
-# CANDIDATE_MAX_INTERVAL_S)``, never earlier; a row never attempted with no
-# plan is given ``now``, i.e. due), so once the last endpoint
+# CANDIDATE_MAX_INTERVAL_S)``, never earlier; a row never attempted keeps a
+# plan in place, and with none is given ``now``, i.e. due), so once the last endpoint
 # attempt is already >= 570s old that floor lands at or before this window's
 # own deadline and the deferred poll fires on schedule regardless. Measured
 # 2026-09-24 (T1231, on T1178's analyzer): with header readings already

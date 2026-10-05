@@ -3262,7 +3262,7 @@ class AutoSwitchEngine:
         # already stale at switch time stays decision-trusted for the whole
         # window (T1102). `record_header_reading` pushes `nextPollAt` out the
         # same way (to `lastAttemptAt + CANDIDATE_MAX_INTERVAL_S`; a row never
-        # attempted with no plan is given `now`, i.e. due), but that
+        # attempted keeps a plan in place, and with none is given `now`), but that
         # is the intended cadence for a row fed by free readings, not a stuck
         # defer, so the `next_poll_at - now <= POST_SWITCH_REPLAN_DEFER_S`
         # check below keeps this scoped to a plan still inside the post-switch
