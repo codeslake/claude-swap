@@ -13599,3 +13599,17 @@ class TestUsageRowsFollowTheRoster:
         switcher._collect_usage_entries(info, fetch=set())
 
         assert set(self._rows(switcher)) == {"1", "2"}
+
+    def test_collect_keeps_the_row_of_a_slot_it_was_handed(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        self._seed(switcher, "2", "account2@example.com", 20.0)
+        self._seed(switcher, "8", "handed@example.com", 80.0)
+        self._seed(switcher, "9", "gone@example.com", 90.0)
+        info = [(8, "handed@example.com", "", "", False, "", "")]
+
+        # Slot 8 is not in the roster but is being collected: not an orphan.
+        switcher._collect_usage_entries(info, fetch=set())
+
+        assert set(self._rows(switcher)) == {"2", "8"}

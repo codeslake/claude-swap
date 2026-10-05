@@ -11,6 +11,7 @@ import shutil
 import threading
 import sys
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -1214,12 +1215,17 @@ class ClaudeAccountSwitcher:
         except Exception as e:
             self._logger.warning(f"Usage row {old} -> {new} not carried: {e}")
 
-    def _prune_usage_rows(self) -> None:
+    def _prune_usage_rows(self, collecting: Iterable[str] = ()) -> None:
         """Drop usage rows for slots the roster no longer has. Keyed on the
-        roster itself, not a pass's accounts_info: `--status` collects one slot."""
+        roster itself, not a pass's accounts_info: `--status` collects one slot.
+        A slot being collected right now (``collecting``) is never an orphan."""
         try:
             roster = self._get_sequence_data()
-            dropped = self._usage_store.prune(roster["accounts"]) if roster else []
+            dropped = (
+                self._usage_store.prune({*roster["accounts"], *collecting})
+                if roster
+                else []
+            )
         except Exception as e:
             self._logger.warning(f"Usage row prune skipped: {e}")
             return
@@ -5527,7 +5533,7 @@ class ClaudeAccountSwitcher:
         fields, so the last-good measurement keeps being served
         (stale-on-error).
         """
-        self._prune_usage_rows()
+        self._prune_usage_rows(str(info[0]) for info in accounts_info)
         store = self._usage_store
         identities = {
             str(num): (email, org_uuid or "")
