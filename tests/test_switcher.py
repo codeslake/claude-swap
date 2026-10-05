@@ -3060,11 +3060,84 @@ class TestActiveAccountRefresh:
         write_backup.assert_called_once_with("1", "test@example.com", fresh_login)
 
     @staticmethod
-    def _login_blob(refresh: str, ends_at: int) -> str:
+    def _login_blob(refresh: str, ends_at: "int | None") -> str:
         return json.dumps({"claudeAiOauth": {
             "accessToken": "sk-" + refresh, "refreshToken": refresh,
-            "expiresAt": 9999999999000, "refreshTokenExpiresAt": ends_at,
+            "expiresAt": 9999999999000,
+            **({} if ends_at is None else {"refreshTokenExpiresAt": ends_at}),
         }})
+
+    def _no_plan_row_behind_a_429(self, switcher):
+        """Slot 1's row as a no-plan 403 then a 429 leave it: a day-long plan
+        and a live backoff. Returns a reader of (lastError, backoffUntil,
+        nextPollAt) for it."""
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        store.record({"1": FetchRecord(error=poll_policy.NO_PLAN_ERROR)}, identity)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+        )
+
+        def state():
+            e = store.entries(identity)["1"]
+            return (e.last_error, e.backoff_until, e.next_poll_at)
+
+        assert state()[0] == poll_policy.NO_PLAN_ERROR  # premise
+        assert state()[1] > store.clock()  # premise: the backoff is live
+        return state
+
+    def _resync(self, switcher, live: str) -> None:
+        with patch.object(
+            switcher, "_read_credentials", return_value=live
+        ), patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._PROFILE_SELF,
+        ):
+            switcher._resync_rotated_backup("1", "test@example.com", "", live)
+
+    def test_a_failed_backup_write_leaves_the_row_for_the_retry(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The clear ran ahead of the write, so a write that raised left the
+        old lineage in the backup AND an erased row: every later pass saw a
+        newer login again, wiped the row again, and the next fetch re-asked
+        a no-plan token inside its own Retry-After."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials(
+            "1", "test@example.com", self._login_blob("rt-old", 1_000_000)
+        )
+        state = self._no_plan_row_behind_a_429(switcher)
+        before = state()
+        live = self._login_blob("rt-new", 1_010_000)
+
+        with patch.object(
+            switcher, "_write_account_credentials", side_effect=OSError("disk full")
+        ):
+            self._resync(switcher, live)
+        assert state() == before
+
+        self._resync(switcher, live)  # the retry: the drift is still there
+        assert state() == (None, None, None)
+
+    def test_a_clear_that_raises_does_not_undo_the_adoption(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials(
+            "1", "test@example.com", self._login_blob("rt-old", 1_000_000)
+        )
+        live = self._login_blob("rt-new", 1_010_000)
+
+        with patch.object(
+            switcher._usage_store, "clear_dead_token", side_effect=OSError("full")
+        ), patch.object(
+            switcher._store, "_sync_active_credentials_file_to_adopted_login"
+        ) as sync:
+            self._resync(switcher, live)
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        sync.assert_called_once()
 
     @pytest.mark.parametrize("login", [True, False], ids=["login", "rotation"])
     def test_an_adopted_login_clears_the_row_but_a_rotation_keeps_its_backoff(

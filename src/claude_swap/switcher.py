@@ -6229,18 +6229,30 @@ class ClaudeAccountSwitcher:
                         email=email, uuid=own_uuid,
                     )
                     return
-                if self._live_is_a_newer_login(live, backup_now, False):
+                is_login = self._live_is_a_newer_login(live, backup_now, False)
+                self._write_account_credentials(account_num, email, live)
+                if is_login:
                     # A /login, not a rotation: the strike, backoff and no-plan
                     # plan describe the credential it replaced. A rotation keeps
-                    # them (its token may still be inside its own block). Ahead
-                    # of the write, so a failure leaves the drift to retry. The
-                    # claim stays: this may run inside the fetch `record()`
-                    # fences on it.
-                    self._usage_store.clear_dead_token(
-                        [account_num], {account_num: (email, org_uuid or "")},
-                        revoke_claim=False,
-                    )
-                self._write_account_credentials(account_num, email, live)
+                    # them (its token may still be inside its own block). After
+                    # the write, as `_adopt_login_into_slot` does: a write that
+                    # raised leaves the old lineage in the backup, and a clear
+                    # ahead of it would erase the row on every retry. The claim
+                    # stays: this may run inside the fetch `record()` fences on
+                    # it.
+                    try:
+                        self._usage_store.clear_dead_token(
+                            [account_num],
+                            {account_num: (email, org_uuid or "")},
+                            revoke_claim=False,
+                        )
+                    except (OSError, LockError) as e:
+                        self._logger.warning(
+                            "Adopted a login into Account-%s's backup but "
+                            "could not clear its usage row (%s); the row "
+                            "keeps its failure state until a fetch replaces "
+                            "it.", account_num, e,
+                        )
                 self._store._sync_active_credentials_file_to_adopted_login(
                     live, slot=account_num, email=email,
                 )
