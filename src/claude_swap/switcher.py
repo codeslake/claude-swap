@@ -5964,7 +5964,8 @@ class ClaudeAccountSwitcher:
             raise
 
     def _resync_rotated_backup(
-        self, account_num: str, email: str, org_uuid: str, creds: str
+        self, account_num: str, email: str, org_uuid: str, creds: str,
+        *, revoke_claim: bool = False,
     ) -> None:
         """Resync the slot backup after a rotation that completed elsewhere.
 
@@ -5992,6 +5993,9 @@ class ClaudeAccountSwitcher:
         Best-effort: any failure (lock contention, read error, identity
         moved, oracle unreachable) just leaves the backup stale — the
         recovery branch consumes nothing it cannot attribute. Never raises.
+
+        ``revoke_claim``: a caller that holds no fetch claim on the row passes
+        True, so an adopted login's clear also ends a rival's lease.
         """
         # T1312: whether ownership of `creds` as `account_num`'s own login
         # was ever settled (a fresh oracle match, or a memoized verdict) --
@@ -6229,7 +6233,16 @@ class ClaudeAccountSwitcher:
                         email=email, uuid=own_uuid,
                     )
                     return
-                is_login = self._live_is_a_newer_login(live, backup_now, False)
+                # No stored backup (absent, not merely unreadable) leaves no
+                # rotation to protect: the seed is a login. Both present, the
+                # refresh-expiry stamps are the only evidence of a login, and
+                # an undated side is none (the fingerprint differs for a
+                # rotation too, and `backup_exp` above only refuses an older
+                # credential).
+                is_login = (
+                    not backup_now
+                    and not self._read_account_credentials_ex(account_num, email)[1]
+                ) or self._live_is_a_newer_login(live, backup_now, False)
                 self._write_account_credentials(account_num, email, live)
                 if is_login:
                     # A /login, not a rotation: the strike, backoff and no-plan
@@ -6238,13 +6251,15 @@ class ClaudeAccountSwitcher:
                     # the write, as `_adopt_login_into_slot` does: a write that
                     # raised leaves the old lineage in the backup, and a clear
                     # ahead of it would erase the row on every retry. The claim
-                    # stays: this may run inside the fetch `record()` fences on
-                    # it.
+                    # stays when this runs inside the fetch `record()` fences
+                    # on; a pass that holds none revokes it, so another
+                    # collector's outcome on the old token is not recorded over
+                    # the cleared row.
                     try:
                         self._usage_store.clear_dead_token(
                             [account_num],
                             {account_num: (email, org_uuid or "")},
-                            revoke_claim=False,
+                            revoke_claim=revoke_claim,
                         )
                     except (OSError, LockError) as e:
                         self._logger.warning(
@@ -7098,7 +7113,9 @@ class ClaudeAccountSwitcher:
                 # `_resync_rotated_backup`'s own docstring assumes a fresh
                 # access token, and the held reading, not a resync, is what
                 # the row reports for the hold's span.
-                self._resync_rotated_backup(num, info[1], info[3], info[5])
+                self._resync_rotated_backup(
+                    num, info[1], info[3], info[5], revoke_claim=True
+                )
             elif active_oauth and not expired:
                 # Same "would have resynced but degraded" case as
                 # `_fetch_active_usage`'s success branch -- see

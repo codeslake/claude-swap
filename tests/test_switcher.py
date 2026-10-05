@@ -3139,6 +3139,80 @@ class TestActiveAccountRefresh:
         assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
         sync.assert_called_once()
 
+    @pytest.mark.parametrize("unreadable", [False, True], ids=["absent", "unreadable"])
+    def test_a_login_seeding_an_empty_backup_clears_the_row(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, unreadable: bool,
+    ):
+        """With no stored backup there is no rotation to protect, so the seed
+        is a login and clears what described the credential it replaces. A
+        backup that merely could not be read is not an absent one."""
+        switcher = self._switcher(sample_sequence_data)
+        state = self._no_plan_row_behind_a_429(switcher)
+        before = state()
+        assert not switcher._read_account_credentials("1", "test@example.com")
+
+        with patch.object(
+            switcher, "_read_account_credentials_ex", return_value=("", unreadable)
+        ):
+            self._resync(switcher, self._login_blob("rt-new", 1_010_000))
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        assert state() == (before if unreadable else (None, None, None))
+
+    @pytest.mark.parametrize(
+        "backup_at,live_at", [(None, 1_010_000), (1_000_000, None)],
+        ids=["backup-undated", "live-undated"],
+    )
+    def test_an_undated_side_is_no_evidence_of_a_login(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, backup_at, live_at,
+    ):
+        """Fingerprints differ for a login and a rotation alike, and the
+        expiry ordering only refuses an older credential, so neither says
+        which this is: the row keeps its failure state."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials(
+            "1", "test@example.com", self._login_blob("rt-old", backup_at)
+        )
+        state = self._no_plan_row_behind_a_429(switcher)
+        before = state()
+
+        self._resync(switcher, self._login_blob("rt-new", live_at))
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        assert state() == before
+
+    def test_a_pass_without_the_claim_revokes_it_when_it_adopts_a_login(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Another collector mid-fetch on the pre-login token must not record
+        its outcome over the cleared row: only the pass that holds the fetch
+        claim itself may keep it."""
+        switcher = self._switcher(sample_sequence_data)
+        store = switcher._usage_store
+        identity = {"1": ("test@example.com", "")}
+        switcher._write_account_credentials(
+            "1", "test@example.com", self._login_blob("rt-old", 1_000_000)
+        )
+        assert store.reserve(["1"], identity, respect_plans=False)  # theirs
+        live = self._login_blob("rt-new", 1_010_000)
+        info = [(1, "test@example.com", "", "", True, live, "")]
+
+        with patch.object(
+            switcher, "_read_credentials", return_value=live
+        ), patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._PROFILE_SELF,
+        ):
+            switcher._collect_usage_entries(info)
+
+        stored = switcher._read_account_credentials("1", "test@example.com")
+        assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-new"
+        assert store.entries(identity)["1"].claim_until == 0.0
+
     @pytest.mark.parametrize("login", [True, False], ids=["login", "rotation"])
     def test_an_adopted_login_clears_the_row_but_a_rotation_keeps_its_backoff(
         self, temp_home: Path, mock_claude_config: Path,
