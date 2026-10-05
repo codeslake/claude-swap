@@ -1089,7 +1089,9 @@ class UsageStore:
         ``models`` is accepted for call-site symmetry with ``mark_at_limit``
         (which does consume it, to pick the earliest relevant-window reset a
         wall mark expires at) but is not itself read here: the walled flag on
-        each row is a plain deadline comparison against ``now``."""
+        each row is a deadline comparison against ``now``, which a LEGACY
+        mark (no ``walledUuid``) also needs the row's own reading to leave
+        standing (see ``_legacy_wall_is_contradicted``)."""
         now = self.clock()
         rows = self._read_rows()
         out: dict[str, UsageEntry] = {}
