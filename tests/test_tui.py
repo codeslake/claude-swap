@@ -134,6 +134,7 @@ class FakeSwitcher:
             (a.number for a in accounts if a.is_active), None
         )
         self.calls: list[tuple] = []
+        self.manual_sources: list[str | None] = []
         self.fetch_sets: list[set[str] | None] = []
 
     # -- surface the TUI consumes ------------------------------------------
@@ -150,9 +151,14 @@ class FakeSwitcher:
         return self.active
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        manual_source: str | None = None,
     ) -> dict:
         self.calls.append(("switch_to", str(identifier)))
+        self.manual_sources.append(manual_source)
         old = self.active
         self.active = str(identifier)
         self._accounts = [
@@ -169,8 +175,14 @@ class FakeSwitcher:
             "reason": "requested",
         }
 
-    def switch(self, strategy: str | None = None, json_output: bool = False) -> dict:
+    def switch(
+        self,
+        strategy: str | None = None,
+        json_output: bool = False,
+        manual_source: str | None = None,
+    ) -> dict:
         self.calls.append(("switch", strategy))
+        self.manual_sources.append(manual_source)
         return {"switched": False, "from": None, "to": None, "reason": "no-better-target"}
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
@@ -1789,6 +1801,7 @@ class TestDashboard:
             await pilot.press("down", "enter")
             await settle(pilot)
             assert ("switch_to", "2") in fake.calls
+            assert fake.manual_sources == ["tui"]  # the hand switch names itself
             assert isinstance(app.screen, DashboardScreen)  # popped back
             assert app.snapshot.active_number == "2"
 
@@ -5703,9 +5716,13 @@ class TestNeedsLoginIsReported:
 
     class _EmptySlotSwitcher(FakeSwitcher):
         def switch_to(
-            self, identifier: str, json_output: bool = False, force: bool = False
+            self,
+            identifier: str,
+            json_output: bool = False,
+            force: bool = False,
+            manual_source: str | None = None,
         ) -> dict:
-            payload = super().switch_to(identifier, json_output, force)
+            payload = super().switch_to(identifier, json_output, force, manual_source)
             payload["needsLogin"] = True
             payload["reason"] = "switched-needs-login"
             payload["message"] = (

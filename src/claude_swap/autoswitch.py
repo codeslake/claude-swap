@@ -58,11 +58,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import AutoSwitchSettings, atomic_write_json, load_settings, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome
 from claude_swap.usage_store import UsageEntry, WALL_FALLBACK_S, due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
+STATE_LOCK_FILENAME = ".autoswitch_state.lock"
 STATE_SCHEMA_VERSION = 1
 # Held for the lifetime of a LIVE engine; a second one starts dry-run.
 LIVE_LOCK_FILENAME = ".auto-live.lock"
@@ -756,6 +757,14 @@ def _now_iso() -> str:
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+def _read_state_file(path: Path) -> dict:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 def pct_label(value: float) -> str:
@@ -1533,6 +1542,54 @@ def _model_window_binds_everywhere(
     return saw_model_only_wall
 
 
+def record_manual_switch(
+    switcher: ClaudeAccountSwitcher,
+    source: str,
+    from_ref: dict | None,
+    to_ref: dict | None,
+) -> None:
+    """A hand switch leaves the engine's trace (T1850): a decisions-log line
+    (when ``decision_log`` is on) and, for a real move, ``lastActiveAt`` for
+    BOTH accounts at the hand's own time. Without it the dwell clock reads the
+    engine's stale stamp on the account the owner just chose, and alternation
+    moves them off it a chunk after ITS arrival, not theirs (measured
+    2026-10-05: a hand 2 -> 5 at T+270 s was alternated off at T+662 s). Not
+    ``lastSwitchTo``/``lastSwitchFrom``/``leftTrigger``: the no-return bar is
+    disarmed by a hand switch on purpose.
+
+    Called only through `ClaudeAccountSwitcher._record_manual_switch`, by hand
+    callers (TUI, CLI, menubar) that run with no engine of their own, so it
+    writes the files itself; never by the engine, whose `_perform` holds the
+    state lock across its own switch. Nothing escapes it: a record must never
+    fail the switch it follows.
+    """
+    try:
+        moved = from_ref != to_ref
+        event = (
+            SwitchEvent(trigger=f"manual: {source}", from_ref=from_ref, to_ref=to_ref)
+            if moved
+            else NoSwitchEvent(reason="already-active", detail=f"manual: {source}")
+        )
+        backup_dir = switcher.backup_dir
+        if load_settings(backup_dir).decision_log:
+            decision_logger(backup_dir).info("%s %s", event.ts, event.human())
+        if moved:
+            path = backup_dir / STATE_FILENAME
+            with FileLock(backup_dir / STATE_LOCK_FILENAME):
+                state = _read_state_file(path)
+                stamps = state.get("lastActiveAt")
+                stamps = dict(stamps) if isinstance(stamps, dict) else {}
+                now = switcher._usage_store.clock()
+                for ref in (from_ref, to_ref):
+                    if ref and ref.get("number") is not None:
+                        stamps[str(ref["number"])] = now
+                state["schemaVersion"] = STATE_SCHEMA_VERSION
+                state["lastActiveAt"] = stamps
+                atomic_write_json(path, state)
+    except Exception:  # noqa: BLE001 -- a record must never fail the switch
+        _logger.warning("could not record the manual switch", exc_info=True)
+
+
 class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 
@@ -1736,14 +1793,10 @@ class AutoSwitchEngine:
     # -- state file ---------------------------------------------------------
 
     def _state_lock(self) -> FileLock:
-        return FileLock(self.state_path.parent / ".autoswitch_state.lock")
+        return FileLock(self.state_path.parent / STATE_LOCK_FILENAME)
 
     def _read_state(self) -> dict:
-        try:
-            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return {}
-        return raw if isinstance(raw, dict) else {}
+        return _read_state_file(self.state_path)
 
     def _mutate_state(self, mutator: Callable[[dict], None]) -> dict:
         """Read-modify-write the state file under its lock; returns new state.
@@ -3002,9 +3055,15 @@ class AutoSwitchEngine:
             # T0758: the floor prices a switch against headroom that will
             # still be there later -- false for a candidate whose 7-day
             # window resets BEFORE the active's, since its remaining room
-            # expires unspent regardless. Such a candidate is exempt from
-            # the floor and from the warm-only sourcing (it may come from
-            # `cold_ordered`); it still had to clear `SPENT_HEADROOM_PCT`
+            # expires unspent regardless. T1850: false for THAT WINDOW
+            # ONLY. A perishing candidate is waived on its 7-day headroom
+            # and no other: its 5h and pinned-model-window headroom (every
+            # window but the 7d, read on the axis `floor_headroom` is on)
+            # must still clear the same per-tier floor below (measured
+            # 2026-10-05: a warm 5h 86 / 7d 61 candidate, headroom 14 and
+            # 5h-bound, was admitted because its 7d reset sooner -- the 5h
+            # window does not perish). It may still come from
+            # `cold_ordered`, and still had to clear `SPENT_HEADROOM_PCT`
             # to reach either list at all.
             #
             # T0758 follow-up: `warm_ordered + cold_ordered`, warm first, so
@@ -3032,13 +3091,23 @@ class AutoSwitchEngine:
             cold_set = set(cold_ordered)
             def _clears_the_landing_floor(n):
                 h = floor_headroom.get(n, 0.0)
+                if _perishes_before_active(usage.get(n), usage.get(current), now):
+                    h = 100.0 - max(
+                        (
+                            pct for label, pct, _ in oauth.relevant_windows(
+                                usage.get(n),
+                                () if model_window_dropped else self._models,
+                            )
+                            if label != "7d"
+                        ),
+                        default=0.0,
+                    )
                 if n in cold_set:
                     return h - settings.cold_switch_cost_pct > SPENT_HEADROOM_PCT
                 return h >= settings.cold_switch_cost_pct
             alternation_admissible = [
                 n for n in warm_ordered + cold_ordered
                 if _clears_the_landing_floor(n)
-                or _perishes_before_active(usage.get(n), usage.get(current), now)
             ]
             partner = next(iter(alternation_admissible), None)
             since = last_active_at.get(current)
@@ -5342,7 +5411,8 @@ class AutoSwitchEngine:
         # serialized decision: the loser re-reads the winner's lastSwitchAt
         # and backs off instead of double-switching. No deadlock cycle: the
         # switch path (cswap FileLock + Claude Code locks) never takes the
-        # state lock.
+        # state lock, except for a hand caller's `manual_source` record
+        # (`record_manual_switch`), which the engine never passes.
         with self._state_lock():
             state = self._read_state()
             # `left[0]` is the tick's own widened `active_headroom`, taken

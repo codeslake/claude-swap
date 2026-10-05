@@ -1763,13 +1763,17 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 json_output=args.json,
                 models=models,
                 model_source=model_source,
+                manual_source="cli",
             )
             if payload is not None and models:
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
         elif args.switch_to:
             payload = switcher.switch_to(
-                args.switch_to, json_output=args.json, force=args.force
+                args.switch_to,
+                json_output=args.json,
+                force=args.force,
+                manual_source="cli",
             )
         elif args.status:
             payload = switcher.status(json_output=args.json, read_only=args.read_only)

@@ -10619,6 +10619,18 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             "warnings": warnings or [],
         }
 
+    def _record_manual_switch(
+        self, manual_source: str | None, from_ref: dict | None, to_ref: dict | None
+    ) -> None:
+        """Leave a hand switch's trace for the engine (T1850). Only a hand
+        caller names a ``manual_source``; the engine's own switches stamp for
+        themselves under the state lock and record nothing here."""
+        if manual_source:
+            # Function-local: autoswitch imports this module at load.
+            from claude_swap.autoswitch import record_manual_switch
+
+            record_manual_switch(self, manual_source, from_ref, to_ref)
+
     def switch(
         self,
         strategy: str | None = None,
@@ -10627,6 +10639,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         model_source: str | None = None,
         current_at_limit: bool = False,
         exclude: Iterable[str] = (),
+        manual_source: str | None = None,
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -10661,6 +10674,9 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                   ``current_at_limit=True`` persists nothing; only
                   ``_select_best_switchable``'s existing one-selection zeroing
                   (this call's own ranking, never persisted) applies.
+            manual_source: A hand caller's name (``"tui"``, ``"cli"``,
+                  ``"menubar"``): a real switch is then recorded for the engine
+                  (:meth:`_record_manual_switch`). ``None`` records nothing.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -10817,6 +10833,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 except TargetCredentialDead:
                     struck.add(candidate)
                     continue
+                self._record_manual_switch(manual_source, op["from"], op["to"])
                 return (
                     self._switch_result_from_op(op, strategy_label, warnings)
                     if json_output else None
@@ -10940,6 +10957,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                         exclude=struck,
                     )
                     continue
+                self._record_manual_switch(manual_source, op["from"], op["to"])
                 return (
                     self._switch_result_from_op(op, strategy_label, warnings)
                     if json_output else None
@@ -11203,6 +11221,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             except TargetCredentialDead:
                 struck.add(next_account)
                 continue
+            self._record_manual_switch(manual_source, op["from"], op["to"])
             return (
                 self._switch_result_from_op(op, strategy_label, warnings)
                 if json_output else None
@@ -11221,13 +11240,21 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         return None
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        manual_source: str | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+        ``manual_source`` names a hand caller (``"tui"``, ``"cli"``,
+        ``"menubar"``) so the switch, or the already-active no-op, is
+        recorded for the engine (:meth:`_record_manual_switch`); the engine's
+        own call passes none.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -11309,6 +11336,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                         data.get("accounts", {}).get(target_account, {}).get("email", "")
                     )
                     ref = account_ref(int(target_account), email)
+                    self._record_manual_switch(manual_source, ref, ref)
                     if not json_output:
                         print(
                             f"{accent('Already on')} Account-{target_account} ({email})"
@@ -11365,6 +11393,8 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 to_ref=cur_ref,
                 message=message,
             )
+        if not (force and op["from"] == op["to"]):  # a forced rewrite is no "already-active"
+            self._record_manual_switch(manual_source, op["from"], op["to"])
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
