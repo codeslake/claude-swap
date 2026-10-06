@@ -1902,7 +1902,17 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
-        overload_backoff = self._overload_backoff
+        # An account the API refused a model request on (another process's
+        # `switch(current_refused=True)`, via the usage store) is barred like
+        # one escaped for `overloaded`: same bar, same release, and the same
+        # span (`REFUSAL_BAR_S`).
+        refusal_bar = {
+            n: e.refused_until for n, e in entries.items() if e.refused_until
+        }
+        overload_backoff = {
+            n: max(self._overload_backoff.get(n, 0.0), refusal_bar.get(n, 0.0))
+            for n in self._overload_backoff.keys() | refusal_bar.keys()
+        }
         candidates = [
             num
             for num in self.switcher.switchable_account_numbers()
@@ -2111,6 +2121,17 @@ class AutoSwitchEngine:
                 ordered = api_key_candidates
 
         if not ordered:
+            if skipped := [n for n in oauth_candidates if n in refusal_bar]:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="account-refused",
+                        detail=(
+                            "the API refused model requests on Account-"
+                            + ", Account-".join(skipped)
+                            + "; not a landing spot while the refusal mark holds"
+                        ),
+                    )
+                )
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.

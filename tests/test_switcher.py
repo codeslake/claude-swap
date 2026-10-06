@@ -46,7 +46,7 @@ from claude_swap.switcher import (
 from claude_swap import macos_keychain as _kc
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.paths import get_global_config_path
-from claude_swap.usage_store import SERVE_TTL_S, _row_eligible
+from claude_swap.usage_store import REFUSAL_BAR_S, SERVE_TTL_S, _row_eligible
 from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 
 
@@ -22434,6 +22434,93 @@ class TestSwitchPersistsTheAtLimitMark:
 
         assert result["switched"] is True
         assert not s._usage_store.entries(ident)["1"].walled
+
+
+class TestSwitchRefusedMarksTheAccountItLeft:
+    """`switch(current_refused=True)`: the API answered the ACTIVE account's
+    model request with a refusal its profile probe cannot see. It ranks like
+    `current_at_limit` (the active counts as 0 headroom), reaches the same
+    switch-time probe, and persists a `REFUSAL_BAR_S` mark on the account it
+    left. The mark is not an at-limit wall and binds only the engine's pick,
+    never a hand switch."""
+
+    IDENT = {
+        "1": ("a@example.com", ""),
+        "2": ("b@example.com", ""),
+        "3": ("c@example.com", ""),
+    }
+    # The refused account READS better than the others: that is the incident.
+    USAGE = {
+        "1": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
+        "2": {"five_hour": {"pct": 56.0}, "seven_day": {"pct": 0.0}},
+        "3": {"five_hour": {"pct": 90.0}, "seven_day": {"pct": 0.0}},
+    }
+
+    def _seed_three(self, temp_home):
+        s = TestSwitchPersistsTheAtLimitMark()._seed_two(temp_home)
+        TestCurrentAtLimitOverridesTheFrozenPct()._seed(s, 3, "c@example.com")
+        return s
+
+    def _refuse(self, s, usage=None, **kwargs):
+        with patch.object(
+            s, "_usage_by_account", return_value=usage or self.USAGE
+        ), patch("claude_swap.oauth.probe_oauth_profile_live", return_value=True):
+            return s.switch(
+                strategy="best", json_output=True, current_refused=True, **kwargs
+            )
+
+    def test_it_lands_on_a_candidate_validated_and_marks_the_account_it_left(
+        self, temp_home
+    ):
+        s = self._seed_three(temp_home)
+        t0 = time.time()
+        result = self._refuse(s)
+        t1 = time.time()
+
+        assert result["switched"] is True
+        assert result["to"]["number"] == 2
+        assert result["validated"] is True
+        left = s._usage_store.entries(self.IDENT)["1"]
+        assert t0 + REFUSAL_BAR_S <= left.refused_until <= t1 + REFUSAL_BAR_S
+        assert not left.walled  # a refusal is not a 429 wall
+
+    @pytest.mark.parametrize("exclude,marked", [(set(), {"1"}), ({"3"}, {"3"})])
+    def test_it_marks_the_slots_the_caller_named_else_the_live_one(
+        self, temp_home, exclude, marked
+    ):
+        s = self._seed_three(temp_home)
+        self._refuse(s, exclude=exclude)
+
+        entries = s._usage_store.entries(self.IDENT)
+        assert {n for n, e in entries.items() if e.refused_until} == marked
+
+    def test_with_no_candidate_it_reports_not_switched_and_writes_no_credential(
+        self, temp_home
+    ):
+        s = TestSwitchPersistsTheAtLimitMark()._seed_two(temp_home)
+        live = temp_home / ".claude" / ".credentials.json"
+        before = live.read_bytes()
+        usage = {k: self.USAGE[k] for k in ("1", "2")}
+        usage["2"] = {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0}}
+
+        result = self._refuse(s, usage)
+
+        assert result["switched"] is False
+        assert result["reason"] == "candidates-exhausted"
+        assert live.read_bytes() == before
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        # The API's refusal is true whether or not anything could take over.
+        assert s._usage_store.entries(self.IDENT)["1"].refused_until is not None
+
+    def test_a_hand_switch_onto_the_marked_account_is_not_blocked(self, temp_home):
+        s = self._seed_three(temp_home)
+        self._refuse(s)
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+        result = s.switch_to("1", json_output=True)
+
+        assert result["switched"] is True
+        assert result["to"]["number"] == 1
 
 
 class TestSwitchExcludeNeverLandsOnAnObservedWall:

@@ -8493,6 +8493,7 @@ class ClaudeAccountSwitcher:
         model_source: str | None = None,
         current_at_limit: bool = False,
         exclude: Iterable[str] = (),
+        current_refused: bool = False,
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -8527,6 +8528,16 @@ class ClaudeAccountSwitcher:
                   ``current_at_limit=True`` persists nothing; only
                   ``_select_best_switchable``'s existing one-selection zeroing
                   (this call's own ranking, never persisted) applies.
+            current_refused: The API refused a model request on the active
+                  account while its profile probe and usage still read
+                  healthy (e.g. a 403 naming a missing access grant). Ranks
+                  like ``current_at_limit`` (the active counts as 0
+                  headroom) through the same switch-time probe, and marks
+                  the slots named in ``exclude``, else the live one,
+                  ``UsageStore.mark_refused``: for ``REFUSAL_BAR_S`` the
+                  auto-switch engine will not land on them unless an escape
+                  has nowhere else to go. A hand switch is never blocked, and
+                  the at-limit wall is not written.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -8781,10 +8792,21 @@ class ClaudeAccountSwitcher:
                             num, {num: identity}, models,
                             account_uuid=data["accounts"][num].get("uuid"),
                         )
+            if current_refused:
+                # Before the switch: a failed write raises with nothing
+                # switched, never after a credential already landed.
+                for num in excluded_slots or {current_num}:
+                    info = data["accounts"].get(num)
+                    if info is not None:
+                        self._usage_store.mark_refused(num, {num: (
+                            info.get("email", ""),
+                            info.get("organizationUuid", "") or "",
+                        )})
+            at_limit = current_at_limit or current_refused
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(
-                current_num, models, best_usage, current_at_limit, exclude=struck
+                current_num, models, best_usage, at_limit, exclude=struck
             )
             # Bounded by the candidate count: a struck candidate is excluded
             # from the NEXT `_select_best_switchable` call via `struck`
@@ -8806,7 +8828,7 @@ class ClaudeAccountSwitcher:
                 except TargetCredentialDead:
                     struck.add(target)
                     target, note = self._select_best_switchable(
-                        current_num, models, best_usage, current_at_limit,
+                        current_num, models, best_usage, at_limit,
                         exclude=struck,
                     )
                     continue
