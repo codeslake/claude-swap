@@ -2808,7 +2808,17 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
-        overload_backoff = self._overload_backoff
+        # An account the API refused a model request on (another process's
+        # `switch(current_refused=True)`, via the usage store) is barred like
+        # one escaped for `overloaded`: same bar, same release, and the same
+        # span (`REFUSAL_BAR_S`).
+        refusal_bar = {
+            n: e.refused_until for n, e in entries.items() if e.refused_until
+        }
+        overload_backoff = {
+            n: max(self._overload_backoff.get(n, 0.0), refusal_bar.get(n, 0.0))
+            for n in self._overload_backoff.keys() | refusal_bar.keys()
+        }
         candidates = [
             num
             for num in self.switcher.switchable_account_numbers()
@@ -3364,7 +3374,7 @@ class AutoSwitchEngine:
 
         consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
 
-        def _rank(**kw):
+        def _rank(*, overload_backoff=overload_backoff, **kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
             the barred account is a different proposition from the one we left.
 
@@ -3553,6 +3563,39 @@ class AutoSwitchEngine:
                 ordered = api_key_candidates
 
         if not ordered:
+            # The refusal bar is the reason only when ranking without it would
+            # have picked someone: the tick's one and last NoSwitchEvent. It
+            # holds only where `_rank` did not release it, so it is a hold
+            # (BLOCKED), or for a consume-first nudge a correct stay.
+            if refusal_bar and (
+                would_have_landed := _rank(
+                    overload_backoff=self._overload_backoff,
+                    trigger=trigger,
+                    consume_first=consume_first,
+                    oauth_candidates=oauth_candidates,
+                    usage=usage,
+                    headroom=headroom,
+                    current=current,
+                    active_headroom=active_headroom,
+                    settings=settings,
+                    now=decided_now,
+                )[0]
+            ):
+                self._emit(
+                    NoSwitchEvent(
+                        reason="account-refused",
+                        detail=(
+                            "the API refused model requests on Account-"
+                            + ", Account-".join(would_have_landed)
+                            + "; not a landing spot while the refusal mark holds"
+                        ),
+                    )
+                )
+                return (
+                    TickOutcome.NO_ACTION
+                    if trigger == "consume-first"
+                    else TickOutcome.BLOCKED
+                )
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.

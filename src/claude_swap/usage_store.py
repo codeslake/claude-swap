@@ -75,6 +75,9 @@ LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
 # Fallback span for `UsageStore.mark_at_limit` when the walled row carries no
 # stored reading to key its expiry on (the widest ordinary window: 5h).
 WALL_FALLBACK_S = 18000.0
+# How long `UsageStore.mark_refused` keeps an account out of the engine's
+# landing pick (the span, and the reason, of autoswitch's `OVERLOAD_BACKOFF_S`).
+REFUSAL_BAR_S = 900.0
 
 
 def _live_claim(
@@ -399,6 +402,9 @@ class UsageEntry:
     # import-usage``) keeps every collector off this slot. Appended for the
     # same positional compatibility as ``claim_until``.
     held_until: float | None = None
+    # Until when `UsageStore.mark_refused` keeps this slot out of the engine's
+    # landing pick; None once lapsed. Overrides no reading, unlike `walled`.
+    refused_until: float | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -1196,6 +1202,7 @@ class UsageStore:
             claim_until = _num_or_none(row.get("claimUntil"))
             walled_until = _num_or_none(row.get("walledUntil"))
             held_until = _num_or_none(row.get("heldUntil"))
+            refused_until = _num_or_none(row.get("refusedUntil"))
             # Strict < mirrors due_candidate: at nextPollAt the entry is due,
             # its staleness no longer scheduler-chosen. A live claim keeps the
             # trust bridge up: when another collector just won the fetch, this
@@ -1258,6 +1265,11 @@ class UsageStore:
                 walled_until=walled_until,
                 attempts_in_window=len(_pruned_attempts(row, now)),
                 held_until=held_until,
+                refused_until=(
+                    refused_until
+                    if refused_until is not None and now < refused_until
+                    else None
+                ),
             )
         return out
 
@@ -1629,6 +1641,16 @@ class UsageStore:
             row["walledUuid"] = account_uuid
 
         self._mutate(identities, [num], apply)
+
+    def mark_refused(self, num: str, identities: dict[str, Identity]) -> None:
+        """Persist that the API refused a model request on ``num``, an answer
+        no profile probe or usage reading carries. ``entries()`` reports
+        ``refused_until`` for ``REFUSAL_BAR_S``. Unlike ``mark_at_limit`` it
+        touches no reading, so no other reader (nor a hand switch) changes."""
+        until = self.clock() + REFUSAL_BAR_S
+        self._mutate(
+            identities, [num], lambda _n, row: row.update(refusedUntil=until)
+        )
 
     def record_header_reading(
         self,

@@ -57,6 +57,7 @@ from claude_swap.json_output import (
 )
 from claude_swap.paths import get_credentials_path
 from claude_swap.usage_store import (
+    REFUSAL_BAR_S,
     USAGE_HEADER_5H_PCT,
     WALL_FALLBACK_S,
     FetchRecord,
@@ -19933,3 +19934,65 @@ class TestT1313SettleWiring:
         ):
             delay = h.engine._next_delay(TickOutcome.NO_ACTION)  # must not raise
         assert delay > 0
+
+
+class TestARefusedAccountIsBarredFromTheEnginesPick:
+    """The pin's refusal entry (`switch(current_refused=True)`) leaves the
+    account the API refused and marks it for `REFUSAL_BAR_S`. The mark lives
+    in the usage store, so the engine in ANOTHER process reads it as
+    `UsageEntry.refused_until`, and bars the account from its landing pick the
+    way `overload_backoff` bars an account it escaped: every trigger skips it,
+    and only an escape with nowhere else to go releases the bar."""
+
+    IDENT = {
+        "1": ("a@example.com", ""),
+        "2": ("b@example.com", ""),
+        "3": ("c@example.com", ""),
+    }
+
+    @pytest.mark.parametrize(
+        "active_pct,advance,left_pct,landed,reasons",
+        [
+            # proactive: the bar holds, and is the tick's one and last reason
+            (95.0, 0.0, 10.0, 2, ["account-refused"]),
+            (95.0, REFUSAL_BAR_S + 1, 10.0, 1, []),  # the mark has expired
+            (100.0, 0.0, 10.0, 1, []),  # at-limit, nowhere else: it releases
+            # the marked account was never a landing spot: not the bar's doing
+            (95.0, 0.0, 98.0, 2, ["no-qualifying-candidate"]),
+        ],
+    )
+    def test_the_bar_holds_until_it_expires_and_never_strands_an_escape(
+        self, harness, active_pct, advance, left_pct, landed, reasons
+    ):
+        harness.engine.settings = replace(harness.engine.settings, strategy="best")
+        harness.switcher.set_account_disabled("3", True)
+        # The entry the pin calls: leaves 1 for 2, though 1 reads healthier.
+        with patch.object(
+            harness.switcher, "_usage_by_account",
+            return_value={"1": _usage(5.0), "2": _usage(10.0)},
+        ):
+            result = harness.switcher.switch(
+                strategy="best", json_output=True, current_refused=True
+            )
+        assert result["to"]["number"] == 2
+        harness.clock.advance(advance)
+        harness.events.clear()
+
+        # Entries as the real store holds them: the mark rides in `refused_until`.
+        marks = harness.switcher._usage_store.entries(self.IDENT)
+        outcome = harness.tick_with_entries({
+            n: replace(
+                _entry_for(v, harness.clock.now),
+                refused_until=marks[n].refused_until,
+            )
+            for n, v in {"1": _usage(left_pct), "2": _usage(active_pct)}.items()
+        })
+
+        assert harness.active_number() == landed
+        assert (outcome is TickOutcome.SWITCHED) == (landed == 1)
+        holds = [e for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in holds] == reasons
+        # Said once, and last: nothing else the tick emitted follows it.
+        assert not reasons or harness.events[-1] is holds[-1]
+        if reasons == ["account-refused"]:
+            assert "Account-1" in holds[0].detail

@@ -10030,8 +10030,10 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         call already struck: ``_slot_token_dead`` needs a second strike
         before it agrees (``_strike_is_suspected_race`` doubts the first one
         whenever the row carries a prior success), so without this a
-        just-struck candidate is picked right back up next pass. Returns
-        ``(target, note)``:
+        just-struck candidate is picked right back up next pass. With
+        ``current_at_limit`` (an automated escape) a candidate carrying a live
+        ``UsageStore.mark_refused`` mark is skipped unless that leaves no
+        target. Returns ``(target, note)``:
 
         - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
         - ``(None, "current-unavailable")`` — current account's usage is unknown,
@@ -10073,6 +10075,27 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             # candidate. Zero, so any candidate with real headroom wins and a
             # field of exhausted ones still reports "exhausted".
             current_headroom = 0.0
+            # An automated escape (the pin's 429 or refusal) does not land on
+            # a slot `mark_refused` marked: the API refuses that credential
+            # whatever its headroom reads. It never strands, the way the
+            # engine's `_rank` never does on an escape (`_overload_bar_releases`
+            # is true for every one): with nothing else to pick, the unbarred
+            # pass below runs over every candidate. The inner call has nothing
+            # left to bar, so it does not recurse.
+            roster = {
+                n: (i.get("email", ""), i.get("organizationUuid", "") or "")
+                for n, i in data.get("accounts", {}).items()
+            }
+            refused = {
+                n for n, e in self._usage_store.entries(roster).items()
+                if e.refused_until
+            } & set(others)
+            if refused:
+                target, note = self._select_best_switchable(
+                    current_num, models, usage, True, exclude={*exclude, *refused}
+                )
+                if target is not None:
+                    return target, note
         if current_headroom is None:
             # Can't measure where the user is → can't prove any target is
             # better. Stay rather than risk moving onto a worse account.
@@ -10638,6 +10661,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         models: tuple[str, ...] | None = None,
         model_source: str | None = None,
         current_at_limit: bool = False,
+        current_refused: bool = False,
         exclude: Iterable[str] = (),
         manual_source: str | None = None,
     ) -> dict | None:
@@ -10656,6 +10680,19 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             model_source: Where ``models`` came from (``"cli"`` or
                   ``"autoswitch.model"``) — announced up front so a config
                   fallback silently steering the pick is impossible.
+            current_refused: The API refused a model request on the active
+                  account while its profile probe and usage still read
+                  healthy (e.g. a 403 naming a missing access grant). Ranks
+                  like ``current_at_limit`` (the active counts as 0
+                  headroom) through the same switch-time probe, and marks
+                  the slots named in ``exclude``, else the live one,
+                  ``UsageStore.mark_refused``: for ``REFUSAL_BAR_S`` neither
+                  the auto-switch engine nor this automated pick lands on
+                  them unless nothing else is left. A hand switch is never
+                  blocked, and the at-limit wall is not written. When
+                  ``exclude`` names only other slots (a straggler), they are
+                  marked and nothing else happens: the live account did not
+                  draw the refusal, so it is not ranked at 0 and not left.
             exclude: Slot numbers the CALLER already observed at-limit
                   out-of-band (the pin's own 429s) and must not land on this
                   call — e.g. a straggling 429 on a bearer from a wall the
@@ -10928,10 +10965,41 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                             num, {num: identity}, models,
                             account_uuid=data["accounts"][num].get("uuid"),
                         )
+            if current_refused:
+                # Before the switch: a failed write raises with nothing
+                # switched, never after a credential already landed.
+                for num in excluded_slots or {current_num}:
+                    info = data["accounts"].get(num)
+                    if info is not None:
+                        self._usage_store.mark_refused(num, {num: (
+                            info.get("email", ""),
+                            info.get("organizationUuid", "") or "",
+                        )})
+            # The live account counts as 0 headroom only when the refusal is
+            # its own. A straggler names another slot (`exclude`): it is
+            # marked above, and the healthy live account is neither ranked at
+            # 0 nor left (no usage fetch, no probe, no credential write).
+            at_limit = current_at_limit or (
+                current_refused
+                and (not excluded_slots or current_num in excluded_slots)
+            )
+            if current_refused and not at_limit:
+                message = (
+                    "The API refused requests on Account-"
+                    f"{', Account-'.join(sorted(excluded_slots))}, which is not "
+                    f"the account in use; staying on Account-{current_num}."
+                )
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="refusal-marked",
+                        to_ref=current_ref, warnings=warnings, message=message,
+                    )
+                print(dimmed(message))
+                return None
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(
-                current_num, models, best_usage, current_at_limit, exclude=struck
+                current_num, models, best_usage, at_limit, exclude=struck
             )
             # Bounded by the candidate count: a struck candidate is excluded
             # from the NEXT `_select_best_switchable` call via `struck`
@@ -10953,7 +11021,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 except TargetCredentialDead:
                     struck.add(target)
                     target, note = self._select_best_switchable(
-                        current_num, models, best_usage, current_at_limit,
+                        current_num, models, best_usage, at_limit,
                         exclude=struck,
                     )
                     continue

@@ -20,6 +20,7 @@ from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
     CLAIM_TTL_S,
+    REFUSAL_BAR_S,
     SERVE_TTL_S,
     STALE_OK_S,
     TRUST_MAX_AGE_S,
@@ -371,6 +372,27 @@ class TestMarkAtLimit:
         assert store.entries(IDENT)["1"].walled
         clock.advance(2)
         assert not store.entries(IDENT)["1"].walled
+
+
+class TestMarkRefused:
+    """``mark_refused``: the API refused a model request on this account. Not
+    a wall: the poll still reads the account as it measures it, and the mark
+    only surfaces as ``refused_until`` for the span ``REFUSAL_BAR_S``."""
+
+    @pytest.mark.parametrize("advance,live", [(0.0, True), (REFUSAL_BAR_S + 1, False)])
+    def test_a_mark_reads_live_through_a_good_poll_until_its_span_ends(
+        self, store, clock, advance, live
+    ):
+        ident = {"1": IDENT["1"]}
+        store.mark_refused("1", ident)
+        store.record({"1": FetchRecord(usage=USAGE)}, ident)
+        entry = store.entries(ident)["1"]
+        assert not entry.walled
+        assert entry.decision_value()["five_hour"]["pct"] == 25.0
+
+        clock.advance(advance)
+        entry = store.entries(ident)["1"]
+        assert entry.refused_until == (1_000_000.0 + REFUSAL_BAR_S if live else None)
 
 
 class TestWallMarkIdentity:
