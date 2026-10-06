@@ -8492,8 +8492,8 @@ class ClaudeAccountSwitcher:
         models: tuple[str, ...] | None = None,
         model_source: str | None = None,
         current_at_limit: bool = False,
-        exclude: Iterable[str] = (),
         current_refused: bool = False,
+        exclude: Iterable[str] = (),
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -8510,6 +8510,16 @@ class ClaudeAccountSwitcher:
             model_source: Where ``models`` came from (``"cli"`` or
                   ``"autoswitch.model"``) — announced up front so a config
                   fallback silently steering the pick is impossible.
+            current_refused: The API refused a model request on the active
+                  account while its profile probe and usage still read
+                  healthy (e.g. a 403 naming a missing access grant). Ranks
+                  like ``current_at_limit`` (the active counts as 0
+                  headroom) through the same switch-time probe, and marks
+                  the slots named in ``exclude``, else the live one,
+                  ``UsageStore.mark_refused``: for ``REFUSAL_BAR_S`` the
+                  auto-switch engine will not land on them unless an escape
+                  has nowhere else to go. A hand switch is never blocked, and
+                  the at-limit wall is not written.
             exclude: Slot numbers the CALLER already observed at-limit
                   out-of-band (the pin's own 429s) and must not land on this
                   call — e.g. a straggling 429 on a bearer from a wall the
@@ -8528,16 +8538,6 @@ class ClaudeAccountSwitcher:
                   ``current_at_limit=True`` persists nothing; only
                   ``_select_best_switchable``'s existing one-selection zeroing
                   (this call's own ranking, never persisted) applies.
-            current_refused: The API refused a model request on the active
-                  account while its profile probe and usage still read
-                  healthy (e.g. a 403 naming a missing access grant). Ranks
-                  like ``current_at_limit`` (the active counts as 0
-                  headroom) through the same switch-time probe, and marks
-                  the slots named in ``exclude``, else the live one,
-                  ``UsageStore.mark_refused``: for ``REFUSAL_BAR_S`` the
-                  auto-switch engine will not land on them unless an escape
-                  has nowhere else to go. A hand switch is never blocked, and
-                  the at-limit wall is not written.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
