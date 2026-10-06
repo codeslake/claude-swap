@@ -14185,10 +14185,10 @@ class TestARefusedAccountIsBarredFromTheEnginesPick:
     ):
         harness.engine.settings = replace(harness.engine.settings, strategy="best")
         harness.switcher.set_account_disabled("3", True)
-        # The entry the pin calls: leaves 1 for 2, and 1 reads healthy.
+        # The entry the pin calls: leaves 1 for 2, though 1 reads healthier.
         with patch.object(
             harness.switcher, "_usage_by_account",
-            return_value={"1": _usage(10.0), "2": _usage(5.0)},
+            return_value={"1": _usage(5.0), "2": _usage(10.0)},
         ):
             result = harness.switcher.switch(
                 strategy="best", json_output=True, current_refused=True
