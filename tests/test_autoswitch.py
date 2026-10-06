@@ -14173,15 +14173,18 @@ class TestARefusedAccountIsBarredFromTheEnginesPick:
     }
 
     @pytest.mark.parametrize(
-        "active_pct,advance,landed,skip_logged",
+        "active_pct,advance,left_pct,landed,reasons",
         [
-            (95.0, 0.0, 2, True),  # proactive: the bar holds, and says why
-            (95.0, REFUSAL_BAR_S + 1, 1, False),  # the mark has expired
-            (100.0, 0.0, 1, False),  # at-limit, nowhere else: the bar releases
+            # proactive: the bar holds, and is the tick's one and last reason
+            (95.0, 0.0, 10.0, 2, ["account-refused"]),
+            (95.0, REFUSAL_BAR_S + 1, 10.0, 1, []),  # the mark has expired
+            (100.0, 0.0, 10.0, 1, []),  # at-limit, nowhere else: it releases
+            # the marked account was never a landing spot: not the bar's doing
+            (95.0, 0.0, 98.0, 2, ["no-qualifying-candidate"]),
         ],
     )
     def test_the_bar_holds_until_it_expires_and_never_strands_an_escape(
-        self, harness, active_pct, advance, landed, skip_logged
+        self, harness, active_pct, advance, left_pct, landed, reasons
     ):
         harness.engine.settings = replace(harness.engine.settings, strategy="best")
         harness.switcher.set_account_disabled("3", True)
@@ -14204,14 +14207,14 @@ class TestARefusedAccountIsBarredFromTheEnginesPick:
                 _entry_for(v, harness.clock.now),
                 refused_until=marks[n].refused_until,
             )
-            for n, v in {"1": _usage(10.0), "2": _usage(active_pct)}.items()
+            for n, v in {"1": _usage(left_pct), "2": _usage(active_pct)}.items()
         })
 
         assert harness.active_number() == landed
         assert (outcome is TickOutcome.SWITCHED) == (landed == 1)
-        skips = [
-            e for e in harness.events
-            if isinstance(e, NoSwitchEvent) and e.reason == "account-refused"
-        ]
-        assert bool(skips) == skip_logged
-        assert not skips or "Account-1" in skips[0].detail
+        holds = [e for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in holds] == reasons
+        # Said once, and last: nothing else the tick emitted follows it.
+        assert not reasons or harness.events[-1] is holds[-1]
+        if reasons == ["account-refused"]:
+            assert "Account-1" in holds[0].detail

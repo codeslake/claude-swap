@@ -22484,15 +22484,39 @@ class TestSwitchRefusedMarksTheAccountItLeft:
         assert t0 + REFUSAL_BAR_S <= left.refused_until <= t1 + REFUSAL_BAR_S
         assert not left.walled  # a refusal is not a 429 wall
 
-    @pytest.mark.parametrize("exclude,marked", [(set(), {"1"}), ({"3"}, {"3"})])
+    @pytest.mark.parametrize(
+        "exclude,marked,switched",
+        [(set(), {"1"}, True), ({"3"}, {"3"}, False)],
+    )
     def test_it_marks_the_slots_the_caller_named_else_the_live_one(
-        self, temp_home, exclude, marked
+        self, temp_home, exclude, marked, switched
     ):
         s = self._seed_three(temp_home)
-        self._refuse(s, exclude=exclude)
+        live = temp_home / ".claude" / ".credentials.json"
+        before = live.read_bytes()
+
+        result = self._refuse(s, exclude=exclude)
 
         entries = s._usage_store.entries(self.IDENT)
         assert {n for n, e in entries.items() if e.refused_until} == marked
+        # A straggler names a slot that is not live: the healthy live account
+        # did not draw the refusal, so it is neither ranked at 0 nor left.
+        assert result["switched"] is switched
+        assert (s._get_sequence_data()["activeAccountNumber"] == 2) is switched
+        assert (live.read_bytes() != before) is switched
+
+    def test_a_straggler_says_so_on_the_console_and_switches_nothing(
+        self, temp_home, capsys
+    ):
+        s = self._seed_three(temp_home)
+        with patch.object(s, "_usage_by_account", return_value=self.USAGE):
+            result = s.switch(
+                strategy="best", current_refused=True, exclude={"3"}
+            )
+
+        assert result is None
+        assert "refused requests on Account-3" in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
 
     def test_with_no_candidate_it_reports_not_switched_and_writes_no_credential(
         self, temp_home
@@ -22521,6 +22545,66 @@ class TestSwitchRefusedMarksTheAccountItLeft:
 
         assert result["switched"] is True
         assert result["to"]["number"] == 1
+
+
+class TestTheAutomatedPickSkipsARefusedSlot:
+    """`_select_best_switchable` on the automated entries (`current_at_limit`
+    or `current_refused`) does not hand the session an account whose
+    `refused_until` mark is still live, unless nothing else is left. A `best`
+    switch with neither flag has no such bar."""
+
+    IDENT = TestSwitchRefusedMarksTheAccountItLeft.IDENT
+    # Slot 2 is the marked one and reads best; slot 3 is healthy with less.
+    USAGE = {
+        "1": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
+        "2": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 0.0}},
+        "3": {"five_hour": {"pct": 60.0}, "seven_day": {"pct": 0.0}},
+    }
+    ENTRIES = [{"current_at_limit": True}, {"current_refused": True}]
+
+    def _marked(self, temp_home):
+        s = TestSwitchRefusedMarksTheAccountItLeft()._seed_three(temp_home)
+        s._usage_store.mark_refused("2", {"2": self.IDENT["2"]})
+        return s
+
+    def _switch(self, s, usage=None, **entry):
+        with patch.object(
+            s, "_usage_by_account", return_value=usage or self.USAGE
+        ), patch("claude_swap.oauth.probe_oauth_profile_live", return_value=True):
+            return s.switch(strategy="best", json_output=True, **entry)
+
+    @pytest.mark.parametrize("entry", ENTRIES)
+    def test_it_lands_on_the_healthy_slot_not_the_one_marked_seconds_ago(
+        self, temp_home, entry
+    ):
+        s = self._marked(temp_home)
+
+        result = self._switch(s, **entry)
+
+        assert result["switched"] is True
+        assert result["to"]["number"] == 3
+
+    @pytest.mark.parametrize("entry", ENTRIES)
+    def test_with_only_the_marked_slot_left_it_still_lands_there(
+        self, temp_home, entry
+    ):
+        s = self._marked(temp_home)
+        # Barring "2" leaves only a spent "3": that reads "exhausted", so the
+        # pick has to release the bar rather than strand the session.
+        usage = {
+            **self.USAGE,
+            "3": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0}},
+        }
+
+        result = self._switch(s, usage, **entry)
+
+        assert result["switched"] is True
+        assert result["to"]["number"] == 2
+
+    def test_a_best_switch_with_no_escape_flag_is_not_barred(self, temp_home):
+        s = self._marked(temp_home)
+
+        assert self._switch(s)["to"]["number"] == 2
 
 
 class TestSwitchExcludeNeverLandsOnAnObservedWall:
