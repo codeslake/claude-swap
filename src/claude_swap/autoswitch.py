@@ -1072,10 +1072,9 @@ def _every_account_above_threshold(
     """Whether the active account AND every measured candidate are at or over
     the threshold (a candidate's own, from ``bars``, when it has one) — the
     state where "land somewhere healthy" has no answer. The ACTIVE must be past
-    the strategy's threshold AND its own line (``active_bar``) when that is
+    the strategy's threshold AND its own line (``active_bar``), whichever is
     higher: an account under its own line is not in trouble, and recovery
-    ranking must not pull it onto a peer with less room. Its own line BELOW the
-    strategy's changes nothing here: merely past it, the active stays.
+    ranking must not pull it onto a peer with less room.
 
     Requires the active account's own headroom to be known: without it we do
     not know we are in this state, and guessing here would relax the landing
@@ -3288,8 +3287,8 @@ class AutoSwitchEngine:
         to land: `h > 100 - settings.threshold` -- the complement of
         `_every_account_above_threshold` for a peer with no switch threshold
         of its own (deliberately kept on the raw threshold, #321, so a peer's
-        own line does not move it), not `_rank_candidates`'s own landing gate, which
-        under `dynamic` reads the wider `proactive_switch_bar_pct` bar
+        own line does not move it), not `_rank_candidates`'s own landing gate,
+        which under `dynamic` reads the wider `proactive_switch_bar_pct` bar
         instead; the two agree for every OTHER strategy, where `bar`
         hands `threshold` straight back; and (2), when the landing floor
         cannot answer, whether the peer's own binding reset is meaningfully

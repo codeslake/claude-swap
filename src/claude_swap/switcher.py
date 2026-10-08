@@ -1981,9 +1981,8 @@ class ClaudeAccountSwitcher:
             str(num): float(v)
             for num, record in accounts.items()
             # A hand edit is unset unless it is a number the setter would take
-            # (`True` is an int to isinstance, and NaN fails every comparison).
-            if not isinstance(v := record.get("switchThreshold"), bool)
-            and isinstance(v, (int, float))
+            # (an exact type test: `True` is an int; NaN fails the range).
+            if type(v := record.get("switchThreshold")) in (int, float)
             and spec.lo <= v <= spec.hi
         }
 
