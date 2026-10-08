@@ -1394,8 +1394,11 @@ class AutoSwitchEngine:
         # Per tick too: whether the active is inside the danger band, which
         # bounds `_next_delay`'s sleep (adr/0010 R2).
         self._danger_band = False
-        # Per tick too: slot -> own switch threshold, for the slots that set one.
+        # Per tick too: slot -> own switch threshold, for the slots that set
+        # one, and the headroom the active account is walled at (its own, or
+        # SPENT_HEADROOM_PCT).
         self._bars: dict[str, float] = {}
+        self._active_wall = SPENT_HEADROOM_PCT
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -1959,7 +1962,7 @@ class AutoSwitchEngine:
         # A PER-ACCOUNT SWITCH THRESHOLD (`switchThreshold`, a used-%) REPLACES
         # THE STRATEGY'S BAR FOR THAT ACCOUNT ONLY, and only where a bar is
         # applied: leaving it while it is active (`departure_pct`,
-        # `active_wall`) and refusing to land on it while it is a candidate
+        # `_active_wall`) and refusing to land on it while it is a candidate
         # (`cand_bar`, `_rank_dynamic_candidates`), because an account past
         # its own line would leave again next tick. Land bar and hold bar are
         # one number per account, so the anti-flap argument of
@@ -1972,7 +1975,7 @@ class AutoSwitchEngine:
         # own line rather than ride to the limit and pin the sessions. Unset
         # reads exactly as before. Poll cadence stays on the strategy's bar.
         self._bars = self.switcher.account_switch_thresholds()
-        active_wall = _wall_headroom(self._bars.get(current))
+        self._active_wall = _wall_headroom(self._bars.get(current))
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=self._bars.get(current, settings.threshold)
         )
@@ -2095,7 +2098,7 @@ class AutoSwitchEngine:
             utilization = 100.0 - active_headroom
             departure_pct = self._bars.get(current, settings.threshold)
             if settings.strategy == "dynamic":
-                trigger = _classify_dynamic_trigger(active_headroom, active_wall)
+                trigger = _classify_dynamic_trigger(active_headroom, self._active_wall)
             elif utilization < departure_pct:
                 if settings.strategy not in CONSUME_FIRST_STRATEGIES:
                     self._emit(
@@ -2168,7 +2171,7 @@ class AutoSwitchEngine:
         if (
             trigger in _COOLDOWN_GATED_TRIGGERS
             and not _cooldown_yields_to_the_wall(
-                settings.strategy, active_headroom, active_wall
+                settings.strategy, active_headroom, self._active_wall
             )
             and self._in_cooldown(state)
         ):
@@ -2534,7 +2537,7 @@ class AutoSwitchEngine:
                 and floor_headroom.get(current, 0.0) < settings.cold_switch_cost_pct
             )
             walled_escape = None
-            if _about_to_wall(raw_active_headroom, active_wall):
+            if _about_to_wall(raw_active_headroom, self._active_wall):
                 if blackout_escape:
                     # ONE list, warm and cold together — never `cold_
                     # ordered` alone (that left a WARM rescue invisible to
@@ -3050,7 +3053,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot, active_wall)
+                return self._perform(num, email, trigger, left_snapshot)
             status = self._freshen_target(num, email)
             if self._stop.is_set():
                 # `_freshen_target` POSTs the consume-gate refresh, the one
@@ -3090,7 +3093,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot, active_wall)
+            return self._perform(num, email, trigger, left_snapshot)
 
         if systemic or transient_failure:
             self._emit(
@@ -4383,7 +4386,6 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
-        wall: float = SPENT_HEADROOM_PCT,
     ) -> TickOutcome:
         # ASK `_stop`, NOT `dry_run`. `stop()` sets `dry_run = True` so the
         # badge cannot read " LIVE " for a dead engine; that is a DISPLAY
@@ -4432,7 +4434,7 @@ class AutoSwitchEngine:
             if (
                 trigger in _COOLDOWN_GATED_TRIGGERS
                 and not _cooldown_yields_to_the_wall(
-                    self.settings.strategy, left[0], wall
+                    self.settings.strategy, left[0], self._active_wall
                 )
                 and self._in_cooldown(state)
             ):
