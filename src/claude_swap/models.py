@@ -143,6 +143,9 @@ class AccountSnapshot:
     # RUNNING engine leaves a disabled ACTIVE on its next tick, so the explicit
     # switch holds only while auto is stopped.
     disabled: bool = False
+    # Own auto-switch threshold (used %) overriding the strategy's bar; None
+    # follows the strategy.
+    switch_threshold: float | None = None
 
     @property
     def display_tag(self) -> str:

@@ -206,7 +206,17 @@ _COOLDOWN_GATED_TRIGGERS = ("proactive", "alternation", *CONSUME_FIRST_STRATEGIE
 _FRESHEN_GATED_TRIGGERS = ("proactive", "alternation", "failover", *CONSUME_FIRST_STRATEGIES)
 
 
-def _about_to_wall(active_headroom: float | None) -> bool:
+def _wall_headroom(own_bar: float | None) -> float:
+    """The headroom `dynamic` calls walled for one account: its own switch
+    threshold (``switchThreshold``, a used-%) when it has one, else the fixed
+    ``SPENT_HEADROOM_PCT``. The one place a per-account bar becomes a wall, so
+    the land bar and the hold bar of an account stay the same number."""
+    return SPENT_HEADROOM_PCT if own_bar is None else 100.0 - own_bar
+
+
+def _about_to_wall(
+    active_headroom: float | None, wall: float = SPENT_HEADROOM_PCT
+) -> bool:
     """Whether the active account's binding headroom is at the wall.
 
     THE ONE predicate `dynamic`'s proactive-arm trigger classification and
@@ -214,11 +224,13 @@ def _about_to_wall(active_headroom: float | None) -> bool:
     is exactly the kind of two-call-site drift this file has already paid
     for once (see ``_dynamic_active_headroom``'s docstring).
     """
-    return (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
+    return (active_headroom or 0.0) <= wall
 
 
 def _cooldown_yields_to_the_wall(
-    strategy: str, active_headroom: float | None
+    strategy: str,
+    active_headroom: float | None,
+    wall: float = SPENT_HEADROOM_PCT,
 ) -> bool:
     """Whether the anti-flap cooldown must stand aside (adr/0010 R1).
 
@@ -256,7 +268,7 @@ def _cooldown_yields_to_the_wall(
     return (
         strategy == "dynamic"
         and active_headroom is not None
-        and _about_to_wall(active_headroom)
+        and _about_to_wall(active_headroom, wall)
     )
 
 
@@ -272,7 +284,9 @@ def _walled_may_take_any_room(about_to_wall: bool, candidate_headroom: float) ->
     return about_to_wall and candidate_headroom > SPENT_HEADROOM_PCT
 
 
-def _classify_dynamic_trigger(active_headroom: float) -> str:
+def _classify_dynamic_trigger(
+    active_headroom: float, wall: float = SPENT_HEADROOM_PCT
+) -> str:
     """`dynamic`'s own trigger classification (#375 item 1): drop the bare
     threshold, `_about_to_wall` (SPENT_HEADROOM_PCT) is the only bar left
     for the proactive arm; a mutant restoring the pre-#375 bare-threshold
@@ -280,7 +294,7 @@ def _classify_dynamic_trigger(active_headroom: float) -> str:
     """
     if active_headroom <= 0:
         return "at-limit"
-    if _about_to_wall(active_headroom):
+    if _about_to_wall(active_headroom, wall):
         return "proactive"
     # Resolved by the caller, once `oauth_candidates` exists — either
     # `alternation` or a `below-threshold` NO_ACTION.
@@ -305,6 +319,7 @@ def _rank_dynamic_candidates(
     now: float,
     last_active_at: dict,
     cache_ttl_seconds: float,
+    bars: dict[str, float] | None = None,
 ) -> tuple[list[str], list[str]]:
     """WARM-tiered candidates for a `dynamic` proactive/alternation switch
     (#375 item 3), each tier soonest-weekly-reset first (`dynamic`'s own
@@ -335,7 +350,9 @@ def _rank_dynamic_candidates(
     cold: list[tuple[tuple, str]] = []
     for num in oauth_candidates:
         h = headroom.get(num)
-        if h is None or h <= SPENT_HEADROOM_PCT:
+        # A candidate past its OWN switch threshold (`bars`) is as unlandable
+        # as a spent one: it would leave again on the next tick.
+        if h is None or h <= _wall_headroom((bars or {}).get(num)):
             continue
         reset_ts = _seven_day_reset_ts(usage.get(num), now)
         key = (reset_ts if reset_ts is not None else float("inf"), -h)
@@ -1048,9 +1065,14 @@ def _every_account_above_threshold(
     headroom: dict[str, float | None],
     active_headroom: float | None,
     threshold: float,
+    bars: dict[str, float] | None = None,
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
-    the threshold — the state where "land somewhere healthy" has no answer.
+    the threshold (a candidate's own, from ``bars``, when it has one) — the
+    state where "land somewhere healthy" has no answer. The ACTIVE is held to
+    the strategy's threshold alone: an account that merely passed its own soft
+    line is not in trouble, and recovery ranking must not pull it onto a peer
+    with less room.
 
     Requires the active account's own headroom to be known: without it we do
     not know we are in this state, and guessing here would relax the landing
@@ -1060,10 +1082,10 @@ def _every_account_above_threshold(
     """
     if active_headroom is None or (100.0 - active_headroom) < threshold:
         return False
-    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    measured = {n: headroom[n] for n in candidates if headroom.get(n) is not None}
     if not measured:
         return False
-    return all((100.0 - h) >= threshold for h in measured)
+    return all((100.0 - h) >= (bars or {}).get(n, threshold) for n, h in measured.items())
 
 
 def _ref(number: str, email: str) -> dict:
@@ -1372,6 +1394,8 @@ class AutoSwitchEngine:
         # Per tick too: whether the active is inside the danger band, which
         # bounds `_next_delay`'s sleep (adr/0010 R2).
         self._danger_band = False
+        # Per tick too: slot -> own switch threshold, for the slots that set one.
+        self._bars: dict[str, float] = {}
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -1932,8 +1956,25 @@ class AutoSwitchEngine:
         if self._stop.is_set():
             raise _EngineStopped()
 
+        # A PER-ACCOUNT SWITCH THRESHOLD (`switchThreshold`, a used-%) REPLACES
+        # THE STRATEGY'S BAR FOR THAT ACCOUNT ONLY, and only where a bar is
+        # applied: leaving it while it is active (`departure_pct`,
+        # `active_wall`) and refusing to land on it while it is a candidate
+        # (`cand_bar`, `_rank_dynamic_candidates`), because an account past
+        # its own line would leave again next tick. Land bar and hold bar are
+        # one number per account, so the anti-flap argument of
+        # `_cooldown_yields_to_the_wall` holds per account. It is a bar, not a
+        # ranking: the strategy still orders candidates (`consume-first` and
+        # `dynamic`: soonest weekly reset), so an 80 beside peers at the
+        # default means "use this one last", not "first". And a preference,
+        # not a veto: an active at the real wall, or a fleet entirely past its
+        # lines (`_every_account_above_threshold`), still takes a peer past its
+        # own line rather than ride to the limit and pin the sessions. Unset
+        # reads exactly as before. Poll cadence stays on the strategy's bar.
+        self._bars = self.switcher.account_switch_thresholds()
+        active_wall = _wall_headroom(self._bars.get(current))
         entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
+            current, quarantined, threshold=self._bars.get(current, settings.threshold)
         )
         self._emit(
             PollEvent(
@@ -2052,9 +2093,9 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            departure_pct = settings.threshold
+            departure_pct = self._bars.get(current, settings.threshold)
             if settings.strategy == "dynamic":
-                trigger = _classify_dynamic_trigger(active_headroom)
+                trigger = _classify_dynamic_trigger(active_headroom, active_wall)
             elif utilization < departure_pct:
                 if settings.strategy not in CONSUME_FIRST_STRATEGIES:
                     self._emit(
@@ -2064,7 +2105,7 @@ class AutoSwitchEngine:
                             # display an impossible "100% < 99.9%".
                             detail=(
                                 f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                                f"{pct_label(departure_pct)}%"
                             ),
                         )
                     )
@@ -2126,7 +2167,9 @@ class AutoSwitchEngine:
 
         if (
             trigger in _COOLDOWN_GATED_TRIGGERS
-            and not _cooldown_yields_to_the_wall(settings.strategy, active_headroom)
+            and not _cooldown_yields_to_the_wall(
+                settings.strategy, active_headroom, active_wall
+            )
             and self._in_cooldown(state)
         ):
             self._emit(NoSwitchEvent(reason="cooldown"))
@@ -2199,17 +2242,26 @@ class AutoSwitchEngine:
             no_return = self._no_return_account(
                 "proactive", state, hroom, active_h, recovered, settings, current,
             )
-            barred = [n for n in cands if n != no_return]
-            warm, cold = _rank_dynamic_candidates(
-                barred, hroom, usage, at_now, last_active_at,
-                settings.cache_ttl_seconds,
-            )
+
+            def rank(pool):
+                warm, cold = _rank_dynamic_candidates(
+                    pool, hroom, usage, at_now, last_active_at,
+                    settings.cache_ttl_seconds, self._bars,
+                )
+                if not warm and not cold and _about_to_wall(active_h):
+                    # Only an active at the REAL wall lifts the peers' own
+                    # lines (see `_bars` above): one merely past its own line
+                    # stays, or two such accounts would trade places every tick.
+                    warm, cold = _rank_dynamic_candidates(
+                        pool, hroom, usage, at_now, last_active_at,
+                        settings.cache_ttl_seconds,
+                    )
+                return warm, cold
+
+            warm, cold = rank([n for n in cands if n != no_return])
             bar_active = no_return is not None
             if no_return is not None and not warm and not cold and recovered:
-                warm, cold = _rank_dynamic_candidates(
-                    cands, hroom, usage, at_now, last_active_at,
-                    settings.cache_ttl_seconds,
-                )
+                warm, cold = rank(cands)
                 bar_active = False
             return warm, cold, bar_active
 
@@ -2311,7 +2363,7 @@ class AutoSwitchEngine:
             # unchanged accounts (never "recovered").
             warm_ordered, cold_ordered = _rank_dynamic_candidates(
                 oauth_candidates, headroom, usage, now, last_active_at,
-                settings.cache_ttl_seconds,
+                settings.cache_ttl_seconds, self._bars,
             )
             # Kept alongside `warm_ordered`/`cold_ordered` (which the
             # retry below may re-rank on the UNMODELED axis): the
@@ -2341,7 +2393,7 @@ class AutoSwitchEngine:
                 unmodeled = _headroom_by_account(usage, ())
                 warm_ordered, cold_ordered = _rank_dynamic_candidates(
                     oauth_candidates, unmodeled, usage, now, last_active_at,
-                    settings.cache_ttl_seconds,
+                    settings.cache_ttl_seconds, self._bars,
                 )
                 floor_headroom = unmodeled
                 model_window_dropped = True
@@ -2482,7 +2534,7 @@ class AutoSwitchEngine:
                 and floor_headroom.get(current, 0.0) < settings.cold_switch_cost_pct
             )
             walled_escape = None
-            if _about_to_wall(raw_active_headroom):
+            if _about_to_wall(raw_active_headroom, active_wall):
                 if blackout_escape:
                     # ONE list, warm and cold together — never `cold_
                     # ordered` alone (that left a WARM rescue invisible to
@@ -2644,7 +2696,7 @@ class AutoSwitchEngine:
                     reason="below-threshold",
                     detail=(
                         f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                        f"{pct_label(departure_pct)}%"
                     ),
                 )
             )
@@ -2998,7 +3050,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(num, email, trigger, left_snapshot, active_wall)
             status = self._freshen_target(num, email)
             if self._stop.is_set():
                 # `_freshen_target` POSTs the consume-gate refresh, the one
@@ -3038,7 +3090,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(num, email, trigger, left_snapshot, active_wall)
 
         if systemic or transient_failure:
             self._emit(
@@ -3603,7 +3655,8 @@ class AutoSwitchEngine:
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates, headroom, active_headroom, settings.threshold,
+            self._bars,
         )
         # THE BINDING WINDOW, not the five-hour one. "About to stop answering"
         # is distance to the NEAREST wall, which is what `account_headroom`
@@ -3751,6 +3804,9 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
+            # This candidate's own line when it has one (see `_bars`), so the
+            # landing gate and the health tier below read the same number.
+            cand_bar = self._bars.get(num, bar)
             if h <= 0:
                 # SPENT IS NOT DISQUALIFYING WHEN NOTHING CAN SERVE. A limited
                 # session is pinned to the account it was on -- Claude Code
@@ -3838,7 +3894,7 @@ class AutoSwitchEngine:
                 # burned worse). `best`/`consume-first` keep the escape
                 # unchanged — this is additive, gated on the strategy AND on
                 # `about_to_wall`, not the strategy alone.
-                if (100.0 - h) >= bar and not (
+                if (100.0 - h) >= cand_bar and not (
                     (all_above and not dynamic_landing) or dynamic_at_limit_escape
                 ):
                     continue
@@ -4042,7 +4098,7 @@ class AutoSwitchEngine:
                 # two floors coincide by construction (`bar == 100 -
                 # SPENT_HEADROOM_PCT`) and the tiers simply agree.
                 key = consume_first_rank_key(
-                    usage.get(num), bar, now, models
+                    usage.get(num), cand_bar, now, models
                 )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
@@ -4327,6 +4383,7 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        wall: float = SPENT_HEADROOM_PCT,
     ) -> TickOutcome:
         # ASK `_stop`, NOT `dry_run`. `stop()` sets `dry_run = True` so the
         # badge cannot read " LIVE " for a dead engine; that is a DISPLAY
@@ -4375,7 +4432,7 @@ class AutoSwitchEngine:
             if (
                 trigger in _COOLDOWN_GATED_TRIGGERS
                 and not _cooldown_yields_to_the_wall(
-                    self.settings.strategy, left[0]
+                    self.settings.strategy, left[0], wall
                 )
                 and self._in_cooldown(state)
             ):

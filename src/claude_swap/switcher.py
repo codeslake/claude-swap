@@ -87,7 +87,7 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances, scan_sessions
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -1798,6 +1798,7 @@ class ClaudeAccountSwitcher:
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
         seq_data = self._get_sequence_data() or {}
+        thresholds = self.account_switch_thresholds()
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
         for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
@@ -1816,6 +1817,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    switch_threshold=thresholds.get(n),
                 )
             )
         return AccountsSnapshot(
@@ -1970,6 +1972,48 @@ class ClaudeAccountSwitcher:
                 )
         else:
             print(dimmed("  It is back in the rotation."))
+
+    def account_switch_thresholds(self) -> dict[str, float]:
+        """Slot -> own switch threshold (used %), for the slots that set one."""
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        return {
+            str(num): float(record["switchThreshold"])
+            for num, record in accounts.items()
+            if isinstance(record.get("switchThreshold"), (int, float))
+        }
+
+    def set_account_switch_threshold(self, identifier: str, pct: float | None) -> None:
+        """Give one account its own switch threshold, or (``None``) clear it.
+
+        The auto-switch engine leaves the account, and refuses to land on it,
+        at this used-% instead of the strategy's bar; every other account and
+        the strategy's ordering are untouched (see `AutoSwitchEngine._bars`).
+
+        Raises:
+            ConfigError: no accounts are managed yet, the email is ambiguous,
+                or ``pct`` is outside ``autoswitch.threshold``'s range.
+            AccountNotFoundError: identifier doesn't match any account.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+        account_num, email, _ = self.resolve_account(identifier)
+        spec = SETTING_SPECS["autoswitch.threshold"]
+        if pct is not None and not spec.lo <= pct <= spec.hi:
+            raise ConfigError(f"switch threshold must be {spec.lo:g}-{spec.hi:g}")
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        if pct is None:
+            record.pop("switchThreshold", None)
+        else:
+            record["switchThreshold"] = pct
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        print(
+            f"{accent('Set')} Account-{account_num} ({email}) switch threshold: "
+            + (f"{pct:g}%." if pct is not None else "the strategy's.")
+        )
 
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""

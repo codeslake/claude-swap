@@ -11607,6 +11607,43 @@ class TestAddAccountAlias:
 # ---------------------------------------------------------------------------
 
 
+class TestAccountSwitchThreshold:
+    """An account's own auto-switch threshold lives on its `sequence.json`
+    record, like the disabled flag, and nowhere else."""
+
+    @staticmethod
+    def _switcher(temp_home: Path) -> ClaudeAccountSwitcher:
+        helper = TestDisableEnableAccount()
+        s = helper._setup(temp_home)
+        helper._seed(s, 1, "a@example.com")
+        helper._seed(s, 2, "b@example.com")
+        return s
+
+    def test_set_persists_and_none_clears(self, temp_home, capsys):
+        s = self._switcher(temp_home)
+        s.set_account_switch_threshold("b@example.com", 80.0)
+        assert s.account_switch_thresholds() == {"2": 80.0}
+        assert s._get_sequence_data()["accounts"]["2"]["switchThreshold"] == 80.0
+        assert "switch threshold: 80%" in capsys.readouterr().out
+        s.set_account_switch_threshold("2", None)
+        assert s.account_switch_thresholds() == {}
+        assert "switchThreshold" not in s._get_sequence_data()["accounts"]["2"]
+
+    @pytest.mark.parametrize("pct", [49.9, 100.0, -1.0])
+    def test_out_of_range_is_refused_and_nothing_is_written(self, temp_home, pct):
+        s = self._switcher(temp_home)
+        with pytest.raises(ConfigError):
+            s.set_account_switch_threshold("1", pct)
+        assert s.account_switch_thresholds() == {}
+
+    def test_a_hand_edited_non_number_reads_as_unset(self, temp_home):
+        s = self._switcher(temp_home)
+        data = s._get_sequence_data()
+        data["accounts"]["1"]["switchThreshold"] = "high"
+        s._write_json(s.sequence_file, data)
+        assert s.account_switch_thresholds() == {}
+
+
 class TestDisableEnableAccount:
     """`cswap disable`/`cswap enable`: park a managed account out of automatic
     rotation without removing it. Disabled slots are skipped by the auto-switch
