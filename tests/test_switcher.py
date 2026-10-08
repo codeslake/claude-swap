@@ -11636,10 +11636,11 @@ class TestAccountSwitchThreshold:
             s.set_account_switch_threshold("1", pct)
         assert s.account_switch_thresholds() == {}
 
-    def test_a_hand_edited_non_number_reads_as_unset(self, temp_home):
+    @pytest.mark.parametrize("value", ["high", True, False, 49.9, 100.0, -1, float("nan")])
+    def test_a_hand_edited_non_number_reads_as_unset(self, temp_home, value):
         s = self._switcher(temp_home)
         data = s._get_sequence_data()
-        data["accounts"]["1"]["switchThreshold"] = "high"
+        data["accounts"]["1"]["switchThreshold"] = value
         s._write_json(s.sequence_file, data)
         assert s.account_switch_thresholds() == {}
 

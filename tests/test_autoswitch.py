@@ -16683,6 +16683,83 @@ class TestPerAccountSwitchThreshold:
         assert outcome is TickOutcome.NO_ACTION
         assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == ["cooldown"]
 
+    @staticmethod
+    def _five(h, pct, resets_in_s):
+        """5h at ``pct`` resetting ``resets_in_s`` from now; 7d at 10%."""
+        return {
+            "five_hour": {"pct": pct, "resets_at": _iso_at(h.clock.now + resets_in_s)},
+            "seven_day": {"pct": 10.0},
+        }
+
+    @pytest.mark.parametrize("strategy", ["consume-first", "best"])
+    def test_control_a_fleet_all_past_the_threshold_takes_the_recovery_axis(
+        self, temp_home, strategy
+    ):
+        h = self._harness(temp_home, strategy, threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": self._five(h, 92, 4 * 3600),
+            "2": self._five(h, 95, 600),
+            "3": self._five(h, 95, 900),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize("strategy", ["consume-first", "best", "dynamic"])
+    def test_an_active_under_its_own_higher_line_is_not_a_fleet_in_trouble(
+        self, temp_home, strategy
+    ):
+        """The control's fleet, but the active's own line (98) sits above the
+        strategy's 90: at 92 it is not past its line, so peers returning
+        sooner must not pull it onto less room."""
+        h = self._harness(temp_home, strategy, threshold=90.0)
+        self._set(h, 1, 98.0)
+        outcome = h.tick_with_usage({
+            "1": self._five(h, 92, 4 * 3600),
+            "2": self._five(h, 95, 600),
+            "3": self._five(h, 95, 900),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    @staticmethod
+    def _api_key_harness(temp_home):
+        h = EngineHarness(
+            temp_home, strategy="dynamic", threshold=98.0,
+            include_api_key_accounts=True,
+        )
+        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "key@token.local")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["3"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        return h
+
+    def test_dynamic_an_active_past_its_own_line_does_not_spend_the_metered_last_resort(
+        self, temp_home
+    ):
+        """Every OAuth peer is past its own line and the active is not at the
+        real wall (15 left): it stays, as it would with no metered slot."""
+        h = self._api_key_harness(temp_home)
+        self._set(h, 1, 80.0)
+        self._set(h, 2, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 85), "3": "api key",
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_control_dynamic_an_active_at_the_real_wall_still_spends_it(
+        self, temp_home
+    ):
+        h = self._api_key_harness(temp_home)
+        self._set(h, 1, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 98), "2": self._use(h, 99), "3": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
     def test_it_escalates_the_candidate_fetch_inside_its_own_band(self, temp_home):
         """Active at 82 reads 17 under the global 98's escalation line (83),
         so only its own 80 puts the candidates on a fresh fetch."""

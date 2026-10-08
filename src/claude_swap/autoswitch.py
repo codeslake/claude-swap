@@ -288,9 +288,10 @@ def _classify_dynamic_trigger(
     active_headroom: float, wall: float = SPENT_HEADROOM_PCT
 ) -> str:
     """`dynamic`'s own trigger classification (#375 item 1): drop the bare
-    threshold, `_about_to_wall` (SPENT_HEADROOM_PCT) is the only bar left
-    for the proactive arm; a mutant restoring the pre-#375 bare-threshold
-    shape is the digest control (`TestOutcomeDigest375`).
+    threshold, `_about_to_wall` (``wall``, SPENT_HEADROOM_PCT unless the active
+    has its own switch threshold) is the only bar left for the proactive arm;
+    a mutant restoring the pre-#375 bare-threshold shape is the digest control
+    (`TestOutcomeDigest375`).
     """
     if active_headroom <= 0:
         return "at-limit"
@@ -1066,13 +1067,15 @@ def _every_account_above_threshold(
     active_headroom: float | None,
     threshold: float,
     bars: dict[str, float] | None = None,
+    active_bar: float | None = None,
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
     the threshold (a candidate's own, from ``bars``, when it has one) — the
-    state where "land somewhere healthy" has no answer. The ACTIVE is held to
-    the strategy's threshold alone: an account that merely passed its own soft
-    line is not in trouble, and recovery ranking must not pull it onto a peer
-    with less room.
+    state where "land somewhere healthy" has no answer. The ACTIVE must be past
+    the strategy's threshold AND its own line (``active_bar``) when that is
+    higher: an account under its own line is not in trouble, and recovery
+    ranking must not pull it onto a peer with less room. Its own line BELOW the
+    strategy's changes nothing here: merely past it, the active stays.
 
     Requires the active account's own headroom to be known: without it we do
     not know we are in this state, and guessing here would relax the landing
@@ -1080,7 +1083,9 @@ def _every_account_above_threshold(
     verdict (it may be healthy, but it cannot be *chosen* either — the caller
     skips ``None`` headroom) as long as at least one candidate was measured.
     """
-    if active_headroom is None or (100.0 - active_headroom) < threshold:
+    if active_headroom is None or (100.0 - active_headroom) < max(
+        threshold, active_bar or 0.0
+    ):
         return False
     measured = {n: headroom[n] for n in candidates if headroom.get(n) is not None}
     if not measured:
@@ -2841,7 +2846,18 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger not in CONSUME_FIRST_STRATEGIES:
+        if (
+            not ordered
+            and api_key_candidates
+            and trigger not in CONSUME_FIRST_STRATEGIES
+            # `dynamic` reaches "proactive" at an account's OWN line too, where
+            # staying is a choice: only the real wall must move onto a meter.
+            and not (
+                settings.strategy == "dynamic"
+                and trigger == "proactive"
+                and not _about_to_wall(active_headroom)
+            )
+        ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
@@ -3269,9 +3285,10 @@ class AutoSwitchEngine:
         departure — there is no `leftHeadroom` to diff against and never was
         — so the two signals that do not depend on the active's LIVE state
         are (1) whether the peer, right now, would itself be a healthy place
-        to land: `h > 100 - settings.threshold` -- the exact complement of
-        `_every_account_above_threshold` (deliberately kept on the raw
-        threshold, #321), not `_rank_candidates`'s own landing gate, which
+        to land: `h > 100 - settings.threshold` -- the complement of
+        `_every_account_above_threshold` for a peer with no switch threshold
+        of its own (deliberately kept on the raw threshold, #321, so a peer's
+        own line does not move it), not `_rank_candidates`'s own landing gate, which
         under `dynamic` reads the wider `proactive_switch_bar_pct` bar
         instead; the two agree for every OTHER strategy, where `bar`
         hands `threshold` straight back; and (2), when the landing floor
@@ -3392,9 +3409,10 @@ class AutoSwitchEngine:
             # that proved it. Two legs, both read-only against CURRENT state
             # (no departure baseline exists to diff against):
             #
-            #   landing   `h > 100 - settings.threshold` -- the exact
-            #             complement of `_every_account_above_threshold`
-            #             (kept on the raw threshold, #321), NOT
+            #   landing   `h > 100 - settings.threshold` -- the complement
+            #             of `_every_account_above_threshold` for a peer with
+            #             no switch threshold of its own (kept on the raw
+            #             threshold, #321; a peer's own line is not read), NOT
             #             `_rank_candidates`'s own landing gate, which
             #             reads the wider dynamic bar under `dynamic`.
             #   recovery  the peer's binding reset is meaningfully sooner
@@ -3659,7 +3677,7 @@ class AutoSwitchEngine:
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
             oauth_candidates, headroom, active_headroom, settings.threshold,
-            self._bars,
+            self._bars, self._bars.get(current),
         )
         # THE BINDING WINDOW, not the five-hour one. "About to stop answering"
         # is distance to the NEAREST wall, which is what `account_headroom`

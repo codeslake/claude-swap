@@ -1976,10 +1976,15 @@ class ClaudeAccountSwitcher:
     def account_switch_thresholds(self) -> dict[str, float]:
         """Slot -> own switch threshold (used %), for the slots that set one."""
         accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        spec = SETTING_SPECS["autoswitch.threshold"]
         return {
-            str(num): float(record["switchThreshold"])
+            str(num): float(v)
             for num, record in accounts.items()
-            if isinstance(record.get("switchThreshold"), (int, float))
+            # A hand edit is unset unless it is a number the setter would take
+            # (`True` is an int to isinstance, and NaN fails every comparison).
+            if not isinstance(v := record.get("switchThreshold"), bool)
+            and isinstance(v, (int, float))
+            and spec.lo <= v <= spec.hi
         }
 
     def set_account_switch_threshold(self, identifier: str, pct: float | None) -> None:
