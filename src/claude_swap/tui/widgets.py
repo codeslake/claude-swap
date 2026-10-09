@@ -275,6 +275,8 @@ def account_card_text(
             text.append(" (not applying)", style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
+    if acc.switch_threshold is not None:
+        text.append(f"   (switch at {acc.switch_threshold:g}%)", style=palette.muted)
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
@@ -391,7 +393,7 @@ def _mini_marks(
     acc: AccountSnapshot, ahead: bool, cloud_pinned: bool, palette: Palette
 ) -> Text:
     """The row's one trailing marker field: ``(ahead)``, ``○ cloud``,
-    ``(not applying)``, ``(disabled)``, whichever apply, in that order."""
+    ``(not applying)``, ``(disabled)``, ``(switch at N%)``, whichever apply, in that order."""
     marks = [Text("(ahead)", style=palette.sev_warn)] if ahead else []
     if cloud_pinned:
         # Labelled, like the full card: a bare glyph sitting between the
@@ -401,6 +403,8 @@ def _mini_marks(
             marks.append(Text("(not applying)", style=f"bold {palette.sev_crit}"))
     if acc.disabled:
         marks.append(Text("(disabled)", style=palette.muted))
+    if acc.switch_threshold is not None:
+        marks.append(Text(f"(switch at {acc.switch_threshold:g}%)", style=palette.muted))
     return Text(" ").join(marks)
 
 
@@ -554,7 +558,7 @@ def mini_account_text(
     ``2  work@acme.dev  login 5h07m  [personal]  5h(⟳2h28m): 92%  7d(⟳3d04h): 63%  Fable(⟳?):100% (!)  $$ 40% · $4.00 / $10.00  (ahead) ○ cloud (disabled)``
     — slot, name, login, tag, one cell per window, the spend cell, then ONE
     trailing field of markers (``(ahead)``, ``○ cloud``, ``(not applying)``,
-    ``(disabled)``, whichever apply, in that order). Pcts only, severity
+    ``(disabled)``, ``(switch at N%)``, whichever apply, in that order). Pcts only, severity
     colored; each window reads as the same chip the auto view draws, padded
     so its pct starts at one column, and a maxed per-model window carries
     ``(!)``. A window the account lacks is a blank cell, and a sentinel

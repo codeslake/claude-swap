@@ -20058,3 +20058,277 @@ class TestARefusedAccountIsBarredFromTheEnginesPick:
         assert not reasons or harness.events[-1] is holds[-1]
         if reasons == ["account-refused"]:
             assert "Account-1" in holds[0].detail
+
+
+class TestPerAccountSwitchThreshold:
+    """An account's own switch threshold replaces the strategy's bar for THAT
+    account only, and composes with the strategy's ordering.
+
+    The field is seeded straight into the roster (not through the setter), so
+    a red run is the engine ignoring it rather than a missing method.
+    """
+
+    @staticmethod
+    def _set(h, num, pct):
+        data = h.switcher._get_sequence_data()
+        data["accounts"][str(num)]["switchThreshold"] = pct
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+    @staticmethod
+    def _use(h, pct, resets_in_s=None):
+        """5h at ``pct``; 7d at 10% resetting ``resets_in_s`` from now."""
+        window = {"pct": 10.0}
+        if resets_in_s is not None:
+            window["resets_at"] = _iso_at(h.clock.now + resets_in_s)
+        return {"five_hour": {"pct": pct}, "seven_day": window}
+
+    @staticmethod
+    def _harness(temp_home, strategy, threshold=98.0):
+        h = EngineHarness(temp_home, strategy=strategy, threshold=threshold)
+        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        return h
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first", "best"])
+    def test_the_active_leaves_at_its_own_threshold(self, temp_home, strategy):
+        h = self._harness(temp_home, strategy)
+        self._set(h, 1, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 50), "3": self._use(h, 50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert [e.trigger for e in h.events if e.kind == "switch"] == ["proactive"]
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first", "best"])
+    def test_control_without_the_field_the_active_stays(self, temp_home, strategy):
+        h = self._harness(temp_home, strategy)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 50), "3": self._use(h, 50),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
+    def test_a_peer_over_its_own_threshold_is_not_landed_on(self, temp_home, strategy):
+        h = self._harness(temp_home, strategy)
+        self._set(h, 2, 70.0)
+        # The active is walled at the default line. 2 resets soonest and has
+        # room, but sits over its own 70; 3 is the only peer under its line.
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 99, 9 * 86400),
+            "2": self._use(h, 75, 1 * 86400),
+            "3": self._use(h, 50, 5 * 86400),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
+    def test_a_peer_over_its_own_threshold_is_no_landing_for_a_merely_past_its_line_active(
+        self, temp_home, strategy
+    ):
+        """The only peer with room sits over its own 70 (and 3 is walled): an
+        active that merely passed its own 80 stays rather than hop onto it."""
+        h = self._harness(temp_home, strategy)
+        self._set(h, 1, 80.0)
+        self._set(h, 2, 70.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85, 9 * 86400),
+            "2": self._use(h, 75, 1 * 86400),
+            "3": self._use(h, 99, 5 * 86400),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
+    def test_control_without_a_peer_threshold_the_soonest_reset_wins(
+        self, temp_home, strategy
+    ):
+        h = self._harness(temp_home, strategy)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 99, 9 * 86400),
+            "2": self._use(h, 75, 1 * 86400),
+            "3": self._use(h, 50, 5 * 86400),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
+    def test_the_soonest_reset_ordering_is_unchanged(self, temp_home, strategy):
+        h = self._harness(temp_home, strategy)
+        self._set(h, 1, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85, 9 * 86400),
+            "2": self._use(h, 40, 5 * 86400),
+            "3": self._use(h, 60, 2 * 86400),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, "the sooner weekly reset still wins"
+
+    def test_an_own_threshold_above_the_strategys_keeps_the_account_landable(
+        self, temp_home
+    ):
+        """The bar replaces the strategy's in BOTH directions: 2 sits over the
+        strategy's 90 but under its own 98, so it still competes on reset."""
+        h = self._harness(temp_home, "consume-first", threshold=90.0)
+        self._set(h, 2, 98.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 95, 9 * 86400),
+            "2": self._use(h, 92, 1 * 86400),
+            "3": self._use(h, 50, 5 * 86400),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
+    def test_a_walled_active_still_takes_a_peer_over_its_own_threshold(
+        self, temp_home, strategy
+    ):
+        """A threshold is a preference, not a veto: the last peer with room is
+        taken before the active walls, not after."""
+        h = self._harness(temp_home, strategy)
+        self._set(h, 2, 70.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 99, 9 * 86400),
+            "2": self._use(h, 75, 5 * 86400),
+            "3": self._use(h, 99, 5 * 86400),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_dynamic_two_accounts_past_their_own_line_do_not_trade_places(
+        self, temp_home
+    ):
+        """Only an active at the REAL wall lifts a peer's own line, or two
+        accounts past theirs would swap every tick (the cooldown yields to an
+        account's own wall)."""
+        h = self._harness(temp_home, "dynamic")
+        self._set(h, 1, 80.0)
+        self._set(h, 2, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 85), "3": self._use(h, 99),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_dynamic_cooldown_yields_at_the_accounts_own_line(self, temp_home):
+        """Land bar and hold bar are one number per account, so the cooldown
+        yields at the account's own line exactly as it does at the default."""
+        h = self._harness(temp_home, "dynamic")
+        self._set(h, 1, 80.0)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 10))
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 50), "3": self._use(h, 50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_control_cooldown_still_holds_a_default_active_at_its_threshold(
+        self, temp_home
+    ):
+        h = self._harness(temp_home, "consume-first", threshold=80.0)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 10))
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 50), "3": self._use(h, 50),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == ["cooldown"]
+
+    @staticmethod
+    def _five(h, pct, resets_in_s):
+        """5h at ``pct`` resetting ``resets_in_s`` from now; 7d at 10%."""
+        return {
+            "five_hour": {"pct": pct, "resets_at": _iso_at(h.clock.now + resets_in_s)},
+            "seven_day": {"pct": 10.0},
+        }
+
+    @pytest.mark.parametrize("strategy", ["consume-first", "best"])
+    def test_control_a_fleet_all_past_the_threshold_takes_the_recovery_axis(
+        self, temp_home, strategy
+    ):
+        h = self._harness(temp_home, strategy, threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": self._five(h, 92, 4 * 3600),
+            "2": self._five(h, 95, 600),
+            "3": self._five(h, 95, 900),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize("strategy", ["consume-first", "best", "dynamic"])
+    def test_an_active_under_its_own_higher_line_is_not_a_fleet_in_trouble(
+        self, temp_home, strategy
+    ):
+        """The control's fleet, but the active's own line (98) sits above the
+        strategy's 90: at 92 it is not past its line, so peers returning
+        sooner must not pull it onto less room."""
+        h = self._harness(temp_home, strategy, threshold=90.0)
+        self._set(h, 1, 98.0)
+        outcome = h.tick_with_usage({
+            "1": self._five(h, 92, 4 * 3600),
+            "2": self._five(h, 95, 600),
+            "3": self._five(h, 95, 900),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    @staticmethod
+    def _api_key_harness(temp_home):
+        h = EngineHarness(
+            temp_home, strategy="dynamic", threshold=98.0,
+            include_api_key_accounts=True,
+        )
+        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "key@token.local")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["3"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        return h
+
+    def test_dynamic_an_active_past_its_own_line_does_not_spend_the_metered_last_resort(
+        self, temp_home
+    ):
+        """Every OAuth peer is past its own line and the active is not at the
+        real wall (15 left): it stays, as it would with no metered slot."""
+        h = self._api_key_harness(temp_home)
+        self._set(h, 1, 80.0)
+        self._set(h, 2, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 85), "3": "api key",
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_control_dynamic_an_active_at_the_real_wall_still_spends_it(
+        self, temp_home
+    ):
+        h = self._api_key_harness(temp_home)
+        self._set(h, 1, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 98), "2": self._use(h, 99), "3": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_it_escalates_the_candidate_fetch_inside_its_own_band(self, temp_home):
+        """Active at 82 reads 17 under the global 98's escalation line (83),
+        so only its own 80 puts the candidates on a fresh fetch."""
+        h = self._harness(temp_home, "consume-first")
+        self._set(h, 1, 80.0)
+        entries = {
+            n: _entry_for(v, h.clock.now)
+            for n, v in {
+                "1": self._use(h, 82), "2": self._use(h, 50), "3": self._use(h, 50),
+            }.items()
+        }
+        fetch_sets: list[set] = []
+
+        def spying(*args, **kwargs):
+            fetch_sets.append(set(kwargs.get("fetch") or ()))
+            return entries
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=spying):
+            h.engine.tick()
+        assert {"2", "3"} <= set().union(*fetch_sets), fetch_sets

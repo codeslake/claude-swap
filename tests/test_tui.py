@@ -94,6 +94,7 @@ def make_account(
     # `pin.account_is_pinned` -- so nothing rendered that pair.
     org_uuid: str = "",
     access_token_fp: str | None = None,
+    switch_threshold: float | None = None,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -107,6 +108,7 @@ def make_account(
         alias=alias,
         disabled=disabled,
         access_token_fp=access_token_fp,
+        switch_threshold=switch_threshold,
     )
 
 
@@ -200,6 +202,16 @@ class FakeSwitcher:
         ]
         verb = "Disabled" if disabled else "Enabled"
         print(f"{verb} Account-{identifier}")
+
+    def set_account_switch_threshold(self, identifier: str, pct: float | None) -> None:
+        self.calls.append(("set_threshold", str(identifier), pct))
+        self._accounts = [
+            dataclasses.replace(a, switch_threshold=pct)
+            if a.number == str(identifier)
+            else a
+            for a in self._accounts
+        ]
+        print(f"Set Account-{identifier} switch threshold")
 
     def add_account(self, slot: int | None = None, assume_yes: bool = False) -> None:
         self.calls.append(("add", slot, assume_yes))
@@ -1378,6 +1390,24 @@ class TestDashboard:
             # both the active card and the mini row carry the marker
             assert panel.count("(disabled)") == 2
 
+    async def test_switch_threshold_marker_on_active_card_and_mini(self, tmp_path):
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, switch_threshold=80.0),
+                make_account(2, switch_threshold=85.0),
+                make_account(3),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountsPanel
+
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            assert "switch at 80%" in panel and "switch at 85%" in panel
+            assert panel.count("switch at") == 2  # the strategy-default one is unmarked
+
     async def test_active_card_skips_absent_window_and_shows_scoped(self, tmp_path):
         fake = FakeSwitcher(
             [
@@ -1643,6 +1673,7 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
+                "threshold-menu",
                 # No "pin-menu": pinned False above, not left to sys.path.
                 "remove-menu",
                 "theme-menu",
@@ -1895,6 +1926,45 @@ class TestDashboard:
             await menu_select(pilot, "disable:2")
             await settle(pilot)
             assert ("set_disabled", "2", False) in fake.calls
+
+    async def test_threshold_menu_sets_and_clears_an_accounts_own_threshold(
+        self, tmp_path
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2, switch_threshold=85.0)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from textual.widgets import ListView, Static
+
+            from claude_swap.tui.widgets import MenuItem
+
+            def labels():
+                menu = app.screen.query_one("#menu", ListView)
+                return [
+                    item.query_one(Static).render().plain
+                    for item in menu.query(MenuItem)
+                ]
+
+            await menu_select(pilot, "threshold-menu")
+            rows = labels()
+            assert any("2" in r and "85%" in r for r in rows), rows
+            assert any("1" in r and "strategy" in r for r in rows), rows
+            await menu_select(pilot, "threshold:1")
+            await menu_select(pilot, "set-threshold:1:80")
+            await settle(pilot)
+            assert ("set_threshold", "1", 80.0) in fake.calls
+            # back at the root, not stranded in the submenu
+            menu = app.screen.query_one("#menu", ListView)
+            assert [i.action_id for i in menu.query(MenuItem)][0] == "switch"
+
+            await menu_select(pilot, "threshold-menu")
+            await menu_select(pilot, "threshold:2")
+            await menu_select(pilot, "set-threshold:2:default")
+            await settle(pilot)
+            assert ("set_threshold", "2", None) in fake.calls
 
     async def test_modal_arrow_keys_choose_button(self, tmp_path):
         fake = FakeSwitcher(
@@ -3479,6 +3549,24 @@ class TestAccountsSnapshot:
         assert all(not acc.switchable for acc in snap.accounts)
         assert all(acc.usage.sentinel is not None for acc in snap.accounts)
         assert isinstance(snap.taken_at, float)
+
+    def test_snapshot_carries_an_accounts_own_switch_threshold(
+        self, temp_home, mock_claude_config
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["sequence"] = [1, 2]
+        data["accounts"] = {
+            "1": {"email": "test@example.com", "uuid": "test-uuid-1234"},
+            "2": {"email": "other@example.com", "uuid": "uuid-2"},
+        }
+        switcher._write_json(switcher.sequence_file, data)
+        switcher.set_account_switch_threshold("2", 85.0)
+
+        snap = switcher.accounts_snapshot(fetch=set())
+        assert [acc.switch_threshold for acc in snap.accounts] == [None, 85.0]
 
 
 # ---------------------------------------------------------------------------

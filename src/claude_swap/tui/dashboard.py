@@ -191,6 +191,7 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
+            ("Switch threshold…", "threshold-menu"),
             # Only when the extra is installed — OR when a wiring it left
             # behind is still in .claude.json. A user who never asked for the
             # pin should not see a row for it; one who installs it while the
@@ -271,6 +272,27 @@ class DashboardScreen(Screen):
             entries.append(
                 (f"{acc.number}  {name}{state}   {action}", f"disable:{acc.number}")
             )
+        entries.append(_BACK)
+        return entries
+
+    def _threshold_entries(self) -> MenuEntries:
+        """One row per account with the threshold it switches at."""
+        snap = self.app.snapshot
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            own = acc.switch_threshold
+            state = "strategy's" if own is None else f"{own:g}%"
+            entries.append((f"{acc.number}  {name}   {state}", f"threshold:{acc.number}"))
+        entries.append(_BACK)
+        return entries
+
+    @staticmethod
+    def _threshold_value_entries(number: str) -> MenuEntries:
+        entries: MenuEntries = [("strategy's threshold", f"set-threshold:{number}:default")]
+        entries += [
+            (f"{pct}%", f"set-threshold:{number}:{pct}") for pct in (80, 85, 90, 95, 98)
+        ]
         entries.append(_BACK)
         return entries
 
@@ -470,6 +492,16 @@ class DashboardScreen(Screen):
         elif action_id.startswith("disable:"):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
+            await self._pop_menu()
+        elif action_id == "threshold-menu":
+            await self._push_menu("switch threshold", self._threshold_entries())
+        elif action_id.startswith("threshold:"):
+            number = action_id.split(":", 1)[1]
+            await self._push_menu(f"account {number}", self._threshold_value_entries(number))
+        elif action_id.startswith("set-threshold:"):
+            _, number, value = action_id.split(":")
+            app.do_set_switch_threshold(number, None if value == "default" else float(value))
+            await self._pop_menu()
             await self._pop_menu()
         elif action_id == "pin-menu":
             await self._push_menu(

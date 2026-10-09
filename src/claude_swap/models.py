@@ -159,6 +159,9 @@ class AccountSnapshot:
     # unreadable — see oauth.login_expires_at_epoch. Feeds the "login Xd Yh"
     # countdown every account view shows.
     login_expires_at: float | None = None
+    # Own auto-switch threshold (used %) overriding the strategy's bar; None
+    # follows the strategy.
+    switch_threshold: float | None = None
 
     @property
     def display_tag(self) -> str:
