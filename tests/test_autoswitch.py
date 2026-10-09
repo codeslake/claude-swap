@@ -6144,9 +6144,9 @@ class TestAModelWindowIsNotABlackout:
     ):
         """The additive contract is at the `PollEvent` class level, not the
         engine's: a hand-built event that never sets `switch_bar` omits the
-        key, but the engine (autoswitch.py:1872) always passes
-        `switch_bar=proactive_switch_bar_pct(strategy, threshold)`, and
-        that function returns the raw `threshold` unchanged for every
+        key, but the engine always passes `switch_bar`, the active's own line
+        or else `proactive_switch_bar_pct(strategy, threshold)`, and that
+        function returns the raw `threshold` unchanged for every
         non-`dynamic` strategy — so a real `best`/`consume-first` poll DOES
         carry `switchBar`, equal to `threshold`. Additive and harmless (a
         UI reading only `threshold` sees nothing new), but the payload
@@ -20332,3 +20332,59 @@ class TestPerAccountSwitchThreshold:
         with patch.object(h.switcher, "usage_entries_by_account", side_effect=spying):
             h.engine.tick()
         assert {"2", "3"} <= set().union(*fetch_sets), fetch_sets
+
+    @pytest.mark.parametrize(
+        "strategy, own, shown",
+        [
+            ("dynamic", 90.0, 90.0),
+            ("dynamic", 99.0, 99.0),
+            ("dynamic", None, 97.0),
+            ("best", 80.0, 80.0),
+            ("best", None, 98.0),
+        ],
+    )
+    def test_the_poll_states_the_actives_own_bar(
+        self, temp_home, strategy, own, shown
+    ):
+        """The state line's "(switch at N%)" and the JSON `switchBar` are the
+        number the trigger compares the active against, which is its OWN line
+        when it has one: a reader checking usage against the logged bar would
+        otherwise take a refusal at 91% over a line of 90 for healthy."""
+        h = self._harness(temp_home, strategy)
+        if own is not None:
+            self._set(h, 1, own)
+        h.tick_with_usage({
+            "1": self._use(h, 50), "2": self._use(h, 50), "3": self._use(h, 50),
+        })
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.to_json()["switchBar"] == shown
+        assert f"switch at {pct_label(shown)}%" in poll.human()
+
+    @staticmethod
+    def _seven(pct):
+        return {"five_hour": {"pct": 5.0}, "seven_day": {"pct": pct}}
+
+    def test_a_peer_is_labelled_at_its_landing_bar_not_the_actives_line(
+        self, temp_home
+    ):
+        """Peer 2 at 7d 95% sits under dynamic's 97 and the engine lands on
+        it; the active's own 90 must not make the log call it "7d full"."""
+        h = self._harness(temp_home, "dynamic")
+        self._set(h, 1, 90.0)
+        h.tick_with_usage({
+            "1": self._use(h, 60), "2": self._seven(95.0), "3": self._use(h, 50),
+        })
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "#2: 5h 5% · 7d 95%" in poll.human()
+        assert "full" not in poll.human()
+
+    def test_a_peer_with_its_own_line_is_labelled_full_past_it(self, temp_home):
+        """The engine refuses to land on peer 2 past its own 70, so the log
+        says why, rather than reading it at the strategy's 98."""
+        h = self._harness(temp_home, "best")
+        self._set(h, 2, 70.0)
+        h.tick_with_usage({
+            "1": self._use(h, 60), "2": self._seven(75.0), "3": self._use(h, 50),
+        })
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "#2: 5h 5% · 7d 75% (7d full)" in poll.human()

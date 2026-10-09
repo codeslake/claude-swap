@@ -828,9 +828,14 @@ class PollEvent(AutoSwitchEvent):
     active: dict | None  # account_ref shape, or None
     headroom: dict[str, float | None]  # account number → headroom pct (None=unknown)
     threshold: float
-    # The used-% the proactive arm actually fires at (`proactive_switch_bar_pct`).
-    # Additive field: absent (None) callers fall back to `threshold` below.
+    # The used-% the ACTIVE account is left at: its own switch threshold when
+    # it has one, else `proactive_switch_bar_pct`. Additive field: absent
+    # (None) callers fall back to `threshold` below.
     switch_bar: float | None = None
+    # account number → the used-% a candidate is refused at (its own switch
+    # threshold, else the strategy's bar), for `_describe`. Not serialized;
+    # a number it lacks falls back to `switch_bar`.
+    landing_bars: dict[str, float] = field(default_factory=dict)
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
     # accounts whose usage is unknown this tick. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
@@ -870,12 +875,15 @@ class PollEvent(AutoSwitchEvent):
             # WHAT actually blocks this candidate — a full 5h/7d block, or
             # only its pinned model's window (which the engine's fallback in
             # `_rank_candidates` can rank around; see `classify_candidate_block`).
-            # Same fallback as `human()` below (#321): `switch_bar`, the
-            # strategy-aware landing bar, when the event carries one, never
-            # the raw `threshold` alone under `dynamic`.
+            # This candidate's own landing bar (#321), else the same fallback
+            # as `human()` below: `switch_bar`, never the raw `threshold`
+            # alone under `dynamic`.
             kind, model = classify_candidate_block(
                 wins.items(),
-                self.switch_bar if self.switch_bar is not None else self.threshold,
+                self.landing_bars.get(
+                    num,
+                    self.switch_bar if self.switch_bar is not None else self.threshold,
+                ),
             )
             if kind == "full":
                 text += f" ({model} full)"
@@ -2651,14 +2659,14 @@ class AutoSwitchEngine:
             LoginRestoreOutcome.RESTORED, LoginRestoreOutcome.WAITING,
         ):
             return TickOutcome.NO_ACTION
+        bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
-                switch_bar=proactive_switch_bar_pct(
-                    settings.strategy, settings.threshold
-                ),
+                switch_bar=self._bars.get(current, bar),
+                landing_bars={num: self._bars.get(num, bar) for num in headroom},
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
