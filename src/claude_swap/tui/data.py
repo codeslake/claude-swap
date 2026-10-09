@@ -447,7 +447,7 @@ def rank_switch_candidates(
         headroom = _headroom_by_account(usage, axis)
         warm, cold = _rank_dynamic_candidates(
             oauth_candidates, headroom, usage, now, last_active_at or {},
-            settings.cache_ttl_seconds, reasons,
+            settings.cache_ttl_seconds, reasons=reasons,  # by name: `bars` (#321) precedes it
         )
         if trigger == "proactive":
             cold_floor = settings.cold_switch_cost_pct
