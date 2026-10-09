@@ -2568,6 +2568,54 @@ class TestOrderedAccounts:
         assert order[1:] == _autoview_order(snap, "1", _ORDER_SETTINGS)
 
 
+class TestNextBestReadsEachAccountsOwnLine:
+    """The panel ranks and labels on each account's own switch threshold
+    (`AccountSnapshot.switch_threshold`, #321), as the tick does."""
+
+    @staticmethod
+    def _rank(strategy, *accounts):
+        snap = AccountsSnapshot(accounts=list(accounts), active_number="1", taken_at=0.0)
+        reasons: dict = {}
+        ordered, _axis, trigger, _unmodeled = tui_data.rank_switch_candidates(
+            snap, AutoSwitchSettings(strategy=strategy, threshold=98.0),
+            time.time(), "1", None, reasons,
+        )
+        return ordered, trigger, reasons
+
+    def test_a_peer_past_its_own_line_is_not_listed(self):
+        """2 sits at 85% used: open under the strategy's 98, closed past its own 80."""
+        ordered, _, reasons = self._rank(
+            "dynamic",
+            make_account(1, active=True, entry=make_entry(50.0, 50.0)),
+            make_account(2, entry=make_entry(85.0, 5.0), switch_threshold=80.0),
+            make_account(3, entry=make_entry(85.0, 5.0)),
+        )
+        assert (ordered, reasons) == (["3"], {"2": "no headroom left"})
+
+    @pytest.mark.parametrize("strategy", ["best", "dynamic"])
+    def test_an_active_past_its_own_line_is_previewed(self, strategy):
+        """The active at 85% used is under the strategy's 98 (`below-threshold`, nothing
+        previewed) but past its own 80: the tick leaves it, for 2 and not for 3, which
+        sits past its own 30."""
+        ordered, trigger, _ = self._rank(
+            strategy,
+            make_account(1, active=True, entry=make_entry(85.0, 5.0), switch_threshold=80.0),
+            make_account(2, entry=make_entry(5.0, 5.0)),
+            make_account(3, entry=make_entry(60.0, 5.0), switch_threshold=30.0),
+        )
+        assert (trigger, ordered) == ("proactive", ["2"])
+
+    def test_an_active_at_the_real_wall_still_lists_a_peer_past_its_own_line(self):
+        """Only an active at the REAL wall lifts the peers' own lines (the tick's `rank`
+        retries without them): its one peer is past its own 80 and is still listed."""
+        ordered, trigger, _ = self._rank(
+            "dynamic",
+            make_account(1, active=True, entry=make_entry(98.0, 5.0)),
+            make_account(2, entry=make_entry(85.0, 5.0), switch_threshold=80.0),
+        )
+        assert (trigger, ordered) == ("proactive", ["2"])
+
+
 class TestRankSwitchReasons:
     """`reasons_out` names why the engine's own pass dropped a candidate."""
 
@@ -3850,6 +3898,7 @@ class TestUnswitchableRowsAreListed:
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
+        a.switch_threshold = None  # a real field (#321): the panel reads it, a MagicMock is not a bar
         a.login_expires_at = None
         # A real UsageEntry, not a MagicMock -- `.decision_value()` (the
         # ranking pass's own read) is real code, not an auto-mocked

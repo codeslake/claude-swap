@@ -27,12 +27,14 @@ from claude_swap import oauth, printer, usage_store
 from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     STATE_FILENAME,
+    _about_to_wall,
     _binding_recovery_ts,
     _classify_dynamic_trigger,
     _dynamic_active_headroom,
     _headroom_by_account,
     _model_window_binds_everywhere,
     _rank_dynamic_candidates,
+    _wall_headroom,
     rank_candidates_pass,
 )
 from claude_swap.exceptions import ClaudeSwitchError
@@ -377,6 +379,13 @@ def rank_switch_candidates(
     models = parse_model_names(settings.model)
     consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
     usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
+    # Each account's own switch threshold (#321's `AutoSwitchEngine._bars`): the snapshot carries the field
+    # the tick reads, so the panel ranks and labels on the same lines.
+    bars = {
+        acc.number: acc.switch_threshold
+        for acc in snap.accounts
+        if acc.switch_threshold is not None
+    }
     oauth_candidates = [
         acc.number
         for acc in snap.accounts
@@ -404,8 +413,10 @@ def rank_switch_candidates(
         if active_headroom is None:
             return "unreadable-active"
         if settings.strategy == "dynamic":
-            return _classify_dynamic_trigger(active_headroom)
-        if (100.0 - active_headroom) < settings.threshold:
+            return _classify_dynamic_trigger(
+                active_headroom, _wall_headroom(bars.get(active_number))
+            )
+        if (100.0 - active_headroom) < bars.get(active_number, settings.threshold):
             return (
                 settings.strategy
                 if settings.strategy in CONSUME_FIRST_STRATEGIES
@@ -447,8 +458,21 @@ def rank_switch_candidates(
         headroom = _headroom_by_account(usage, axis)
         warm, cold = _rank_dynamic_candidates(
             oauth_candidates, headroom, usage, now, last_active_at or {},
-            settings.cache_ttl_seconds, reasons=reasons,  # by name: `bars` (#321) precedes it
+            settings.cache_ttl_seconds, bars=bars, reasons=reasons,
         )
+        if trigger == "proactive" and not warm and not cold:
+            # The tick's `rank` closure (`_dynamic_rank`) retries without the peers' own lines when its active is
+            # at the REAL wall, and only then: one merely past its own line stays, or two such accounts would
+            # trade places every tick. Its `active_h` is the widened one, as here.
+            active_h = _dynamic_active_headroom(
+                settings, axis, usage, active_number, headroom.get(active_number)
+            )
+            if _about_to_wall(active_h):
+                reasons.clear()
+                warm, cold = _rank_dynamic_candidates(
+                    oauth_candidates, headroom, usage, now, last_active_at or {},
+                    settings.cache_ttl_seconds, reasons=reasons,
+                )
         if trigger == "proactive":
             cold_floor = settings.cold_switch_cost_pct
             cold_clears = [n for n in cold if headroom[n] >= cold_floor]
@@ -483,6 +507,7 @@ def rank_switch_candidates(
             now=now,
             probe_cooldown=probe_cooldown,
             reasons=reasons,
+            bars=bars,
         )
         return ordered, rank_axis
 

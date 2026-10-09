@@ -2951,6 +2951,9 @@ class AutoSwitchEngine:
                     )
                 return warm, cold
 
+            # T1883 sweep: drop an account whose overload/refusal bar is live BEFORE either ranking below.
+            # The no-return retry re-ranks `cands` by name, so it releases `no_return` only, never this bar.
+            cands = [n for n in cands if at_now >= (overload_backoff.get(n) or 0)]
             warm, cold = rank([n for n in cands if n != no_return])
             bar_active = no_return is not None
             if no_return is not None and not warm and not cold and recovered:
