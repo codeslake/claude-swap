@@ -421,6 +421,7 @@ class AutoScreen(Screen):
         # row -> (body, tags): a tag field starts where the widest body ends, so it is joined below
         bodies: dict[str, tuple[Text, list[Text]]] = {}
         body_w = 0
+        statuses: dict[str, Text] = {}  # row -> its status cell: between its body and its tags, one width for every row
         # The badge rides on that account's own row rather than the summary
         # line: naming the pin separately makes you match an email against the
         # list directly below it instead of just reading the list.
@@ -723,6 +724,7 @@ class AutoScreen(Screen):
                             tags.append(
                                 Text(f"{blocked_model} full", style=palette.muted)
                             )
+                statuses[acc.number], tags = Text("  ").join(tags), []  # the status cell ends here, the tag cell starts
                 if acc.disabled:
                     tags.append(Text("auto-swap disabled", style=palette.muted))
                 elif (
@@ -783,14 +785,17 @@ class AutoScreen(Screen):
             if acc.usage.sentinel is None:  # a sentinel note is free text: it sizes no column
                 body_w = max(body_w, entry.cell_len)
 
+        status_w = max((s.cell_len for s in statuses.values()), default=0)
         for number, (entry, tags) in bodies.items():
-            if tags:
-                entry.pad_right(body_w - entry.cell_len)
-                entry.append("  ")
-                entry.append(Text("  ").join(tags))
-            else:
-                # the chip block's blank cells only exist to line up the tags after them
-                entry.rstrip()
+            status = statuses.get(number, Text())
+            if entry.cell_len <= body_w:  # a note wider than the grid is free text: its tags follow it
+                status.pad_right(status_w - status.cell_len)
+            entry.pad_right(body_w - entry.cell_len)
+            for cell in (status, Text("  ").join(tags)):
+                if cell.cell_len:
+                    entry.append("  ")
+                    entry.append(cell)
+            entry.rstrip()  # the blank cells only exist to line up what follows them
             lines[number] = entry
 
         text = Text()

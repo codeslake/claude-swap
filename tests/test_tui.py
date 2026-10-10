@@ -4948,7 +4948,7 @@ class TestUnswitchableRowsAreListed:
         `5h(⟳5h00m):` (the chips were right-aligned), the spend row and its `auto-swap
         disabled` tag started elsewhere, and the pct beside a retry label read as live
         usage. One plain row, one retry-label row, a spend-only row and an unranked no-plan
-        row (the last two are notes): login, 5h and 7d cells and the tags each start in one
+        row (the last two are notes): login, 5h, 7d and status cells each start in one
         column, both notes start in the 5h column, and a pct that predates its window's reset
         is dim while a live one is not."""
         import re
@@ -4991,11 +4991,11 @@ class TestUnswitchableRowsAreListed:
         column("login", "plain@x.com", "retry@x.com", "spend@x.com")
         column("7d(", "plain@x.com", "retry@x.com")
         assert column("$$ ", "spend@x.com") == column("no plan", "noplan@x.com") == five, out.plain
-        tags = {
-            e: re.search(r"Fable-walled|stale|auto-swap disabled", rows[e].plain).start()
-            for e in ("plain@x.com", "retry@x.com", "spend@x.com")
+        statuses = {
+            e: re.search(r"Fable-walled|stale", rows[e].plain).start()
+            for e in ("plain@x.com", "retry@x.com")
         }
-        assert len(set(tags.values())) == 1, (tags, out.plain)
+        assert len(set(statuses.values())) == 1, (statuses, out.plain)
 
         def dim(email, pct):
             row = rows[email]
@@ -5013,6 +5013,50 @@ class TestUnswitchableRowsAreListed:
         ), active="1", settings=AutoSwitchSettings(model="Fable", threshold=90.0))
         note, tag = (next(ln for ln in narrow.split("\n") if e in ln) for e in ("noplan@", "five@"))
         assert tag.index("auto-swap disabled") == note.index("no plan") + len("no plan (subscription inactive)") + 2, narrow
+
+    def test_the_status_cell_and_the_tag_cell_each_start_in_one_column(self, monkeypatch):
+        """T2037, the owner's report of 2026-10-08: a row's status (`7d full`, `stale`) and its tags (`auto-swap
+        disabled`, `not a candidate`, `○ cloud`) were one run of text, so a spend row, which has no status, drew
+        its `auto-swap disabled` where the other rows draw theirs. The status starts in one column across the
+        rows that have one, the tags in one column across every row, and the tags come after the status."""
+        import re
+        from claude_swap import pin
+        from claude_swap.settings import AutoSwitchSettings
+
+        def windows(pct, seven=5.0):
+            return {"five_hour": {"pct": pct}, "seven_day": {"pct": seven}}
+
+        now = time.time()
+        retrying = UsageEntry(
+            last_good=windows(20.0), fetched_at=now - 120, age_s=120.0, consecutive_failures=1, next_poll_at=now + 330,
+        )
+        spend = {"used": 466.17, "limit": 466.0, "pct": 100.0, "currency": "USD"}
+        cloud = self._acct("7", "cloud@x.com", switchable=True, last_good=windows(20.0))
+        cloud.org_uuid = ""  # the badge compares (email, org) against the pin
+        monkeypatch.setattr(pin, "pinned_identity", lambda _sw: ("cloud@x.com", ""))
+        monkeypatch.setattr(pin, "pin_is_applying", lambda _sw: True)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good=windows(92.0)),
+            self._acct("2", "open@x.com", switchable=True, last_good=windows(20.0)),  # nothing after the chips
+            self._acct("3", "close@x.com", switchable=True, last_good=windows(85.0)),  # not a candidate
+            self._acct("4", "full@x.com", switchable=True, last_good=windows(10.0, 100.0)),  # 7d full
+            self._acct("5", "retry@x.com", switchable=True, usage=retrying),  # stale
+            self._acct("6", "spend@x.com", switchable=True, disabled=True, last_good={"spend": spend}),
+            cloud,  # ○ cloud
+            self._acct("8", "off@x.com", switchable=True, disabled=True, last_good=windows(10.0, 100.0)),  # both
+        ), active="1", settings=AutoSwitchSettings(threshold=90.0, strategy="best"))
+        rows = {ln.split()[1]: ln for ln in out.split("\n") if "@x.com" in ln}
+        assert len(rows) == 7 and "7d full" in rows["off@x.com"] and "○ cloud" in rows["cloud@x.com"], out  # premise
+
+        def column(pattern, *emails):
+            cols = {e: re.search(pattern, rows[e]).start() for e in emails}
+            assert len(set(cols.values())) == 1, (pattern, cols, out)
+            return cols[emails[0]]
+
+        status = column(r"7d full|stale", "full@x.com", "retry@x.com", "off@x.com")
+        tag = column(r"auto-swap disabled|not a candidate|· ○ cloud", "close@x.com", "spend@x.com", "cloud@x.com", "off@x.com")
+        assert tag > status + len("7d full"), out
+        assert rows["open@x.com"] == rows["open@x.com"].rstrip(), out  # nothing after the chips, no trailing pad
 
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach
