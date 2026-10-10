@@ -530,6 +530,7 @@ class TestTryRefreshOAuthCredentials:
         assert rotated["accessToken"] == "new-access"
         assert rotated["refreshToken"] == "new-refresh"
 
+    @pytest.mark.no_oauth_profile_fake
     def test_refresh_keeps_the_previous_blobs_tier(self):
         credentials = json.dumps({
             "organizationUuid": "org-1",
@@ -553,9 +554,10 @@ class TestTryRefreshOAuthCredentials:
 
         with patch(
             "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
-        ):
+        ) as urlopen:
             outcome = oauth.try_refresh_oauth_credentials(credentials)
 
+        assert urlopen.call_count == 1  # a blob that has its tier asks the profile nothing
         rotated = json.loads(outcome.credentials)
         oauth_blob = rotated["claudeAiOauth"]
         assert oauth_blob["subscriptionType"] == "pro"
@@ -564,6 +566,76 @@ class TestTryRefreshOAuthCredentials:
         assert oauth_blob["accessToken"] == "new-access"
         assert oauth_blob["refreshToken"] == "new-refresh"
         assert oauth_blob["scopes"] == ["user:profile", "user:inference"]
+
+    @pytest.mark.no_oauth_profile_fake
+    @pytest.mark.parametrize("profile, filled", [
+        ({"account": {"uuid": "u"}, "organization": {
+            "organization_type": "claude_max", "rate_limit_tier": "default_claude_max_20x"}},
+         {"subscriptionType": "max", "rateLimitTier": "default_claude_max_20x"}),
+        ({"account": {"uuid": "u"}, "organization": {
+            "organization_type": "claude_free", "rate_limit_tier": "default"}},
+         {"rateLimitTier": "default"}),
+        (urllib.error.HTTPError(oauth.OAUTH_TOKEN_URL, 500, "err", hdrs=None, fp=None), {}),
+        (urllib.error.URLError("down"), {}),
+    ], ids=["max", "unmapped-type", "http-500", "network"])
+    def test_refresh_fills_a_missing_tier_from_the_profile(self, profile, filled):
+        """The refresh answers with the rotated tokens whatever the profile says."""
+        seen = []
+
+        def respond(req, timeout=0):
+            seen.append((req.get_method(), req.headers.get("Authorization")))
+            if req.full_url == oauth.OAUTH_TOKEN_URL:
+                body = {"access_token": "new-access", "refresh_token": "new-refresh",
+                        "expires_in": 3600}
+            elif isinstance(profile, Exception):
+                raise profile
+            else:
+                body = profile
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=respond):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+        blob = json.loads(outcome.credentials)["claudeAiOauth"]
+        assert outcome.error is None
+        assert blob["accessToken"] == "new-access"
+        assert blob["refreshToken"] == "new-refresh"
+        assert {k: blob[k] for k in ("subscriptionType", "rateLimitTier") if k in blob} == filled
+        assert seen[1] == ("GET", "Bearer new-access")  # the new token, after the grant
+
+    @pytest.mark.no_oauth_profile_fake
+    def test_refresh_skips_the_tier_fill_when_the_budget_cannot_hold_it(self):
+        """Callers size timeout_s for the POST under a lock; the GET must not outrun it."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ) as urlopen:
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials(), timeout_s=1.0)
+
+        assert urlopen.call_count == 1
+        assert json.loads(outcome.credentials)["claudeAiOauth"]["accessToken"] == "new-access"
+
+    @pytest.mark.no_oauth_profile_fake
+    @pytest.mark.parametrize("credentials", [
+        "not json",
+        '["a list"]',
+        '{"mcpOAuth": {}}',
+        '{"claudeAiOauth": {"accessToken": "t", "subscriptionType": "pro"}}',
+    ])
+    def test_fill_missing_tier_leaves_other_input_alone(self, credentials):
+        with patch("claude_swap.oauth.urllib.request.urlopen") as urlopen:
+            assert oauth.fill_missing_tier(credentials) == credentials
+        urlopen.assert_not_called()
 
     def test_invalid_grant_body_on_400_is_permanent(self):
         err = self._http_error(400, b'{"error": "invalid_grant"}')

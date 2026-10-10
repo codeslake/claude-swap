@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -19,6 +20,14 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+PROFILE_TIMEOUT_S = 5
+# Claude Code's own organization_type -> subscriptionType mapping.
+_SUBSCRIPTION_BY_ORG_TYPE = {
+    "claude_max": "max",
+    "claude_pro": "pro",
+    "claude_team": "team",
+    "claude_enterprise": "enterprise",
+}
 
 _logger = logging.getLogger("claude-swap")
 
@@ -192,6 +201,7 @@ def try_refresh_oauth_credentials(
     if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
         return RefreshOutcome(None, "no_refresh_token")
 
+    started = time.monotonic()
     try:
         body = json.dumps({
             "grant_type": "refresh_token",
@@ -255,9 +265,12 @@ def try_refresh_oauth_credentials(
         # Keep the tier: CC refills it only in its own refresh, which this one pre-empts.
         data["claudeAiOauth"] = oauth
         _logger.info("Refresh POST for account %s: ok", slot)
-        return RefreshOutcome(
-            json.dumps(data), None, _parse_token_account(resp_data)
-        )
+        rotated = json.dumps(data)
+        # Fill a missing tier only while POST + GET still fit the caller's
+        # budget (callers hold a lock the POST was sized to stay inside).
+        if time.monotonic() - started + PROFILE_TIMEOUT_S <= timeout_s:
+            rotated = fill_missing_tier(rotated)
+        return RefreshOutcome(rotated, None, _parse_token_account(resp_data))
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
         _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
@@ -321,6 +334,33 @@ def _parse_token_account(resp_data: dict) -> dict | None:
     }
 
 
+def fill_missing_tier(credentials: str) -> str:
+    """Fill a blob's missing ``subscriptionType`` / ``rateLimitTier`` from the profile.
+
+    Claude Code fills both only from ``GET /api/oauth/profile`` inside its own
+    token refresh, which cswap's refreshes pre-empt; without them it shows
+    "Claude API" and can hide /remote-control. A blob that has a
+    ``subscriptionType`` is returned as is, with no request. Best effort: any
+    failure returns ``credentials`` unchanged. Makes one request of at most
+    ``PROFILE_TIMEOUT_S``, so it must not be called under a lock that cannot
+    wait that long.
+    """
+    try:
+        data = json.loads(credentials)
+        blob = data["claudeAiOauth"]
+        if blob.get("subscriptionType") is not None:
+            return credentials
+        profile = fetch_oauth_profile(blob["accessToken"]) or {}
+        tier = {k: profile[k] for k in ("subscriptionType", "rateLimitTier") if k in profile}
+        if not tier:
+            return credentials
+        blob.update(tier)
+        return json.dumps(data)
+    except Exception as e:
+        _logger.debug("Tier fill skipped: %r", e)
+        return credentials
+
+
 def refresh_oauth_credentials(
     credentials: str, slot: str | None = None
 ) -> str | None:
@@ -340,7 +380,8 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     non-empty string ``account.uuid`` — a response without a usable uuid,
     including a schema change that renames it, is None, keeping that drift
     on the fail-open path rather than silently degrading switches.
-    ``email``/``organizationUuid`` are optional (str-or-None); a uuid-only
+    ``email``/``organizationUuid`` are optional (str-or-None); ``subscriptionType``
+    and ``rateLimitTier`` are added only when the response names them; a uuid-only
     response *does* resolve, and classification decides whether such partial
     evidence is sufficient for each decision. Must not be called while any
     credential/config lock is held (network under locks is forbidden).
@@ -353,7 +394,7 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     }
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=PROFILE_TIMEOUT_S) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -383,11 +424,20 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     email = account.get("email")
     organization = data.get("organization")
     org_uuid = organization.get("uuid") if isinstance(organization, dict) else None
-    return {
+    profile = {
         "uuid": uuid.strip(),
         "email": email if isinstance(email, str) else None,
         "organizationUuid": org_uuid if isinstance(org_uuid, str) else None,
     }
+    # Optional, present only when the response names them: the blob's tier fields.
+    if isinstance(organization, dict):
+        subscription = _SUBSCRIPTION_BY_ORG_TYPE.get(str(organization.get("organization_type")))
+        if subscription:
+            profile["subscriptionType"] = subscription
+        tier = organization.get("rate_limit_tier")
+        if isinstance(tier, str) and tier:
+            profile["rateLimitTier"] = tier
+    return profile
 
 
 def probe_oauth_profile_live(access_token: str, timeout_s: float = 5.0) -> bool | None:
