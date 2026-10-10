@@ -2333,11 +2333,41 @@ class ClaudeAccountSwitcher:
             # blame the network for local serialization working as designed.
             return oauth.RefreshOutcome(None, "consume-busy")
         try:
-            return self._consume_backup_grant_locked(
+            outcome = self._consume_backup_grant_locked(
                 account_num, email, snapshot
             )
         finally:
             consume_lock.release()
+        return self._fill_successor_tier(account_num, email, outcome)
+
+    def _fill_successor_tier(
+        self, account_num: str, email: str, outcome: "oauth.RefreshOutcome"
+    ) -> "oauth.RefreshOutcome":
+        """Fill a tier-less successor's tier, after it is durable and no lock is held.
+
+        The GET must not widen the window between the grant POST and the
+        persist. The write back is a fingerprint CAS under the slot lock: a
+        newer generation that landed meanwhile keeps the slot. Best effort.
+        """
+        creds = outcome.credentials
+        if outcome.error is not None or not creds:
+            return outcome
+        try:
+            filled = oauth.fill_missing_tier(creds)
+            if filled != creds:
+                with FileLock(self.lock_file):
+                    if oauth.credential_fingerprint(
+                        self._read_account_credentials(account_num, email)
+                    ) == oauth.credential_fingerprint(creds):
+                        self._write_account_credentials(
+                            account_num, email, filled
+                        )
+                        return dataclasses.replace(outcome, credentials=filled)
+        except Exception:
+            self._logger.debug(
+                "Tier fill for account %s skipped.", account_num, exc_info=True
+            )
+        return outcome
 
     def _consume_backup_grant_locked(
         self, account_num: str, email: str, snapshot: str

@@ -7,7 +7,6 @@ import json
 import logging
 import math
 import sys
-import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -20,7 +19,6 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-PROFILE_TIMEOUT_S = 5
 # Claude Code's own organization_type -> subscriptionType mapping.
 _SUBSCRIPTION_BY_ORG_TYPE = {
     "claude_max": "max",
@@ -201,7 +199,6 @@ def try_refresh_oauth_credentials(
     if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
         return RefreshOutcome(None, "no_refresh_token")
 
-    started = time.monotonic()
     try:
         body = json.dumps({
             "grant_type": "refresh_token",
@@ -265,12 +262,9 @@ def try_refresh_oauth_credentials(
         # Keep the tier: CC refills it only in its own refresh, which this one pre-empts.
         data["claudeAiOauth"] = oauth
         _logger.info("Refresh POST for account %s: ok", slot)
-        rotated = json.dumps(data)
-        # Fill a missing tier only while POST + GET still fit the caller's
-        # budget (callers hold a lock the POST was sized to stay inside).
-        if time.monotonic() - started + PROFILE_TIMEOUT_S <= timeout_s:
-            rotated = fill_missing_tier(rotated)
-        return RefreshOutcome(rotated, None, _parse_token_account(resp_data))
+        return RefreshOutcome(
+            json.dumps(data), None, _parse_token_account(resp_data)
+        )
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
         _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
@@ -341,9 +335,9 @@ def fill_missing_tier(credentials: str) -> str:
     token refresh, which cswap's refreshes pre-empt; without them it shows
     "Claude API" and can hide /remote-control. A blob that has a
     ``subscriptionType`` is returned as is, with no request. Best effort: any
-    failure returns ``credentials`` unchanged. Makes one request of at most
-    ``PROFILE_TIMEOUT_S``, so it must not be called under a lock that cannot
-    wait that long.
+    failure, and an organization type with no ``subscriptionType`` mapping,
+    returns ``credentials`` unchanged. One network request: never call it
+    between a grant POST and the successor's persist, or under a lock.
     """
     try:
         data = json.loads(credentials)
@@ -351,10 +345,9 @@ def fill_missing_tier(credentials: str) -> str:
         if blob.get("subscriptionType") is not None:
             return credentials
         profile = fetch_oauth_profile(blob["accessToken"]) or {}
-        tier = {k: profile[k] for k in ("subscriptionType", "rateLimitTier") if k in profile}
-        if not tier:
+        if "subscriptionType" not in profile:
             return credentials
-        blob.update(tier)
+        blob.update({k: profile[k] for k in ("subscriptionType", "rateLimitTier") if k in profile})
         return json.dumps(data)
     except Exception as e:
         _logger.debug("Tier fill skipped: %r", e)
@@ -373,15 +366,15 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
 
     ``GET /api/oauth/profile`` answers the one question the credential bytes
     can't: *whose* token is this. Returns ``{"uuid", "email",
-    "organizationUuid"}`` or None on any failure — callers treat None as
+    "organizationUuid"}`` (plus ``"subscriptionType"`` / ``"rateLimitTier"``
+    when the response names them) or None on any failure — callers treat None as
     "unresolvable", never as an error. The identity oracle is strictly
     advisory (a switch proceeds pre-fix on None), so the boundary is strict
     the other way: a response counts as resolved only when it carries a
     non-empty string ``account.uuid`` — a response without a usable uuid,
     including a schema change that renames it, is None, keeping that drift
     on the fail-open path rather than silently degrading switches.
-    ``email``/``organizationUuid`` are optional (str-or-None); ``subscriptionType``
-    and ``rateLimitTier`` are added only when the response names them; a uuid-only
+    ``email``/``organizationUuid`` are optional (str-or-None); a uuid-only
     response *does* resolve, and classification decides whether such partial
     evidence is sufficient for each decision. Must not be called while any
     credential/config lock is held (network under locks is forbidden).
@@ -394,7 +387,7 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     }
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=PROFILE_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:

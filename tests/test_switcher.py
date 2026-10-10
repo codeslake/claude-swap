@@ -14892,6 +14892,60 @@ class TestConsumeGate:
         unclaimed = s.list_unclaimed_credentials()
         assert unclaimed, "consumed successor must be stashed, never discarded"
 
+    def test_gate_fills_a_tierless_successor_after_it_is_durable(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The profile GET runs once the successor is on disk and no lock is
+        held (a kill during it must not lose the spent grant), then the tier
+        is written back to the slot."""
+        from claude_swap.locking import FileLock
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        seen = {}
+
+        def profile(token):
+            seen["stored"] = s._read_account_credentials("1", "test@example.com")
+            probe = FileLock(s.lock_file)
+            seen["slot_lock_free"] = probe.acquire(timeout=0)
+            probe.release()
+            return {"uuid": "u", "subscriptionType": "max", "rateLimitTier": "t20"}
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)), \
+             patch("claude_swap.oauth.fetch_oauth_profile", side_effect=profile):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert seen == {"stored": self._NEW, "slot_lock_free": True}
+        for creds in (result.credentials,
+                      s._read_account_credentials("1", "test@example.com")):
+            blob = json.loads(creds)["claudeAiOauth"]
+            assert (blob["subscriptionType"], blob["rateLimitTier"]) == ("max", "t20")
+            assert blob["refreshToken"] == "rt-new"
+
+    def test_gate_drops_the_tier_fill_when_the_lineage_moved_during_the_get(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        racer = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-racer", "refreshToken": "rt-racer",
+            "expiresAt": 8888888888000,
+        }})
+
+        def profile(token):
+            s._store._write_account_credentials("1", "test@example.com", racer)
+            return {"uuid": "u", "subscriptionType": "max", "rateLimitTier": "t20"}
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)), \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   side_effect=profile) as fetch:
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert fetch.call_count == 1  # the race happened
+        assert s._read_account_credentials("1", "test@example.com") == racer
+
     def test_gate_prefers_newer_session_profile_lineage(
         self, temp_home: Path, sample_sequence_data: dict
     ):
