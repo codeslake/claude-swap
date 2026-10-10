@@ -252,14 +252,7 @@ def try_refresh_oauth_credentials(
         if isinstance(scope, str) and scope:
             oauth["scopes"] = scope.split()
 
-        # The refresh grant says nothing about the account's tier. Claude
-        # Code skips its own profile fetch while these two fields are
-        # present and re-fetches (and re-writes them) once they are absent,
-        # so carrying the previous blob's values forward showed a stale
-        # subscription label.
-        oauth.pop("subscriptionType", None)
-        oauth.pop("rateLimitTier", None)
-
+        # Keep the tier: CC refills it only in its own refresh, which this one pre-empts.
         data["claudeAiOauth"] = oauth
         _logger.info("Refresh POST for account %s: ok", slot)
         return RefreshOutcome(

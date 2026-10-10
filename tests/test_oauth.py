@@ -530,7 +530,7 @@ class TestTryRefreshOAuthCredentials:
         assert rotated["accessToken"] == "new-access"
         assert rotated["refreshToken"] == "new-refresh"
 
-    def test_refresh_drops_the_previous_blobs_tier(self):
+    def test_refresh_keeps_the_previous_blobs_tier(self):
         credentials = json.dumps({
             "organizationUuid": "org-1",
             "claudeAiOauth": {
@@ -558,8 +558,8 @@ class TestTryRefreshOAuthCredentials:
 
         rotated = json.loads(outcome.credentials)
         oauth_blob = rotated["claudeAiOauth"]
-        assert "subscriptionType" not in oauth_blob
-        assert "rateLimitTier" not in oauth_blob
+        assert oauth_blob["subscriptionType"] == "pro"
+        assert oauth_blob["rateLimitTier"] == "default_claude_ai"
         assert rotated["organizationUuid"] == "org-1"
         assert oauth_blob["accessToken"] == "new-access"
         assert oauth_blob["refreshToken"] == "new-refresh"
