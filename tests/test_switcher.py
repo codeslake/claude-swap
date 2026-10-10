@@ -2542,13 +2542,17 @@ class TestActiveAccountRefresh:
         (2000, True),               # expired backup: POSTed, successor to both stores
         (9999999999000, False),     # live backup: restored to the live store only
     ])
-    def test_a_tierless_backup_input_takes_the_live_blobs_tier(
+    @pytest.mark.parametrize("live_is_the_slots", [True, False])
+    def test_a_tierless_backup_input_takes_the_tier_of_a_live_blob_that_is_the_slots(
         self, temp_home: Path, mock_claude_config: Path,
-        sample_sequence_data: dict, backup_expires_at: int, backup_written: bool
+        sample_sequence_data: dict, backup_expires_at: int, backup_written: bool,
+        live_is_the_slots: bool
     ):
         """Every slot backup refreshed since 09-14 is tier-less, so the keep-tier
         refresh keeps nothing when the backup is the input. The live blob's
-        tier must not be overwritten by tier-less bytes."""
+        tier must not be overwritten by tier-less bytes, but only a live blob
+        with the slot's lineage (a True verdict here) may donate it: an
+        unattributed one may be another account's, whose tier is never corrected."""
         switcher = self._switcher(sample_sequence_data)
         live = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-active", "refreshToken": "rt-orig", "expiresAt": 1000,
@@ -2558,6 +2562,11 @@ class TestActiveAccountRefresh:
             "accessToken": "sk-backup", "refreshToken": "rt-backup",
             "expiresAt": backup_expires_at,
         }})
+
+        if live_is_the_slots:
+            switcher._probe_verdicts[switcher._lineage_key(
+                "1", "test@example.com", oauth.credential_fingerprint(live)
+            )] = True
 
         with patch.object(switcher, "_read_credentials", return_value=live), \
              patch.object(switcher, "_read_account_credentials", return_value=backup), \
@@ -2573,7 +2582,9 @@ class TestActiveAccountRefresh:
         assert write_backup.called is backup_written
         for write in writes:
             blob = json.loads(write.call_args.args[-1])["claudeAiOauth"]
-            assert (blob["subscriptionType"], blob["rateLimitTier"]) == ("max", "t20")
+            assert (blob.get("subscriptionType"), blob.get("rateLimitTier")) == (
+                ("max", "t20") if live_is_the_slots else (None, None)
+            )
 
     def test_identity_check_compares_organization_too(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -9450,6 +9461,39 @@ class TestSwitchTargetLivenessGuard:
         assert result["switched"] is True
         assert result.get("validated") is True
         assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_switch_fills_a_tierless_slots_tier_before_activating_it(
+        self, temp_home: Path
+    ):
+        """A slot backup that lost its tier answers the probe 200, so the
+        switch copied its bytes live unchanged and nothing healed it. The
+        tier is filled into the slot before the lock; the activation then
+        reads the tiered bytes."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        tier = {"uuid": "u", "subscriptionType": "max", "rateLimitTier": "t20"}
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live", return_value=True
+        ), patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            side_effect=lambda token: tier if token == "sk-2" else None,
+        ):
+            result = s.switch_to("2", json_output=True)
+
+        assert result["switched"] is True
+        assert result.get("validated") is True
+        live = json.loads(
+            (temp_home / ".claude" / ".credentials.json").read_text()
+        )
+        slot = json.loads(s._read_account_credentials("2", "b@example.com"))
+        for blob in (live, slot):
+            assert (
+                blob["claudeAiOauth"]["subscriptionType"],
+                blob["claudeAiOauth"]["rateLimitTier"],
+            ) == ("max", "t20")
 
     def test_best_strategy_never_falls_through_to_struck_slot_via_rotation(
         self, temp_home: Path

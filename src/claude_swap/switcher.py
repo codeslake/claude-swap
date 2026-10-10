@@ -2338,20 +2338,20 @@ class ClaudeAccountSwitcher:
             )
         finally:
             consume_lock.release()
-        return self._fill_successor_tier(account_num, email, outcome)
+        if outcome.error is None and outcome.credentials:
+            filled = self._fill_slot_tier(account_num, email, outcome.credentials)
+            if filled != outcome.credentials:
+                return dataclasses.replace(outcome, credentials=filled)
+        return outcome
 
-    def _fill_successor_tier(
-        self, account_num: str, email: str, outcome: "oauth.RefreshOutcome"
-    ) -> "oauth.RefreshOutcome":
-        """Fill a tier-less successor's tier, after it is durable and no lock is held.
+    def _fill_slot_tier(self, account_num: str, email: str, creds: str) -> str:
+        """Fill a tier-less slot credential's tier; the filled bytes, or ``creds``.
 
-        The GET must not widen the window between the grant POST and the
+        Call it with no lock held, and for a successor only once it is durable:
+        the GET must not widen the window between the grant POST and the
         persist. The write back is a fingerprint CAS under the slot lock: a
         newer generation that landed meanwhile keeps the slot. Best effort.
         """
-        creds = outcome.credentials
-        if outcome.error is not None or not creds:
-            return outcome
         try:
             filled = oauth.fill_missing_tier(creds)
             if filled != creds:
@@ -2362,12 +2362,12 @@ class ClaudeAccountSwitcher:
                         self._write_account_credentials(
                             account_num, email, filled
                         )
-                        return dataclasses.replace(outcome, credentials=filled)
+                        return filled
         except Exception:
             self._logger.debug(
                 "Tier fill for account %s skipped.", account_num, exc_info=True
             )
-        return outcome
+        return creds
 
     def _consume_backup_grant_locked(
         self, account_num: str, email: str, snapshot: str
@@ -5802,8 +5802,21 @@ class ClaudeAccountSwitcher:
                                 account_num, exc_info=True,
                             )
                     # Every backup refreshed since 09-14 is tier-less, so a
-                    # backup input keeps no tier: take it from the live blob.
-                    working = oauth.carry_tier(working, live, backup)
+                    # backup input keeps no tier: take it from the live blob,
+                    # but only a live blob of this slot's lineage. Another
+                    # account's tier would be donated and never corrected.
+                    try:
+                        live_fp = oauth.credential_fingerprint(live)
+                        live_is_ours = live_fp == backup_fp or bool(
+                            self._probe_verdicts.get(self._lineage_key(
+                                account_num, email, live_fp or ""
+                            ))
+                        )
+                    except Exception:  # a torn roster must not cost the successor
+                        live_is_ours = False
+                    working = oauth.carry_tier(
+                        working, backup, *([live] if live_is_ours else [])
+                    )
                     # The credential must reach the stores — after a POST the
                     # grant is consumed and the successor MUST survive in at
                     # least one of them. Attempt both; tolerate either
@@ -10444,6 +10457,12 @@ class ClaudeAccountSwitcher:
                         "shortly."
                     )
                 if live is True:
+                    # A slot backup that lost its tier would be copied live as
+                    # it is, and nothing heals it there. Fill it now, no lock
+                    # held; the fingerprint is of the bytes the lock will read.
+                    probed_creds = self._fill_slot_tier(
+                        target_account, pre_email, probed_creds
+                    )
                     probed_fp = oauth.credential_fingerprint(probed_creds)
 
         # Pre-lock identity resolution (may hit the network — must happen
