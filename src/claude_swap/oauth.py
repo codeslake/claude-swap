@@ -328,6 +328,26 @@ def _parse_token_account(resp_data: dict) -> dict | None:
     }
 
 
+def carry_tier(credentials: str, *donors: str) -> str:
+    """Give a blob with no ``subscriptionType`` the tier of the first donor blob that has one.
+
+    Pure, no request, never raises: it runs under the credential locks and
+    right after a grant POST, where a failure must not cost the successor.
+    """
+    try:
+        data = json.loads(credentials)
+        blob = data["claudeAiOauth"]
+        if blob.get("subscriptionType") is None:
+            for donor in donors:
+                tier = extract_oauth_data(donor) or {}
+                if tier.get("subscriptionType") is not None:
+                    blob.update({k: tier[k] for k in ("subscriptionType", "rateLimitTier") if k in tier})
+                    return json.dumps(data)
+    except Exception as e:
+        _logger.debug("Tier carry skipped: %r", e)
+    return credentials
+
+
 def fill_missing_tier(credentials: str) -> str:
     """Fill a blob's missing ``subscriptionType`` / ``rateLimitTier`` from the profile.
 
@@ -397,8 +417,8 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
             # expired on an idle machine). Log-file only — the caller falls
             # back to pre-fix behavior and the user sees nothing.
             _logger.warning(
-                "OAuth profile returned 401 while resolving credential "
-                "ownership; proceeding without identity (pre-fix behavior)."
+                "OAuth profile returned 401; the caller proceeds without it "
+                "(pre-fix behavior)."
             )
         else:
             _logger.debug("OAuth profile fetch failed: %r", e)

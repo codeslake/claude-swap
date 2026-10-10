@@ -2538,6 +2538,43 @@ class TestActiveAccountRefresh:
         write_backup.assert_not_called()          # backup already holds it
         assert mock_fetch.call_args[0][2] == successor
 
+    @pytest.mark.parametrize("backup_expires_at, backup_written", [
+        (2000, True),               # expired backup: POSTed, successor to both stores
+        (9999999999000, False),     # live backup: restored to the live store only
+    ])
+    def test_a_tierless_backup_input_takes_the_live_blobs_tier(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, backup_expires_at: int, backup_written: bool
+    ):
+        """Every slot backup refreshed since 09-14 is tier-less, so the keep-tier
+        refresh keeps nothing when the backup is the input. The live blob's
+        tier must not be overwritten by tier-less bytes."""
+        switcher = self._switcher(sample_sequence_data)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-active", "refreshToken": "rt-orig", "expiresAt": 1000,
+            "subscriptionType": "max", "rateLimitTier": "t20",
+        }})
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-backup", "refreshToken": "rt-backup",
+            "expiresAt": backup_expires_at,
+        }})
+
+        with patch.object(switcher, "_read_credentials", return_value=live), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            switcher._fetch_active_usage("1", "test@example.com", live)
+
+        writes = [write_live] + ([write_backup] if backup_written else [])
+        assert write_backup.called is backup_written
+        for write in writes:
+            blob = json.loads(write.call_args.args[-1])["claudeAiOauth"]
+            assert (blob["subscriptionType"], blob["rateLimitTier"]) == ("max", "t20")
+
     def test_identity_check_compares_organization_too(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -14906,9 +14943,11 @@ class TestConsumeGate:
 
         def profile(token):
             seen["stored"] = s._read_account_credentials("1", "test@example.com")
-            probe = FileLock(s.lock_file)
-            seen["slot_lock_free"] = probe.acquire(timeout=0)
-            probe.release()
+            for name, path in (("slot_lock_free", s.lock_file),
+                               ("consume_lock_free", s.credentials_dir / ".consume-1.lock")):
+                probe = FileLock(path)
+                seen[name] = probe.acquire(timeout=0)
+                probe.release()
             return {"uuid": "u", "subscriptionType": "max", "rateLimitTier": "t20"}
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
@@ -14916,7 +14955,8 @@ class TestConsumeGate:
              patch("claude_swap.oauth.fetch_oauth_profile", side_effect=profile):
             result = s.consume_backup_grant("1", "test@example.com", self._OLD)
 
-        assert seen == {"stored": self._NEW, "slot_lock_free": True}
+        assert seen == {"stored": self._NEW, "slot_lock_free": True,
+                        "consume_lock_free": True}
         for creds in (result.credentials,
                       s._read_account_credentials("1", "test@example.com")):
             blob = json.loads(creds)["claudeAiOauth"]

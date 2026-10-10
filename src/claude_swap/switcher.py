@@ -5801,6 +5801,9 @@ class ClaudeAccountSwitcher:
                                 "the stores.",
                                 account_num, exc_info=True,
                             )
+                    # Every backup refreshed since 09-14 is tier-less, so a
+                    # backup input keeps no tier: take it from the live blob.
+                    working = oauth.carry_tier(working, live, backup)
                     # The credential must reach the stores — after a POST the
                     # grant is consumed and the successor MUST survive in at
                     # least one of them. Attempt both; tolerate either
