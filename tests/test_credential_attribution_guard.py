@@ -479,6 +479,8 @@ CROSS_PR_WRITE_SITES: dict[tuple[str, str], int] = {
     ("switcher.py", "_adopt_login_into_slot"): 1,
     ("switcher.py", "_adopt_stashed_login_for_slot"): 1,
     ("switcher.py", "_adopt_into_dead_slot"): 1,
+    # T2116: #199's tier fill, a same-lineage CAS write, unattributed.
+    ("switcher.py", "_fill_slot_tier"): 1,
 }
 
 # A SECOND call PR 199 added inside a function this round DID review

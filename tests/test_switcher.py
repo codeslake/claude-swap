@@ -18838,7 +18838,8 @@ class TestConsumeGate:
         }})
 
         def profile(token):
-            s._store._write_account_credentials("1", "test@example.com", racer)
+            # T2116: the racer is an attributed writer, as the sibling test's is.
+            s._store._write_account_credentials("1", "test@example.com", racer, attributed=True)
             return {"uuid": "u", "subscriptionType": "max", "rateLimitTier": "t20"}
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
