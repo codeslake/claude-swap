@@ -3794,11 +3794,41 @@ class ClaudeAccountSwitcher:
             # blame the network for local serialization working as designed.
             return oauth.RefreshOutcome(None, "consume-busy")
         try:
-            return self._consume_backup_grant_locked(
+            outcome = self._consume_backup_grant_locked(
                 account_num, email, snapshot
             )
         finally:
             consume_lock.release()
+        if outcome.error is None and outcome.credentials:
+            filled = self._fill_slot_tier(account_num, email, outcome.credentials)
+            if filled != outcome.credentials:
+                return dataclasses.replace(outcome, credentials=filled)
+        return outcome
+
+    def _fill_slot_tier(self, account_num: str, email: str, creds: str) -> str:
+        """Fill a tier-less slot credential's tier; the filled bytes, or ``creds``.
+
+        Call it with no lock held, and for a successor only once it is durable:
+        the GET must not widen the window between the grant POST and the
+        persist. The write back is a fingerprint CAS under the slot lock: a
+        newer generation that landed meanwhile keeps the slot. Best effort.
+        """
+        try:
+            filled = oauth.fill_missing_tier(creds)
+            if filled != creds:
+                with FileLock(self.lock_file):
+                    if oauth.credential_fingerprint(
+                        self._read_account_credentials(account_num, email)
+                    ) == oauth.credential_fingerprint(creds):
+                        self._write_account_credentials(
+                            account_num, email, filled
+                        )
+                        return filled
+        except Exception:
+            self._logger.debug(
+                "Tier fill for account %s skipped.", account_num, exc_info=True
+            )
+        return creds
 
     def _consume_backup_grant_locked(
         self, account_num: str, email: str, snapshot: str
@@ -7892,6 +7922,22 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                                 "the stores.",
                                 account_num, exc_info=True,
                             )
+                    # Every backup refreshed since 09-14 is tier-less, so a
+                    # backup input keeps no tier: take it from the live blob,
+                    # but only a live blob of this slot's lineage. Another
+                    # account's tier would be donated and never corrected.
+                    try:
+                        live_fp = oauth.credential_fingerprint(live)
+                        live_is_ours = live_fp == backup_fp or bool(
+                            self._probe_verdicts.get(self._lineage_key(
+                                account_num, email, live_fp or ""
+                            ))
+                        )
+                    except Exception:  # a torn roster must not cost the successor
+                        live_is_ours = False
+                    working = oauth.carry_tier(
+                        working, backup, *([live] if live_is_ours else [])
+                    )
                     # The credential must reach the stores — after a POST the
                     # grant is consumed and the successor MUST survive in at
                     # least one of them. Attempt both; tolerate either
@@ -12743,6 +12789,12 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                         "shortly."
                     )
                 if live is True:
+                    # A slot backup that lost its tier would be copied live as
+                    # it is, and nothing heals it there. Fill it now, no lock
+                    # held; the fingerprint is of the bytes the lock will read.
+                    probed_creds = self._fill_slot_tier(
+                        target_account, pre_email, probed_creds
+                    )
                     probed_fp = oauth.credential_fingerprint(probed_creds)
 
         # Pre-lock identity resolution (may hit the network — must happen

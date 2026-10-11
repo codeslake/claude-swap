@@ -2892,6 +2892,54 @@ class TestActiveAccountRefresh:
         assert result.sentinel == USAGE_TOKEN_EXPIRED
         assert switcher.list_unclaimed_credentials() == {}
 
+    @pytest.mark.parametrize("backup_expires_at, backup_written", [
+        (2000, True),               # expired backup: POSTed, successor to both stores
+        (9999999999000, False),     # live backup: restored to the live store only
+    ])
+    @pytest.mark.parametrize("live_is_the_slots", [True, False])
+    def test_a_tierless_backup_input_takes_the_tier_of_a_live_blob_that_is_the_slots(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, backup_expires_at: int, backup_written: bool,
+        live_is_the_slots: bool
+    ):
+        """Every slot backup refreshed since 09-14 is tier-less, so the keep-tier
+        refresh keeps nothing when the backup is the input. The live blob's
+        tier must not be overwritten by tier-less bytes, but only a live blob
+        with the slot's lineage (a True verdict here) may donate it: an
+        unattributed one may be another account's, whose tier is never corrected."""
+        switcher = self._switcher(sample_sequence_data)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-active", "refreshToken": "rt-orig", "expiresAt": 1000,
+            "subscriptionType": "max", "rateLimitTier": "t20",
+        }})
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-backup", "refreshToken": "rt-backup",
+            "expiresAt": backup_expires_at,
+        }})
+
+        if live_is_the_slots:
+            switcher._probe_verdicts[switcher._lineage_key(
+                "1", "test@example.com", oauth.credential_fingerprint(live)
+            )] = True
+
+        with patch.object(switcher, "_read_credentials", return_value=live), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            switcher._fetch_active_usage("1", "test@example.com", live)
+
+        writes = [write_live] + ([write_backup] if backup_written else [])
+        assert write_backup.called is backup_written
+        for write in writes:
+            blob = json.loads(write.call_args.args[-1])["claudeAiOauth"]
+            assert (blob.get("subscriptionType"), blob.get("rateLimitTier")) == (
+                ("max", "t20") if live_is_the_slots else (None, None)
+            )
+
     def test_identity_check_compares_organization_too(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -10769,6 +10817,39 @@ class TestSwitchTargetLivenessGuard:
         assert result["switched"] is True
         assert result.get("validated") is True
         assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_switch_fills_a_tierless_slots_tier_before_activating_it(
+        self, temp_home: Path
+    ):
+        """A slot backup that lost its tier answers the probe 200, so the
+        switch copied its bytes live unchanged and nothing healed it. The
+        tier is filled into the slot before the lock; the activation then
+        reads the tiered bytes."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        tier = {"uuid": "u", "subscriptionType": "max", "rateLimitTier": "t20"}
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live", return_value=True
+        ), patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            side_effect=lambda token: tier if token == "sk-2" else None,
+        ):
+            result = s.switch_to("2", json_output=True)
+
+        assert result["switched"] is True
+        assert result.get("validated") is True
+        live = json.loads(
+            (temp_home / ".claude" / ".credentials.json").read_text()
+        )
+        slot = json.loads(s._read_account_credentials("2", "b@example.com"))
+        for blob in (live, slot):
+            assert (
+                blob["claudeAiOauth"]["subscriptionType"],
+                blob["claudeAiOauth"]["rateLimitTier"],
+            ) == ("max", "t20")
 
     def test_best_strategy_never_falls_through_to_struck_slot_via_rotation(
         self, temp_home: Path
@@ -18711,6 +18792,63 @@ class TestConsumeGate:
         assert result.credentials == racer      # adopt the store's newer lineage
         unclaimed = s.list_unclaimed_credentials()
         assert unclaimed, "consumed successor must be stashed, never discarded"
+
+    def test_gate_fills_a_tierless_successor_after_it_is_durable(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The profile GET runs once the successor is on disk and no lock is
+        held (a kill during it must not lose the spent grant), then the tier
+        is written back to the slot."""
+        from claude_swap.locking import FileLock
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        seen = {}
+
+        def profile(token):
+            seen["stored"] = s._read_account_credentials("1", "test@example.com")
+            for name, path in (("slot_lock_free", s.lock_file),
+                               ("consume_lock_free", s.credentials_dir / ".consume-1.lock")):
+                probe = FileLock(path)
+                seen[name] = probe.acquire(timeout=0)
+                probe.release()
+            return {"uuid": "u", "subscriptionType": "max", "rateLimitTier": "t20"}
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)), \
+             patch("claude_swap.oauth.fetch_oauth_profile", side_effect=profile):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert seen == {"stored": self._NEW, "slot_lock_free": True,
+                        "consume_lock_free": True}
+        for creds in (result.credentials,
+                      s._read_account_credentials("1", "test@example.com")):
+            blob = json.loads(creds)["claudeAiOauth"]
+            assert (blob["subscriptionType"], blob["rateLimitTier"]) == ("max", "t20")
+            assert blob["refreshToken"] == "rt-new"
+
+    def test_gate_drops_the_tier_fill_when_the_lineage_moved_during_the_get(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        racer = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-racer", "refreshToken": "rt-racer",
+            "expiresAt": 8888888888000,
+        }})
+
+        def profile(token):
+            s._store._write_account_credentials("1", "test@example.com", racer)
+            return {"uuid": "u", "subscriptionType": "max", "rateLimitTier": "t20"}
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)), \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   side_effect=profile) as fetch:
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert fetch.call_count == 1  # the race happened
+        assert s._read_account_credentials("1", "test@example.com") == racer
 
     def test_gate_prefers_newer_session_profile_lineage(
         self, temp_home: Path, sample_sequence_data: dict

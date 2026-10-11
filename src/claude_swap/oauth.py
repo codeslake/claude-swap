@@ -22,6 +22,13 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Claude Code's own organization_type -> subscriptionType mapping.
+_SUBSCRIPTION_BY_ORG_TYPE = {
+    "claude_max": "max",
+    "claude_pro": "pro",
+    "claude_team": "team",
+    "claude_enterprise": "enterprise",
+}
 
 _logger = logging.getLogger("claude-swap")
 
@@ -401,14 +408,7 @@ def try_refresh_oauth_credentials(
         if isinstance(scope, str) and scope:
             oauth["scopes"] = scope.split()
 
-        # The refresh grant says nothing about the account's tier. Claude
-        # Code skips its own profile fetch while these two fields are
-        # present and re-fetches (and re-writes them) once they are absent,
-        # so carrying the previous blob's values forward showed a stale
-        # subscription label.
-        oauth.pop("subscriptionType", None)
-        oauth.pop("rateLimitTier", None)
-
+        # Keep the tier: CC refills it only in its own refresh, which this one pre-empts.
         data["claudeAiOauth"] = oauth
         _logger.info("Refresh POST for account %s: ok", slot)
         return RefreshOutcome(
@@ -477,6 +477,52 @@ def _parse_token_account(resp_data: dict) -> dict | None:
     }
 
 
+def carry_tier(credentials: str, *donors: str) -> str:
+    """Give a blob with no ``subscriptionType`` the tier of the first donor blob that has one.
+
+    Pure, no request, never raises: it runs under the credential locks and
+    right after a grant POST, where a failure must not cost the successor.
+    """
+    try:
+        data = json.loads(credentials)
+        blob = data["claudeAiOauth"]
+        if blob.get("subscriptionType") is None:
+            for donor in donors:
+                tier = extract_oauth_data(donor) or {}
+                if tier.get("subscriptionType") is not None:
+                    blob.update({k: tier[k] for k in ("subscriptionType", "rateLimitTier") if k in tier})
+                    return json.dumps(data)
+    except Exception as e:
+        _logger.debug("Tier carry skipped: %r", e)
+    return credentials
+
+
+def fill_missing_tier(credentials: str) -> str:
+    """Fill a blob's missing ``subscriptionType`` / ``rateLimitTier`` from the profile.
+
+    Claude Code fills both only from ``GET /api/oauth/profile`` inside its own
+    token refresh, which cswap's refreshes pre-empt; without them it shows
+    "Claude API" and can hide /remote-control. A blob that has a
+    ``subscriptionType`` is returned as is, with no request. Best effort: any
+    failure, and an organization type with no ``subscriptionType`` mapping,
+    returns ``credentials`` unchanged. One network request: never call it
+    between a grant POST and the successor's persist, or under a lock.
+    """
+    try:
+        data = json.loads(credentials)
+        blob = data["claudeAiOauth"]
+        if blob.get("subscriptionType") is not None:
+            return credentials
+        profile = fetch_oauth_profile(blob["accessToken"]) or {}
+        if "subscriptionType" not in profile:
+            return credentials
+        blob.update({k: profile[k] for k in ("subscriptionType", "rateLimitTier") if k in profile})
+        return json.dumps(data)
+    except Exception as e:
+        _logger.debug("Tier fill skipped: %r", e)
+        return credentials
+
+
 def refresh_oauth_credentials(
     credentials: str, slot: str | None = None
 ) -> str | None:
@@ -489,7 +535,8 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
 
     ``GET /api/oauth/profile`` answers the one question the credential bytes
     can't: *whose* token is this. Returns ``{"uuid", "email",
-    "organizationUuid"}`` or None on any failure — callers treat None as
+    "organizationUuid"}`` (plus ``"subscriptionType"`` / ``"rateLimitTier"``
+    when the response names them) or None on any failure — callers treat None as
     "unresolvable", never as an error. The identity oracle is strictly
     advisory (a switch proceeds pre-fix on None), so the boundary is strict
     the other way: a response counts as resolved only when it carries a
@@ -521,8 +568,8 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
             # expired on an idle machine). Log-file only — the caller falls
             # back to pre-fix behavior and the user sees nothing.
             _logger.warning(
-                "OAuth profile returned 401 while resolving credential "
-                "ownership; proceeding without identity (pre-fix behavior)."
+                "OAuth profile returned 401; the caller proceeds without it "
+                "(pre-fix behavior)."
             )
         else:
             _logger.debug("OAuth profile fetch failed: %r", e)
@@ -541,11 +588,20 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     email = account.get("email")
     organization = data.get("organization")
     org_uuid = organization.get("uuid") if isinstance(organization, dict) else None
-    return {
+    profile = {
         "uuid": uuid.strip(),
         "email": email if isinstance(email, str) else None,
         "organizationUuid": org_uuid if isinstance(org_uuid, str) else None,
     }
+    # Optional, present only when the response names them: the blob's tier fields.
+    if isinstance(organization, dict):
+        subscription = _SUBSCRIPTION_BY_ORG_TYPE.get(str(organization.get("organization_type")))
+        if subscription:
+            profile["subscriptionType"] = subscription
+        tier = organization.get("rate_limit_tier")
+        if isinstance(tier, str) and tier:
+            profile["rateLimitTier"] = tier
+    return profile
 
 
 def probe_oauth_profile_live(access_token: str, timeout_s: float = 5.0) -> bool | None:
