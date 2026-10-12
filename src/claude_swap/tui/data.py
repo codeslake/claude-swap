@@ -386,6 +386,7 @@ def rank_switch_candidates(
         for acc in snap.accounts
         if acc.switch_threshold is not None
     }
+    entries = {acc.number: acc.usage for acc in snap.accounts}
     oauth_candidates = [
         acc.number
         for acc in snap.accounts
@@ -458,7 +459,7 @@ def rank_switch_candidates(
         headroom = _headroom_by_account(usage, axis)
         warm, cold = _rank_dynamic_candidates(
             oauth_candidates, headroom, usage, now, last_active_at or {},
-            settings.cache_ttl_seconds, bars=bars, reasons=reasons,
+            settings.cache_ttl_seconds, bars=bars, reasons=reasons, entries=entries,
         )
         if trigger == "proactive" and not warm and not cold:
             # The tick's `rank` closure (`_dynamic_rank`) retries without the peers' own lines when its active is
@@ -508,6 +509,7 @@ def rank_switch_candidates(
             probe_cooldown=probe_cooldown,
             reasons=reasons,
             bars=bars,
+            entries=entries,
         )
         return ordered, rank_axis
 
