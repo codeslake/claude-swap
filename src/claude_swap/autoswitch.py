@@ -291,10 +291,10 @@ def _is_warm(number: str, last_active_at: dict, now: float, cache_ttl_seconds: f
 def _unreadable_reason(entries: dict | None, num: str, now: float) -> str:
     """Why a candidate's decision value is None, in the panel's plain words.
 
-    A reading that merely aged past ``STALE_OK_S`` with no failure and a poll
-    that is now due is "overdue", not unreadable: nothing failed, the next
-    poll just has not landed. ``entries=None`` (the engine, which collects no
-    reasons) keeps the generic wording.
+    A reading that merely aged past the trust window with no failure and no
+    backoff is "overdue", not unreadable: nothing failed, whatever its poll
+    plan says, the next poll just has not landed. ``entries=None`` (the
+    engine, which collects no reasons) keeps the generic wording.
     """
     entry = (entries or {}).get(num)
     if (
@@ -303,8 +303,6 @@ def _unreadable_reason(entries: dict | None, num: str, now: float) -> str:
         and entry.last_good is not None
         and not entry.consecutive_failures
         and not entry.in_backoff(now)
-        and entry.next_poll_at is not None
-        and entry.next_poll_at <= now
     ):
         return "usage overdue for refresh"
     return "usage unreadable"

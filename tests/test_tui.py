@@ -1825,14 +1825,14 @@ class TestRankSwitchReasons:
 
     def test_an_overdue_reading_is_not_called_unreadable(self):
         """A row whose last good reading aged past `STALE_OK_S` with no failure
-        and a poll that is due says so (its chips still show the reading); a
-        failing or backed-off one stays "usage unreadable", on both passes."""
+        says it is overdue, whatever its poll plan (its chips still show the
+        reading); a failure count alone, or a backoff alone, keeps "usage
+        unreadable", on both passes."""
         now = time.time()
         stale = make_entry(61.0, 96.0, age_s=STALE_OK_S + 60)
-        overdue = dataclasses.replace(stale, next_poll_at=now - 5)
-        failing = dataclasses.replace(
-            overdue, consecutive_failures=2, backoff_until=now + 600
-        )
+        planned = dataclasses.replace(stale, next_poll_at=now - 5)
+        failing = dataclasses.replace(stale, consecutive_failures=2)
+        backed_off = dataclasses.replace(stale, backoff_until=now + 600)
         for settings in (
             _WARM_ORDER_SETTINGS,
             AutoSwitchSettings(strategy="consume-first", threshold=90.0),
@@ -1840,11 +1840,16 @@ class TestRankSwitchReasons:
             reasons = self._reasons(
                 settings,
                 make_account(1, active=True, entry=make_entry(50.0, 50.0)),
-                make_account(2, entry=overdue),
-                make_account(3, entry=failing),
+                make_account(2, entry=planned),
+                make_account(3, entry=stale),
+                make_account(4, entry=failing),
+                make_account(5, entry=backed_off),
             )
             assert reasons == {
-                "2": "usage overdue for refresh", "3": "usage unreadable",
+                "2": "usage overdue for refresh",
+                "3": "usage overdue for refresh",
+                "4": "usage unreadable",
+                "5": "usage unreadable",
             }, (settings.strategy, reasons)
 
 
