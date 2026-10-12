@@ -99,11 +99,12 @@ def _live_claim(
         and (now - last_attempt_at) < LEGACY_CLAIM_TTL_S
     )
 
-# Deliberate staleness (a not-yet-due scheduler cadence, a live fetch lease,
-# or a live hold from `cswap import-usage`) extends decision trust past
-# STALE_OK_S, but never past this ceiling: an account with nothing scheduled
-# must eventually read as unknown so the unknown-path machinery
-# (escalate-all, unhealthy ticks, verified failover) takes back over. A row
+# Deliberate staleness (a scheduler cadence not yet due or its poll not yet
+# attempted, a live fetch lease, or a live hold from `cswap import-usage`)
+# extends decision trust past STALE_OK_S, but never past this ceiling: an
+# account with nothing scheduled must eventually read as unknown so the
+# unknown-path machinery (escalate-all, unhealthy ticks, verified failover)
+# takes back over. A row
 # whose last poll attempt FAILED does not use this ceiling UNLESS it is also
 # held: it is capped at poll_policy.POST_429_MIN_INTERVAL_S instead (see
 # UsageStore.entries), whatever Retry-After or any window reset says — a
@@ -370,12 +371,12 @@ class UsageEntry:
     rejected_fingerprint: str | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the scheduler itself chose the cadence (within
-    # nextPollAt), a fetch lease is live, or the row is held for another
-    # machine's reading. Capped at TRUST_MAX_AGE_S. A row whose last poll
-    # attempt FAILED never sets this from any of those UNLESS it is also
-    # held — see UsageStore.entries, which caps a failed, unheld row's trust
-    # at poll_policy.POST_429_MIN_INTERVAL_S directly. Computed by
-    # UsageStore.entries().
+    # nextPollAt, or past it with the poll unattempted), a fetch lease is
+    # live, or the row is held for another machine's reading. Capped at
+    # TRUST_MAX_AGE_S. A row whose last poll attempt FAILED never sets this
+    # from any of those UNLESS it is also held — see UsageStore.entries, which
+    # caps a failed, unheld row's trust at poll_policy.POST_429_MIN_INTERVAL_S
+    # directly. Computed by UsageStore.entries().
     trust_extended: bool = False
     # Appended to preserve positional compatibility for the older read-model
     # fields while exposing whether a fetch lease is currently live.
@@ -498,8 +499,10 @@ class UsageEntry:
         reaches the ``trust_extended`` branch between ``STALE_OK_S`` (300s)
         and that cap; a row whose last attempt did not fail, or is held for
         another machine's reading, keeps the wider ``TRUST_MAX_AGE_S``
-        ceiling instead. Display code reads ``last_good``/``age_s`` directly
-        instead — it may show older data, annotated with its age.
+        ceiling instead, also past ``nextPollAt`` while the due poll is
+        unattempted (it waits for the next tick). Display code reads
+        ``last_good``/``age_s`` directly instead — it may show older data,
+        annotated with its age.
         """
         if self.sentinel is not None:
             return self.sentinel
@@ -1127,7 +1130,9 @@ class UsageStore:
             held_until = _num_or_none(row.get("heldUntil"))
             refused_until = _num_or_none(row.get("refusedUntil"))
             # Strict < mirrors due_candidate: at nextPollAt the entry is due,
-            # its staleness no longer scheduler-chosen. A live claim keeps the
+            # but a tick can be minutes away, so its staleness stays
+            # scheduler-chosen until lastAttemptAt (stamped on claim and on
+            # record) reaches nextPollAt. A live claim keeps the
             # trust bridge up: when another collector just won the fetch, this
             # reader must not flip trusted → unknown (and e.g. count an
             # unhealthy tick) for the seconds the result is in flight.
@@ -1155,8 +1160,12 @@ class UsageStore:
             else:
                 within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
                 live_claim = _live_claim(claim_until, last_attempt_at, now)
+                poll_untried = next_poll_at is not None and (
+                    last_attempt_at is None or last_attempt_at < next_poll_at
+                )
                 trust_extended = within_ceiling and (
                     (next_poll_at is not None and now < next_poll_at)
+                    or poll_untried
                     or live_claim
                     or held
                 )
