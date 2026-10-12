@@ -270,15 +270,18 @@ The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to 
 <details>
 <summary>Keep Remote Control and Artifacts on one account while inference follows the swap</summary>
 
-Needs the `pin` extra, and an account to point it at:
+Install the pin with the command in the [cswap-pin README's Install section](https://github.com/codeslake/cswap-pin#install), which pins the claude-swap commit and the cswap-pin version together. A plain `uv tool install 'claude-swap[pin]'` resolves from the index, and a release that predates the extra only warns and installs a cswap without `cswap pin`. Then point the pin at an account:
 
 ```bash
-uv tool install 'claude-swap[pin]'   # or: pipx install 'claude-swap[pin]'
 cswap list                           # the numbers come from here
 cswap pin 2
 ```
 
-If the install warns that claude-swap has no `pin` extra, that release predates it and the pin is not installed: follow the Install section of the [cswap-pin README](https://github.com/codeslake/cswap-pin#readme) instead.
+Add this line to `~/.bashrc` or `~/.zshrc` so every `claude` launch first repairs a dead pin daemon:
+
+```bash
+claude() { (cswap pin --ensure >/dev/null 2>&1 &); command claude "$@"; }
+```
 
 Swapping accounts moves *everything*, including two things that are not inference:
 
