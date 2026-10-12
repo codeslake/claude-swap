@@ -1548,26 +1548,39 @@ class TestAdaptiveScheduler:
         ):
             return h.engine.tick()
 
-    def test_baseline_fetches_active_plus_one_candidate(self, temp_home, monkeypatch):
+    def test_baseline_fetches_active_plus_every_due_candidate(
+        self, temp_home, monkeypatch
+    ):
         h = self._harness(temp_home, monkeypatch)
         usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
-        # t0: active (never fetched) + the stalest candidate.
-        self._tick(h, counts, usage)
-        assert counts == {"1": 1, "2": 1}
-        # t60: active planned MIN_INTERVAL_S out; the never-fetched candidate
-        # is the due one.
-        h.clock.advance(60)
+        # t0: active (never fetched) + EVERY due candidate. One per tick left
+        # the rest "usage unreadable" in the ranking while they queued.
         self._tick(h, counts, usage)
         assert counts == {"1": 1, "2": 1, "3": 1}
-        # t120: nobody due — everyone served from the store.
-        h.clock.advance(60)
-        self._tick(h, counts, usage)
+        # t60, t120: nobody due: everyone served from the store.
+        for _ in range(2):
+            h.clock.advance(60)
+            self._tick(h, counts, usage)
         assert counts == {"1": 1, "2": 1, "3": 1}
         # t180: the active account's plan comes due.
         h.clock.advance(60)
         self._tick(h, counts, usage)
         assert counts == {"1": 2, "2": 1, "3": 1}
+
+    def test_candidate_in_backoff_is_not_fetched_with_the_due_ones(
+        self, temp_home, monkeypatch
+    ):
+        from claude_swap.usage_store import FetchRecord
+
+        h = self._harness(temp_home, monkeypatch)
+        h.switcher._usage_store.record(
+            {"3": FetchRecord(error="http-429", retry_after_s=600.0)},
+            {"3": ("c@example.com", "")},
+        )
+        counts: dict[str, int] = {}
+        self._tick(h, counts, {"1": _usage(50), "2": _usage(10)})
+        assert counts == {"1": 1, "2": 1}
 
     def test_near_threshold_escalates_to_full_refresh(self, temp_home, monkeypatch):
         # threshold 90, margin 15 → active at 80% is within the escalation band.
@@ -1862,7 +1875,7 @@ class TestAdaptiveScheduler:
         assert outcome is TickOutcome.NO_ACTION
         assert h.engine._unhealthy_ticks == 0
         assert "1" not in counts  # backoff respected
-        assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
+        assert counts == {"2": 1, "3": 1}  # the due candidates only, no escalate-all
 
     def test_a_non_429_ask_is_bounded_at_its_own_trust_ceiling(
         self, temp_home, monkeypatch
@@ -2535,8 +2548,9 @@ class TestAdaptiveScheduler:
                 h.clock.advance(60)
         # (a) HTTP volume identical to the baseline cadence under `best`.
         assert counts == {"1": 2, "2": 1, "3": 1}
-        # (b) no collection ever requested the all-candidates escalation set.
-        assert {"1", "2", "3"} not in fetch_sets
+        # (b) only the two baseline fetches ran (t0: the active and both due
+        # candidates; t180: the active). An escalation would add a third.
+        assert [f for f in fetch_sets if f] == [{"1", "2", "3"}, {"1"}]
 
     def test_consume_first_stale_target_holds_then_switches(
         self, temp_home, monkeypatch
@@ -15437,11 +15451,11 @@ class TestStoppedEngineDoesNotAct:
 
         A stop landing inside the phase-1 collection fetch surfaces on the
         way back from that call, before `_collect_scheduled_usage` has
-        decided whether to escalate. Measured (one candidate, active near
-        the escalation band):
+        decided whether to escalate. Measured (two due candidates, active
+        near the escalation band):
 
-            gate present:  network_fetches == [['2']]
-            gate deleted:  network_fetches == [['2'], ['1', '2', '3']]
+            gate present:  network_fetches == [['2', '3']]
+            gate deleted:  network_fetches == [['2', '3'], ['1', '2', '3']]
 
         A stopped engine would issue a full 3-account fetch for a
         successor that already owns LIVE — exactly the harm the :1590
@@ -15468,7 +15482,7 @@ class TestStoppedEngineDoesNotAct:
         ):
             engine.tick()
 
-        assert network_fetches == [["2"]], (
+        assert network_fetches == [["2", "3"]], (
             f"network_fetches={network_fetches} — a stopped engine issued "
             "a full candidate refetch for a successor that already owns "
             "LIVE"
@@ -15492,11 +15506,10 @@ class TestStoppedEngineDoesNotAct:
         fetch is far below the escalation band here (so that collection
         returns normally without ever reaching :1676), and surfaces only
         when the two-phase commit re-checks before spending its own
-        refetch. Measured (active well below threshold, one sooner-resetting
-        candidate):
+        refetch. Measured (active well below threshold, two due candidates):
 
-            gate present:  network_fetches == [['2']]
-            gate deleted:  network_fetches == [['2'], ['1', '2', '3']]
+            gate present:  network_fetches == [['2', '3']]
+            gate deleted:  network_fetches == [['2', '3'], ['1', '2', '3']]
         """
         harness.settings = replace(harness.settings, strategy="consume-first")
         engine = harness._make_engine()
@@ -15523,7 +15536,7 @@ class TestStoppedEngineDoesNotAct:
         ):
             engine.tick()
 
-        assert network_fetches == [["2"]], (
+        assert network_fetches == [["2", "3"]], (
             f"network_fetches={network_fetches} — a stopped engine issued "
             "a full candidate refetch for a successor that already owns "
             "LIVE"
