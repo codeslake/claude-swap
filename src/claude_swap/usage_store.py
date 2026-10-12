@@ -99,11 +99,12 @@ def _live_claim(
         and (now - last_attempt_at) < LEGACY_CLAIM_TTL_S
     )
 
-# Deliberate staleness (a not-yet-due scheduler cadence, a live fetch lease,
-# or a live hold from `cswap import-usage`) extends decision trust past
-# STALE_OK_S, but never past this ceiling: an account with nothing scheduled
-# must eventually read as unknown so the unknown-path machinery
-# (escalate-all, unhealthy ticks, verified failover) takes back over. A row
+# Deliberate staleness (a scheduler cadence not yet due or its poll not yet
+# attempted, a live fetch lease, or a live hold from `cswap import-usage`)
+# extends decision trust past STALE_OK_S, but never past this ceiling: an
+# account with nothing scheduled must eventually read as unknown so the
+# unknown-path machinery (escalate-all, unhealthy ticks, verified failover)
+# takes back over. A row
 # whose last poll attempt FAILED does not use this ceiling UNLESS it is also
 # held: it is capped at poll_policy.POST_429_MIN_INTERVAL_S instead (see
 # UsageStore.entries), whatever Retry-After or any window reset says — a
@@ -370,12 +371,12 @@ class UsageEntry:
     rejected_fingerprint: str | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the scheduler itself chose the cadence (within
-    # nextPollAt), a fetch lease is live, or the row is held for another
-    # machine's reading. Capped at TRUST_MAX_AGE_S. A row whose last poll
-    # attempt FAILED never sets this from any of those UNLESS it is also
-    # held — see UsageStore.entries, which caps a failed, unheld row's trust
-    # at poll_policy.POST_429_MIN_INTERVAL_S directly. Computed by
-    # UsageStore.entries().
+    # nextPollAt, or past it with the poll unattempted), a fetch lease is
+    # live, or the row is held for another machine's reading. Capped at
+    # TRUST_MAX_AGE_S. A row whose last poll attempt FAILED never sets this
+    # from any of those UNLESS it is also held — see UsageStore.entries, which
+    # caps a failed, unheld row's trust at poll_policy.POST_429_MIN_INTERVAL_S
+    # directly. Computed by UsageStore.entries().
     trust_extended: bool = False
     # Appended to preserve positional compatibility for the older read-model
     # fields while exposing whether a fetch lease is currently live.
@@ -602,8 +603,10 @@ def due_candidates(
     removes it from the due set between attempts.
 
     Used by the auto engine to poll each due alternate once per pass: a due
-    row with no failure reads no decision value (``decision_value``), so one
-    left waiting its turn would be dropped from the ranking as unreadable.
+    row stays decision-trusted for one poll interval past ``nextPollAt``
+    (``UsageStore.entries``), so the pass fetches it before that runs out;
+    one left waiting longer reads no decision value and is dropped from the
+    ranking as unreadable.
     Poll plans
     (``nextPollAt``/``pollIntervalS``) are written by whichever collector
     fetched (see the plan persistence in ``_collect_usage_entries``), so
@@ -1205,13 +1208,21 @@ class UsageStore:
             age_s = (now - fetched_at) if fetched_at is not None else None
             consecutive_failures = int(row.get("consecutiveFailures") or 0)
             next_poll_at = _num_or_none(row.get("nextPollAt"))
+            poll_interval_s = _num_or_none(row.get("pollIntervalS"))
             last_attempt_at = _num_or_none(row.get("lastAttemptAt"))
             claim_until = _num_or_none(row.get("claimUntil"))
             walled_until = _num_or_none(row.get("walledUntil"))
             held_until = _num_or_none(row.get("heldUntil"))
             refused_until = _num_or_none(row.get("refusedUntil"))
-            # Strict < mirrors due_candidate: at nextPollAt the entry is due,
-            # its staleness no longer scheduler-chosen. A live claim keeps the
+            # At nextPollAt the entry is due (strict <, as in due_candidate),
+            # but a tick can be minutes away, so its staleness stays
+            # scheduler-chosen until its poll was attempted (lastAttemptAt,
+            # stamped on claim and on record, reaches nextPollAt) or one poll
+            # interval past nextPollAt (at least POST_429_MIN_INTERVAL_S, the
+            # longest tick) has run out. By then the first tick at or after
+            # nextPollAt had its chance, and a row it declined (the hourly
+            # attempt cap) must not keep the unknown-path takeover off for the
+            # rest of TRUST_MAX_AGE_S. A live claim keeps the
             # trust bridge up: when another collector just won the fetch, this
             # reader must not flip trusted → unknown (and e.g. count an
             # unhealthy tick) for the seconds the result is in flight.
@@ -1239,8 +1250,15 @@ class UsageStore:
             else:
                 within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
                 live_claim = _live_claim(claim_until, last_attempt_at, now)
+                poll_grace_s = max(poll_interval_s or 0.0, POST_429_MIN_INTERVAL_S)
+                poll_untried = (
+                    next_poll_at is not None
+                    and now < next_poll_at + poll_grace_s
+                    and (last_attempt_at is None or last_attempt_at < next_poll_at)
+                )
                 trust_extended = within_ceiling and (
                     (next_poll_at is not None and now < next_poll_at)
+                    or poll_untried
                     or live_claim
                     or held
                 )
@@ -1253,7 +1271,7 @@ class UsageStore:
                 last_error=row.get("lastError"),
                 backoff_until=_num_or_none(row.get("backoffUntil")),
                 next_poll_at=next_poll_at,
-                poll_interval_s=_num_or_none(row.get("pollIntervalS")),
+                poll_interval_s=poll_interval_s,
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 struck_fingerprint=row.get("struckFingerprint"),
