@@ -2292,7 +2292,7 @@ def run(
     ensure: bool = False,
     state: bool = False,
     everywhere: bool = False,
-    shell_prefix: bool = False,
+    print_shell_prefix_path: bool = False,
 ) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
@@ -2440,7 +2440,7 @@ def run(
         )
         return 0
 
-    if shell_prefix:
+    if print_shell_prefix_path:
         # The package prints the path, bare, for `$(...)`. A cswap-pin before
         # 0.1.340 lacks the entry point: name the upgrade, not an AttributeError.
         fn = getattr(_impl(), "shell_prefix_main", None)
