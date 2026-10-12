@@ -265,7 +265,7 @@ The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to 
 <details>
 <summary>Keep Remote Control and Artifacts on one account while inference follows the swap</summary>
 
-PyPI's claude-swap has no `pin` extra, so `uv tool install 'claude-swap[pin]'` warns, exits 0, and leaves you a cswap without `cswap pin` (`cswap pin --help` prints the general help, with no pin command in it). Install with the command in the [cswap-pin README's Install section](https://github.com/codeslake/cswap-pin#install), which pins the claude-swap commit and the cswap-pin version together. Then point the pin at an account:
+Install the pin with the command in the [cswap-pin README's Install section](https://github.com/codeslake/cswap-pin#install), which pins the claude-swap commit and the cswap-pin version together. A plain `uv tool install 'claude-swap[pin]'` resolves from the index, and a release that predates the extra only warns and installs a cswap without `cswap pin`. Then point the pin at an account:
 
 ```bash
 cswap list                           # the numbers come from here
