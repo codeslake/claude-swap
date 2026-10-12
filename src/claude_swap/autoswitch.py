@@ -288,6 +288,28 @@ def _is_warm(number: str, last_active_at: dict, now: float, cache_ttl_seconds: f
     return ts is not None and (now - ts) < cache_ttl_seconds
 
 
+def _unreadable_reason(entries: dict | None, num: str, now: float) -> str:
+    """Why a candidate's decision value is None, in the panel's plain words.
+
+    A reading that merely aged past ``STALE_OK_S`` with no failure and a poll
+    that is now due is "overdue", not unreadable: nothing failed, the next
+    poll just has not landed. ``entries=None`` (the engine, which collects no
+    reasons) keeps the generic wording.
+    """
+    entry = (entries or {}).get(num)
+    if (
+        entry is not None
+        and entry.decision_value() is None
+        and entry.last_good is not None
+        and not entry.consecutive_failures
+        and not entry.in_backoff(now)
+        and entry.next_poll_at is not None
+        and entry.next_poll_at <= now
+    ):
+        return "usage overdue for refresh"
+    return "usage unreadable"
+
+
 def _rank_dynamic_candidates(
     oauth_candidates: Sequence[str],
     headroom: dict[str, float | None],
@@ -296,6 +318,7 @@ def _rank_dynamic_candidates(
     last_active_at: dict,
     cache_ttl_seconds: float,
     reasons: dict[str, str] | None = None,
+    entries: dict | None = None,
 ) -> tuple[list[str], list[str]]:
     """WARM-tiered candidates for a `dynamic` proactive/alternation switch
     (#375 item 3), each tier soonest-weekly-reset first (`dynamic`'s own
@@ -331,7 +354,10 @@ def _rank_dynamic_candidates(
     for num in oauth_candidates:
         h = headroom.get(num)
         if h is None or h <= SPENT_HEADROOM_PCT:
-            reasons[num] = "usage unreadable" if h is None else "no headroom left"
+            reasons[num] = (
+                _unreadable_reason(entries, num, now) if h is None
+                else "no headroom left"
+            )
             continue
         reset_ts = _seven_day_reset_ts(usage.get(num), now)
         key = (reset_ts if reset_ts is not None else float("inf"), -h)
@@ -3390,6 +3416,7 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         now: float,
         reasons: dict[str, str] | None = None,
+        entries: dict | None = None,
     ) -> tuple[list[str], bool, float | None, bool, str | None]:
         """Filter and rank OAuth candidates for this tick's trigger, on one
         window set (``models``); pure, no state writes, called at most
@@ -3523,7 +3550,7 @@ class AutoSwitchEngine:
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
-                reasons[num] = "usage unreadable"
+                reasons[num] = _unreadable_reason(entries, num, now)
                 continue
             any_known = True          # it EXISTS and is readable either way
             recovery_ts = (

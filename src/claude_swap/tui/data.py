@@ -257,6 +257,7 @@ def rank_switch_candidates(
     models = parse_model_names(settings.model)
     consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
     usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
+    entries = {acc.number: acc.usage for acc in snap.accounts}
     oauth_candidates = [
         acc.number
         for acc in snap.accounts
@@ -327,7 +328,7 @@ def rank_switch_candidates(
         headroom = _headroom_by_account(usage, axis)
         warm, cold = _rank_dynamic_candidates(
             oauth_candidates, headroom, usage, now, last_active_at or {},
-            settings.cache_ttl_seconds, reasons,
+            settings.cache_ttl_seconds, reasons, entries,
         )
         if trigger == "proactive":
             cold_floor = settings.cold_switch_cost_pct
@@ -362,6 +363,7 @@ def rank_switch_candidates(
             settings=settings,
             now=now,
             reasons=reasons,
+            entries=entries,
         )
         return ordered, rank_axis
 

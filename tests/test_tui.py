@@ -1823,6 +1823,30 @@ class TestRankSwitchReasons:
             "2": "usage unreadable", "3": "no headroom left",
         }, reasons
 
+    def test_an_overdue_reading_is_not_called_unreadable(self):
+        """A row whose last good reading aged past `STALE_OK_S` with no failure
+        and a poll that is due says so (its chips still show the reading); a
+        failing or backed-off one stays "usage unreadable", on both passes."""
+        now = time.time()
+        stale = make_entry(61.0, 96.0, age_s=STALE_OK_S + 60)
+        overdue = dataclasses.replace(stale, next_poll_at=now - 5)
+        failing = dataclasses.replace(
+            overdue, consecutive_failures=2, backoff_until=now + 600
+        )
+        for settings in (
+            _WARM_ORDER_SETTINGS,
+            AutoSwitchSettings(strategy="consume-first", threshold=90.0),
+        ):
+            reasons = self._reasons(
+                settings,
+                make_account(1, active=True, entry=make_entry(50.0, 50.0)),
+                make_account(2, entry=overdue),
+                make_account(3, entry=failing),
+            )
+            assert reasons == {
+                "2": "usage overdue for refresh", "3": "usage unreadable",
+            }, (settings.strategy, reasons)
+
 
 @pytest.mark.asyncio
 class TestSharedAccountOrder:
