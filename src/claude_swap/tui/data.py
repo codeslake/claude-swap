@@ -473,6 +473,7 @@ def rank_switch_candidates(
                 warm, cold = _rank_dynamic_candidates(
                     oauth_candidates, headroom, usage, now, last_active_at or {},
                     settings.cache_ttl_seconds, reasons=reasons,
+                    entries=entries,  # #371: the retried pass names an overdue reading as overdue too
                 )
         if trigger == "proactive":
             cold_floor = settings.cold_switch_cost_pct
