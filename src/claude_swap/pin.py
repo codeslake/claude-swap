@@ -2441,10 +2441,8 @@ def run(
         return 0
 
     if shell_prefix:
-        # The package writes the script and prints its path: nothing but that
-        # path on stdout, for `$(...)`. A cswap-pin older than 0.1.340 lacks
-        # the entry point, so say what to upgrade rather than let an
-        # AttributeError out of a command the user typed.
+        # The package prints the path, bare, for `$(...)`. A cswap-pin before
+        # 0.1.340 lacks the entry point: name the upgrade, not an AttributeError.
         fn = getattr(_impl(), "shell_prefix_main", None)
         if fn is None:
             from claude_swap.printer import error
