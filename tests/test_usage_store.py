@@ -214,9 +214,8 @@ class TestExtendedTrust:
         store.record(
             {"1": FetchRecord(usage=USAGE), "2": FetchRecord(usage=USAGE)}, IDENT
         )
-        store.set_poll_plan(
-            {n: (clock.now + 600.0, 600.0) for n in ("1", "2")}, IDENT
-        )
+        due = clock.now + 600.0
+        store.set_poll_plan({n: (due, 600.0) for n in ("1", "2")}, IDENT)
         clock.advance(400)
         entry = store.entries(IDENT)["1"]
         assert entry.consecutive_failures == 0
@@ -231,8 +230,11 @@ class TestExtendedTrust:
         entries = store.entries(IDENT)
         assert entries["1"].decision_value() == USAGE
         assert entries["2"].decision_value() is None
-        # Nor does an untried poll outlive the ceiling.
-        clock.advance(TRUST_MAX_AGE_S)
+        # Nor does an untried poll (a tick never reached it, or the hourly
+        # attempt cap refused it) outlive one poll interval past nextPollAt.
+        clock.now = due + 600.0 - 1
+        assert store.entries(IDENT)["1"].decision_value() == USAGE
+        clock.now = due + 600.0 + 1
         assert store.entries(IDENT)["1"].decision_value() is None
 
     def test_trust_ceiling_wins_over_non_failed_stale_plan(self, store, clock):
