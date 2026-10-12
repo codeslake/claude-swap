@@ -4820,12 +4820,12 @@ class TestHealADeadPin:
         # caught it, and the case failed as `exit 1` — a real signal, but for
         # the wrong reason and in the wrong place.)
         def _run(switcher, account, *, clear, heal_only, get_port, get_certdir,
-                 set_port, ensure, state, everywhere):
+                 set_port, ensure, state, print_shell_prefix_path, everywhere):
             seen.update(
                 account=account, clear=clear, heal_only=heal_only,
                 get_port=get_port, get_certdir=get_certdir,
                 set_port=set_port, ensure=ensure, state=state,
-                everywhere=everywhere,
+                print_shell_prefix_path=print_shell_prefix_path, everywhere=everywhere,
             )
             return 0
 
@@ -4947,7 +4947,8 @@ class TestHealADeadPin:
         assert seen == {
             "account": None, "clear": False, "heal_only": True,
             "get_port": False, "get_certdir": False, "set_port": None,
-            "ensure": False, "state": False, "everywhere": False,
+            "ensure": False, "state": False, "print_shell_prefix_path": False,
+            "everywhere": False,
         }
 
     def test_get_port_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
@@ -5036,6 +5037,41 @@ class TestHealADeadPin:
             f"stdout must be the bare path and nothing else, or it lands "
             f"inside the caller's variable: {out.getvalue()!r}"
         )
+
+    @pytest.mark.parametrize("rc, printed", [(0, "/pin-proxy/shell-prefix\n"), (1, "")])
+    def test_print_shell_prefix_path_hands_over_to_the_package(
+        self, monkeypatch, capsys, rc, printed
+    ):
+        """`--print-shell-prefix-path` is the package's `shell_prefix_main`,
+        unchanged: its rc and its stdout (a bare path, read by `$(...)`) reach
+        the caller."""
+        import types
+
+        from claude_swap import pin
+
+        def entry():
+            print(printed, end="")
+            return rc
+
+        monkeypatch.setattr(
+            pin, "_impl", lambda: types.SimpleNamespace(shell_prefix_main=entry))
+        assert pin.run(object(), None, print_shell_prefix_path=True) == rc
+        assert capsys.readouterr().out == printed
+
+    def test_print_shell_prefix_path_names_the_upgrade_when_the_package_predates_it(
+        self, monkeypatch, capsys
+    ):
+        """cswap-pin before 0.1.340 has no entry point. One stderr line that
+        says so, rc 1, and nothing on stdout for a `$(...)` to capture."""
+        import types
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_impl", lambda: types.SimpleNamespace())
+        assert pin.run(object(), None, print_shell_prefix_path=True) == 1
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert len(err.strip().splitlines()) == 1 and "0.1.340" in err, err
 
     def test_set_port_persists_where_the_package_looks_for_it(
         self, tmp_path, monkeypatch
@@ -11375,7 +11411,8 @@ class TestAskSwallowsThePackagesOwnExceptions:
 
 class TestThePinFlagsAreMutuallyExclusive:
     """`cswap pin` takes exactly one of NUM|EMAIL / --clear / --heal /
-    --get_port / --get_certdir / --set_port / --ensure / --state.
+    --get_port / --get_certdir / --set_port / --ensure / --state /
+    --print-shell-prefix-path.
 
     Every pair has to be refused, and refused with an exit code a shell can
     branch on. A query that silently discarded an action would be
@@ -11384,7 +11421,7 @@ class TestThePinFlagsAreMutuallyExclusive:
 
     ONE_OF = (["2"], ["--clear"], ["--heal"], ["--get_port"],
               ["--get_certdir"], ["--set_port", "5"], ["--ensure"],
-              ["--state"])
+              ["--state"], ["--print-shell-prefix-path"])
 
     def test_every_pair_is_refused(self):
         import itertools
@@ -11421,6 +11458,10 @@ class TestThePinFlagsAreMutuallyExclusive:
             assert exc.value.code == 0, f"{argv} was refused on its own"
         assert len(seen) == len(self.ONE_OF), (
             f"not every single flag reached pin.run: {seen}")
+        # Reaching `run` is not carrying the flag: only the shell-prefix argv may
+        # forward it True, so a wrong `args.` field in cli.py fails here.
+        assert [kw["print_shell_prefix_path"] for _, kw in seen] == [
+            argv == ["--print-shell-prefix-path"] for argv in self.ONE_OF]
 
     def test_debug_combines_with_all_of_them(self):
         """`--debug` is not one of the exclusive set and must stay usable."""

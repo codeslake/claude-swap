@@ -316,7 +316,7 @@ class TestCliShouldProbe:
         differently.
         """
         for argv in (["pin", "--ensure"], ["pin", "--get_port"],
-                     ["pin", "--get_certdir"]):
+                     ["pin", "--get_certdir"], ["pin", "--print-shell-prefix-path"]):
             assert appearance.cli_should_probe(argv, colors_enabled=True) is False, argv
 
     def test_every_script_consumed_pin_flag_is_listed(self):

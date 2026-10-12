@@ -129,6 +129,8 @@ Examples:
   cswap pin --set_port N   serve on port N from the next start (0 = dynamic)
   cswap pin --ensure   repair a stale wiring before a launch (rc hooks)
   cswap pin --state    print OK/NOT-OK/UNKNOWN and exit 0, for a monitor
+  cswap pin --print-shell-prefix-path  write the opt-in CLAUDE_CODE_SHELL_PREFIX
+                       script if missing and print its absolute path
         """,
     )
     # EXACTLY ONE OF THESE. `--debug` stays outside the group; everything else
@@ -202,6 +204,18 @@ Examples:
             "stdout, detail on stderr, and always exit 0."
         ),
     )
+    # Opt-in: only writes the script and prints where it is. Nothing here sets
+    # CLAUDE_CODE_SHELL_PREFIX; that stays the user's own line.
+    one_of.add_argument(
+        "--print-shell-prefix-path",
+        action="store_true",
+        help=(
+            "Write the script a user may point CLAUDE_CODE_SHELL_PREFIX at to "
+            "keep the programs Claude Code starts off the pin, if it is "
+            "missing, and print its absolute path and nothing else. Needs "
+            "cswap-pin 0.1.340 or newer."
+        ),
+    )
     # A MODIFIER OF `--clear`, so outside the group. Alone it would be a
     # discarded flag, and a discarded flag reads as a performed action.
     parser.add_argument(
@@ -262,6 +276,7 @@ Examples:
                 set_port=args.set_port,
                 ensure=args.ensure,
                 state=args.state,
+                print_shell_prefix_path=args.print_shell_prefix_path,
             )
         )
     except ClaudeSwitchError as e:

@@ -171,7 +171,8 @@ def resolve_theme(setting: str, detect=detect_terminal_background) -> str:
 # The `cswap pin` invocations read by a script or an rc hook rather than by a
 # person. One set, two consumers: this module refuses to probe the terminal for
 # them, and `cli.main` keeps the native-TLS fallback warning off their stderr.
-_PIN_SCRIPT_FLAGS = frozenset({"--ensure", "--get_port", "--get_certdir"})
+_PIN_SCRIPT_FLAGS = frozenset(
+    {"--ensure", "--get_port", "--get_certdir", "--print-shell-prefix-path"})
 
 
 def pin_invocation_is_script_consumed(argv) -> bool:

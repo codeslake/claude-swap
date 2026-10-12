@@ -2292,6 +2292,7 @@ def run(
     ensure: bool = False,
     state: bool = False,
     everywhere: bool = False,
+    print_shell_prefix_path: bool = False,
 ) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
@@ -2438,6 +2439,18 @@ def run(
             else msg
         )
         return 0
+
+    if print_shell_prefix_path:
+        # The package prints the path, bare, for `$(...)`. A cswap-pin before
+        # 0.1.340 lacks the entry point: name the upgrade, not an AttributeError.
+        fn = getattr(_impl(), "shell_prefix_main", None)
+        if fn is None:
+            from claude_swap.printer import error
+
+            error("The installed cswap-pin has no shell prefix: upgrade it to "
+                  "cswap-pin >= 0.1.340")
+            return 1
+        return fn()
 
     # Show and set are the package's: it resolves the account, pins it through the
     # one `set_pin` the TUI calls, and prints what the command prints.
