@@ -4820,12 +4820,12 @@ class TestHealADeadPin:
         # caught it, and the case failed as `exit 1` — a real signal, but for
         # the wrong reason and in the wrong place.)
         def _run(switcher, account, *, clear, heal_only, get_port, get_certdir,
-                 set_port, ensure, state, everywhere):
+                 set_port, ensure, state, shell_prefix, everywhere):
             seen.update(
                 account=account, clear=clear, heal_only=heal_only,
                 get_port=get_port, get_certdir=get_certdir,
                 set_port=set_port, ensure=ensure, state=state,
-                everywhere=everywhere,
+                shell_prefix=shell_prefix, everywhere=everywhere,
             )
             return 0
 
@@ -4947,7 +4947,8 @@ class TestHealADeadPin:
         assert seen == {
             "account": None, "clear": False, "heal_only": True,
             "get_port": False, "get_certdir": False, "set_port": None,
-            "ensure": False, "state": False, "everywhere": False,
+            "ensure": False, "state": False, "shell_prefix": False,
+            "everywhere": False,
         }
 
     def test_get_port_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
@@ -5036,6 +5037,40 @@ class TestHealADeadPin:
             f"stdout must be the bare path and nothing else, or it lands "
             f"inside the caller's variable: {out.getvalue()!r}"
         )
+
+    @pytest.mark.parametrize("rc, printed", [(0, "/pin-proxy/shell-prefix\n"), (1, "")])
+    def test_shell_prefix_hands_over_to_the_package(
+        self, monkeypatch, capsys, rc, printed
+    ):
+        """`--shell-prefix` is the package's `shell_prefix_main`, unchanged: its
+        rc and its stdout (a bare path, read by `$(...)`) reach the caller."""
+        import types
+
+        from claude_swap import pin
+
+        def entry():
+            print(printed, end="")
+            return rc
+
+        monkeypatch.setattr(
+            pin, "_impl", lambda: types.SimpleNamespace(shell_prefix_main=entry))
+        assert pin.run(object(), None, shell_prefix=True) == rc
+        assert capsys.readouterr().out == printed
+
+    def test_shell_prefix_names_the_upgrade_when_the_package_predates_it(
+        self, monkeypatch, capsys
+    ):
+        """cswap-pin before 0.1.340 has no entry point. One stderr line that
+        says so, rc 1, and nothing on stdout for a `$(...)` to capture."""
+        import types
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_impl", lambda: types.SimpleNamespace())
+        assert pin.run(object(), None, shell_prefix=True) == 1
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert len(err.strip().splitlines()) == 1 and "0.1.340" in err, err
 
     def test_set_port_persists_where_the_package_looks_for_it(
         self, tmp_path, monkeypatch
@@ -11367,7 +11402,8 @@ class TestAskSwallowsThePackagesOwnExceptions:
 
 class TestThePinFlagsAreMutuallyExclusive:
     """`cswap pin` takes exactly one of NUM|EMAIL / --clear / --heal /
-    --get_port / --get_certdir / --set_port / --ensure / --state.
+    --get_port / --get_certdir / --set_port / --ensure / --state /
+    --shell-prefix.
 
     Every pair has to be refused, and refused with an exit code a shell can
     branch on. A query that silently discarded an action would be
@@ -11376,7 +11412,7 @@ class TestThePinFlagsAreMutuallyExclusive:
 
     ONE_OF = (["2"], ["--clear"], ["--heal"], ["--get_port"],
               ["--get_certdir"], ["--set_port", "5"], ["--ensure"],
-              ["--state"])
+              ["--state"], ["--shell-prefix"])
 
     def test_every_pair_is_refused(self):
         import itertools
