@@ -66,7 +66,7 @@ from claude_swap.switcher import (
 )
 from claude_swap.usage_store import (
     WALL_FALLBACK_S,
-    due_candidate,
+    due_candidates,
     plan_oversleeps_interval,
 )
 
@@ -453,7 +453,7 @@ class _CandidateDead(Exception):
         self.confirmed = confirmed
 
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
-# active account plus ONE due candidate (stalest data first) — instead of
+# active account plus every DUE candidate (stalest data first) — instead of
 # every account in parallel, and the per-account cadence itself (movement,
 # threshold distance, urgent mode, 429 recovery) lives in poll_policy, is
 # persisted in the usage store by whichever collector fetched, and is shared
@@ -3234,9 +3234,10 @@ class AutoSwitchEngine:
 
         Phase A fetches the active account (when its persisted poll plan says
         it is due — poll_policy's urgent mode is what tightens that cadence
-        near the band) plus ONE due candidate (the one with the stalest data
-        — never-fetched first, then oldest fetch); everyone else is served
-        from the usage store. Phase B refetches ALL candidates and recomputes
+        near the band) plus every due candidate (stalest data first —
+        never-fetched, then oldest fetch; a due row has no decision value, so
+        one left queued would drop out of the ranking); everyone else is
+        served from the usage store. Phase B refetches ALL candidates and recomputes
         before any switch decision when a switch could be near: active
         utilization within ``ESCALATION_MARGIN_PCT`` of the threshold, or
         active usage unknown (failover must not run on stale candidate data).
@@ -3268,8 +3269,8 @@ class AutoSwitchEngine:
         decision values and ``headroom`` the derived headroom per account.
         """
         now = self.clock()
-        # Quarantined accounts can never be switch targets, so spending the
-        # single alternate poll slot (or an escalation fetch) on one is wasted.
+        # Quarantined accounts can never be switch targets, so spending a
+        # baseline poll (or an escalation fetch) on one is wasted.
         candidates = [
             n
             for n in self.switcher.switchable_account_numbers()
@@ -3362,9 +3363,7 @@ class AutoSwitchEngine:
         ):
             plan.add(current)
         if self._idle_hold_since is None:
-            pick = due_candidate(candidates, pre, now)
-            if pick is not None:
-                plan.add(pick)
+            plan.update(due_candidates(candidates, pre, now))
         # A STOPPED ENGINE ISSUES NO FETCHES, and an entry gate is not enough:
         # `stop()` returns while a worker is parked in an emit (the exemption
         # that keeps the TUI from deadlocking), and that worker then wakes and
@@ -3970,7 +3969,7 @@ class AutoSwitchEngine:
           quarantined`` mirrors the candidate list ``_collect_scheduled_usage``
           builds — a disabled slot or one in the engine's own quarantine
           ledger is never planned or fetched regardless of its stored state;
-        - at the store: ``due_candidate`` additionally skips a row that is
+        - at the store: ``due_candidates`` additionally skips a row that is
           ``sentinel``, in backoff, a dead token (e.g. quarantined by
           ``authDeadStrikes``), or already at its hourly attempt cap
           (``ATTEMPTS_PER_HOUR_MAX`` — ``reserve()`` would refuse it too)

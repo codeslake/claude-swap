@@ -29,6 +29,7 @@ from claude_swap.usage_store import (
     UsageEntry,
     UsageStore,
     due_candidate,
+    due_candidates,
     with_sentinel,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -1209,6 +1210,7 @@ class TestDueCandidate:
             "3": UsageEntry(fetched_at=self.NOW - 300, age_s=300.0),
         }
         assert due_candidate(["2", "3"], entries, self.NOW) == "3"
+        assert due_candidates(["2", "3"], entries, self.NOW) == ["3", "2"]
 
     def test_sentinel_accounts_skipped(self):
         entries = {"2": UsageEntry(sentinel="api-key")}
@@ -1226,6 +1228,7 @@ class TestDueCandidate:
         }
         # "2" is stalest but not yet due per auto's learned plan → "3" wins.
         assert due_candidate(["2", "3"], entries, self.NOW) == "3"
+        assert due_candidates(["2", "3"], entries, self.NOW) == ["3"]
 
     def test_reset_parked_exhausted_plan_is_due_for_repair(self):
         exhausted = {"seven_day": {"pct": 100.0}}

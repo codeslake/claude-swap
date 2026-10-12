@@ -542,10 +542,10 @@ def plan_oversleeps_interval(entry: UsageEntry, now: float) -> bool:
     )
 
 
-def due_candidate(
+def due_candidates(
     candidates: list[str], entries: dict[str, UsageEntry], now: float
-) -> str | None:
-    """The due candidate with the stalest data, or None.
+) -> list[str]:
+    """Every due candidate, stalest data first (never-fetched before any).
 
     Due = past its ``nextPollAt``, not in failure backoff, not held for
     another machine's reading (``UsageStore.adopt``), and not already at its
@@ -556,7 +556,9 @@ def due_candidate(
     perpetually failing account can't monopolize the slot: its backoff
     removes it from the due set between attempts.
 
-    Used by the auto engine to pick the single alternate to poll per pass.
+    Used by the auto engine to poll each due alternate once per pass: a due
+    row with no failure reads no decision value (``decision_value``), so one
+    left waiting its turn would be dropped from the ranking as unreadable.
     Poll plans
     (``nextPollAt``/``pollIntervalS``) are written by whichever collector
     fetched (see the plan persistence in ``_collect_usage_entries``), so
@@ -571,7 +573,7 @@ def due_candidate(
     reaches here is "could not determine", where that scan relies on this
     refusal to keep the row out of a fetch. Binding it would not merely drop a
     guard, it would WASTE the pass: ``_row_eligible`` refuses a struck row
-    under the write lock regardless, so ``reserve`` returns nothing and the one
+    under the write lock regardless, so ``reserve`` returns nothing and an
     alternate poll is spent on a row that cannot be fetched.
     """
     due: list[tuple[int, float, str]] = []
@@ -600,10 +602,15 @@ def due_candidate(
             due.append((0, 0.0, num))
         else:
             due.append((1, entry.fetched_at, num))
-    if not due:
-        return None
     due.sort()
-    return due[0][2]
+    return [num for *_, num in due]
+
+
+def due_candidate(
+    candidates: list[str], entries: dict[str, UsageEntry], now: float
+) -> str | None:
+    """The stalest of ``due_candidates``, or None."""
+    return next(iter(due_candidates(candidates, entries, now)), None)
 
 
 def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> float | None:
