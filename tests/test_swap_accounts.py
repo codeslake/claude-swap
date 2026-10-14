@@ -657,7 +657,10 @@ class TestSwapAccounts:
             mp.setattr("claude_swap.switcher.os.rename", windows_rename)
             switcher._write_json(switcher.sequence_file, {"x": 1})
 
-        assert json.loads(switcher.sequence_file.read_text(encoding="utf-8")) == {"x": 1}
+        written = json.loads(switcher.sequence_file.read_text(encoding="utf-8"))
+        # _write_json stamps the high-water mark on every sequence.json write.
+        written.pop("highestAccountNumber")
+        assert written == {"x": 1}
         assert switcher.sequence_file.stat().st_ino != before_ino
         assert not list(switcher.sequence_file.parent.glob("*.tmp"))
 
