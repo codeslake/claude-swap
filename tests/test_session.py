@@ -3286,6 +3286,75 @@ class TestReadSessionCredentials:
         creds = session_mod.read_session_credentials(session_dir)
         assert creds is not None and "sk-own" in creds
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_relative_symlink_target_is_normalised_before_hashing(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        """``sessions/profile -> ../space`` hashes ``/x/space``, the path a
+        tool launching at the target exports, not ``/x/sessions/../space``."""
+        target = tmp_path / "space"
+        target.mkdir()
+        (target / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-stale-seed"}}'
+        )
+        (tmp_path / "sessions").mkdir()
+        session_dir = tmp_path / "sessions" / "profile"
+        session_dir.symlink_to("../space")
+        block_real_keychain.set_password(
+            keychain_service_name(target),
+            session_mod._keychain_account_name(),
+            '{"claudeAiOauth": {"accessToken": "sk-rotated"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-rotated" in creds
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_lexical_target_naming_another_directory_is_not_consulted(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        """When the link's parent is itself a symlink elsewhere, ``..`` resolves
+        under the parent's target, so the lexical spelling names an unrelated
+        directory whose entry must never be served as this profile's."""
+        (tmp_path / "leases" / "sessions").mkdir(parents=True)
+        (tmp_path / "leases" / "space").mkdir()
+        (tmp_path / "leases" / "space" / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-seed"}}'
+        )
+        (tmp_path / "sessions").symlink_to("leases/sessions")
+        session_dir = tmp_path / "sessions" / "profile"
+        session_dir.symlink_to("../space")
+        unrelated = tmp_path / "space"
+        unrelated.mkdir()
+        block_real_keychain.set_password(
+            keychain_service_name(unrelated),
+            session_mod._keychain_account_name(),
+            '{"claudeAiOauth": {"accessToken": "sk-unrelated"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-seed" in creds
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_raw_joined_target_spelling_still_matches(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        """A tool that exports ``$(dirname link)/$(readlink link)`` verbatim
+        hashes the un-normalised join; that spelling stays a candidate."""
+        target = tmp_path / "space"
+        target.mkdir()
+        (target / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-stale-seed"}}'
+        )
+        (tmp_path / "sessions").mkdir()
+        session_dir = tmp_path / "sessions" / "profile"
+        session_dir.symlink_to("../space")
+        block_real_keychain.set_password(
+            keychain_service_name(f"{session_dir.parent}/../space"),
+            session_mod._keychain_account_name(),
+            '{"claudeAiOauth": {"accessToken": "sk-rotated"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-rotated" in creds
+
 
 ACTIVE_TOKEN = "active-store-token"
 CONFIG_DIR_TOKEN = "config-dir-token"
