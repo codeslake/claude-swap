@@ -2663,7 +2663,10 @@ class TestAdaptiveScheduler:
         the healthy alternate is polled when due."""
         import time
 
-        h = self._harness(temp_home, monkeypatch)
+        # The picker is strategy-blind. "best" keeps t0 on NO_ACTION: under
+        # the default consume-first no candidate is readable at t0 (only #1
+        # and the sentinel #2 are polled), which reads BLOCKED/no-comparison.
+        h = self._harness(temp_home, monkeypatch, strategy="best")
         session_creds = json.dumps({
             "claudeAiOauth": {
                 "accessToken": "sk-session-2",
