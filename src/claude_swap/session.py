@@ -473,7 +473,10 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     ``_is_session_valid``: the email must match, the org only when both sides
     have a value. An unreadable identity is NOT drift — missing metadata
     degrades to trusting the profile (its token family is normally the slot's
-    freshest) rather than abandoning it over a broken ``.claude.json``.
+    freshest) rather than abandoning it over a broken ``.claude.json``. That
+    is a read-side policy: ``_adopt_session_credential``, which writes the
+    profile's credential into the backup, requires ``read_session_identity``
+    to succeed on top of this.
     """
     identity = read_session_identity(session_dir)
     if identity is None:
