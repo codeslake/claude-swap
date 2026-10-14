@@ -1611,6 +1611,31 @@ class TestGuards:
         # The profile is the source of that generation, not a stale seed.
         assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
 
+    def test_switch_refuses_exited_target_whose_ahead_profile_cannot_be_adopted(
+        self, seeded_switcher, monkeypatch
+    ):
+        """Nothing running and the profile ahead, but its identity unreadable:
+        adoption refuses to write (it cannot tell whose credential that is),
+        and the switch must not then activate the consumed backup silently."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text("not json{{{")
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="could not be adopted"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        data = seeded_switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == CREDS
+        )
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+
     def test_backup_credential_write_invalidates_stale_profile(
         self, seeded_switcher, block_real_keychain
     ):
