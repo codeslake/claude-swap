@@ -513,9 +513,12 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     family is normally the slot's freshest) rather than abandoning it over a
     broken ``.claude.json`` (``TestIsSessionValid::test_probe_timeout_lenient_
     on_unreadable_identity`` pins this: failing closed here reopens the
-    destructive #224 cleanup on every loaded launch). A caller that must
-    fail closed on CORRUPT specifically (a write, not a reuse fallback) uses
-    ``session_identity_unreadable`` instead, alongside this check.
+    destructive #224 cleanup on every loaded launch). That is a read-side
+    policy. A caller that must fail closed on CORRUPT specifically (a write,
+    not a reuse fallback) uses ``session_identity_unreadable`` instead,
+    alongside this check; ``_adopt_session_credential``, which writes the
+    profile's credential into the backup, requires ``read_session_identity``
+    to succeed on top of this (ABSENT included).
     """
     identity, _corrupt = _read_session_identity_state(session_dir)
     if identity is None:

@@ -548,7 +548,7 @@ def plan_oversleeps_interval(entry: UsageEntry, now: float) -> bool:
 def due_candidates(
     candidates: list[str], entries: dict[str, UsageEntry], now: float
 ) -> list[str]:
-    """Every due candidate, stalest data first (never-fetched before any).
+    """Every due candidate, least recently attempted or measured first.
 
     Due = past its ``nextPollAt``, not in failure backoff, not held for
     another machine's reading (``UsageStore.adopt``), and not already at its
@@ -581,11 +581,11 @@ def due_candidates(
     under the write lock regardless, so ``reserve`` returns nothing and an
     alternate poll is spent on a row that cannot be fetched.
     """
-    due: list[tuple[int, float, str]] = []
+    due: list[tuple[float, str]] = []
     for num in candidates:
         entry = entries.get(num)
         if entry is None:
-            due.append((0, 0.0, num))
+            due.append((0.0, num))
             continue
         if entry.sentinel is not None:
             continue
@@ -603,10 +603,19 @@ def due_candidates(
             and not plan_oversleeps_interval(entry, now)
         ):
             continue
-        if entry.fetched_at is None:
-            due.append((0, 0.0, num))
-        else:
-            due.append((1, entry.fetched_at, num))
+        # Least recently touched wins: the last attempt (``reserve`` stamps
+        # it on every claim) or the last measurement, whichever is later. A
+        # fetch-path sentinel -- a live session's expired or refused
+        # credential -- records no measurement, plan or backoff, so keyed on
+        # ``fetchedAt`` alone that slot stayed the stalest due row and took
+        # this pick every tick while the other alternates went unpolled;
+        # keyed on the attempt, a no-op pick rotates to the back and only
+        # fills ticks nothing else is due on, where re-deriving it costs no
+        # request. An adopted reading (``adopt``) moves ``fetchedAt`` with no
+        # attempt, hence the later of the two. A never-touched row keys 0.
+        due.append(
+            (max(entry.fetched_at or 0.0, entry.last_attempt_at or 0.0), num)
+        )
     due.sort()
     return [num for *_, num in due]
 
@@ -614,7 +623,7 @@ def due_candidates(
 def due_candidate(
     candidates: list[str], entries: dict[str, UsageEntry], now: float
 ) -> str | None:
-    """The stalest of ``due_candidates``, or None."""
+    """The first of ``due_candidates``, or None."""
     return next(iter(due_candidates(candidates, entries, now)), None)
 
 

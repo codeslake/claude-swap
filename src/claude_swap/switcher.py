@@ -3481,13 +3481,15 @@ class ClaudeAccountSwitcher:
         newer generation of this one); a profile flagged stale (the backup
         moved under it while it was live, and cswap has already decided it
         re-bootstraps); and anything unreadable, because a read error is not
-        evidence of drift.
+        evidence of drift. An unreadable identity file is the one exception:
+        like ``session_identity_drifted`` it reads as "not drift" here, so
+        the switch guard stays on its safe side; the adopting write, which
+        needs positive evidence, checks the identity itself.
         """
         from claude_swap.session import (
             is_session_stale,
             read_session_credentials,
             session_identity_drifted,
-            session_identity_unreadable,
         )
 
         session_dir = self._session_dir(account_num, email)
@@ -3495,15 +3497,6 @@ class ClaudeAccountSwitcher:
             return None
         profile = read_session_credentials(session_dir)
         if not profile:
-            return None
-        if session_identity_unreadable(session_dir):
-            # Present but unparseable/corrupt .claude.json: unknown is not
-            # "trust it" — refuse the adoption rather than write a profile
-            # whose identity could not be verified.
-            self._logger.info(
-                "Account %s's session profile identity could not be read; "
-                "refusing to adopt it.", account_num,
-            )
             return None
         if session_identity_drifted(session_dir, email, org_uuid):
             return None
@@ -3526,7 +3519,7 @@ class ClaudeAccountSwitcher:
 
     def _adopt_session_credential(
         self, account_num: str, email: str, org_uuid: str
-    ) -> bool:
+    ) -> bool | None:
         """Capture a quiescent session profile's credential into the slot backup.
 
         The complement of ``_post_backup_write``: that direction invalidates
@@ -3543,18 +3536,38 @@ class ClaudeAccountSwitcher:
         ``_bootstrap`` and the consume gate's persist move the same two
         copies. The store write is deliberately the pure one:
         ``_post_backup_write`` would invalidate the very profile just
-        captured, and the two now hold the same generation. Returns whether
-        the backup was advanced.
+        captured, and the two now hold the same generation.
+
+        Tri-state, because the usage fetch treats the two refusals
+        differently:
+
+        - True: the backup was advanced.
+        - False: the profile is not ahead of the backup (same generation,
+          behind a re-login, stale-marked, gone, or another account's), so
+          the backup is the slot's credential truth and safe to refresh.
+        - None: undecidable, and nothing was written. A claude is live
+          against the profile, a session record could not be read (that
+          family may still be rotating), or the profile's identity could
+          not be read. ``session_identity_drifted`` reads an unreadable
+          ``.claude.json`` as "not drift" -- the right degradation for a
+          read-only fetch and for the switch guard, where refusing is the
+          safe side -- but this is a WRITE: a profile that an in-session
+          /login re-pointed at another account, and whose identity file
+          then broke, would land a foreign credential in the slot's backup.
+          Checked after the generation test, so a profile provably on the
+          backup's generation still answers False with its identity gone.
         """
-        from claude_swap.session import profile_is_quiescent
+        from claude_swap.session import profile_is_quiescent, read_session_identity
 
         session_dir = self._session_dir(account_num, email)
         with FileLock(self.lock_file):
             if not profile_is_quiescent(session_dir):
-                return False
+                return None
             profile = self._session_profile_ahead(account_num, email, org_uuid)
             if profile is None:
                 return False
+            if read_session_identity(session_dir) is None:
+                return None
             self._store._write_account_credentials(account_num, email, profile)
         self._logger.info(
             f"Adopted account {account_num}'s session profile credential "
@@ -6798,7 +6811,6 @@ class ClaudeAccountSwitcher:
             return self._fetch_active_usage(str(num), email, creds, org_uuid)
 
         from claude_swap.session import (
-            profile_is_quiescent,
             read_session_credentials,
             session_identity_drifted,
         )
@@ -6835,21 +6847,33 @@ class ClaudeAccountSwitcher:
             # consumed generation until then) and take the idle path below,
             # refresh included, on that credential. A profile already on the
             # backup's generation, or behind a fresh re-login in the backup,
-            # needs no adoption and takes the same path on the backup.
-            #
-            # Gate on confirmed quiescence here: _adopt_session_credential
-            # already re-checks profile_is_quiescent inside its own FileLock,
-            # so this outer check adds nothing to the WRITE's safety. Its
-            # effect is on ROUTING instead -- when the record is unreadable,
-            # session_creds survives this block and the read-only path just
-            # below runs on the profile's own current token, rather than
-            # falling through to the backup-grant refresh.
-            if profile_is_quiescent(session_dir):
-                try:
-                    if self._adopt_session_credential(str(num), email, org_uuid):
-                        creds = session_creds
-                except LockError:
-                    pass
+            # needs no adoption and takes the same path on the backup. An
+            # adoption that could not be decided -- a session record that
+            # could not be read, lock contention, an unreadable profile
+            # identity, a failed write -- leaves both copies as they were
+            # AND keeps the profile's credential for the read-only fetch
+            # below, as before adoption existed: the backup path would POST
+            # a grant the profile may already have consumed (invalid_grant,
+            # and a healthy slot struck), or rotate a family that a claude
+            # behind the unreadable record still owns.
+            try:
+                adopted = self._adopt_session_credential(str(num), email, org_uuid)
+            except LockError:
+                adopted = None
+            except Exception as e:
+                # Never raises: this runs one worker per slot under
+                # ``_run_usage_fetches``'s executor.map, where a raise
+                # discards every slot's result for the pass (and the auto
+                # engine's whole tick). The store write re-raises a failed
+                # file write, and the lock file's own open can fail likewise.
+                self._logger.warning(
+                    f"Could not adopt account {num}'s session profile "
+                    f"credential into its backup: {e}"
+                )
+                adopted = None
+            if adopted:
+                creds = session_creds
+            if adopted is not None:
                 session_creds = None
         if session_creds:
             session_oauth = oauth.extract_oauth_data(session_creds)
@@ -10357,7 +10381,9 @@ class ClaudeAccountSwitcher:
         # backup, the backup is a consumed generation and activating it is
         # certain to fail: refuse. With nothing running against the profile
         # the fix is simpler still — adopt its credential into the backup
-        # first, and the switch activates the live generation.
+        # first, and the switch activates the live generation. An adoption
+        # that cannot be decided while the profile is ahead refuses likewise:
+        # the backup is a consumed generation either way.
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
@@ -10399,7 +10425,30 @@ class ClaudeAccountSwitcher:
                     else:
                         warnings_out.append(msg)
             else:
-                self._adopt_session_credential(target_account, pre_email, pre_org)
+                adopted = self._adopt_session_credential(
+                    target_account, pre_email, pre_org
+                )
+                if adopted is None and self._session_profile_ahead(
+                    target_account, pre_email, pre_org
+                ):
+                    # Undecidable with the profile provably ahead: the
+                    # identity check inside the adoption refused the write
+                    # (or a claude started against the profile since the
+                    # scan above). Either way the backup is a consumed
+                    # generation, and proceeding would activate it silently
+                    # -- the very landmine adoption exists to defuse.
+                    raise SwitchError(
+                        f"Account-{target_account} ({pre_email}) has a session "
+                        "profile whose credential has rotated past the stored "
+                        "backup, and it could not be adopted into the backup: "
+                        "the profile's identity file (.claude.json) could not "
+                        "be read, or a Claude instance started against it just "
+                        "now. The backup is a consumed generation, and "
+                        "activating it would fail with invalid_grant on its "
+                        "first refresh. Re-login inside the profile "
+                        f"('cswap run {target_account}', then /login) so its "
+                        "identity is rewritten, or switch to another account."
+                    )
 
         # Switch-time liveness guard (issue #199), pre-lock: confirm the
         # target's stored credential is actually accepted by the API before
