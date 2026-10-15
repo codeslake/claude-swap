@@ -3685,14 +3685,14 @@ class ClaudeAccountSwitcher:
 
         ``add_account`` snapshots the *live* active credential under an
         ``oauthAccount`` identity. Now that ``_read_credentials`` can return a raw
-        ``sk-ant-api…`` key, a live ``/login`` key could be backed up as a kindless
+        ``sk-ant-…`` key, a live ``/login`` key could be backed up as a kindless
         account, corrupting the session-guard / export / collision logic that keys
         off ``kind``. Reject with guidance toward the supported path instead.
         """
         if looks_like_api_key(creds):
             raise ValidationError(
                 "Active login is an API-key account. Add it with "
-                "'cswap --add-token sk-ant-api...' instead of --add-account."
+                "'cswap add-token sk-ant-...' instead of 'cswap add'."
             )
 
     def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
@@ -4131,12 +4131,14 @@ class ClaudeAccountSwitcher:
 
         Useful for headless servers or when the token is received from another
         machine, without needing a prior Claude Code login on this machine. The
-        token type is auto-detected: an ``sk-ant-api…`` value is a managed API key
-        (stored raw, activated on Claude Code's API-key auth axis), anything else is
-        treated as an OAuth setup-token. No Anthropic API calls are made.
+        token type is auto-detected: a bare ``sk-ant-…`` value of any Console key
+        family (``sk-ant-api03-…``, ``sk-ant-usr-…``, …) is a managed API key
+        (stored raw, activated on Claude Code's API-key auth axis); an OAuth-prefixed
+        ``sk-ant-oat…`` token — or anything else — is treated as an OAuth
+        setup-token. No Anthropic API calls are made.
 
         Args:
-            token: Raw OAuth setup-token or ``sk-ant-api…`` key, or ``"-"`` to read
+            token: Raw OAuth setup-token or ``sk-ant-…`` API key, or ``"-"`` to read
                    one line from stdin, or ``""`` to prompt securely via getpass.
             email: Email address to associate with the account. When omitted,
                    defaults to ``setup-token-{slot}@token.local`` (or
