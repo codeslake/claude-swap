@@ -664,6 +664,30 @@ class TestSwapAccounts:
         assert switcher.sequence_file.stat().st_ino != before_ino
         assert not list(switcher.sequence_file.parent.glob("*.tmp"))
 
+    def test_write_json_temp_file_is_private_from_creation(
+        self, temp_home: Path
+    ):
+        """The temp file holds the whole payload (``~/.claude.json`` can carry
+        ``primaryApiKey`` and MCP env secrets), so it has to be 0600 when it
+        is created. With chmod neutralised, the published file carries the
+        mode the temp file was created with: a write-then-chmod writer shows
+        up here as 0644 under the usual 022 umask."""
+        if sys.platform == "win32":
+            pytest.skip("POSIX file modes")
+        switcher = ClaudeAccountSwitcher()
+        target = temp_home / ".claude.json"
+
+        old_umask = os.umask(0o022)
+        try:
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr("claude_swap.switcher.os.chmod", lambda *a, **k: None)
+                switcher._write_json(target, {"primaryApiKey": "sk-test"})
+        finally:
+            os.umask(old_umask)
+
+        assert target.stat().st_mode & 0o777 == 0o600
+        assert not list(temp_home.glob(".claude.*.tmp"))
+
     def test_swap_same_email_one_sided_clears_destination(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
