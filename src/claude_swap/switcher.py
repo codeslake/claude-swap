@@ -16,7 +16,6 @@ import shutil
 import stat
 import threading
 import sys
-import tempfile
 import time
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor

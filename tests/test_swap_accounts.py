@@ -686,7 +686,7 @@ class TestSwapAccounts:
             os.umask(old_umask)
 
         assert target.stat().st_mode & 0o777 == 0o600
-        assert not list(temp_home.glob(".claude.*.tmp"))
+        assert not list(temp_home.glob("*.tmp"))
 
     def test_swap_same_email_one_sided_clears_destination(
         self, temp_home: Path, sample_sequence_data_with_org: dict
