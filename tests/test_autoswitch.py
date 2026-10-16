@@ -1398,7 +1398,6 @@ class TestAtLimitWallMarkOverridesTheActiveReading:
         reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
 
-
     def test_a_straggler_429_across_a_roll_does_not_strand_the_active_account(
         self, temp_home
     ):

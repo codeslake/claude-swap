@@ -351,26 +351,6 @@ class TestMarkAtLimit:
         clock.advance(WALL_FALLBACK_S - 1)  # a 5h mark is still up at its end
         assert store.entries(IDENT)["1"].walled is walled
 
-    @pytest.mark.parametrize("past_reset,walled", [
-        (0.6, False),  # the old fallback branch's mark over a straggler 429
-        (RESET_SLACK_S + 1.0, True),  # a stale reading under a real new wall
-    ])
-    def test_a_stamped_fallback_mark_over_a_straggler_reads_not_walled(
-        self, store, clock, past_reset, walled
-    ):
-        # A row as the old `mark_at_limit` wrote it: stamped, and keyed on
-        # now + WALL_FALLBACK_S because the stored reset had already passed.
-        store.record(
-            {"1": FetchRecord(usage=self._usage_resetting_at(clock, 0.0))}, IDENT
-        )
-        rows = store._read_rows()
-        rows["1"]["walledUntil"] = clock.now + past_reset + WALL_FALLBACK_S
-        rows["1"]["walledUuid"] = "u"
-        store._write_rows(rows)
-        clock.advance(past_reset + 1.0)
-
-        assert store.entries(IDENT)["1"].walled is walled
-
 
 class TestMarkRefused:
     """``mark_refused``: the API refused a model request on this account. Not

@@ -724,21 +724,6 @@ def _legacy_wall_is_contradicted(
     return bool(pcts) and max(pcts) < 100.0
 
 
-def _is_straggler_fallback_wall(
-    walled_until: float, last_good: object, models: tuple[str, ...]
-) -> bool:
-    """Whether a wall mark is the 5h fallback an old ``mark_at_limit`` wrote
-    over a STRAGGLER 429: one relayed within ``RESET_SLACK_S`` after the row's
-    own earliest reset, from the window that had just rolled (lmd42 slot 8,
-    2026-10-16, 0.6 s). ``mark_at_limit`` no longer writes one; this lifts one
-    already stored. It reads the row's CURRENT reading, so it stops matching
-    once a poll replaces ``last_good`` with the new window's reset.
-    """
-    reset = _earliest_reset(last_good, models)
-    marked_at = walled_until - WALL_FALLBACK_S
-    return reset is not None and marked_at - RESET_SLACK_S < reset <= marked_at
-
-
 def _walled_decision_value(last_good: dict | None, walled_until: float | None) -> dict:
     """The synthetic full reading ``UsageEntry.decision_value`` reports while
     ``walled``.
@@ -1128,12 +1113,12 @@ class UsageStore:
         """Identity-guarded snapshot for the given slots (empty entry when the
         row is missing or belongs to a different account).
 
-        ``models`` picks the relevant windows, as in ``mark_at_limit``, for the
-        reset a straggler wall is judged against (see
-        ``_is_straggler_fallback_wall``). The walled flag on each row is a
-        deadline comparison against ``now``, which a LEGACY mark (no
-        ``walledUuid``) also needs the row's own reading to leave standing
-        (see ``_legacy_wall_is_contradicted``)."""
+        ``models`` is accepted for call-site symmetry with ``mark_at_limit``
+        (which does consume it, to pick the earliest relevant-window reset a
+        wall mark expires at) but is not itself read here: the walled flag on
+        each row is a deadline comparison against ``now``, which a LEGACY
+        mark (no ``walledUuid``) also needs the row's own reading to leave
+        standing (see ``_legacy_wall_is_contradicted``)."""
         now = self.clock()
         rows = self._read_rows()
         out: dict[str, UsageEntry] = {}
@@ -1223,9 +1208,6 @@ class UsageStore:
                 claim_until=claim_until,
                 walled=walled_until is not None
                 and now < walled_until
-                and not _is_straggler_fallback_wall(
-                    walled_until, last_good, models
-                )
                 and (
                     "walledUuid" in row
                     or not _legacy_wall_is_contradicted(
@@ -1558,9 +1540,10 @@ class UsageStore:
         Expires at ``min(`` the row's OWN stored reading's earliest
         relevant-window reset (one that passed within ``RESET_SLACK_S`` counts:
         a straggler 429 from the window that just rolled marks nothing),
-        ``now + WALL_FALLBACK_S)`` — a 5h window's own reset sits inside
-        ``WALL_FALLBACK_S`` so the mark expires at that genuine reset, but a
-        stored 7d (or scoped, or malformed far-future) reset is capped at the fallback instead, well before its
+        ``now + WALL_FALLBACK_S)`` — a 5h window's
+        own reset sits inside ``WALL_FALLBACK_S`` so the mark expires at
+        that genuine reset, but a stored 7d (or scoped, or malformed
+        far-future) reset is capped at the fallback instead, well before its
         own reset: the mark lifts on the trade that a possibly-early release
         beats parking it for days; ``WALL_FALLBACK_S`` from now alone when no
         reading is stored to key it on. While the mark has not expired, ``entries()``
