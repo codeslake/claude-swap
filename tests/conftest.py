@@ -764,6 +764,12 @@ def _deterministic_poll_jitter(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_fetch_stagger(monkeypatch):
+    """A real 0.25 s per-account sleep in the fetch pool that no test needs."""
+    monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_colour(monkeypatch):
     """A developer's terminal must not decide whether the suite passes.
 
