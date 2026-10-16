@@ -1399,6 +1399,53 @@ class TestAtLimitWallMarkOverridesTheActiveReading:
         assert reasons == ["below-threshold"]
 
 
+    def test_a_straggler_429_across_a_roll_does_not_strand_the_active_account(
+        self, temp_home
+    ):
+        """lmd42, 2026-10-16: the pin relayed a 429 on active slot 8 at
+        15:59:59.6Z, 0.6 s after its stored 5h reset. The mark ran the 5h
+        fallback, outlived the roll by hours, and the 16:00:59 tick moved to
+        7 (7d full) and declared "all accounts exhausted" while 8 read 6%.
+        Driven through the real `mark_at_limit` and store, then the engine's
+        own wake instant (reset + RESET_SLACK_S). Slots 6 and 11 are disabled.
+        """
+        h = EngineHarness(temp_home, strategy="best")
+        for n in range(1, 12):
+            h.seed(n, f"acct{n}@example.com")
+        h.switcher.set_account_disabled("6", True)
+        h.switcher.set_account_disabled("11", True)
+        h.make_live("acct8@example.com", 8)
+        h.set_active(8)
+        store = h.switcher._usage_store
+        ident = {str(n): (f"acct{n}@example.com", "") for n in range(1, 12)}
+
+        reset = h.clock.now - 0.6
+        pre_roll = {
+            "five_hour": {"pct": 100.0, "resets_at": _iso_at(reset)},
+            "seven_day": {"pct": 54.0},
+        }
+        store.record({"8": FetchRecord(usage=pre_roll)}, ident)
+        store.mark_at_limit("8", ident, ("all",), account_uuid="uuid-8")
+
+        h.clock.now = reset + poll_policy.RESET_SLACK_S
+        now = h.clock.now
+        fleet = {
+            str(n): _usage7(0.0, 100.0, _iso_at(now + (4 * 3600 if n == 7 else 5 * 86400)))
+            for n in (1, 2, 3, 4, 5, 7, 9, 10)
+        }
+        fleet["8"] = {
+            "five_hour": {"pct": 6.0, "resets_at": _iso_at(reset + 5 * 3600)},
+            "seven_day": {"pct": 54.0},
+        }
+        store.record({n: FetchRecord(usage=u) for n, u in fleet.items()}, ident)
+
+        assert h.tick_with_entries(store.entries(ident, ("all",))) is (
+            TickOutcome.NO_ACTION
+        )
+        assert h.active_number() == 8
+        assert not [e for e in h.events if isinstance(e, (SwitchEvent, AllExhaustedEvent))]
+
+
 class TestIdleHold:
     """Active token expired while Claude Code owns it → hold, don't fail over."""
 
