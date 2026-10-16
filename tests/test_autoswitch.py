@@ -1430,7 +1430,7 @@ class TestAtLimitWallMarkOverridesTheActiveReading:
         h.clock.now = reset + poll_policy.RESET_SLACK_S
         now = h.clock.now
         fleet = {
-            str(n): _usage7(0.0, 100.0, _iso_at(now + (4 * 3600 if n == 7 else 5 * 86400)))
+            str(n): _usage7(0.0, 100.0, _iso_at(now + 4 * 3600 * (1 if n == 7 else 30)))
             for n in (1, 2, 3, 4, 5, 7, 9, 10)
         }
         fleet["8"] = {
@@ -1443,7 +1443,9 @@ class TestAtLimitWallMarkOverridesTheActiveReading:
             TickOutcome.NO_ACTION
         )
         assert h.active_number() == 8
-        assert not [e for e in h.events if isinstance(e, (SwitchEvent, AllExhaustedEvent))]
+        assert not [
+            e for e in h.events if isinstance(e, (SwitchEvent, AllExhaustedEvent))
+        ]
 
 
 class TestIdleHold:

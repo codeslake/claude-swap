@@ -1574,9 +1574,8 @@ class UsageStore:
 
         def apply(_num: str, row: dict) -> None:
             reset = _earliest_reset(row.get("lastGood"), models)
-            # A reset that passed within RESET_SLACK_S makes this a straggler
-            # 429 from the window that just rolled: the mark is already
-            # expired, not 5h long (lmd42 slot 8, 2026-10-16).
+            # Past by under RESET_SLACK_S: a straggler 429 from the window that
+            # just rolled, so the mark is already expired, not 5h long.
             row["walledUntil"] = (
                 min(reset, fallback)
                 if reset is not None and reset > now - RESET_SLACK_S
