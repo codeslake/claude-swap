@@ -15,6 +15,7 @@ from claude_swap.poll_policy import (
     NO_PLAN_POLL_INTERVAL_S,
     POST_429_MIN_INTERVAL_S,
     POST_SWITCH_REPLAN_DEFER_S,
+    RESET_SLACK_S,
 )
 from claude_swap.usage_store import (
     BACKOFF_BASE_S,
@@ -389,6 +390,22 @@ class TestMarkAtLimit:
         assert store.entries(IDENT)["1"].walled
         clock.advance(2)
         assert not store.entries(IDENT)["1"].walled
+
+    @pytest.mark.parametrize("reset_ahead,walled", [
+        (-0.6, False),  # lmd42 slot 8, 2026-10-16: a straggler 429, 0.6 s past the roll
+        (0.0, False),
+        (-(RESET_SLACK_S + 1.0), True),  # a reading stale long before the 429
+    ])
+    def test_a_reset_that_just_passed_is_a_straggler_not_a_fresh_5h_wall(
+        self, store, clock, reset_ahead, walled
+    ):
+        usage = self._usage_resetting_at(clock, reset_ahead)
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.mark_at_limit("1", IDENT, account_uuid="u")
+
+        assert store.entries(IDENT)["1"].walled is walled
+        clock.advance(WALL_FALLBACK_S - 1)  # a 5h mark is still up at its end
+        assert store.entries(IDENT)["1"].walled is walled
 
 
 class TestMarkRefused:

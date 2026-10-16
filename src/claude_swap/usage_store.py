@@ -1650,8 +1650,10 @@ class UsageStore:
         (email, organizationUuid) guard already reads another account's row
         as empty and replaces it on the next write.
 
-        Expires at ``min(`` the row's OWN stored reading's earliest future
-        relevant-window reset, ``now + WALL_FALLBACK_S)`` — a 5h window's
+        Expires at ``min(`` the row's OWN stored reading's earliest
+        relevant-window reset (one that passed within ``RESET_SLACK_S`` counts:
+        a straggler 429 from the window that just rolled marks nothing),
+        ``now + WALL_FALLBACK_S)`` — a 5h window's
         own reset sits inside ``WALL_FALLBACK_S`` so the mark expires at
         that genuine reset, but a stored 7d (or scoped, or malformed
         far-future) reset is capped at the fallback instead, well before its
@@ -1668,8 +1670,11 @@ class UsageStore:
 
         def apply(_num: str, row: dict) -> None:
             reset = _earliest_reset(row.get("lastGood"), models)
+            # Past by under RESET_SLACK_S: a straggler 429 from the window that
+            # just rolled, so the mark is already expired, not 5h long.
             row["walledUntil"] = (
-                min(reset, fallback) if reset is not None and reset > now
+                min(reset, fallback)
+                if reset is not None and reset > now - RESET_SLACK_S
                 else fallback
             )
             row["walledUuid"] = account_uuid
