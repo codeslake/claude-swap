@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -560,6 +561,17 @@ def _seed_roster(switcher, home, fake, slots=2):
     (home / ".claude.json").write_text(json.dumps({"oauthAccount": {
         "emailAddress": "u1@example.com", "accountUuid": "uuid-1",
     }}))
+
+
+def test_a_locked_keychain_read_retries_without_waiting(
+    mac_switcher, fake_security, monkeypatch
+):
+    slept: list[float] = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    fake_security.items[_ACTIVE] = _creds("rt")
+    fake_security.rc = 36
+    mac_switcher._store._read_active_credentials()
+    assert slept and set(slept) == {0}  # it did retry, and the retry cost nothing
 
 
 def test_a_memo_hit_is_not_the_keychain_answering(mac_switcher, fake_security):

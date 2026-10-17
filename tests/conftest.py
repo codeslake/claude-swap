@@ -625,6 +625,12 @@ def block_real_urlopen(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", unreachable)
 
 
+@pytest.fixture(autouse=True)
+def no_keychain_retry_wait(monkeypatch):
+    """A locked-Keychain read retries after a real 0.3 s sleep; no test waits it out."""
+    monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""
