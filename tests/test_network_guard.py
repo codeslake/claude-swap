@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import os
 import socket
+import urllib.error
 import urllib.request
 from unittest.mock import patch
 
 import pytest
 
+from claude_swap import oauth
 from tests.test_cli import _subprocess_env
 
 
@@ -35,3 +37,18 @@ def test_subprocess_env_proxies_a_spawned_cli_off_the_real_network(tmp_path):
     with patch.dict(os.environ, _subprocess_env(HOME=str(tmp_path)), clear=True):
         assert urllib.request.getproxies()["https"] == "http://127.0.0.1:1"
         assert not urllib.request.proxy_bypass("pypi.org")
+
+
+def test_the_suite_never_reaches_the_vendors_usage_api(monkeypatch):
+    # The getaddrinfo guard cannot see a loopback egress proxy: urllib then
+    # resolves and connects to the proxy alone.
+    lookups = []
+
+    def refuse(*args, **kwargs):
+        lookups.append(args)
+        raise OSError("lookup refused")
+
+    monkeypatch.setattr("socket.getaddrinfo", refuse)
+    with pytest.raises(urllib.error.URLError):
+        oauth.request_usage_data("sk-x")
+    assert lookups == []
