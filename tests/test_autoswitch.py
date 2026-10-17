@@ -254,6 +254,12 @@ def harness(temp_home: Path) -> EngineHarness:
     return h
 
 
+@pytest.fixture
+def no_usage_fetch(harness, monkeypatch):
+    """A tick that is not handed its usage would fetch every seeded account for real."""
+    monkeypatch.setattr(harness.switcher, "_run_usage_fetches", lambda *a, **k: {})
+
+
 class TestEngineHarnessIsolation:
     """Pins the guarantee `EngineHarness.__init__`'s per-instance isolation
     exists for (see its docstring): two harnesses built against the SAME
@@ -9576,6 +9582,7 @@ class TestLiveLock:
         finally:
             demoted.stop()
 
+    @pytest.mark.usefixtures("no_usage_fetch")
     def test_a_promotion_before_any_announcement_stays_silent(self, harness):
         """An errno recorded while nothing has been announced yet.
 
@@ -9746,6 +9753,7 @@ class TestLiveLock:
         finally:
             successor.stop()
 
+    @pytest.mark.usefixtures("no_usage_fetch")
     def test_a_raising_consumer_does_not_escape_the_tick(self, harness):
         """`tick()` documents "Never raises" and its try covers only
         `_tick_inner`.
@@ -12412,6 +12420,7 @@ class TestABrokenPipeEndsTheLoopInsteadOfOrphaningIt:
         """
         monkeypatch.setattr(engine._wake, "wait", lambda _t=None: True)
 
+    @pytest.mark.usefixtures("no_usage_fetch")
     def test_a_broken_pipe_ends_the_loop(self, harness, monkeypatch):
         engine = harness.engine
         self._no_waiting(engine, monkeypatch)
@@ -12421,6 +12430,7 @@ class TestABrokenPipeEndsTheLoopInsteadOfOrphaningIt:
         assert engine.run_loop() == 0
         assert engine._consumer_gone is True
 
+    @pytest.mark.usefixtures("no_usage_fetch")
     def test_a_broken_pipe_drops_the_live_lock(self, harness, monkeypatch):
         """The process outlives the loop with nothing left to release it —
         #522's signature. A dead engine holding LIVE blocks every later
@@ -12511,6 +12521,7 @@ class TestAClosedPipeDoesNotOutlastItsOwnSleep:
     later instead of never.
     """
 
+    @pytest.mark.usefixtures("no_usage_fetch")
     def test_the_loop_stops_within_the_tick_the_pipe_died_in(
         self, harness, monkeypatch
     ):

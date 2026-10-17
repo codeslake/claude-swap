@@ -22200,7 +22200,10 @@ class TestSwitchOffAtLimitAccount:
                 switch_off_at_limit_account(s)
             assert built == [], "at-limit routed through an engine"
 
-            with contextlib.suppress(Exception):
+            with (
+                patch.object(s, "_run_usage_fetches", return_value={}),
+                contextlib.suppress(Exception),
+            ):
                 s.switch()
             assert built == [], "switch() routed through an engine"
 
