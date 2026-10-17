@@ -1851,6 +1851,50 @@ class TestAutoScreen:
             await app.push_screen(AutoScreen())
             assert app.screen._settings.strategy == "consume-first"
 
+    async def test_strategy_cycle_refreshes_a_strategy_gated_footer(
+        self, tmp_path, fake_engine
+    ):
+        from textual.binding import Binding
+        from textual.widgets import Footer
+        from textual.widgets._footer import FooterKey
+
+        from claude_swap.tui.autoview import AutoScreen
+
+        class GatedScreen(AutoScreen):
+            # no shipped binding gates on strategy; this stands in for one
+            BINDINGS = [Binding("c", "probe", "Probe")]
+
+            def check_action(self, action, parameters):
+                if action == "probe":
+                    return self._settings.strategy == "dynamic"
+                return super().check_action(action, parameters)
+
+            def action_probe(self) -> None:
+                pass
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await app.push_screen(GatedScreen())
+            await settle(pilot)
+
+            def footer_keys() -> list[str]:
+                footer = app.screen.query_one(Footer)
+                return [k.key for k in footer.query(FooterKey)]
+
+            assert "c" not in footer_keys()  # consume-first: gated off
+            await pilot.press("s")  # -> dynamic
+            await settle(pilot)
+            assert app.screen._settings.strategy == "dynamic"
+            assert "c" in footer_keys()
+            await pilot.press("s")  # -> best
+            await settle(pilot)
+            assert app.screen._settings.strategy == "best"
+            assert "c" not in footer_keys()
+
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine
     ):

@@ -233,6 +233,9 @@ class AutoScreen(Screen):
         current = _STRATEGY_CYCLE.index(self._settings.strategy)
         value = _STRATEGY_CYCLE[(current + 1) % len(_STRATEGY_CYCLE)]
         self._settings = replace(self._settings, strategy=value)
+        # A binding may be gated on strategy; the footer reads check_action
+        # only on refresh.
+        self.refresh_bindings()
         self.app.threshold_pct = proactive_switch_bar_pct(
             value, self._settings.threshold
         )
