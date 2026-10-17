@@ -935,9 +935,10 @@ def keepalive_due(
     slot_kept: bool,
 ) -> tuple[bool, str]:
     """Whether an idle session's cache is worth a keep-alive ping now:
-    ``(True, "")``, or ``(False, why)``. ``slot_kept`` is the pin's keep decision
-    at request time (kept in the snapshot, not resting, not dropped after a
-    reply at its bar)."""
+    ``(True, "")``, or ``(False, why)``. ``idle_s`` is the seconds since the
+    session's last real request or last keep-alive ping, whichever is later.
+    ``slot_kept`` is the pin's keep decision at request time (kept in the
+    snapshot, not resting, not dropped after a reply at its bar)."""
     if ttl_s < KEEPALIVE_MIN_TTL_S:
         return False, "a 5 min cache tier is not worth a ping"
     if not slot_kept:

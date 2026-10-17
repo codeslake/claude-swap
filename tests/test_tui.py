@@ -1874,6 +1874,7 @@ class TestAutoScreen:
             # `dynamic` is not a strategy on this branch (the file value is
             # clamped), so the state is injected, as a file could once it is.
             screen._settings = replace(screen._settings, strategy="dynamic")
+            screen._configured_strategy = "dynamic"
             screen.refresh_bindings()
             screen._update_summary()
             await pilot.pause()
@@ -1888,6 +1889,59 @@ class TestAutoScreen:
             await pilot.pause()
             assert load_settings(tmp_path).cache_aware is False
             assert "cache-aware off" in summary.render().plain
+
+    async def test_c_follows_the_file_strategy_not_the_session_one(
+        self, tmp_path, fake_engine
+    ):
+        from dataclasses import replace
+
+        from textual.widgets import Static
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            # The pin arms on the FILE's strategy (still consume-first); a
+            # session override to dynamic (what `s` makes) is not the file.
+            screen._settings = replace(screen._settings, strategy="dynamic")
+            screen.refresh_bindings()
+            screen._update_summary()
+            await pilot.pause()
+            assert screen.check_action("toggle_cache_aware", ()) is False
+            assert "c" not in screen.active_bindings
+            assert "cache-aware" not in screen.query_one("#auto-summary", Static).render().plain
+            await pilot.press("c")
+            await pilot.pause()
+            assert not (tmp_path / "settings.json").exists()
+
+    async def test_c_flips_the_files_current_value_not_the_mount_time_one(
+        self, tmp_path, fake_engine
+    ):
+        from dataclasses import replace
+
+        from textual.widgets import Static
+
+        from claude_swap.settings import load_settings, set_setting
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            screen._settings = replace(screen._settings, strategy="dynamic")
+            screen._configured_strategy = "dynamic"
+            screen.refresh_bindings()
+            assert screen._settings.cache_aware is False  # the mount-time value
+            set_setting(tmp_path, "autoswitch.cacheAware", "true")  # edited elsewhere
+            await pilot.press("c")
+            await pilot.pause()
+            assert load_settings(tmp_path).cache_aware is False
+            assert "cache-aware off" in screen.query_one("#auto-summary", Static).render().plain
 
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine

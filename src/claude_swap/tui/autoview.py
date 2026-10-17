@@ -103,6 +103,9 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # The file's strategy at mount: the pin arms cache-aware on it, so `c`
+        # and the summary's cache-aware segment follow it, not the session copy.
+        self._configured_strategy: str | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -124,6 +127,7 @@ class AutoScreen(Screen):
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
+        self._configured_strategy = self._settings.strategy
         self.app.threshold_pct = self._settings.threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
@@ -165,7 +169,7 @@ class AutoScreen(Screen):
         if action in ("threshold_step", "adjust_done") and not self._adjusting:
             return False  # hidden and inert until adjust mode is armed
         if action == "toggle_cache_aware":
-            return self._settings is not None and self._settings.strategy == "dynamic"
+            return self._configured_strategy == "dynamic"
         return True
 
     def action_adjust_threshold(self) -> None:
@@ -217,7 +221,7 @@ class AutoScreen(Screen):
     def action_toggle_cache_aware(self) -> None:
         # Persisted, unlike `t`: the pin is another process and reads the
         # file. Nothing for the engine to apply (it never reads this).
-        value = not self._settings.cache_aware
+        value = not load_settings(self.app.switcher.backup_dir).cache_aware
         try:
             set_setting(
                 self.app.switcher.backup_dir, "autoswitch.cacheAware",
@@ -245,7 +249,7 @@ class AutoScreen(Screen):
         )
         if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
-        if self._settings.strategy == "dynamic":
+        if self._configured_strategy == "dynamic":
             text.append(f" · cache-aware {'on' if self._settings.cache_aware else 'off'}")
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
