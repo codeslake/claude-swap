@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -940,6 +941,8 @@ def pytest_sessionfinish(session, exitstatus):
     # Not tmp_path_retention_policy="failed": its per-test rmtree runs while monkeypatch is still active, so a worker crashes with RealStoreWriteBlocked.
     # A user-given --basetemp is left alone in the controller; a worker always cleans its own share on green.
     # The removal is a detached child, so the run never waits on it: in-process it held the -n 10 wall.
+    # The workers' children and the controller's child then remove nested paths (pytest-N/popen-gwX under pytest-N) at the same time; ignore_errors makes them converge.
+    # A spawn that fails (EAGAIN/ENOMEM under a process cap) must not turn a green run into an INTERNALERROR: remove in-process then.
     if exitstatus != 0:
         return
     factory = session.config._tmp_path_factory
@@ -949,10 +952,13 @@ def pytest_sessionfinish(session, exitstatus):
     is_worker = hasattr(session.config, "workerinput")
     if factory._given_basetemp is not None and not is_worker:
         return
-    subprocess.Popen(
-        [sys.executable, "-S", "-c", "import shutil, sys; shutil.rmtree(sys.argv[1], ignore_errors=True)", str(basetemp)],
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.Popen(
+            [sys.executable, "-S", "-c", "import shutil, sys; shutil.rmtree(sys.argv[1], ignore_errors=True)", str(basetemp)],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        shutil.rmtree(basetemp, ignore_errors=True)

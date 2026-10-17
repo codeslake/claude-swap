@@ -3476,8 +3476,8 @@ class TestActiveAccountRefresh:
     # and used to ``continue`` outright on a held active slot, skipping the
     # resync along with the expired-sentinel arm. For the hold's duration a
     # Claude Code rotation left the slot backup on the consumed
-    # predecessor. The held twin of the backoff test above: the resync
-    # must still run underneath a hold.
+    # predecessor. The ``how``-parametrized tests cover the hold alongside the
+    # backoff: the resync must still run underneath it.
 
     @pytest.mark.parametrize(
         "how, sentinel", [("backoff", USAGE_TOKEN_EXPIRED), ("held", None)]

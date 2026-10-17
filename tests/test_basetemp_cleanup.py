@@ -71,6 +71,19 @@ def test_the_removal_is_detached_and_never_waited_on(tmp_path, monkeypatch):
     assert kw["stdin"] == kw["stdout"] == kw["stderr"] == subprocess.DEVNULL  # no inherited pipe to wait on
 
 
+def test_a_failed_spawn_falls_back_to_removing_in_process(tmp_path, monkeypatch):
+    basetemp = _make_basetemp(tmp_path)
+
+    def refused(*a, **kw):
+        raise OSError(11, "Resource temporarily unavailable")  # EAGAIN under a process cap
+
+    monkeypatch.setattr(subprocess, "Popen", refused)
+
+    conftest.pytest_sessionfinish(_make_session(basetemp, None, is_worker=False), exitstatus=0)  # must not raise
+
+    assert not basetemp.exists()
+
+
 def test_nothing_made_is_a_no_op(tmp_path):
     session = _make_session(None, None, is_worker=False)
 
