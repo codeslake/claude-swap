@@ -15,6 +15,8 @@ import tempfile
 import threading
 import time
 import types
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -954,6 +956,20 @@ def _loopback_only_getaddrinfo(host, *args, **kwargs):
 
 
 socket.getaddrinfo = _loopback_only_getaddrinfo
+
+
+def _unreachable_urlopen(*args, **kwargs):
+    """No test may make a live ``urllib`` request, for the whole test process.
+
+    The getaddrinfo guard cannot see a loopback egress proxy (urllib then
+    resolves only the proxy), so a fetch still went out: ~0.8 s each on a
+    host with a proxy, the fake token on the vendor on CI. A test that needs
+    an answer patches ``urllib.request.urlopen`` itself, over this.
+    """
+    raise urllib.error.URLError("network blocked under test")
+
+
+urllib.request.urlopen = _unreachable_urlopen
 
 
 @pytest.fixture(autouse=True)
