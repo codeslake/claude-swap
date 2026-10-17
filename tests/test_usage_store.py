@@ -351,6 +351,48 @@ class TestMarkAtLimit:
         clock.advance(WALL_FALLBACK_S - 1)  # a 5h mark is still up at its end
         assert store.entries(IDENT)["1"].walled is walled
 
+    @pytest.mark.parametrize("seven_ahead,late,wall_until,span", [
+        # T2571: 5h is the wall (100%, 3 h out); a 7d window at 40% rolled
+        # 30 s ago says nothing about it, nor does one rolled 90 s ago.
+        (-30.0, 0.0, None, 3 * 3600.0),
+        (-90.0, 0.0, None, 3 * 3600.0),
+        # The 5h wall rolled at t0; the mark lands RESET_SLACK_S + 30 later
+        # (queued behind the pin): a fresh 5h mark without the 429's reset...
+        (None, RESET_SLACK_S + 30, None, WALL_FALLBACK_S),
+        # ...and none once the caller passes it (``wall_until`` caps the mark).
+        (None, RESET_SLACK_S + 30, 0.0, 0.0),
+    ])
+    def test_the_wall_is_the_full_window_not_a_rolled_one(
+        self, store, clock, seven_ahead, late, wall_until, span
+    ):
+        t0 = clock.now
+        usage = {
+            "five_hour": {
+                "pct": 100.0,
+                "resets_at": usage_store._reset_ts_to_resets_at(
+                    t0 + (3 * 3600.0 if seven_ahead is not None else 0.0)
+                ),
+            },
+            "seven_day": {"pct": 40.0},
+        }
+        if seven_ahead is not None:
+            usage["seven_day"]["resets_at"] = usage_store._reset_ts_to_resets_at(
+                t0 + seven_ahead
+            )
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        clock.advance(late)
+        store.mark_at_limit(
+            "1", IDENT, account_uuid="u",
+            **({} if wall_until is None else {"wall_until": t0 + wall_until}),
+        )
+
+        assert store.entries(IDENT)["1"].walled is bool(span)
+        if span:
+            clock.advance(span - 1)
+            assert store.entries(IDENT)["1"].walled
+            clock.advance(2)
+            assert not store.entries(IDENT)["1"].walled
+
 
 class TestMarkRefused:
     """``mark_refused``: the API refused a model request on this account. Not

@@ -8587,6 +8587,7 @@ class ClaudeAccountSwitcher:
         current_at_limit: bool = False,
         current_refused: bool = False,
         exclude: Iterable[str] = (),
+        wall_until: Mapping[str, float] | None = None,
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -8634,6 +8635,11 @@ class ClaudeAccountSwitcher:
                   ``current_at_limit=True`` persists nothing; only
                   ``_select_best_switchable``'s existing one-selection zeroing
                   (this call's own ranking, never persisted) applies.
+            wall_until: Per excluded slot, the epoch its own 429 resets, as
+                  the caller measured it when the 429 arrived; caps that
+                  slot's persisted mark, so a mark written after the switch
+                  queue cannot outlast the real wall. A slot it does not
+                  name keeps the mark's own span.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -8887,6 +8893,7 @@ class ClaudeAccountSwitcher:
                         self._usage_store.mark_at_limit(
                             num, {num: identity}, models,
                             account_uuid=data["accounts"][num].get("uuid"),
+                            wall_until=(wall_until or {}).get(num),
                         )
             if current_refused:
                 # Before the switch: a failed write raises with nothing

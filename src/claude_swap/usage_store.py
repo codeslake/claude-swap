@@ -1524,6 +1524,7 @@ class UsageStore:
         identities: dict[str, Identity],
         models: tuple[str, ...] = (),
         account_uuid: str | None = None,
+        wall_until: float | None = None,
     ) -> None:
         """Persist that ``num`` is at its limit, per a signal the poller
         cannot see (the pin's own 429 on ``/v1/messages``, not a fetch).
@@ -1538,9 +1539,12 @@ class UsageStore:
         as empty and replaces it on the next write.
 
         Expires at ``min(`` the row's OWN stored reading's earliest
-        relevant-window reset (one that passed within ``RESET_SLACK_S`` counts:
-        a straggler 429 from the window that just rolled marks nothing),
-        ``now + WALL_FALLBACK_S)`` — a 5h window's
+        relevant-window reset still ahead, ``now + WALL_FALLBACK_S)``, except
+        that a window which rolled within ``RESET_SLACK_S`` while no window
+        still ahead reads full is a straggler 429 from that window and marks
+        nothing (a rolled window that is not the wall, or one rolled longer
+        ago, says nothing about the wall). ``wall_until``, the 429's own
+        reset when the caller measured it, caps the result. A 5h window's
         own reset sits inside ``WALL_FALLBACK_S`` so the mark expires at
         that genuine reset, but a stored 7d (or scoped, or malformed
         far-future) reset is capped at the fallback instead, well before its
@@ -1556,14 +1560,19 @@ class UsageStore:
         fallback = now + WALL_FALLBACK_S
 
         def apply(_num: str, row: dict) -> None:
-            reset = _earliest_reset(row.get("lastGood"), models)
-            # Past by under RESET_SLACK_S: a straggler 429 from the window that
-            # just rolled, so the mark is already expired, not 5h long.
-            row["walledUntil"] = (
-                min(reset, fallback)
-                if reset is not None and reset > now - RESET_SLACK_S
-                else fallback
+            windows = [
+                (pct, ts)
+                for _, pct, resets_at in oauth.relevant_windows(row.get("lastGood"), models)
+                if (ts := parse_reset_ts(resets_at)) is not None
+            ]
+            rolled = [ts for _, ts in windows if now - RESET_SLACK_S < ts <= now]
+            still_full = any(pct >= 100.0 and ts > now for pct, ts in windows)
+            until = (
+                min(rolled)
+                if rolled and not still_full
+                else min([ts for _, ts in windows if ts > now] + [fallback])
             )
+            row["walledUntil"] = until if wall_until is None else min(until, wall_until)
             row["walledUuid"] = account_uuid
 
         self._mutate(identities, [num], apply)
