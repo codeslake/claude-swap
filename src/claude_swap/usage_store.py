@@ -1539,12 +1539,10 @@ class UsageStore:
         as empty and replaces it on the next write.
 
         Expires at ``min(`` the row's OWN stored reading's earliest
-        relevant-window reset still ahead, ``now + WALL_FALLBACK_S)``, except
-        that a window which rolled within ``RESET_SLACK_S`` while no window
-        still ahead reads full is a straggler 429 from that window and marks
-        nothing (a rolled window that is not the wall, or one rolled longer
-        ago, says nothing about the wall). ``wall_until``, the 429's own
-        reset when the caller measured it, caps the result. A 5h window's
+        relevant-window reset still ahead, ``now + WALL_FALLBACK_S)``; a window
+        that rolled within ``RESET_SLACK_S`` with no full window still ahead
+        is a straggler 429, so it marks nothing. ``wall_until``, the 429's own
+        reset as the caller measured it, caps the result. A 5h window's
         own reset sits inside ``WALL_FALLBACK_S`` so the mark expires at
         that genuine reset, but a stored 7d (or scoped, or malformed
         far-future) reset is capped at the fallback instead, well before its

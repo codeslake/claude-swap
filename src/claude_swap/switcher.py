@@ -8636,10 +8636,8 @@ class ClaudeAccountSwitcher:
                   ``_select_best_switchable``'s existing one-selection zeroing
                   (this call's own ranking, never persisted) applies.
             wall_until: Per excluded slot, the epoch its own 429 resets, as
-                  the caller measured it when the 429 arrived; caps that
-                  slot's persisted mark, so a mark written after the switch
-                  queue cannot outlast the real wall. A slot it does not
-                  name keeps the mark's own span.
+                  the caller measured it; caps that slot's persisted mark. A
+                  slot it does not name keeps the mark's own span.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
