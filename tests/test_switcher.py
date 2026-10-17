@@ -17787,30 +17787,38 @@ class TestGateUltraReviewFixes:
             for r in caplog.records
         ), f"a failed stale-mark was not reported: {caplog.text}"
 
-    def test_an_unreadable_identity_with_an_unparseable_profile_never_posts_the_backup(
-        self, temp_home: Path, sample_sequence_data: dict
+    @pytest.mark.parametrize(
+        "profile",
+        [
+            # valid JSON without "claudeAiOauth": extract_oauth_data returns None
+            {"accessToken": "sk-unwrapped", "refreshToken": "rt-unwrapped",
+             "expiresAt": 999999},
+            # a well-formed dict missing the key: not falsy, so a `prof_oauth or {}`
+            # guard alone does not catch it
+            {"claudeAiOauth": {"accessToken": "sk-ne", "refreshToken": "rt-ne"}},
+            # `bool` subclasses `int`: `True <= cur_exp` compares as `1 <= cur_exp`
+            {"claudeAiOauth": {"accessToken": "sk-be", "refreshToken": "rt-be",
+                               "expiresAt": True}},
+        ],
+        ids=["unparseable-profile", "no-expiry", "bool-expiry"],
+    )
+    def test_an_unreadable_identity_with_an_unknown_profile_generation_still_defers(
+        self, temp_home: Path, sample_sequence_data: dict, profile
     ):
         """`prof_exp = (prof_oauth or {}).get("expiresAt") or 0` reads an
-        UNKNOWN generation as 0, and `0 <= cur_exp` is always true — so an
-        unwrapped or otherwise unparseable-as-claudeAiOauth profile credential
-        (`prof_oauth is None`) would mark stale on an expiry that was never
-        actually compared. "Unknown" must fall to the SAME defer side as
-        "possibly ahead", never read as "provably not ahead".
-        """
+        UNKNOWN generation as 0, and `0 <= cur_exp` is always true: an
+        unknown expiry would mark the profile stale on a comparison that never
+        happened. "Unknown" must fall to the SAME defer side as "possibly
+        ahead", never read as "provably not ahead"."""
         from claude_swap.session import is_session_stale, session_dir_for
         s = self._switcher(sample_sequence_data)
         backup = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-bk", "refreshToken": "rt-bk",
             "expiresAt": 1000}})
         s._write_account_credentials("1", "test@example.com", backup)
-        # Unwrapped: valid JSON, no "claudeAiOauth" key, so extract_oauth_data
-        # returns None cleanly (not the AttributeError case below).
-        unwrapped = json.dumps({
-            "accessToken": "sk-unwrapped", "refreshToken": "rt-unwrapped",
-            "expiresAt": 999999})
         sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
         sdir.mkdir(parents=True, exist_ok=True)
-        (sdir / ".credentials.json").write_text(unwrapped)
+        (sdir / ".credentials.json").write_text(json.dumps(profile))
         (sdir / ".claude.json").write_text("not json")
 
         def mock_refresh(credentials, **kw):
@@ -17821,14 +17829,14 @@ class TestGateUltraReviewFixes:
              patch.object(s, "_live_session_pids", return_value=[]):
             outcome = s.consume_backup_grant("1", "test@example.com", backup)
             assert not is_session_stale(sdir), (
-                "an unparseable profile's unknown expiry was treated as "
-                "provably not ahead and marked stale"
+                "an unknown profile generation was treated as provably not "
+                "ahead and marked stale"
             )
 
         assert outcome.error == "identity-unreadable"
         assert not posted.called, (
             f"the backup was POSTed {posted.call_count} time(s) for an "
-            "unknown (unparseable) profile generation"
+            "unknown profile generation"
         )
 
     def test_an_unreadable_identity_with_a_non_numeric_expiry_still_defers(
@@ -17901,87 +17909,6 @@ class TestGateUltraReviewFixes:
             f"got {outcome.error!r}: a stale profile's unrelated scalar "
             "credential body must not crash the consume into the generic "
             "'transient' handler"
-        )
-
-    def test_an_unreadable_identity_with_no_expiry_at_all_still_defers(
-        self, temp_home: Path, sample_sequence_data: dict
-    ):
-        """`prof_exp = (prof_oauth or {}).get("expiresAt") or 0` reads an
-        ABSENT `expiresAt` (a well-formed claudeAiOauth dict missing the
-        key) the same as a proven 0 -- unknown again read as "not ahead",
-        the same defect class as the unparseable-profile case above, on a
-        narrower input: `prof_oauth` here is NOT falsy, so that guard alone
-        does not catch it.
-        """
-        from claude_swap.session import is_session_stale, session_dir_for
-        s = self._switcher(sample_sequence_data)
-        backup = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-bk", "refreshToken": "rt-bk",
-            "expiresAt": 1000}})
-        s._write_account_credentials("1", "test@example.com", backup)
-        no_expiry = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-ne", "refreshToken": "rt-ne"}})
-        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
-        sdir.mkdir(parents=True, exist_ok=True)
-        (sdir / ".credentials.json").write_text(no_expiry)
-        (sdir / ".claude.json").write_text("not json")
-
-        def mock_refresh(credentials, **kw):
-            return oauth.RefreshOutcome(self._NEW, None)
-
-        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
-                   side_effect=mock_refresh) as posted, \
-             patch.object(s, "_live_session_pids", return_value=[]):
-            outcome = s.consume_backup_grant("1", "test@example.com", backup)
-            assert not is_session_stale(sdir), (
-                "a profile with no expiresAt at all was treated as "
-                "provably not ahead and marked stale"
-            )
-
-        assert outcome.error == "identity-unreadable"
-        assert not posted.called, (
-            f"the backup was POSTed {posted.call_count} time(s) for a "
-            "profile whose generation is entirely unknown"
-        )
-
-    def test_an_unreadable_identity_with_a_bool_expiry_still_defers(
-        self, temp_home: Path, sample_sequence_data: dict
-    ):
-        """`bool` subclasses `int`, so `isinstance(True, (int, float))` is
-        True and `True <= cur_exp` compares as `1 <= cur_exp` -- a second
-        door into the same "unknown read as proven" defect, one type check
-        further in. `expiresAt: true` is not a real generation marker.
-        """
-        from claude_swap.session import is_session_stale, session_dir_for
-        s = self._switcher(sample_sequence_data)
-        backup = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-bk", "refreshToken": "rt-bk",
-            "expiresAt": 1000}})
-        s._write_account_credentials("1", "test@example.com", backup)
-        bool_expiry = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-be", "refreshToken": "rt-be",
-            "expiresAt": True}})
-        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
-        sdir.mkdir(parents=True, exist_ok=True)
-        (sdir / ".credentials.json").write_text(bool_expiry)
-        (sdir / ".claude.json").write_text("not json")
-
-        def mock_refresh(credentials, **kw):
-            return oauth.RefreshOutcome(self._NEW, None)
-
-        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
-                   side_effect=mock_refresh) as posted, \
-             patch.object(s, "_live_session_pids", return_value=[]):
-            outcome = s.consume_backup_grant("1", "test@example.com", backup)
-            assert not is_session_stale(sdir), (
-                "a boolean expiresAt was treated as a real numeric "
-                "generation and marked stale"
-            )
-
-        assert outcome.error == "identity-unreadable"
-        assert not posted.called, (
-            f"the backup was POSTed {posted.call_count} time(s) for a "
-            "profile whose expiresAt was a bool, not a real generation"
         )
 
     def test_an_older_profile_never_supersedes_the_backup(
