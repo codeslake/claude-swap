@@ -2,6 +2,7 @@
 self-delete -- see that hook's comment for the measured reason."""
 from __future__ import annotations
 
+import subprocess
 import types
 
 import pytest
@@ -25,6 +26,18 @@ def _make_session(basetemp, given_basetemp, is_worker):
     return types.SimpleNamespace(config=config)
 
 
+@pytest.fixture(autouse=True)
+def _wait_for_the_detached_removal(monkeypatch):
+    real = subprocess.Popen
+
+    def popen(*args, **kwargs):
+        child = real(*args, **kwargs)
+        child.wait()
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+
 @pytest.mark.parametrize(
     "exitstatus, is_worker, user_given, expect_deleted",
     [
@@ -42,6 +55,33 @@ def test_pytest_sessionfinish(tmp_path, exitstatus, is_worker, user_given, expec
     conftest.pytest_sessionfinish(session, exitstatus=exitstatus)
 
     assert basetemp.exists() != expect_deleted
+
+
+def test_the_removal_is_detached_and_never_waited_on(tmp_path, monkeypatch):
+    basetemp = _make_basetemp(tmp_path)
+    started = []
+    # a child with no wait/poll/communicate: any wait by the hook is an AttributeError
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: started.append(kw) or types.SimpleNamespace())
+
+    conftest.pytest_sessionfinish(_make_session(basetemp, None, is_worker=False), exitstatus=0)
+
+    assert basetemp.exists()  # the hook itself removed nothing
+    (kw,) = started
+    assert kw["start_new_session"] is True
+    assert kw["stdin"] == kw["stdout"] == kw["stderr"] == subprocess.DEVNULL  # no inherited pipe to wait on
+
+
+def test_a_failed_spawn_falls_back_to_removing_in_process(tmp_path, monkeypatch):
+    basetemp = _make_basetemp(tmp_path)
+
+    def refused(*a, **kw):
+        raise OSError(11, "Resource temporarily unavailable")  # EAGAIN under a process cap
+
+    monkeypatch.setattr(subprocess, "Popen", refused)
+
+    conftest.pytest_sessionfinish(_make_session(basetemp, None, is_worker=False), exitstatus=0)  # must not raise
+
+    assert not basetemp.exists()
 
 
 def test_nothing_made_is_a_no_op(tmp_path):

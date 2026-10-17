@@ -3586,18 +3586,28 @@ class TestActiveAccountRefresh:
     # it cannot claim; it must also resync a healthy, rotated login the same
     # way -- read-only, no fetch, no consume.
 
-    def test_backoff_blocked_active_slot_still_resyncs_a_fresh_login(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
-    ):
-        from claude_swap.usage_store import FetchRecord
-
-        switcher = self._switcher(sample_sequence_data)
+    @staticmethod
+    def _block_polling(switcher, how: str) -> None:
+        """Slot 1 cannot be polled this tick: a live 429 backoff, or a hold."""
         store = switcher._usage_store
         identity = {"1": ("test@example.com", "")}
-        store.record(
-            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
-        )
-        assert store.entries(identity)["1"].backoff_until is not None  # premise
+        if how == "backoff":
+            store.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+            )
+            assert store.entries(identity)["1"].backoff_until is not None  # premise
+        else:
+            store.adopt(
+                {"1": ({"five_hour": {"pct": 1.0}}, 0.0)}, identity, hold_s=3600.0
+            )
+            assert store.entries(identity)["1"].held(store.clock())  # premise
+
+    @pytest.mark.parametrize("how", ["backoff", "held"])
+    def test_a_poll_blocked_active_slot_still_resyncs_a_fresh_login(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, how
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        self._block_polling(switcher, how)
 
         fresh_login = self._REFRESHED  # a different lineage than the backup
         info = [(1, "test@example.com", "", "", True, fresh_login, "")]
@@ -3614,7 +3624,7 @@ class TestActiveAccountRefresh:
         ), patch.object(switcher, "_run_usage_fetches") as run_fetches:
             switcher._collect_usage_entries(info)
 
-        run_fetches.assert_not_called()  # premise: the backoff blocked it
+        run_fetches.assert_not_called()  # premise: the backoff or hold blocked it
         write_backup.assert_called_once_with(
             "1", "test@example.com", fresh_login, attributed=True,
         )
@@ -3854,83 +3864,30 @@ class TestActiveAccountRefresh:
     # and used to ``continue`` outright on a held active slot, skipping the
     # resync along with the expired-sentinel arm. For the hold's duration a
     # Claude Code rotation left the slot backup on the consumed
-    # predecessor. The held twin of the backoff test above: the resync
-    # must still run underneath a hold.
+    # predecessor. The ``how``-parametrized tests cover the hold alongside the
+    # backoff: the resync must still run underneath it.
 
-    def test_held_blocked_active_slot_still_resyncs_a_fresh_login(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    @pytest.mark.parametrize(
+        "how, sentinel", [("backoff", USAGE_TOKEN_EXPIRED), ("held", None)]
+    )
+    def test_a_poll_blocked_active_slot_with_expired_login_is_not_resynced(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        how, sentinel
     ):
+        """Control: the live token is genuinely expired, so it has no valid
+        token pair to attribute and must never reach the resync (T1537 m1).
+        A backoff leaves the sentinel branch to report it; a hold exempts
+        the sentinel (the held reading, not this token's expiry, is what
+        the row reports)."""
         switcher = self._switcher(sample_sequence_data)
-        store = switcher._usage_store
-        identity = {"1": ("test@example.com", "")}
-        store.adopt(
-            {"1": ({"five_hour": {"pct": 1.0}}, 0.0)}, identity, hold_s=3600.0
-        )
-        assert store.entries(identity)["1"].held(store.clock())  # premise
-
-        fresh_login = self._REFRESHED  # a different lineage than the backup
-        info = [(1, "test@example.com", "", "", True, fresh_login, "")]
-
-        with patch.object(
-            switcher, "_read_credentials", return_value=fresh_login
-        ), patch.object(
-            switcher, "_read_account_credentials", return_value=self._EXPIRED
-        ), patch.object(
-            switcher, "_write_account_credentials"
-        ) as write_backup, patch(
-            "claude_swap.oauth.fetch_oauth_profile",
-            return_value=self._PROFILE_SELF,
-        ), patch.object(switcher, "_run_usage_fetches") as run_fetches:
-            switcher._collect_usage_entries(info)
-
-        run_fetches.assert_not_called()  # premise: the hold blocked the claim
-        write_backup.assert_called_once_with(
-            "1", "test@example.com", fresh_login, attributed=True,  # T0938 sweep
-        )
-
-    def test_backoff_blocked_active_slot_with_expired_login_is_not_resynced(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
-    ):
-        """Control: the live token is genuinely expired — the sentinel
-        branch above handles it, and must never reach the resync."""
-        from claude_swap.usage_store import FetchRecord
-
-        switcher = self._switcher(sample_sequence_data)
-        store = switcher._usage_store
-        identity = {"1": ("test@example.com", "")}
-        store.record(
-            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
-        )
+        self._block_polling(switcher, how)
 
         info = [(1, "test@example.com", "", "", True, self._EXPIRED, "")]
 
         with patch.object(switcher, "_resync_rotated_backup") as resync:
             entries = switcher._collect_usage_entries(info)
 
-        assert entries["1"].sentinel == USAGE_TOKEN_EXPIRED
-        resync.assert_not_called()
-
-    def test_held_blocked_active_slot_with_expired_login_is_not_resynced(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
-    ):
-        """Held twin of the expired-login control above: the hold exempts
-        the sentinel (that reading, not this token's expiry, is what the
-        row reports), but an expired live token must still never reach the
-        resync — it has no valid token pair to attribute (T1537 m1)."""
-        switcher = self._switcher(sample_sequence_data)
-        store = switcher._usage_store
-        identity = {"1": ("test@example.com", "")}
-        store.adopt(
-            {"1": ({"five_hour": {"pct": 1.0}}, 0.0)}, identity, hold_s=3600.0
-        )
-        assert store.entries(identity)["1"].held(store.clock())  # premise
-
-        info = [(1, "test@example.com", "", "", True, self._EXPIRED, "")]
-
-        with patch.object(switcher, "_resync_rotated_backup") as resync:
-            entries = switcher._collect_usage_entries(info)
-
-        assert entries["1"].sentinel is None
+        assert entries["1"].sentinel == sentinel
         resync.assert_not_called()
 
     def test_backoff_blocked_active_slot_does_not_adopt_a_foreign_login(
@@ -10670,53 +10627,9 @@ class TestSwitchTargetLivenessGuard:
     BEFORE any lock, and a dead verdict strikes the slot through the same
     writer the collector uses rather than being activated."""
 
-    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
-        s = ClaudeAccountSwitcher()
-        s.platform = Platform.LINUX
-        s._setup_directories()
-        s._init_sequence_file()
-        return s
-
-    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
-        s._write_account_credentials(
-            str(num),
-            email,
-            json.dumps({
-                "claudeAiOauth": {
-                    "accessToken": f"sk-{num}",
-                    "refreshToken": f"rt-{num}",
-                },
-            }),
-        )
-        s._write_account_config(
-            str(num),
-            email,
-            json.dumps({
-                "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
-            }),
-        )
-        data = s._get_sequence_data()
-        data["accounts"][str(num)] = {
-            "email": email,
-            "uuid": f"uuid-{num}",
-            "organizationUuid": "",
-            "organizationName": "",
-            "added": "2024-01-01T00:00:00Z",
-        }
-        if num not in data["sequence"]:
-            data["sequence"].append(num)
-            data["sequence"].sort()
-        if data["activeAccountNumber"] is None:
-            data["activeAccountNumber"] = num
-        s._write_json(s.sequence_file, data)
-
-    def _make_live(self, temp_home: Path, email: str, num: int) -> None:
-        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
-        }))
-        (temp_home / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
-        }))
+    _setup = TestUsageAwareSwitch._setup
+    _seed = TestUsageAwareSwitch._seed
+    _make_live = TestUsageAwareSwitch._make_live
 
     @staticmethod
     def _usage(pct: float) -> dict:
@@ -11013,51 +10926,21 @@ class TestSwitchTargetLivenessGuard:
         assert not struck_entry.token_dead()  # doubted first strike
         assert any("Account-2" in w for w in result["warnings"])
 
-    def test_plain_rotation_skips_dead_candidate_and_lands_on_next(
-        self, temp_home: Path
+    @pytest.mark.parametrize(
+        "kwargs, pcts",
+        [({}, None), ({"strategy": "next-available"}, (50, 10, 20))],
+        ids=["plain-rotation", "next-available"],
+    )
+    def test_a_rotation_skips_a_dead_candidate_and_lands_on_next(
+        self, temp_home: Path, kwargs, pcts
     ):
         s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        self._seed(s, 3, "c@example.com")
+        for num, c in enumerate("abc", 1):
+            self._seed(s, num, f"{c}@example.com")
         self._make_live(temp_home, "a@example.com", 1)
-        for num, email in (
-            (1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com"),
-        ):
-            self._seed_prior_success(s, num, email)
-
-        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
-            return {"sk-2": False, "sk-3": True}.get(token)
-
-        with patch(
-            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
-        ), patch(
-            "claude_swap.oauth.try_refresh_oauth_credentials",
-            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
-        ):
-            result = s.switch(json_output=True)
-
-        assert result["switched"] is True
-        assert result["to"]["number"] == 3
-        struck_entry = s._usage_store.entries(
-            {"2": self._identity("b@example.com")}
-        )["2"]
-        assert struck_entry.auth_dead_strikes == 1
-        assert not struck_entry.token_dead()  # doubted first strike
-
-    def test_next_available_rotation_skips_dead_candidate_and_lands_on_next(
-        self, temp_home: Path
-    ):
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        self._seed(s, 3, "c@example.com")
-        self._make_live(temp_home, "a@example.com", 1)
-        for num, email in (
-            (1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com"),
-        ):
-            self._seed_prior_success(s, num, email)
-        usage = {"1": self._usage(50), "2": self._usage(10), "3": self._usage(20)}
+        for num, c in enumerate("abc", 1):
+            self._seed_prior_success(s, num, f"{c}@example.com")
+        usage = {str(n): self._usage(p) for n, p in enumerate(pcts or (), 1)}
 
         def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
             return {"sk-2": False, "sk-3": True}.get(token)
@@ -11068,10 +10951,15 @@ class TestSwitchTargetLivenessGuard:
             "claude_swap.oauth.try_refresh_oauth_credentials",
             return_value=oauth.RefreshOutcome(None, "invalid_grant"),
         ):
-            result = s.switch(strategy="next-available", json_output=True)
+            result = s.switch(json_output=True, **kwargs)
 
         assert result["switched"] is True
         assert result["to"]["number"] == 3
+        struck_entry = s._usage_store.entries(
+            {"2": self._identity("b@example.com")}
+        )["2"]
+        assert struck_entry.auth_dead_strikes == 1
+        assert not struck_entry.token_dead()  # doubted first strike
 
     def test_fresh_machine_switch_skips_dead_preferred_and_lands_on_fallback(
         self, temp_home: Path
@@ -11213,8 +11101,17 @@ class TestSwitchTargetLivenessGuard:
             {str(num): self._identity(email)},
         )
 
-    def test_plain_rotation_survives_two_dead_candidates_with_prior_success(
-        self, temp_home: Path
+    @pytest.mark.parametrize(
+        "kwargs, pcts",
+        [
+            ({}, None),
+            ({"strategy": "best", "current_at_limit": True}, (50, 10, 30, 70)),
+            ({"strategy": "next-available"}, (50, 10, 10, 10)),
+        ],
+        ids=["plain-rotation", "best", "next-available"],
+    )
+    def test_a_strategy_survives_two_dead_candidates_with_prior_success(
+        self, temp_home: Path, kwargs, pcts
     ):
         """4 slots, 2 dead (accounts 2 and 3), every slot carrying a prior
         success. ``_slot_token_dead`` doubts each candidate's first strike,
@@ -11222,99 +11119,12 @@ class TestSwitchTargetLivenessGuard:
         ``len(sequence)``-bounded retry (4 passes) is exhausted re-striking
         2 and 3 a second time each before ever reaching account 4."""
         s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        self._seed(s, 3, "c@example.com")
-        self._seed(s, 4, "d@example.com")
+        for num, c in enumerate("abcd", 1):
+            self._seed(s, num, f"{c}@example.com")
         self._make_live(temp_home, "a@example.com", 1)
-        for num, email in (
-            (1, "a@example.com"), (2, "b@example.com"),
-            (3, "c@example.com"), (4, "d@example.com"),
-        ):
-            self._seed_prior_success(s, num, email)
-
-        probed: list[str] = []
-
-        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
-            probed.append(token)
-            return {"sk-2": False, "sk-3": False, "sk-4": True}.get(token)
-
-        with patch(
-            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
-        ), patch(
-            "claude_swap.oauth.try_refresh_oauth_credentials",
-            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
-        ):
-            result = s.switch(json_output=True)
-
-        assert result["switched"] is True
-        assert result["to"]["number"] == 4
-        assert probed.count("sk-2") == 1
-        assert probed.count("sk-3") == 1
-
-    def test_best_strategy_survives_two_dead_candidates_with_prior_success(
-        self, temp_home: Path
-    ):
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        self._seed(s, 3, "c@example.com")
-        self._seed(s, 4, "d@example.com")
-        self._make_live(temp_home, "a@example.com", 1)
-        for num, email in (
-            (1, "a@example.com"), (2, "b@example.com"),
-            (3, "c@example.com"), (4, "d@example.com"),
-        ):
-            self._seed_prior_success(s, num, email)
-        usage = {
-            "1": self._usage(50), "2": self._usage(10),
-            "3": self._usage(30), "4": self._usage(70),
-        }
-
-        probed: list[str] = []
-
-        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
-            probed.append(token)
-            return {"sk-2": False, "sk-3": False, "sk-4": True}.get(token)
-
-        with patch.object(s, "_usage_by_account", return_value=usage), \
-             patch(
-                 "claude_swap.oauth.probe_oauth_profile_live",
-                 side_effect=fake_probe,
-             ), \
-             patch(
-                 "claude_swap.oauth.try_refresh_oauth_credentials",
-                 return_value=oauth.RefreshOutcome(None, "invalid_grant"),
-             ), \
-             patch.object(s, "list_accounts"):
-            result = s.switch(
-                strategy="best", json_output=True, current_at_limit=True
-            )
-
-        assert result["switched"] is True
-        assert result["to"]["number"] == 4
-        assert probed.count("sk-2") == 1
-        assert probed.count("sk-3") == 1
-
-    def test_next_available_survives_two_dead_candidates_with_prior_success(
-        self, temp_home: Path
-    ):
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        self._seed(s, 3, "c@example.com")
-        self._seed(s, 4, "d@example.com")
-        self._make_live(temp_home, "a@example.com", 1)
-        for num, email in (
-            (1, "a@example.com"), (2, "b@example.com"),
-            (3, "c@example.com"), (4, "d@example.com"),
-        ):
-            self._seed_prior_success(s, num, email)
-        usage = {
-            "1": self._usage(50), "2": self._usage(10),
-            "3": self._usage(10), "4": self._usage(10),
-        }
-
+        for num, c in enumerate("abcd", 1):
+            self._seed_prior_success(s, num, f"{c}@example.com")
+        usage = {str(n): self._usage(p) for n, p in enumerate(pcts or (), 1)}
         probed: list[str] = []
 
         def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
@@ -11326,8 +11136,8 @@ class TestSwitchTargetLivenessGuard:
         ), patch(
             "claude_swap.oauth.try_refresh_oauth_credentials",
             return_value=oauth.RefreshOutcome(None, "invalid_grant"),
-        ):
-            result = s.switch(strategy="next-available", json_output=True)
+        ), patch.object(s, "list_accounts"):
+            result = s.switch(json_output=True, **kwargs)
 
         assert result["switched"] is True
         assert result["to"]["number"] == 4
@@ -21874,30 +21684,38 @@ class TestGateUltraReviewFixes:
             for r in caplog.records
         ), f"a failed stale-mark was not reported: {caplog.text}"
 
-    def test_an_unreadable_identity_with_an_unparseable_profile_never_posts_the_backup(
-        self, temp_home: Path, sample_sequence_data: dict
+    @pytest.mark.parametrize(
+        "profile",
+        [
+            # valid JSON without "claudeAiOauth": extract_oauth_data returns None
+            {"accessToken": "sk-unwrapped", "refreshToken": "rt-unwrapped",
+             "expiresAt": 999999},
+            # a well-formed dict missing the key: not falsy, so a `prof_oauth or {}`
+            # guard alone does not catch it
+            {"claudeAiOauth": {"accessToken": "sk-ne", "refreshToken": "rt-ne"}},
+            # `bool` subclasses `int`: `True <= cur_exp` compares as `1 <= cur_exp`
+            {"claudeAiOauth": {"accessToken": "sk-be", "refreshToken": "rt-be",
+                               "expiresAt": True}},
+        ],
+        ids=["unparseable-profile", "no-expiry", "bool-expiry"],
+    )
+    def test_an_unreadable_identity_with_an_unknown_profile_generation_still_defers(
+        self, temp_home: Path, sample_sequence_data: dict, profile
     ):
         """`prof_exp = (prof_oauth or {}).get("expiresAt") or 0` reads an
-        UNKNOWN generation as 0, and `0 <= cur_exp` is always true — so an
-        unwrapped or otherwise unparseable-as-claudeAiOauth profile credential
-        (`prof_oauth is None`) would mark stale on an expiry that was never
-        actually compared. "Unknown" must fall to the SAME defer side as
-        "possibly ahead", never read as "provably not ahead".
-        """
+        UNKNOWN generation as 0, and `0 <= cur_exp` is always true: an
+        unknown expiry would mark the profile stale on a comparison that never
+        happened. "Unknown" must fall to the SAME defer side as "possibly
+        ahead", never read as "provably not ahead"."""
         from claude_swap.session import is_session_stale, session_dir_for
         s = self._switcher(sample_sequence_data)
         backup = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-bk", "refreshToken": "rt-bk",
             "expiresAt": 1000}})
         s._write_account_credentials("1", "test@example.com", backup)
-        # Unwrapped: valid JSON, no "claudeAiOauth" key, so extract_oauth_data
-        # returns None cleanly (not the AttributeError case below).
-        unwrapped = json.dumps({
-            "accessToken": "sk-unwrapped", "refreshToken": "rt-unwrapped",
-            "expiresAt": 999999})
         sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
         sdir.mkdir(parents=True, exist_ok=True)
-        (sdir / ".credentials.json").write_text(unwrapped)
+        (sdir / ".credentials.json").write_text(json.dumps(profile))
         (sdir / ".claude.json").write_text("not json")
 
         def mock_refresh(credentials, **kw):
@@ -21908,14 +21726,14 @@ class TestGateUltraReviewFixes:
              patch.object(s, "_live_session_pids", return_value=[]):
             outcome = s.consume_backup_grant("1", "test@example.com", backup)
             assert not is_session_stale(sdir), (
-                "an unparseable profile's unknown expiry was treated as "
-                "provably not ahead and marked stale"
+                "an unknown profile generation was treated as provably not "
+                "ahead and marked stale"
             )
 
         assert outcome.error == "identity-unreadable"
         assert not posted.called, (
             f"the backup was POSTed {posted.call_count} time(s) for an "
-            "unknown (unparseable) profile generation"
+            "unknown profile generation"
         )
 
     def test_an_unreadable_identity_with_a_non_numeric_expiry_still_defers(
@@ -21988,87 +21806,6 @@ class TestGateUltraReviewFixes:
             f"got {outcome.error!r}: a stale profile's unrelated scalar "
             "credential body must not crash the consume into the generic "
             "'transient' handler"
-        )
-
-    def test_an_unreadable_identity_with_no_expiry_at_all_still_defers(
-        self, temp_home: Path, sample_sequence_data: dict
-    ):
-        """`prof_exp = (prof_oauth or {}).get("expiresAt") or 0` reads an
-        ABSENT `expiresAt` (a well-formed claudeAiOauth dict missing the
-        key) the same as a proven 0 -- unknown again read as "not ahead",
-        the same defect class as the unparseable-profile case above, on a
-        narrower input: `prof_oauth` here is NOT falsy, so that guard alone
-        does not catch it.
-        """
-        from claude_swap.session import is_session_stale, session_dir_for
-        s = self._switcher(sample_sequence_data)
-        backup = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-bk", "refreshToken": "rt-bk",
-            "expiresAt": 1000}})
-        s._write_account_credentials("1", "test@example.com", backup)
-        no_expiry = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-ne", "refreshToken": "rt-ne"}})
-        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
-        sdir.mkdir(parents=True, exist_ok=True)
-        (sdir / ".credentials.json").write_text(no_expiry)
-        (sdir / ".claude.json").write_text("not json")
-
-        def mock_refresh(credentials, **kw):
-            return oauth.RefreshOutcome(self._NEW, None)
-
-        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
-                   side_effect=mock_refresh) as posted, \
-             patch.object(s, "_live_session_pids", return_value=[]):
-            outcome = s.consume_backup_grant("1", "test@example.com", backup)
-            assert not is_session_stale(sdir), (
-                "a profile with no expiresAt at all was treated as "
-                "provably not ahead and marked stale"
-            )
-
-        assert outcome.error == "identity-unreadable"
-        assert not posted.called, (
-            f"the backup was POSTed {posted.call_count} time(s) for a "
-            "profile whose generation is entirely unknown"
-        )
-
-    def test_an_unreadable_identity_with_a_bool_expiry_still_defers(
-        self, temp_home: Path, sample_sequence_data: dict
-    ):
-        """`bool` subclasses `int`, so `isinstance(True, (int, float))` is
-        True and `True <= cur_exp` compares as `1 <= cur_exp` -- a second
-        door into the same "unknown read as proven" defect, one type check
-        further in. `expiresAt: true` is not a real generation marker.
-        """
-        from claude_swap.session import is_session_stale, session_dir_for
-        s = self._switcher(sample_sequence_data)
-        backup = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-bk", "refreshToken": "rt-bk",
-            "expiresAt": 1000}})
-        s._write_account_credentials("1", "test@example.com", backup)
-        bool_expiry = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-be", "refreshToken": "rt-be",
-            "expiresAt": True}})
-        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
-        sdir.mkdir(parents=True, exist_ok=True)
-        (sdir / ".credentials.json").write_text(bool_expiry)
-        (sdir / ".claude.json").write_text("not json")
-
-        def mock_refresh(credentials, **kw):
-            return oauth.RefreshOutcome(self._NEW, None)
-
-        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
-                   side_effect=mock_refresh) as posted, \
-             patch.object(s, "_live_session_pids", return_value=[]):
-            outcome = s.consume_backup_grant("1", "test@example.com", backup)
-            assert not is_session_stale(sdir), (
-                "a boolean expiresAt was treated as a real numeric "
-                "generation and marked stale"
-            )
-
-        assert outcome.error == "identity-unreadable"
-        assert not posted.called, (
-            f"the backup was POSTed {posted.call_count} time(s) for a "
-            "profile whose expiresAt was a bool, not a real generation"
         )
 
     def test_an_older_profile_never_supersedes_the_backup(
@@ -26585,7 +26322,10 @@ class TestSwitchOffAtLimitAccount:
                 switch_off_at_limit_account(s)
             assert built == [], "at-limit routed through an engine"
 
-            with contextlib.suppress(Exception):
+            with (
+                patch.object(s, "_run_usage_fetches", return_value={}),
+                contextlib.suppress(Exception),
+            ):
                 s.switch()
             assert built == [], "switch() routed through an engine"
 
@@ -26802,6 +26542,23 @@ class TestSwitchPersistsTheAtLimitMark:
         entry = s._usage_store.entries(ident)["1"]
         assert entry.walled
         assert entry.decision_value()["five_hour"]["pct"] == 100.0
+
+    def test_wall_until_caps_only_the_slot_it_names(self, temp_home):
+        # T2571: the pin passes each slot's own 429 reset; a slot it does not
+        # name keeps the mark's own span.
+        s = TestSwitchRefusedMarksTheAccountItLeft()._seed_three(temp_home)
+        usage = TestSwitchRefusedMarksTheAccountItLeft.USAGE
+        t = time.time() + 600.0
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            s.switch(
+                strategy="best", json_output=True, current_at_limit=True,
+                exclude={"1", "3"}, wall_until={"3": t},
+            )
+
+        marks = json.loads(s._usage_store.path.read_text())["accounts"]
+        assert marks["3"]["walledUntil"] == t
+        assert marks["1"]["walledUntil"] > t
 
     def test_switch_with_no_exclude_persists_nothing(self, temp_home):
         # Today's pin: `current_at_limit=True` with no `exclude` keyword.

@@ -10784,6 +10784,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         current_refused: bool = False,
         exclude: Iterable[str] = (),
         manual_source: str | None = None,
+        wall_until: Mapping[str, float] | None = None,
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -10834,6 +10835,9 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             manual_source: A hand caller's name (``"tui"``, ``"cli"``,
                   ``"menubar"``): a real switch is then recorded for the engine
                   (:meth:`_record_manual_switch`). ``None`` records nothing.
+            wall_until: Per excluded slot, the epoch its own 429 resets, as
+                  the caller measured it; caps that slot's persisted mark. A
+                  slot it does not name keeps the mark's own span.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -11084,6 +11088,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                         self._usage_store.mark_at_limit(
                             num, {num: identity}, models,
                             account_uuid=data["accounts"][num].get("uuid"),
+                            wall_until=(wall_until or {}).get(num),
                         )
             if current_refused:
                 # Before the switch: a failed write raises with nothing

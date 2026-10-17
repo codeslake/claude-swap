@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -770,6 +771,12 @@ def block_real_policy_limits_fetch(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def no_keychain_retry_wait(monkeypatch):
+    """A locked-Keychain read retries after a real 0.3 s sleep; no test waits it out."""
+    monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""
@@ -1188,6 +1195,9 @@ def pytest_sessionfinish(session, exitstatus):
     # Measured: a green run leaves ~45k entries in the shared /tmp/pytest-of-<user>, a ~3.8s serial rmtree landing on whichever later session evicts it, which made the -n 10 wall bimodal ~19s/~23s.
     # Not tmp_path_retention_policy="failed": its per-test rmtree runs while monkeypatch is still active, so a worker crashes with RealStoreWriteBlocked.
     # A user-given --basetemp is left alone in the controller; a worker always cleans its own share on green.
+    # The removal is a detached child, so the run never waits on it: in-process it held the -n 10 wall.
+    # The workers' children and the controller's child then remove nested paths (pytest-N/popen-gwX under pytest-N) at the same time; ignore_errors makes them converge.
+    # A spawn that fails (EAGAIN/ENOMEM under a process cap) must not turn a green run into an INTERNALERROR: remove in-process then.
     if exitstatus != 0:
         return
     factory = session.config._tmp_path_factory
@@ -1197,4 +1207,13 @@ def pytest_sessionfinish(session, exitstatus):
     is_worker = hasattr(session.config, "workerinput")
     if factory._given_basetemp is not None and not is_worker:
         return
-    shutil.rmtree(basetemp, ignore_errors=True)
+    try:
+        subprocess.Popen(
+            [sys.executable, "-S", "-c", "import shutil, sys; shutil.rmtree(sys.argv[1], ignore_errors=True)", str(basetemp)],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        shutil.rmtree(basetemp, ignore_errors=True)
