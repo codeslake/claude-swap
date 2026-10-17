@@ -26,20 +26,16 @@ def _make_session(basetemp, given_basetemp, is_worker):
     return types.SimpleNamespace(config=config)
 
 
-@pytest.fixture
-def removals(monkeypatch):
-    """The hook's detached removals, each waited for HERE so a test reads their result."""
-    spawned = []
+@pytest.fixture(autouse=True)
+def _wait_for_the_detached_removal(monkeypatch):
     real = subprocess.Popen
 
     def popen(*args, **kwargs):
-        spawned.append(kwargs)
         child = real(*args, **kwargs)
         child.wait()
         return child
 
     monkeypatch.setattr(subprocess, "Popen", popen)
-    return spawned
 
 
 @pytest.mark.parametrize(
@@ -52,7 +48,7 @@ def removals(monkeypatch):
     ],
     ids=["green-worker", "red-worker", "green-controller-user-given", "green-controller"],
 )
-def test_pytest_sessionfinish(tmp_path, removals, exitstatus, is_worker, user_given, expect_deleted):
+def test_pytest_sessionfinish(tmp_path, exitstatus, is_worker, user_given, expect_deleted):
     basetemp = _make_basetemp(tmp_path)
     session = _make_session(basetemp, basetemp if user_given else None, is_worker)
 
