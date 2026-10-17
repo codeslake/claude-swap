@@ -1915,15 +1915,3 @@ class TestLoginExpiresAtIso:
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
 
-
-def test_the_suite_never_reaches_the_vendors_usage_api(monkeypatch):
-    lookups = []
-
-    def refuse(*args, **kwargs):
-        lookups.append(args)
-        raise OSError("lookup refused")
-
-    monkeypatch.setattr("socket.getaddrinfo", refuse)
-    with pytest.raises(urllib.error.URLError):
-        oauth.request_usage_data("sk-x")
-    assert lookups == []

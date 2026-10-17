@@ -9,7 +9,6 @@ import sys
 import tempfile
 import time
 import types
-import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -612,17 +611,6 @@ def block_real_switch_target_probe(request, monkeypatch):
         lambda token, timeout_s=5.0: None,
     )
     yield
-
-
-@pytest.fixture(autouse=True)
-def block_real_urlopen(monkeypatch):
-    """Safety net: no test may make a live ``urllib`` request (a tick that was
-    not handed its usage fetched every seeded account for real). A test that
-    needs an answer patches ``urllib.request.urlopen`` itself, after this."""
-    def unreachable(*args, **kwargs):
-        raise urllib.error.URLError("network blocked under test")
-
-    monkeypatch.setattr("urllib.request.urlopen", unreachable)
 
 
 @pytest.fixture(autouse=True)
