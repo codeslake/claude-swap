@@ -8587,7 +8587,7 @@ class ClaudeAccountSwitcher:
         current_at_limit: bool = False,
         current_refused: bool = False,
         exclude: Iterable[str] = (),
-        wall_until: Mapping[str, float] | None = None,
+        wall_until: Mapping[str | int, float] | None = None,
     ) -> dict | None:
         """Switch to next account in sequence.
 

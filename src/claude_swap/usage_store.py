@@ -1539,11 +1539,12 @@ class UsageStore:
         as empty and replaces it on the next write.
 
         Expires at ``min(`` the row's OWN stored reading's earliest
-        relevant-window reset still ahead, ``now + WALL_FALLBACK_S)``; a window
-        that rolled within ``RESET_SLACK_S`` with no full window still ahead
-        is a straggler 429, so it marks nothing; with no full window still
-        ahead, one that rolled earlier than that makes the reading stale and
-        the mark ``WALL_FALLBACK_S``. ``wall_until``, the 429's own
+        relevant-window reset still ahead, ``now + WALL_FALLBACK_S)``, by the
+        FULL (100%) windows first: one still ahead sets it, whatever else
+        rolled; else one that rolled within ``RESET_SLACK_S`` is a straggler
+        429 and marks nothing; else the reading is stale and the mark is
+        ``WALL_FALLBACK_S``. With no full window, one that rolled within
+        ``RESET_SLACK_S`` marks nothing. ``wall_until``, the 429's own
         reset as the caller measured it, caps the result. A 5h window's
         own reset sits inside ``WALL_FALLBACK_S`` so the mark expires at
         that genuine reset, but a stored 7d (or scoped, or malformed
@@ -1565,14 +1566,15 @@ class UsageStore:
                 for _, pct, resets_at in oauth.relevant_windows(row.get("lastGood"), models)
                 if (ts := parse_reset_ts(resets_at)) is not None
             ]
+            full = [ts for pct, ts in windows if pct >= 100.0]
+            ahead = min([ts for _, ts in windows if ts > now] + [fallback])
             rolled = [ts for _, ts in windows if now - RESET_SLACK_S < ts <= now]
-            still_full = any(pct >= 100.0 and ts > now for pct, ts in windows)
-            stale = not still_full and any(ts <= now - RESET_SLACK_S for _, ts in windows)
-            until = (
-                fallback if stale
-                else min(rolled) if rolled and not still_full
-                else min([ts for _, ts in windows if ts > now] + [fallback])
-            )
+            if full and max(full) > now:  # the wall is still ahead (T2571)
+                until = ahead
+            elif full:  # it just rolled: a straggler (T2569); long ago: stale
+                until = min((ts for ts in full if ts > now - RESET_SLACK_S), default=fallback)
+            else:
+                until = min(rolled) if rolled else ahead
             row["walledUntil"] = until if wall_until is None else min(until, wall_until)
             row["walledUuid"] = account_uuid
 
