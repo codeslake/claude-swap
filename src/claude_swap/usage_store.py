@@ -1540,11 +1540,12 @@ class UsageStore:
 
         Expires at ``min(`` the row's OWN stored reading's earliest
         relevant-window reset still ahead, ``now + WALL_FALLBACK_S)``, by the
-        FULL (100%) windows first: one still ahead sets it, whatever else
-        rolled; else one that rolled within ``RESET_SLACK_S`` is a straggler
-        429 and marks nothing; else the reading is stale and the mark is
-        ``WALL_FALLBACK_S``. With no full window, one that rolled within
-        ``RESET_SLACK_S`` marks nothing. ``wall_until``, the 429's own
+        FULL (100%) windows first: while any is still ahead the span is that
+        earliest reset over ALL relevant windows (not the full window's own
+        reset), whatever else rolled; else one that rolled within
+        ``RESET_SLACK_S`` is a straggler 429 and marks nothing; else the
+        reading is stale and the mark is ``WALL_FALLBACK_S``. With no full
+        window, one that rolled within ``RESET_SLACK_S`` marks nothing. ``wall_until``, the 429's own
         reset as the caller measured it, caps the result. A 5h window's
         own reset sits inside ``WALL_FALLBACK_S`` so the mark expires at
         that genuine reset, but a stored 7d (or scoped, or malformed

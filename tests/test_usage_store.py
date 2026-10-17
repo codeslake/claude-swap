@@ -351,28 +351,36 @@ class TestMarkAtLimit:
         clock.advance(WALL_FALLBACK_S - 1)  # a 5h mark is still up at its end
         assert store.entries(IDENT)["1"].walled is walled
 
-    @pytest.mark.parametrize("five_pct,five_ahead,seven_ahead,late,wall_until,span", [
+    @pytest.mark.parametrize(
+        "five_pct,five_ahead,seven_pct,seven_ahead,late,wall_until,span", [
         # T2571: 5h is the wall (100%, 3 h out); a 7d window at 40% rolled
         # 30 s ago says nothing about it, nor does one rolled 90 s ago.
-        (100.0, 3 * 3600.0, -30.0, 0.0, None, 3 * 3600.0),
-        (100.0, 3 * 3600.0, -90.0, 0.0, None, 3 * 3600.0),
+        (100.0, 3 * 3600.0, 40.0, -30.0, 0.0, None, 3 * 3600.0),
+        (100.0, 3 * 3600.0, 40.0, -90.0, 0.0, None, 3 * 3600.0),
         # The full window rolled long ago: the reading is stale, the fallback
-        # span (a 7d that rolled 30 s ago marks nothing; a 7d still 1 h ahead
-        # does not set the span).
-        (100.0, -1000.0, -30.0, 0.0, None, WALL_FALLBACK_S),
-        (100.0, -1000.0, 3600.0, 0.0, None, WALL_FALLBACK_S),
+        # span (a 7d that rolled 30 s ago does not turn the mark into
+        # nothing; a 7d still 1 h ahead does not set the span).
+        (100.0, -1000.0, 40.0, -30.0, 0.0, None, WALL_FALLBACK_S),
+        (100.0, -1000.0, 40.0, 3600.0, 0.0, None, WALL_FALLBACK_S),
         # The 5h wall rolled at t0 and the mark lands RESET_SLACK_S + 30 later:
         # the 429's own reset (``wall_until``) caps it to nothing.
-        (100.0, 0.0, None, RESET_SLACK_S + 30, 0.0, 0.0),
+        (100.0, 0.0, 40.0, None, RESET_SLACK_S + 30, 0.0, 0.0),
         # T2569: the full 5h window rolled 0.6 s ago, a straggler 429. A 7d
         # window at 40% that rolled 90 s ago cannot make the reading stale.
-        (100.0, -0.6, -90.0, 0.0, None, 0.0),
+        (100.0, -0.6, 40.0, -90.0, 0.0, None, 0.0),
         # No full window: the earliest reset still ahead is the span, and a
         # 7d at 40% that rolled long ago does not turn it into the fallback.
-        (50.0, 1000.0, -1000.0, 0.0, None, 1000.0),
+        (50.0, 1000.0, 40.0, -1000.0, 0.0, None, 1000.0),
+        # Two full windows: a 5h straggler (0.6 s past) beside a 7d wall still
+        # ahead is a wall, to the earliest future reset (any full ahead wins).
+        (100.0, -0.6, 100.0, 3600.0, 0.0, None, 3600.0),
+        # Both full and both rolled: the straggler (0.6 s) wins over the
+        # long-stale 7d, so nothing is marked and no fallback span is read.
+        (100.0, -0.6, 100.0, -1000.0, 0.0, None, 0.0),
     ])
     def test_the_wall_is_the_full_window_not_a_rolled_one(
-        self, store, clock, five_pct, five_ahead, seven_ahead, late, wall_until, span
+        self, store, clock, five_pct, five_ahead, seven_pct, seven_ahead, late,
+        wall_until, span
     ):
         t0 = clock.now
         usage = {
@@ -380,7 +388,7 @@ class TestMarkAtLimit:
                 "pct": five_pct,
                 "resets_at": usage_store._reset_ts_to_resets_at(t0 + five_ahead),
             },
-            "seven_day": {"pct": 40.0},
+            "seven_day": {"pct": seven_pct},
         }
         if seven_ahead is not None:
             usage["seven_day"]["resets_at"] = usage_store._reset_ts_to_resets_at(
