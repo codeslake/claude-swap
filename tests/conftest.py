@@ -616,15 +616,9 @@ def block_real_switch_target_probe(request, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def block_real_urlopen(monkeypatch):
-    """Safety net: no test may make a live ``urllib`` request.
-
-    A tick or a list that is not handed its usage fetches every seeded
-    account for real: on a host with an egress proxy each of those waits out
-    ~0.8 s for the proxy's refusal, on CI it spends the fake token on the
-    vendor. An unreachable network is a failure the fetch paths already
-    classify; a test that needs an answer patches ``urllib.request.urlopen``
-    itself, after this.
-    """
+    """Safety net: no test may make a live ``urllib`` request (a tick that was
+    not handed its usage fetched every seeded account for real). A test that
+    needs an answer patches ``urllib.request.urlopen`` itself, after this."""
     def unreachable(*args, **kwargs):
         raise urllib.error.URLError("network blocked under test")
 
@@ -951,7 +945,7 @@ def pytest_sessionfinish(session, exitstatus):
     # Measured: a green run leaves ~45k entries in the shared /tmp/pytest-of-<user>, a ~3.8s serial rmtree landing on whichever later session evicts it, which made the -n 10 wall bimodal ~19s/~23s.
     # Not tmp_path_retention_policy="failed": its per-test rmtree runs while monkeypatch is still active, so a worker crashes with RealStoreWriteBlocked.
     # A user-given --basetemp is left alone in the controller; a worker always cleans its own share on green.
-    # The removal is a detached child (own session, no inherited pipe), so the run never waits on a tree this size: measured +1.1s of -n 10 wall when each worker removed its share in-process.
+    # The removal is a detached child, so the run never waits on it: in-process it held the -n 10 wall.
     if exitstatus != 0:
         return
     factory = session.config._tmp_path_factory
@@ -962,7 +956,7 @@ def pytest_sessionfinish(session, exitstatus):
     if factory._given_basetemp is not None and not is_worker:
         return
     subprocess.Popen(
-        [sys.executable, "-S", "-c", "import shutil, sys; shutil.rmtree(sys.argv[1], True)", str(basetemp)],
+        [sys.executable, "-S", "-c", "import shutil, sys; shutil.rmtree(sys.argv[1], ignore_errors=True)", str(basetemp)],
         start_new_session=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,

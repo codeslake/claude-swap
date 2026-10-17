@@ -1679,38 +1679,24 @@ class TestProbeOauthProfileLive:
         ):
             assert oauth.probe_oauth_profile_live("sk-live") is True
 
-    def test_401_is_dead(self):
+    @pytest.mark.parametrize(
+        "code, reason, verdict",
+        [
+            (401, "Unauthorized", False),
+            # a 403 is not a 401: the credential may be alive with a scope problem,
+            # and calling it dead would strike a live account
+            (403, "Forbidden", None),
+            (500, "Internal Server Error", None),
+        ],
+    )
+    def test_only_a_proven_401_is_dead(self, code, reason, verdict):
         err = urllib.error.HTTPError(
-            "https://api.anthropic.com/api/oauth/profile", 401,
-            "Unauthorized", {}, None,
+            "https://api.anthropic.com/api/oauth/profile", code, reason, {}, None,
         )
         with patch(
             "claude_swap.oauth.urllib.request.urlopen", side_effect=err,
         ):
-            assert oauth.probe_oauth_profile_live("sk-live") is False
-
-    def test_403_is_no_verdict(self):
-        """A 403 is not a 401: this credential may still be alive with a
-        scope/permission problem, and misclassifying it as dead would
-        strike a live account (the defect this test exists to catch)."""
-        err = urllib.error.HTTPError(
-            "https://api.anthropic.com/api/oauth/profile", 403,
-            "Forbidden", {}, None,
-        )
-        with patch(
-            "claude_swap.oauth.urllib.request.urlopen", side_effect=err,
-        ):
-            assert oauth.probe_oauth_profile_live("sk-live") is None
-
-    def test_500_is_no_verdict(self):
-        err = urllib.error.HTTPError(
-            "https://api.anthropic.com/api/oauth/profile", 500,
-            "Internal Server Error", {}, None,
-        )
-        with patch(
-            "claude_swap.oauth.urllib.request.urlopen", side_effect=err,
-        ):
-            assert oauth.probe_oauth_profile_live("sk-live") is None
+            assert oauth.probe_oauth_profile_live("sk-live") is verdict
 
     def test_timeout_is_no_verdict(self):
         with patch(

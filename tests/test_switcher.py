@@ -3200,18 +3200,28 @@ class TestActiveAccountRefresh:
     # it cannot claim; it must also resync a healthy, rotated login the same
     # way -- read-only, no fetch, no consume.
 
-    def test_backoff_blocked_active_slot_still_resyncs_a_fresh_login(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
-    ):
-        from claude_swap.usage_store import FetchRecord
-
-        switcher = self._switcher(sample_sequence_data)
+    @staticmethod
+    def _block_polling(switcher, how: str) -> None:
+        """Slot 1 cannot be polled this tick: a live 429 backoff, or a hold."""
         store = switcher._usage_store
         identity = {"1": ("test@example.com", "")}
-        store.record(
-            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
-        )
-        assert store.entries(identity)["1"].backoff_until is not None  # premise
+        if how == "backoff":
+            store.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
+            )
+            assert store.entries(identity)["1"].backoff_until is not None  # premise
+        else:
+            store.adopt(
+                {"1": ({"five_hour": {"pct": 1.0}}, 0.0)}, identity, hold_s=3600.0
+            )
+            assert store.entries(identity)["1"].held(store.clock())  # premise
+
+    @pytest.mark.parametrize("how", ["backoff", "held"])
+    def test_a_poll_blocked_active_slot_still_resyncs_a_fresh_login(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, how
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        self._block_polling(switcher, how)
 
         fresh_login = self._REFRESHED  # a different lineage than the backup
         info = [(1, "test@example.com", "", "", True, fresh_login, "")]
@@ -3228,7 +3238,7 @@ class TestActiveAccountRefresh:
         ), patch.object(switcher, "_run_usage_fetches") as run_fetches:
             switcher._collect_usage_entries(info)
 
-        run_fetches.assert_not_called()  # premise: the backoff blocked it
+        run_fetches.assert_not_called()  # premise: the backoff or hold blocked it
         write_backup.assert_called_once_with("1", "test@example.com", fresh_login)
 
     @staticmethod
@@ -3469,78 +3479,27 @@ class TestActiveAccountRefresh:
     # predecessor. The held twin of the backoff test above: the resync
     # must still run underneath a hold.
 
-    def test_held_blocked_active_slot_still_resyncs_a_fresh_login(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    @pytest.mark.parametrize(
+        "how, sentinel", [("backoff", USAGE_TOKEN_EXPIRED), ("held", None)]
+    )
+    def test_a_poll_blocked_active_slot_with_expired_login_is_not_resynced(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        how, sentinel
     ):
+        """Control: the live token is genuinely expired, so it has no valid
+        token pair to attribute and must never reach the resync (T1537 m1).
+        A backoff leaves the sentinel branch to report it; a hold exempts
+        the sentinel (the held reading, not this token's expiry, is what
+        the row reports)."""
         switcher = self._switcher(sample_sequence_data)
-        store = switcher._usage_store
-        identity = {"1": ("test@example.com", "")}
-        store.adopt(
-            {"1": ({"five_hour": {"pct": 1.0}}, 0.0)}, identity, hold_s=3600.0
-        )
-        assert store.entries(identity)["1"].held(store.clock())  # premise
-
-        fresh_login = self._REFRESHED  # a different lineage than the backup
-        info = [(1, "test@example.com", "", "", True, fresh_login, "")]
-
-        with patch.object(
-            switcher, "_read_credentials", return_value=fresh_login
-        ), patch.object(
-            switcher, "_read_account_credentials", return_value=self._EXPIRED
-        ), patch.object(
-            switcher, "_write_account_credentials"
-        ) as write_backup, patch(
-            "claude_swap.oauth.fetch_oauth_profile",
-            return_value=self._PROFILE_SELF,
-        ), patch.object(switcher, "_run_usage_fetches") as run_fetches:
-            switcher._collect_usage_entries(info)
-
-        run_fetches.assert_not_called()  # premise: the hold blocked the claim
-        write_backup.assert_called_once_with("1", "test@example.com", fresh_login)
-
-    def test_backoff_blocked_active_slot_with_expired_login_is_not_resynced(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
-    ):
-        """Control: the live token is genuinely expired — the sentinel
-        branch above handles it, and must never reach the resync."""
-        from claude_swap.usage_store import FetchRecord
-
-        switcher = self._switcher(sample_sequence_data)
-        store = switcher._usage_store
-        identity = {"1": ("test@example.com", "")}
-        store.record(
-            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, identity
-        )
+        self._block_polling(switcher, how)
 
         info = [(1, "test@example.com", "", "", True, self._EXPIRED, "")]
 
         with patch.object(switcher, "_resync_rotated_backup") as resync:
             entries = switcher._collect_usage_entries(info)
 
-        assert entries["1"].sentinel == USAGE_TOKEN_EXPIRED
-        resync.assert_not_called()
-
-    def test_held_blocked_active_slot_with_expired_login_is_not_resynced(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
-    ):
-        """Held twin of the expired-login control above: the hold exempts
-        the sentinel (that reading, not this token's expiry, is what the
-        row reports), but an expired live token must still never reach the
-        resync — it has no valid token pair to attribute (T1537 m1)."""
-        switcher = self._switcher(sample_sequence_data)
-        store = switcher._usage_store
-        identity = {"1": ("test@example.com", "")}
-        store.adopt(
-            {"1": ({"five_hour": {"pct": 1.0}}, 0.0)}, identity, hold_s=3600.0
-        )
-        assert store.entries(identity)["1"].held(store.clock())  # premise
-
-        info = [(1, "test@example.com", "", "", True, self._EXPIRED, "")]
-
-        with patch.object(switcher, "_resync_rotated_backup") as resync:
-            entries = switcher._collect_usage_entries(info)
-
-        assert entries["1"].sentinel is None
+        assert entries["1"].sentinel == sentinel
         resync.assert_not_called()
 
     def test_backoff_blocked_active_slot_does_not_adopt_a_foreign_login(
@@ -9314,53 +9273,9 @@ class TestSwitchTargetLivenessGuard:
     BEFORE any lock, and a dead verdict strikes the slot through the same
     writer the collector uses rather than being activated."""
 
-    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
-        s = ClaudeAccountSwitcher()
-        s.platform = Platform.LINUX
-        s._setup_directories()
-        s._init_sequence_file()
-        return s
-
-    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
-        s._write_account_credentials(
-            str(num),
-            email,
-            json.dumps({
-                "claudeAiOauth": {
-                    "accessToken": f"sk-{num}",
-                    "refreshToken": f"rt-{num}",
-                },
-            }),
-        )
-        s._write_account_config(
-            str(num),
-            email,
-            json.dumps({
-                "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
-            }),
-        )
-        data = s._get_sequence_data()
-        data["accounts"][str(num)] = {
-            "email": email,
-            "uuid": f"uuid-{num}",
-            "organizationUuid": "",
-            "organizationName": "",
-            "added": "2024-01-01T00:00:00Z",
-        }
-        if num not in data["sequence"]:
-            data["sequence"].append(num)
-            data["sequence"].sort()
-        if data["activeAccountNumber"] is None:
-            data["activeAccountNumber"] = num
-        s._write_json(s.sequence_file, data)
-
-    def _make_live(self, temp_home: Path, email: str, num: int) -> None:
-        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
-        }))
-        (temp_home / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
-        }))
+    _setup = TestUsageAwareSwitch._setup
+    _seed = TestUsageAwareSwitch._seed
+    _make_live = TestUsageAwareSwitch._make_live
 
     @staticmethod
     def _usage(pct: float) -> dict:
@@ -9657,51 +9572,21 @@ class TestSwitchTargetLivenessGuard:
         assert not struck_entry.token_dead()  # doubted first strike
         assert any("Account-2" in w for w in result["warnings"])
 
-    def test_plain_rotation_skips_dead_candidate_and_lands_on_next(
-        self, temp_home: Path
+    @pytest.mark.parametrize(
+        "kwargs, pcts",
+        [({}, None), ({"strategy": "next-available"}, (50, 10, 20))],
+        ids=["plain-rotation", "next-available"],
+    )
+    def test_a_rotation_skips_a_dead_candidate_and_lands_on_next(
+        self, temp_home: Path, kwargs, pcts
     ):
         s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        self._seed(s, 3, "c@example.com")
+        for num, c in enumerate("abc", 1):
+            self._seed(s, num, f"{c}@example.com")
         self._make_live(temp_home, "a@example.com", 1)
-        for num, email in (
-            (1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com"),
-        ):
-            self._seed_prior_success(s, num, email)
-
-        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
-            return {"sk-2": False, "sk-3": True}.get(token)
-
-        with patch(
-            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
-        ), patch(
-            "claude_swap.oauth.try_refresh_oauth_credentials",
-            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
-        ):
-            result = s.switch(json_output=True)
-
-        assert result["switched"] is True
-        assert result["to"]["number"] == 3
-        struck_entry = s._usage_store.entries(
-            {"2": self._identity("b@example.com")}
-        )["2"]
-        assert struck_entry.auth_dead_strikes == 1
-        assert not struck_entry.token_dead()  # doubted first strike
-
-    def test_next_available_rotation_skips_dead_candidate_and_lands_on_next(
-        self, temp_home: Path
-    ):
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        self._seed(s, 3, "c@example.com")
-        self._make_live(temp_home, "a@example.com", 1)
-        for num, email in (
-            (1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com"),
-        ):
-            self._seed_prior_success(s, num, email)
-        usage = {"1": self._usage(50), "2": self._usage(10), "3": self._usage(20)}
+        for num, c in enumerate("abc", 1):
+            self._seed_prior_success(s, num, f"{c}@example.com")
+        usage = {str(n): self._usage(p) for n, p in enumerate(pcts or (), 1)}
 
         def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
             return {"sk-2": False, "sk-3": True}.get(token)
@@ -9712,10 +9597,15 @@ class TestSwitchTargetLivenessGuard:
             "claude_swap.oauth.try_refresh_oauth_credentials",
             return_value=oauth.RefreshOutcome(None, "invalid_grant"),
         ):
-            result = s.switch(strategy="next-available", json_output=True)
+            result = s.switch(json_output=True, **kwargs)
 
         assert result["switched"] is True
         assert result["to"]["number"] == 3
+        struck_entry = s._usage_store.entries(
+            {"2": self._identity("b@example.com")}
+        )["2"]
+        assert struck_entry.auth_dead_strikes == 1
+        assert not struck_entry.token_dead()  # doubted first strike
 
     def test_fresh_machine_switch_skips_dead_preferred_and_lands_on_fallback(
         self, temp_home: Path
@@ -9857,8 +9747,17 @@ class TestSwitchTargetLivenessGuard:
             {str(num): self._identity(email)},
         )
 
-    def test_plain_rotation_survives_two_dead_candidates_with_prior_success(
-        self, temp_home: Path
+    @pytest.mark.parametrize(
+        "kwargs, pcts",
+        [
+            ({}, None),
+            ({"strategy": "best", "current_at_limit": True}, (50, 10, 30, 70)),
+            ({"strategy": "next-available"}, (50, 10, 10, 10)),
+        ],
+        ids=["plain-rotation", "best", "next-available"],
+    )
+    def test_a_strategy_survives_two_dead_candidates_with_prior_success(
+        self, temp_home: Path, kwargs, pcts
     ):
         """4 slots, 2 dead (accounts 2 and 3), every slot carrying a prior
         success. ``_slot_token_dead`` doubts each candidate's first strike,
@@ -9866,99 +9765,12 @@ class TestSwitchTargetLivenessGuard:
         ``len(sequence)``-bounded retry (4 passes) is exhausted re-striking
         2 and 3 a second time each before ever reaching account 4."""
         s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        self._seed(s, 3, "c@example.com")
-        self._seed(s, 4, "d@example.com")
+        for num, c in enumerate("abcd", 1):
+            self._seed(s, num, f"{c}@example.com")
         self._make_live(temp_home, "a@example.com", 1)
-        for num, email in (
-            (1, "a@example.com"), (2, "b@example.com"),
-            (3, "c@example.com"), (4, "d@example.com"),
-        ):
-            self._seed_prior_success(s, num, email)
-
-        probed: list[str] = []
-
-        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
-            probed.append(token)
-            return {"sk-2": False, "sk-3": False, "sk-4": True}.get(token)
-
-        with patch(
-            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
-        ), patch(
-            "claude_swap.oauth.try_refresh_oauth_credentials",
-            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
-        ):
-            result = s.switch(json_output=True)
-
-        assert result["switched"] is True
-        assert result["to"]["number"] == 4
-        assert probed.count("sk-2") == 1
-        assert probed.count("sk-3") == 1
-
-    def test_best_strategy_survives_two_dead_candidates_with_prior_success(
-        self, temp_home: Path
-    ):
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        self._seed(s, 3, "c@example.com")
-        self._seed(s, 4, "d@example.com")
-        self._make_live(temp_home, "a@example.com", 1)
-        for num, email in (
-            (1, "a@example.com"), (2, "b@example.com"),
-            (3, "c@example.com"), (4, "d@example.com"),
-        ):
-            self._seed_prior_success(s, num, email)
-        usage = {
-            "1": self._usage(50), "2": self._usage(10),
-            "3": self._usage(30), "4": self._usage(70),
-        }
-
-        probed: list[str] = []
-
-        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
-            probed.append(token)
-            return {"sk-2": False, "sk-3": False, "sk-4": True}.get(token)
-
-        with patch.object(s, "_usage_by_account", return_value=usage), \
-             patch(
-                 "claude_swap.oauth.probe_oauth_profile_live",
-                 side_effect=fake_probe,
-             ), \
-             patch(
-                 "claude_swap.oauth.try_refresh_oauth_credentials",
-                 return_value=oauth.RefreshOutcome(None, "invalid_grant"),
-             ), \
-             patch.object(s, "list_accounts"):
-            result = s.switch(
-                strategy="best", json_output=True, current_at_limit=True
-            )
-
-        assert result["switched"] is True
-        assert result["to"]["number"] == 4
-        assert probed.count("sk-2") == 1
-        assert probed.count("sk-3") == 1
-
-    def test_next_available_survives_two_dead_candidates_with_prior_success(
-        self, temp_home: Path
-    ):
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        self._seed(s, 3, "c@example.com")
-        self._seed(s, 4, "d@example.com")
-        self._make_live(temp_home, "a@example.com", 1)
-        for num, email in (
-            (1, "a@example.com"), (2, "b@example.com"),
-            (3, "c@example.com"), (4, "d@example.com"),
-        ):
-            self._seed_prior_success(s, num, email)
-        usage = {
-            "1": self._usage(50), "2": self._usage(10),
-            "3": self._usage(10), "4": self._usage(10),
-        }
-
+        for num, c in enumerate("abcd", 1):
+            self._seed_prior_success(s, num, f"{c}@example.com")
+        usage = {str(n): self._usage(p) for n, p in enumerate(pcts or (), 1)}
         probed: list[str] = []
 
         def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
@@ -9970,8 +9782,8 @@ class TestSwitchTargetLivenessGuard:
         ), patch(
             "claude_swap.oauth.try_refresh_oauth_credentials",
             return_value=oauth.RefreshOutcome(None, "invalid_grant"),
-        ):
-            result = s.switch(strategy="next-available", json_output=True)
+        ), patch.object(s, "list_accounts"):
+            result = s.switch(json_output=True, **kwargs)
 
         assert result["switched"] is True
         assert result["to"]["number"] == 4
