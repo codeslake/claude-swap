@@ -72,6 +72,10 @@ class AutoSwitchSettings:
     # `dynamic` only: how long a healthy active is held before rotating to a
     # warm partner, so both accounts' caches stay inside `cache_ttl_seconds`.
     alternation_chunk_seconds: float = 600.0
+    # `dynamic` + pin only: the pin keeps warm sessions on their account and
+    # keep-alives idle ones. Read by the pin (`autoswitch.cache_aware_active`),
+    # never by the engine's switching.
+    cache_aware: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,6 +173,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "alternationChunkSeconds", "alternation_chunk_seconds",
             "float", 60.0, 3600.0,
             help="dynamic: how long to sit before rotating to a warm partner",
+        ),
+        SettingSpec(
+            "autoswitch", "cacheAware", "cache_aware", "bool",
+            help="dynamic + pin: keep warm sessions on their account, keep-alive idle ones",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

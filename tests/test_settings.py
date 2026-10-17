@@ -110,6 +110,14 @@ class TestLoadSettings:
         set_setting(tmp_path, "autoswitch.strategy", "dynamic")
         assert load_settings(tmp_path).strategy == "dynamic"
 
+    def test_cache_aware_is_off_by_default_and_round_trips(self, tmp_path: Path):
+        assert load_settings(tmp_path).cache_aware is False
+        set_setting(tmp_path, "autoswitch.cacheAware", "true")
+        assert json.loads(settings_path(tmp_path).read_text())["autoswitch"] == {
+            "cacheAware": True
+        }
+        assert load_settings(tmp_path).cache_aware is True
+
 
 class TestSaveSettings:
     def test_roundtrip(self, tmp_path: Path):

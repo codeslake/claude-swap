@@ -45,6 +45,7 @@ from claude_swap.settings import (
     AutoSwitchSettings,
     load_settings,
     parse_model_names,
+    set_setting,
 )
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
@@ -98,6 +99,7 @@ class AutoScreen(Screen):
         Binding("l", "toggle_live", "Go live / dry-run"),
         Binding("t", "adjust_threshold", "Threshold"),
         Binding("s", "cycle_strategy", "Strategy"),
+        Binding("c", "toggle_cache_aware", "Cache-aware"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
@@ -192,6 +194,8 @@ class AutoScreen(Screen):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action in ("threshold_step", "adjust_done") and not self._adjusting:
             return False  # hidden and inert until adjust mode is armed
+        if action == "toggle_cache_aware":
+            return self._settings is not None and self._settings.strategy == "dynamic"
         return True
 
     def action_adjust_threshold(self) -> None:
@@ -263,6 +267,27 @@ class AutoScreen(Screen):
             )
         )
 
+    def action_toggle_cache_aware(self) -> None:
+        # Persisted, unlike `t`: the pin is another process and reads the
+        # file. Nothing for the engine to apply (it never reads this).
+        value = not self._settings.cache_aware
+        try:
+            set_setting(
+                self.app.switcher.backup_dir, "autoswitch.cacheAware",
+                "true" if value else "false",
+            )
+        except Exception as exc:  # best-effort, like the theme; never crash the UI
+            self.notify(f"Could not save cache-aware: {exc}", severity="warning")
+            return
+        self._settings = replace(self._settings, cache_aware=value)
+        self._update_summary()
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— cache-aware {'on' if value else 'off'} —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
     def _update_summary(self) -> None:
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
@@ -286,6 +311,8 @@ class AutoScreen(Screen):
         text.append(f" · {self._settings.strategy}")
         if self._settings.strategy != self._configured_strategy:
             text.append(" (session)", style=palette.muted)
+        if self._settings.strategy == "dynamic":
+            text.append(f" · cache-aware {'on' if self._settings.cache_aware else 'off'}")
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
