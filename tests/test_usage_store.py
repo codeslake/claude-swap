@@ -351,27 +351,28 @@ class TestMarkAtLimit:
         clock.advance(WALL_FALLBACK_S - 1)  # a 5h mark is still up at its end
         assert store.entries(IDENT)["1"].walled is walled
 
-    @pytest.mark.parametrize("seven_ahead,late,wall_until,span", [
+    @pytest.mark.parametrize("five_ahead,seven_ahead,late,wall_until,span", [
         # T2571: 5h is the wall (100%, 3 h out); a 7d window at 40% rolled
         # 30 s ago says nothing about it, nor does one rolled 90 s ago.
-        (-30.0, 0.0, None, 3 * 3600.0),
-        (-90.0, 0.0, None, 3 * 3600.0),
-        # The 5h wall rolled at t0; the mark lands RESET_SLACK_S + 30 later
-        # (queued behind the pin): a fresh 5h mark without the 429's reset...
-        (None, RESET_SLACK_S + 30, None, WALL_FALLBACK_S),
-        # ...and none once the caller passes it (``wall_until`` caps the mark).
-        (None, RESET_SLACK_S + 30, 0.0, 0.0),
+        (3 * 3600.0, -30.0, 0.0, None, 3 * 3600.0),
+        (3 * 3600.0, -90.0, 0.0, None, 3 * 3600.0),
+        # With no full window still ahead, one rolled beyond RESET_SLACK_S
+        # makes the reading stale: the fallback span (a 7d that rolled 30 s
+        # ago marks nothing; a 7d still 1 h ahead does not set the span).
+        (-1000.0, -30.0, 0.0, None, WALL_FALLBACK_S),
+        (-1000.0, 3600.0, 0.0, None, WALL_FALLBACK_S),
+        # The 5h wall rolled at t0 and the mark lands RESET_SLACK_S + 30 later:
+        # the 429's own reset (``wall_until``) caps it to nothing.
+        (0.0, None, RESET_SLACK_S + 30, 0.0, 0.0),
     ])
     def test_the_wall_is_the_full_window_not_a_rolled_one(
-        self, store, clock, seven_ahead, late, wall_until, span
+        self, store, clock, five_ahead, seven_ahead, late, wall_until, span
     ):
         t0 = clock.now
         usage = {
             "five_hour": {
                 "pct": 100.0,
-                "resets_at": usage_store._reset_ts_to_resets_at(
-                    t0 + (3 * 3600.0 if seven_ahead is not None else 0.0)
-                ),
+                "resets_at": usage_store._reset_ts_to_resets_at(t0 + five_ahead),
             },
             "seven_day": {"pct": 40.0},
         }

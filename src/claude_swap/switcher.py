@@ -8657,6 +8657,7 @@ class ClaudeAccountSwitcher:
         # walls (`exclude`) join it from the start, so no path below can land
         # on one even outside the `current_at_limit` marking arm.
         excluded_slots = {str(n) for n in exclude}
+        wall_until = {str(k): v for k, v in (wall_until or {}).items()}
         struck: set[str] = set(excluded_slots)
         if strategy_label == "rotation":
             models = ()  # model limits only steer the usage-aware strategies
@@ -8891,7 +8892,7 @@ class ClaudeAccountSwitcher:
                         self._usage_store.mark_at_limit(
                             num, {num: identity}, models,
                             account_uuid=data["accounts"][num].get("uuid"),
-                            wall_until=(wall_until or {}).get(num),
+                            wall_until=wall_until.get(num),
                         )
             if current_refused:
                 # Before the switch: a failed write raises with nothing

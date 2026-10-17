@@ -1541,7 +1541,9 @@ class UsageStore:
         Expires at ``min(`` the row's OWN stored reading's earliest
         relevant-window reset still ahead, ``now + WALL_FALLBACK_S)``; a window
         that rolled within ``RESET_SLACK_S`` with no full window still ahead
-        is a straggler 429, so it marks nothing. ``wall_until``, the 429's own
+        is a straggler 429, so it marks nothing; with no full window still
+        ahead, one that rolled earlier than that makes the reading stale and
+        the mark ``WALL_FALLBACK_S``. ``wall_until``, the 429's own
         reset as the caller measured it, caps the result. A 5h window's
         own reset sits inside ``WALL_FALLBACK_S`` so the mark expires at
         that genuine reset, but a stored 7d (or scoped, or malformed
@@ -1565,9 +1567,10 @@ class UsageStore:
             ]
             rolled = [ts for _, ts in windows if now - RESET_SLACK_S < ts <= now]
             still_full = any(pct >= 100.0 and ts > now for pct, ts in windows)
+            stale = not still_full and any(ts <= now - RESET_SLACK_S for _, ts in windows)
             until = (
-                min(rolled)
-                if rolled and not still_full
+                fallback if stale
+                else min(rolled) if rolled and not still_full
                 else min([ts for _, ts in windows if ts > now] + [fallback])
             )
             row["walledUntil"] = until if wall_until is None else min(until, wall_until)

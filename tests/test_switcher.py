@@ -22421,7 +22421,8 @@ class TestSwitchPersistsTheAtLimitMark:
         assert entry.walled
         assert entry.decision_value()["five_hour"]["pct"] == 100.0
 
-    def test_wall_until_caps_only_the_slot_it_names(self, temp_home):
+    @pytest.mark.parametrize("key", ["3", 3])
+    def test_wall_until_caps_only_the_slot_it_names(self, temp_home, key):
         # T2571: the pin passes each slot's own 429 reset; a slot it does not
         # name keeps the mark's own span.
         s = TestSwitchRefusedMarksTheAccountItLeft()._seed_three(temp_home)
@@ -22431,7 +22432,7 @@ class TestSwitchPersistsTheAtLimitMark:
         with patch.object(s, "_usage_by_account", return_value=usage):
             s.switch(
                 strategy="best", json_output=True, current_at_limit=True,
-                exclude={"1", "3"}, wall_until={"3": t},
+                exclude={"1", "3"}, wall_until={key: t},
             )
 
         marks = json.loads(s._usage_store.path.read_text())["accounts"]
