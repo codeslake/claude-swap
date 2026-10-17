@@ -910,6 +910,47 @@ def _headroom_by_account(
     }
 
 
+def cache_aware_active(settings: AutoSwitchSettings) -> bool:
+    """Whether the cache-aware strategy is on: `dynamic` plus its toggle. The
+    pin arms its per-session keep and keep-alive on this and nothing else; the
+    engine's own switching never reads it."""
+    return settings.strategy == "dynamic" and settings.cache_aware
+
+
+# Keep-alive gate (T2612 design note, section 1, measured over 7 days of
+# lmd42 main-thread rows). A ping extends a cache by one TTL for ~0.05 of a
+# full read, so it pays only where a return is likely enough.
+KEEPALIVE_MIN_TTL_S = 3600.0  # only the 1 h tier; the 5 min tier's r/w is 4%, unmeasured
+KEEPALIVE_IDLE_S = 3300.0  # 55 min: late enough to be a real idle, early enough to beat the 60 min expiry
+KEEPALIVE_MAX_PINGS = 2  # ping 1 nets +68.5M eq, ping 2 +13.9M, ping 3 +0.25M (noise), 4+ negative
+KEEPALIVE_MIN_PREFIX = 20_000  # tokens: the replay that sized the rule counted only prefixes this large
+
+
+def keepalive_due(
+    *,
+    idle_s: float,
+    pings_since_request: int,
+    ttl_s: float,
+    prefix_est: int,
+    slot_kept: bool,
+) -> tuple[bool, str]:
+    """Whether an idle session's cache is worth a keep-alive ping now:
+    ``(True, "")``, or ``(False, why)``. ``slot_kept`` is the pin's keep decision
+    at request time (kept in the snapshot, not resting, not dropped after a
+    reply at its bar)."""
+    if ttl_s < KEEPALIVE_MIN_TTL_S:
+        return False, "a 5 min cache tier is not worth a ping"
+    if not slot_kept:
+        return False, "its slot is not kept"
+    if idle_s < KEEPALIVE_IDLE_S:
+        return False, "not idle long enough"
+    if pings_since_request >= KEEPALIVE_MAX_PINGS:
+        return False, "pings since its last request are spent"
+    if prefix_est < KEEPALIVE_MIN_PREFIX:
+        return False, "its prefix is too small to pay"
+    return True, ""
+
+
 class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 

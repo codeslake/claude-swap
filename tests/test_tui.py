@@ -1845,6 +1845,50 @@ class TestAutoScreen:
             assert app.threshold_pct == 90.0
             assert fake._poll_inputs_override is None
 
+    async def test_c_toggles_cache_aware_under_dynamic_and_persists_it(
+        self, tmp_path, fake_engine
+    ):
+        from dataclasses import replace
+
+        from textual.widgets import RichLog, Static
+
+        from claude_swap.settings import load_settings
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            summary = screen.query_one("#auto-summary", Static)
+            log = screen.query_one("#event-log", RichLog)
+            # not dynamic (the default is consume-first): the key is inert
+            assert screen.check_action("toggle_cache_aware", ()) is False
+            assert "c" not in screen.active_bindings
+            await pilot.press("c")
+            await pilot.pause()
+            assert not (tmp_path / "settings.json").exists()
+            assert "cache-aware" not in summary.render().plain
+
+            # `dynamic` is not a strategy on this branch (the file value is
+            # clamped), so the state is injected, as a file could once it is.
+            screen._settings = replace(screen._settings, strategy="dynamic")
+            screen.refresh_bindings()
+            screen._update_summary()
+            await pilot.pause()
+            assert "c" in screen.active_bindings
+            assert "cache-aware off" in summary.render().plain
+            await pilot.press("c")
+            await pilot.pause()
+            assert load_settings(tmp_path).cache_aware is True  # the file, not the session
+            assert "cache-aware on" in summary.render().plain
+            assert any("cache-aware on" in line.text for line in log.lines)
+            await pilot.press("c")
+            await pilot.pause()
+            assert load_settings(tmp_path).cache_aware is False
+            assert "cache-aware off" in summary.render().plain
+
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine
     ):

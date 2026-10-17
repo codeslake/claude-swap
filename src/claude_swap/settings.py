@@ -58,6 +58,10 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # `dynamic` + pin only: the pin keeps warm sessions on their account and
+    # keep-alives idle ones. Read by the pin (`autoswitch.cache_aware_active`),
+    # never by the engine's switching.
+    cache_aware: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +143,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "cacheAware", "cache_aware", "bool",
+            help="dynamic + pin: keep warm sessions on their account, keep-alive idle ones",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

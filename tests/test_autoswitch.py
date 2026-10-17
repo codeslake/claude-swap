@@ -14296,3 +14296,37 @@ class TestARefusedAccountIsBarredFromTheEnginesPick:
         assert not reasons or harness.events[-1] is holds[-1]
         if reasons == ["account-refused"]:
             assert "Account-1" in holds[0].detail
+
+
+class TestCacheAwareRules:
+    """T2612: the cache-aware strategy's pure rules. The pin calls them
+    in-process; the engine's own switching never reads the toggle."""
+
+    DUE = dict(idle_s=3300, pings_since_request=0, ttl_s=3600,
+               prefix_est=20_000, slot_kept=True)
+
+    @pytest.mark.parametrize("override, due, why", [
+        ({}, True, ""),
+        ({"pings_since_request": 1}, True, ""),
+        ({"idle_s": 7200, "ttl_s": 86400}, True, ""),
+        ({"ttl_s": 300}, False, "5 min"),
+        ({"ttl_s": 3599.9}, False, "5 min"),
+        ({"idle_s": 3299.9}, False, "idle"),
+        ({"pings_since_request": 2}, False, "pings"),
+        ({"prefix_est": 19_999}, False, "prefix"),
+        ({"slot_kept": False}, False, "kept"),
+    ])
+    def test_keepalive_due(self, override, due, why):
+        got_due, got_why = autoswitch.keepalive_due(**{**self.DUE, **override})
+        assert got_due is due
+        assert (why in got_why) if why else got_why == ""
+
+    @pytest.mark.parametrize("strategy, cache_aware, want", [
+        ("dynamic", True, True), ("dynamic", False, False),
+        ("consume-first", True, False), ("best", True, False),
+    ])
+    def test_cache_aware_active_needs_dynamic_and_the_toggle(
+        self, strategy, cache_aware, want
+    ):
+        settings = AutoSwitchSettings(strategy=strategy, cache_aware=cache_aware)
+        assert autoswitch.cache_aware_active(settings) is want
