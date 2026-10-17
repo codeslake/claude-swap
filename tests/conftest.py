@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -933,6 +933,7 @@ def pytest_sessionfinish(session, exitstatus):
     # Measured: a green run leaves ~45k entries in the shared /tmp/pytest-of-<user>, a ~3.8s serial rmtree landing on whichever later session evicts it, which made the -n 10 wall bimodal ~19s/~23s.
     # Not tmp_path_retention_policy="failed": its per-test rmtree runs while monkeypatch is still active, so a worker crashes with RealStoreWriteBlocked.
     # A user-given --basetemp is left alone in the controller; a worker always cleans its own share on green.
+    # The removal is a detached child (own session, no inherited pipe), so the run never waits on a tree this size: measured +1.1s of -n 10 wall when each worker removed its share in-process.
     if exitstatus != 0:
         return
     factory = session.config._tmp_path_factory
@@ -942,4 +943,10 @@ def pytest_sessionfinish(session, exitstatus):
     is_worker = hasattr(session.config, "workerinput")
     if factory._given_basetemp is not None and not is_worker:
         return
-    shutil.rmtree(basetemp, ignore_errors=True)
+    subprocess.Popen(
+        [sys.executable, "-S", "-c", "import shutil, sys; shutil.rmtree(sys.argv[1], True)", str(basetemp)],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )

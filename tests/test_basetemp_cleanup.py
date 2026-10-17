@@ -2,6 +2,7 @@
 self-delete -- see that hook's comment for the measured reason."""
 from __future__ import annotations
 
+import subprocess
 import types
 
 import pytest
@@ -25,6 +26,22 @@ def _make_session(basetemp, given_basetemp, is_worker):
     return types.SimpleNamespace(config=config)
 
 
+@pytest.fixture
+def removals(monkeypatch):
+    """The hook's detached removals, each waited for HERE so a test reads their result."""
+    spawned = []
+    real = subprocess.Popen
+
+    def popen(*args, **kwargs):
+        spawned.append(kwargs)
+        child = real(*args, **kwargs)
+        child.wait()
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    return spawned
+
+
 @pytest.mark.parametrize(
     "exitstatus, is_worker, user_given, expect_deleted",
     [
@@ -35,13 +52,27 @@ def _make_session(basetemp, given_basetemp, is_worker):
     ],
     ids=["green-worker", "red-worker", "green-controller-user-given", "green-controller"],
 )
-def test_pytest_sessionfinish(tmp_path, exitstatus, is_worker, user_given, expect_deleted):
+def test_pytest_sessionfinish(tmp_path, removals, exitstatus, is_worker, user_given, expect_deleted):
     basetemp = _make_basetemp(tmp_path)
     session = _make_session(basetemp, basetemp if user_given else None, is_worker)
 
     conftest.pytest_sessionfinish(session, exitstatus=exitstatus)
 
     assert basetemp.exists() != expect_deleted
+
+
+def test_the_removal_is_detached_and_never_waited_on(tmp_path, monkeypatch):
+    basetemp = _make_basetemp(tmp_path)
+    started = []
+    # a child with no wait/poll/communicate: any wait by the hook is an AttributeError
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: started.append(kw) or types.SimpleNamespace())
+
+    conftest.pytest_sessionfinish(_make_session(basetemp, None, is_worker=False), exitstatus=0)
+
+    assert basetemp.exists()  # the hook itself removed nothing
+    (kw,) = started
+    assert kw["start_new_session"] is True
+    assert kw["stdin"] == kw["stdout"] == kw["stderr"] == subprocess.DEVNULL  # no inherited pipe to wait on
 
 
 def test_nothing_made_is_a_no_op(tmp_path):
