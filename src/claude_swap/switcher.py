@@ -53,7 +53,11 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     newer_login,
     shared_credential_fields,
 )
-from claude_swap.fsutil import read_text_with_retry, replace_with_retry
+from claude_swap.fsutil import (
+    atomic_write_bytes,
+    atomic_write_text,
+    read_text_with_retry,
+)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -87,7 +91,7 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances, scan_sessions
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -372,9 +376,12 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
-        # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
-        self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
-        self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
+        # (settings mtime, (threshold, weekly_threshold, models)) — see
+        # _poll_policy_inputs.
+        self._poll_inputs_cache: tuple[
+            float | None, tuple[float, float | None, tuple[str, ...]]
+        ] | None = None
+        self._poll_inputs_override: tuple[float, float | None, tuple[str, ...]] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -554,8 +561,8 @@ class ClaudeAccountSwitcher:
         MODE. `shutil.copy2` preserves the source mode. Measured on a 0644
         `~/.claude.json` holding `primaryApiKey`: the replacement got 0600 from
         `_write_json` and the salvage stayed 0644, so the secret ended up
-        world-readable in a file cswap created. Copied without metadata and
-        chmod'ed 0600 explicitly.
+        world-readable in a file cswap created. Written through
+        ``atomic_write_bytes``: 0600 from creation, never at the umask mode.
 
         COLLISION. The stamp is second-resolution and `copy2` onto an existing
         name overwrites. Two failed switches inside one second left ONE file —
@@ -584,9 +591,7 @@ class ClaudeAccountSwitcher:
             salvage = path.with_name(f"{stem}.{n}")
             n += 1
         try:
-            shutil.copy(path, salvage)          # NOT copy2: mode is set below
-            if sys.platform != "win32":
-                os.chmod(salvage, 0o600)
+            atomic_write_bytes(salvage, path.read_bytes())
         except OSError as e:
             raise SwitchError(
                 f"{path} could not be parsed and the salvage copy failed "
@@ -604,29 +609,22 @@ class ClaudeAccountSwitcher:
         return salvage
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write JSON file with validation."""
-        content = json.dumps(data, indent=2)
+        """Write a JSON file atomically: 0600 temp beside the target, rename.
 
-        # Write to temp file first
-        temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-        temp_path.write_text(content, encoding="utf-8")
-
-        # Validate written content
+        The mode goes on the temp, so the rename is the final commit and
+        nothing can fail after the file is published (a chmod on the final
+        path could raise with the write already live, making callers roll
+        back around committed metadata); a publish that fails removes the
+        temp instead of stranding it beside the target. ``allow_nan=False``:
+        ``json.dumps`` would happily emit ``NaN`` or ``Infinity``, which
+        Claude Code's ``JSON.parse`` rejects -- in ``~/.claude.json`` that is
+        a corrupted config, so it is refused here, before anything is written.
+        """
         try:
-            json.loads(temp_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            temp_path.unlink()
-            raise ConfigError("Generated invalid JSON")
-
-        # Permissions go on the temp file so the rename below is the final,
-        # atomic commit: nothing can fail after the file is published (a
-        # chmod on the final path could raise with the write already live,
-        # making callers roll back around committed metadata).
-        if sys.platform != "win32":
-            os.chmod(temp_path, 0o600)
-        # Not shutil.move: on Windows it falls back to copy-then-delete when
-        # the target exists, rewriting it in place while readers may open it.
-        replace_with_retry(temp_path, path)
+            content = json.dumps(data, indent=2, allow_nan=False)
+        except ValueError as e:
+            raise ConfigError(f"Generated invalid JSON: {e}")
+        atomic_write_text(path, content)
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
@@ -991,9 +989,8 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Write account config to backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        config_file.write_text(config, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_file, 0o600)
+        # Atomic: a torn backup config is a broken future restore.
+        atomic_write_text(config_file, config)
 
     # -- public accessors for session mode (claude_swap.session) ---------
 
@@ -1316,7 +1313,8 @@ class ClaudeAccountSwitcher:
         """
         for path in staging.values():
             try:
-                path.unlink()
+                # missing_ok: a claim the create never reached holds nothing.
+                path.unlink(missing_ok=True)
             except OSError as e:
                 self._logger.error(f"Could not remove swap staging copy: {e}")
                 warning(
@@ -1346,13 +1344,38 @@ class ClaudeAccountSwitcher:
         whose mid-write failures this protects against).
         """
         staged: dict[str, Path] = {}
+        fd = -1
+
+        def abort() -> None:
+            # Remove only what THIS call created -- after closing a descriptor
+            # no file object took over: on Windows an open file cannot be
+            # unlinked, so the discard would otherwise fail exactly then.
+            nonlocal fd
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = -1
+            self._discard_staging(staged)
+
         try:
             for num, (creds, config) in material.items():
                 for kind, content in (("creds", creds), ("config", config)):
                     if not content:
                         continue
                     path = self.credentials_dir / f".swap-staging-{kind}-{num}.json"
-                    if path.exists():
+                    # Claimed BEFORE the create: a signal delivered inside
+                    # os.open raises once the file already exists, so a record
+                    # made afterwards can miss a file that is there (#268).
+                    key = f"{kind}-{num}"
+                    staged[key] = path
+                    try:
+                        fd = os.open(
+                            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                        )
+                    except FileExistsError:
+                        del staged[key]  # not ours: never remove it
                         raise ConfigError(
                             f"Found leftover staging from an interrupted swap: "
                             f"{path}. It holds that slot's pre-swap credentials "
@@ -1360,19 +1383,25 @@ class ClaudeAccountSwitcher:
                             f"accounts still work (`cswap list`), then delete "
                             f"the file and retry."
                         )
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fd = -1  # the file object owns the descriptor now
                         fh.write(content)
-                    staged[f"{kind}-{num}"] = path
         except ConfigError:
-            # Leftover found: remove only what THIS call created.
-            self._discard_staging(staged)
+            # Leftover found.
+            abort()
             raise
         except OSError as e:
-            self._discard_staging(staged)
+            abort()
             raise ConfigError(
                 f"Could not stage swap material, nothing was changed: {e}"
             )
+        except BaseException:
+            # A Ctrl-C reaches neither handler above, and the caller never
+            # receives the dict to clean up: same policy. A leftover would
+            # hold plaintext credentials and wedge the next same-email swap
+            # behind the refusal above.
+            abort()
+            raise
         return staged
 
     def _swap_session_dirs(
@@ -1800,6 +1829,7 @@ class ClaudeAccountSwitcher:
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
         seq_data = self._get_sequence_data() or {}
+        thresholds = self.account_switch_thresholds()
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
         for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
@@ -1818,6 +1848,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    switch_threshold=thresholds.get(n),
                 )
             )
         return AccountsSnapshot(
@@ -1843,12 +1874,15 @@ class ClaudeAccountSwitcher:
         }
 
     def set_poll_policy_inputs(
-        self, threshold: float, models: tuple[str, ...]
+        self,
+        threshold: float,
+        weekly_threshold: float | None,
+        models: tuple[str, ...],
     ) -> None:
-        """Pin the threshold/models poll planning keys on (set by a hosted
+        """Pin the switch lines/models poll planning keys on (set by a hosted
         auto engine so cadence follows its effective, CLI-merged settings
         instead of the settings file)."""
-        self._poll_inputs_override = (threshold, models)
+        self._poll_inputs_override = (threshold, weekly_threshold, models)
 
     def clear_poll_policy_inputs(self) -> None:
         """Drop the hosted engine's pin so poll planning falls back to the
@@ -1857,10 +1891,11 @@ class ClaudeAccountSwitcher:
         engine it belonged to is gone."""
         self._poll_inputs_override = None
 
-    def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...]]:
-        """Threshold + configured model names for poll planning: the hosting
-        engine's pinned values when present, else the settings file (reloaded
-        only when it changes — one stat per pass)."""
+    def _poll_policy_inputs(self) -> tuple[float, float | None, tuple[str, ...]]:
+        """Switch lines (threshold, weekly threshold or None) + configured
+        model names for poll planning: the hosting engine's pinned values when
+        present, else the settings file (reloaded only when it changes — one
+        stat per pass)."""
         if self._poll_inputs_override is not None:
             return self._poll_inputs_override
         path = settings_path(self.backup_dir)
@@ -1871,7 +1906,11 @@ class ClaudeAccountSwitcher:
         if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
             return self._poll_inputs_cache[1]
         loaded = load_settings(self.backup_dir)
-        inputs = (loaded.threshold, parse_model_names(loaded.model))
+        inputs = (
+            loaded.threshold,
+            loaded.weekly_threshold,
+            parse_model_names(loaded.model),
+        )
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
 
@@ -1972,6 +2011,52 @@ class ClaudeAccountSwitcher:
                 )
         else:
             print(dimmed("  It is back in the rotation."))
+
+    def account_switch_thresholds(self) -> dict[str, float]:
+        """Slot -> own switch threshold (used %), for the slots that set one."""
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        spec = SETTING_SPECS["autoswitch.threshold"]
+        return {
+            str(num): float(v)
+            for num, record in accounts.items()
+            # A hand edit is unset unless it is a number the setter would take
+            # (an exact type test: `True` is an int; NaN fails the range).
+            if type(v := record.get("switchThreshold")) in (int, float)
+            and spec.lo <= v <= spec.hi
+        }
+
+    def set_account_switch_threshold(self, identifier: str, pct: float | None) -> None:
+        """Give one account its own switch threshold, or (``None``) clear it.
+
+        The auto-switch engine leaves the account, and refuses to land on it,
+        at this used-% instead of the strategy's bar; every other account and
+        the strategy's ordering are untouched (see `AutoSwitchEngine._bars`).
+
+        Raises:
+            ConfigError: no accounts are managed yet, the email is ambiguous,
+                or ``pct`` is outside ``autoswitch.threshold``'s range.
+            AccountNotFoundError: identifier doesn't match any account.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+        account_num, email, _ = self.resolve_account(identifier)
+        spec = SETTING_SPECS["autoswitch.threshold"]
+        if pct is not None and not spec.lo <= pct <= spec.hi:
+            raise ConfigError(f"switch threshold must be {spec.lo:g}-{spec.hi:g}")
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        if pct is None:
+            record.pop("switchThreshold", None)
+        else:
+            record["switchThreshold"] = pct
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        print(
+            f"{accent('Set')} Account-{account_num} ({email}) switch threshold: "
+            + (f"{pct:g}%." if pct is not None else "the strategy's.")
+        )
 
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
@@ -3638,14 +3723,14 @@ class ClaudeAccountSwitcher:
 
         ``add_account`` snapshots the *live* active credential under an
         ``oauthAccount`` identity. Now that ``_read_credentials`` can return a raw
-        ``sk-ant-api…`` key, a live ``/login`` key could be backed up as a kindless
+        ``sk-ant-…`` key, a live ``/login`` key could be backed up as a kindless
         account, corrupting the session-guard / export / collision logic that keys
         off ``kind``. Reject with guidance toward the supported path instead.
         """
         if looks_like_api_key(creds):
             raise ValidationError(
                 "Active login is an API-key account. Add it with "
-                "'cswap --add-token sk-ant-api...' instead of --add-account."
+                "'cswap add-token sk-ant-...' instead of 'cswap add'."
             )
 
     def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
@@ -4090,12 +4175,14 @@ class ClaudeAccountSwitcher:
 
         Useful for headless servers or when the token is received from another
         machine, without needing a prior Claude Code login on this machine. The
-        token type is auto-detected: an ``sk-ant-api…`` value is a managed API key
-        (stored raw, activated on Claude Code's API-key auth axis), anything else is
-        treated as an OAuth setup-token. No Anthropic API calls are made.
+        token type is auto-detected: a bare ``sk-ant-…`` value of any Console key
+        family (``sk-ant-api03-…``, ``sk-ant-usr-…``, …) is a managed API key
+        (stored raw, activated on Claude Code's API-key auth axis); an OAuth-prefixed
+        ``sk-ant-oat…`` token — or anything else — is treated as an OAuth
+        setup-token. No Anthropic API calls are made.
 
         Args:
-            token: Raw OAuth setup-token or ``sk-ant-api…`` key, or ``"-"`` to read
+            token: Raw OAuth setup-token or ``sk-ant-…`` API key, or ``"-"`` to read
                    one line from stdin, or ``""`` to prompt securely via getpass.
             email: Email address to associate with the account. When omitted,
                    defaults to ``setup-token-{slot}@token.local`` (or
@@ -5425,7 +5512,7 @@ class ClaudeAccountSwitcher:
         info_by_num = {str(info[0]): info for info in accounts_info}
         # Scoped-window models so the 429-stale trust bound honors per-model
         # (e.g. Fable) resets, matching the poll planner's window view.
-        _threshold, models = self._poll_policy_inputs()
+        _threshold, _weekly_threshold, models = self._poll_policy_inputs()
         sentinels: dict[str, str] = {}
         for num, info in info_by_num.items():
             static = self._static_usage_sentinel(info)
@@ -6052,7 +6139,7 @@ class ClaudeAccountSwitcher:
         for when the backoff lifts.
         """
         now = self._usage_store.clock()
-        threshold, models = self._poll_policy_inputs()
+        threshold, weekly_threshold, models = self._poll_policy_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
@@ -6065,6 +6152,7 @@ class ClaudeAccountSwitcher:
                 new_usage=rec.usage,
                 is_active=bool(info_by_num[num][4]),
                 threshold=threshold,
+                weekly_threshold=weekly_threshold,
                 models=models,
                 recent_429=recent_429,
                 now=now,
@@ -6687,6 +6775,18 @@ class ClaudeAccountSwitcher:
             "warnings": warnings or [],
         }
 
+    def _record_manual_switch(
+        self, manual_source: str | None, from_ref: dict | None, to_ref: dict | None
+    ) -> None:
+        """Leave a hand switch's trace for the engine (T1850). Only a hand
+        caller names a ``manual_source``; the engine's own switches stamp for
+        themselves under the state lock and record nothing here."""
+        if manual_source:
+            # Function-local: autoswitch imports this module at load.
+            from claude_swap.autoswitch import record_manual_switch
+
+            record_manual_switch(self, manual_source, from_ref, to_ref)
+
     def switch(
         self,
         strategy: str | None = None,
@@ -6694,6 +6794,7 @@ class ClaudeAccountSwitcher:
         models: tuple[str, ...] = (),
         model_source: str | None = None,
         current_at_limit: bool = False,
+        manual_source: str | None = None,
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -6710,6 +6811,9 @@ class ClaudeAccountSwitcher:
             model_source: Where ``models`` came from (``"cli"`` or
                   ``"autoswitch.model"``) — announced up front so a config
                   fallback silently steering the pick is impossible.
+            manual_source: A hand caller's name (``"tui"``, ``"cli"``,
+                  ``"menubar"``): a real switch is then recorded for the engine
+                  (:meth:`_record_manual_switch`). ``None`` records nothing.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -6788,6 +6892,7 @@ class ClaudeAccountSwitcher:
                     )
                 target = fallback
             op = self._perform_switch(target, emit_output=not json_output)
+            self._record_manual_switch(manual_source, op["from"], op["to"])
             return (
                 self._switch_result_from_op(op, strategy_label, warnings)
                 if json_output else None
@@ -6854,6 +6959,7 @@ class ClaudeAccountSwitcher:
             )
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
+                self._record_manual_switch(manual_source, op["from"], op["to"])
                 return (
                     self._switch_result_from_op(op, strategy_label, warnings)
                     if json_output else None
@@ -7074,19 +7180,28 @@ class ClaudeAccountSwitcher:
         op = self._perform_switch(
             next_account, emit_output=not json_output, provenance=provenance
         )
+        self._record_manual_switch(manual_source, op["from"], op["to"])
         return (
             self._switch_result_from_op(op, strategy_label, warnings)
             if json_output else None
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        manual_source: str | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+        ``manual_source`` names a hand caller (``"tui"``, ``"cli"``,
+        ``"menubar"``) so the switch, or the already-active no-op, is
+        recorded for the engine (:meth:`_record_manual_switch`); the engine's
+        own call passes none.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -7162,6 +7277,7 @@ class ClaudeAccountSwitcher:
                         data.get("accounts", {}).get(target_account, {}).get("email", "")
                     )
                     ref = account_ref(int(target_account), email)
+                    self._record_manual_switch(manual_source, ref, ref)
                     if not json_output:
                         print(
                             f"{accent('Already on')} Account-{target_account} ({email})"
@@ -7186,6 +7302,8 @@ class ClaudeAccountSwitcher:
             force_activate=force,
             provenance=provenance,
         )
+        if not (force and op["from"] == op["to"]):  # a forced rewrite is no "already-active"
+            self._record_manual_switch(manual_source, op["from"], op["to"])
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
@@ -8308,11 +8426,10 @@ class ClaudeAccountSwitcher:
                 except Exception:
                     if config_written and rollback_config_text is not None:
                         try:
-                            config_path.write_text(
-                                rollback_config_text, encoding="utf-8"
-                            )
-                            if sys.platform != "win32":
-                                os.chmod(config_path, 0o600)
+                            # By rename, never in place: a running Claude Code
+                            # watches ~/.claude.json, and a truncate-then-write
+                            # shows it an empty file (#419).
+                            atomic_write_text(config_path, rollback_config_text)
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback config: {e}"

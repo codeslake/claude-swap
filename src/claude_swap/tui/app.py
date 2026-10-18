@@ -76,16 +76,23 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
-        # The auto-switch threshold (status strip tick) AND the settings
-        # object every account-listing screen ranks by (`ordered_accounts`).
+        # The auto-switch lines, drawn as ticks on the status strip's bars
+        # everywhere (the threshold on the 5h row, the weekly line (when
+        # set) on the 7d and per-model rows), AND the settings object every
+        # account-listing screen ranks by (`ordered_accounts`). Missing/
+        # invalid settings fall back to the default.
         try:
             self.auto_settings = load_settings(switcher.backup_dir)
             self.threshold_pct: float | None = proactive_switch_bar_pct(
                 self.auto_settings.strategy, self.auto_settings.threshold
             )
+            self.weekly_threshold_pct: float | None = (
+                self.auto_settings.weekly_threshold
+            )
         except Exception:
             self.auto_settings = AutoSwitchSettings()
             self.threshold_pct = None
+            self.weekly_threshold_pct = None
         try:
             self._theme_name = load_ui_settings(switcher.backup_dir).theme
         except Exception:
@@ -312,13 +319,20 @@ class CswapApp(App):
     def do_switch(self, number: str) -> None:
         self._start_action(
             f"Switch to account {number}",
-            partial(self.switcher.switch_to, number, json_output=True),
+            partial(
+                self.switcher.switch_to, number, json_output=True, manual_source="tui"
+            ),
         )
 
     def action_switch_best(self) -> None:
         self._start_action(
             "Switch (best)",
-            partial(self.switcher.switch, strategy="best", json_output=True),
+            partial(
+                self.switcher.switch,
+                strategy="best",
+                json_output=True,
+                manual_source="tui",
+            ),
         )
 
     def do_toggle_disabled(self, number: str) -> None:
@@ -335,6 +349,13 @@ class CswapApp(App):
         self._start_action(
             f"{verb} account {number}",
             partial(self.switcher.set_account_disabled, number, target),
+        )
+
+    def do_set_switch_threshold(self, number: str, pct: float | None) -> None:
+        """Give the account its own switch threshold (``None``: the strategy's)."""
+        self._start_action(
+            f"Set switch threshold of account {number}",
+            partial(self.switcher.set_account_switch_threshold, number, pct),
         )
 
     def confirm_remove(self, number: str, email: str) -> None:

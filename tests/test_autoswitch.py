@@ -39,6 +39,7 @@ from claude_swap.autoswitch import (
     _seven_day_reset_ts,
     classify_candidate_block,
     pct_label,
+    proactive_switch_bar_pct,
 )
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
@@ -4371,7 +4372,7 @@ class TestSessionThreshold:
         harness.engine.apply_threshold(72.0)
         assert harness.engine.settings.threshold == 72.0
         # Poll-cadence planning follows the new value immediately.
-        assert harness.switcher._poll_inputs_override == (72.0, ())
+        assert harness.switcher._poll_inputs_override == (72.0, None, ())
         # And the very next tick decides with it: 80% ≥ 72 switches, where
         # the constructed 90 would not have.
         outcome = harness.tick_with_usage({
@@ -4459,7 +4460,7 @@ class TestPctLabel:
         details = [
             e.detail for e in h.events if isinstance(e, NoSwitchEvent)
         ]
-        assert details == ["50% < 99.9%"]
+        assert details == ["5h 50% < 99.9%"]
 
     def test_below_threshold_detail_never_shows_impossible_comparison(
         self, temp_home
@@ -4474,7 +4475,7 @@ class TestPctLabel:
         details = [
             e.detail for e in h.events if isinstance(e, NoSwitchEvent)
         ]
-        assert details == ["99.85% < 99.9%"]
+        assert details == ["5h 99.85% < 99.9%"]
 
 
 class TestTokenIdentity:
@@ -4989,12 +4990,14 @@ class TestAModelWindowIsNotABlackout:
     def test_the_owners_fleet_moves_once_the_model_window_is_dropped(
         self, temp_home
     ):
-        """The reported fleet, reproduced exactly: six accounts, Fable
-        pinned, threshold 90. 1/3/4/5's only over-bar window is Fable — 5h
-        and 7d both have room — so the model-gated pass empties and the
-        retry on 5h/7d alone must both rescue it and rank it (soonest 7-day
-        reset first, the consume-first strategy's own key). #2 stays out
-        either way: its OWN 5h sits at the bar with no model involved.
+        """The reported fleet, reproduced exactly (numbers moved to the
+        dynamic landing bar, 97, not the raw threshold 90 -- #321): six
+        accounts, Fable pinned. 1/3/4/5's only over-bar window is Fable
+        (98%) — 5h and 7d both have room — so the model-gated pass empties
+        and the retry on 5h/7d alone must both rescue it and rank it
+        (soonest 7-day reset first, the consume-first strategy's own key).
+        #2 stays out either way: its OWN 5h sits at the dynamic bar (97)
+        with no model involved.
 
         The active (#6) also reports its own over-bar Fable window — every
         account genuinely pinned to a model reports that model's window,
@@ -5002,7 +5005,9 @@ class TestAModelWindowIsNotABlackout:
         the ACTIVE to be walled too before the retry is allowed to drop the
         model set (never a candidate-only reading): an active with real
         Fable headroom must not have the wall dropped just because its
-        candidates all happen to be model-blocked.
+        candidates all happen to be model-blocked. `_model_window_binds_
+        everywhere` still reads the raw `settings.threshold` (90, #321
+        deliberately leaves it there), so the active's 95% still counts.
         """
         h = EngineHarness(temp_home, model="Fable", threshold=90.0)
         now = h.clock.now
@@ -5025,11 +5030,11 @@ class TestAModelWindowIsNotABlackout:
                 },
                 "scoped": [{"name": "Fable", "pct": 95.0}],
             },
-            "1": usage(34, 69, 91, 4),
-            "2": usage(90, 79, 87, 0.5),
-            "3": usage(33, 69, 94, 3),
-            "4": usage(0, 64, 91, 2),
-            "5": usage(0, 62, 90, 1),
+            "1": usage(34, 69, 98, 4),
+            "2": usage(97, 79, 87, 0.5),
+            "3": usage(33, 69, 98, 3),
+            "4": usage(0, 64, 98, 2),
+            "5": usage(0, 62, 98, 1),
         }
         headroom = {
             num: oauth.account_headroom(val, ("Fable",))
@@ -5045,8 +5050,8 @@ class TestAModelWindowIsNotABlackout:
         assert list(ordered) == ["5", "4", "3", "1"], (
             f"got {list(ordered)} — every candidate's only over-bar window "
             "is Fable, 5h/7d has room on all of 1/3/4/5, and #2 must stay "
-            "excluded on its own 5h at 90%: the retry is not a blanket "
-            "unblock, only a re-rank on 5h/7d"
+            "excluded on its own 5h at the dynamic bar (97): the retry is "
+            "not a blanket unblock, only a re-rank on 5h/7d"
         )
 
     def test_the_retry_drops_the_model_gate_from_both_admission_and_ranking(
@@ -5261,6 +5266,62 @@ class TestAModelWindowIsNotABlackout:
         assert "#3: 5h 5% · 7d 5% · Fable 5%" in text, text
         assert "#3: 5h 5% · 7d 5% · Fable 5% (" not in text, text
 
+    def test_the_decision_log_reads_the_dynamic_bar_not_the_raw_threshold(
+        self,
+    ):
+        """#321: the owner's live case, account 4 at 7d 95% (headroom 5)
+        with hours left on its reset. `_describe` must fall back to
+        `switch_bar` (97 under dynamic), not `threshold` (90), the same
+        fallback `human()`'s own "(switch at X%)" tail already uses --
+        else the decision log calls this candidate "7d full" while the
+        panel next to it reads "open"."""
+        event = PollEvent(
+            active={"number": 7, "email": "a@example.com"},
+            headroom={"7": 82.0, "4": 5.0},
+            threshold=90.0,
+            switch_bar=97.0,
+            windows={
+                "4": {"5h": 5.0, "7d": 95.0},
+            },
+        )
+        text = event.human()
+        assert "#4: 5h 5% · 7d 95%" in text, text
+        assert "full" not in text, text
+
+    def test_the_poll_payload_carries_switch_bar(self):
+        """T0815: `switch_bar` already drives `human()`/`_describe()` (the
+        test above) but `_fields()` never put it in the JSON payload a
+        consumer reads -- so a client rendering the poll never learned the
+        dynamic bar differs from `threshold`. Additive field."""
+        event = PollEvent(
+            active={"number": 7, "email": "a@example.com"},
+            headroom={"7": 82.0, "4": 5.0},
+            threshold=90.0,
+            switch_bar=97.0,
+        )
+        payload = event.to_json()
+        assert payload["switchBar"] == 97.0, payload
+        assert payload["threshold"] == 90.0, payload
+
+    def test_the_poll_payload_carries_switch_bar_for_a_non_dynamic_strategy_too(
+        self, harness
+    ):
+        """The additive contract is at the `PollEvent` class level, not the
+        engine's: a hand-built event that never sets `switch_bar` omits the
+        key, but the engine always passes `switch_bar`, the active's own line
+        or else `proactive_switch_bar_pct(strategy, threshold)`, and that
+        function returns the raw `threshold` unchanged for every
+        non-`dynamic` strategy — so a real `best`/`consume-first` poll DOES
+        carry `switchBar`, equal to `threshold`. Additive and harmless (a
+        UI reading only `threshold` sees nothing new), but the payload
+        gains one more, equal, key rather than omitting it."""
+        harness.tick_with_usage(
+            {"1": _usage(42), "2": _usage(10), "3": _usage(50)}
+        )
+        poll = next(e for e in harness.events if isinstance(e, PollEvent))
+        payload = poll.to_json()
+        assert payload["switchBar"] == payload["threshold"] == 90.0, payload
+
     def test_a_spend_only_account_prints_its_credit_figure_not_a_bare_mark(
         self,
     ):
@@ -5296,13 +5357,21 @@ class TestAModelWindowIsNotABlackout:
 
 
 class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
-    """The owner's own fleet (lmd42, 2026-09-08 ~01:2xZ, `dynamic`,
+    """The owner's own fleet (a live host, 2026-09-08 ~01:2xZ, `dynamic`,
     threshold 90, Fable pinned): active #3 is Fable-100 (walled on the
     model axis), and #7 clears the Fable axis (10%) but is ITSELF over the
     departure threshold on its own 5h (91%) -- genuinely unusable, would
     re-trigger the very next tick. #2 is the only account below threshold
     on every axis (5h 40, 7d 65, Fable 89) and is the only correct target.
     1/5/6 are 7d-walled, #4 is Fable-walled with nothing else open.
+
+    `dynamic_self_walled` (autoswitch.py) deliberately stays keyed on
+    `settings.threshold`, not the wider dynamic bar (#321): the wider bar
+    equals `100 - SPENT_HEADROOM_PCT` for dynamic by construction, so
+    reading it here would make `dynamic_self_walled` (`(100 - h) >= bar`)
+    agree with the tier guard that gates it (`h <= SPENT_HEADROOM_PCT`,
+    i.e. `h > SPENT_HEADROOM_PCT` to even reach this check) for every h,
+    and this demotion would never fire.
 
     Reproduces the escape-axis ranking bug: `_rank_candidates_pass`'s
     at-limit escape ranked candidates by `escape_h` (headroom on the SAME
@@ -5363,6 +5432,46 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
             "threshold on every axis; #7 clears only the axis that blocked "
             "the active and is itself over threshold on its own 5h, #3 is "
             "the active itself, #4 has nothing open but the model axis"
+        )
+
+    def test_self_walled_never_outranks_a_candidate_with_real_headroom(
+        self, temp_home
+    ):
+        """#321: `dynamic_self_walled` demotes a candidate self-walled on
+        its OWN binding window (autoswitch.py) into the SAME tier as one
+        that is genuinely almost dead (`h <= SPENT_HEADROOM_PCT`) -- with
+        one tier for both, the escape-axis magnitude alone then decides,
+        and a nearly-spent peer (#2, 7d 99%, headroom 1) can outrank a
+        self-walled one with a real margin (#1, 7d 95%, headroom 5) purely
+        by reading cleaner on the axis that blocked the active. Landing on
+        #2 re-triggers within the hour; #1 has real room to spend first.
+        Three tiers (open / self-walled / dying) keep the two apart."""
+        h = EngineHarness(temp_home, strategy="dynamic", threshold=90.0)
+        for num, email in ((9, "active@example.invalid"), (1, "a@example.invalid"),
+                            (2, "b@example.invalid")):
+            h.seed(num, email)
+        h.make_live("active@example.invalid", 9)
+        now = h.clock.now
+        usage = {
+            "9": {  # active: walled on its OWN 5h
+                "five_hour": {"pct": 100.0},
+                "seven_day": {"pct": 0.0},
+            },
+            "1": {  # self-walled on 5h (91%), real headroom on 7d (5 pts)
+                "five_hour": {"pct": 91.0, "resets_at": _iso_at(now + 3600)},
+                "seven_day": {"pct": 95.0},
+            },
+            "2": {  # open on 5h, but nearly dead on 7d (1 pt)
+                "five_hour": {"pct": 0.0, "resets_at": _iso_at(now + 3600)},
+                "seven_day": {"pct": 99.0},
+            },
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 1, (
+            f"landed on {h.active_number()} — #1 (headroom 5, self-walled "
+            "only on the axis that blocked the active) must beat #2 "
+            "(headroom 1, genuinely near-dead)"
         )
 
 
@@ -5517,10 +5626,15 @@ class TestDynamicStrategy:
     each tick, and a landing rule that never lands on a candidate with no
     room on the axis in force — even when every account is above the
     threshold, where the pre-existing ``all_above`` recovery-axis escape
-    otherwise admits one on a "recovers soonest" basis alone. Scoped to
-    ``strategy == "dynamic"`` throughout: `best`/`consume-first` keep
-    whatever they did before this class exists, and several tests below
-    assert that directly, on the SAME inputs.
+    otherwise admits one on a "recovers soonest" basis alone. One
+    exception (T0938): when the ACTIVE is itself genuinely walled
+    (``about_to_wall``) on an ``at-limit`` trigger, the escape
+    (``dynamic_at_limit_escape``) does bypass that landing rule, ranked by
+    soonest recovery — "choosing WHERE to be stuck" rather than "landing
+    somewhere healthy". Scoped to ``strategy == "dynamic"`` throughout:
+    `best`/`consume-first` keep whatever they did before this class
+    exists, and several tests below assert that directly, on the SAME
+    inputs.
     """
 
     @staticmethod
@@ -5567,13 +5681,15 @@ class TestDynamicStrategy:
     ):
         """Reproduces the live trace: active over threshold with real
         headroom (`proactive`, not `at-limit`), every account above the
-        threshold (`all_above`), and a peer whose OWN window is already at
-        the switch threshold but whose binding window happens to reset
-        soonest. The pre-existing `all_above` recovery-axis escape admits
-        that peer on recovery timing alone — measured live, the very next
-        tick read `cooldown` while still blocked. `dynamic` closes it;
-        `best`/`consume-first` keep the escape (asserted on the SAME
-        inputs, both directions, as the "unchanged" evidence)."""
+        configured threshold (`all_above`, which reads the raw threshold
+        regardless of strategy), and a peer whose OWN window is already at
+        the landing bar (`proactive_switch_bar_pct` — 97 under `dynamic`,
+        #321) but whose binding window happens to reset soonest. The
+        pre-existing `all_above` recovery-axis escape admits that peer on
+        recovery timing alone — measured live, the very next tick read
+        `cooldown` while still blocked. `dynamic` closes it; `best`/
+        `consume-first` keep the escape (asserted on the SAME inputs, both
+        directions, as the "unchanged" evidence)."""
         h = EngineHarness(temp_home, strategy="dynamic")
         now = h.clock.now
         usage = {
@@ -5581,12 +5697,12 @@ class TestDynamicStrategy:
                 "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
                 "seven_day": {"pct": 0.0},
             },
-            "2": {  # candidate: headroom 10 (at the wall), recovers in 2min
-                "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 120)},
+            "2": {  # candidate: headroom 3 (at the dynamic bar), recovers in 2min
+                "five_hour": {"pct": 97.0, "resets_at": _iso_at(now + 120)},
                 "seven_day": {"pct": 0.0},
             },
         }
-        headroom = {"6": 8.0, "2": 10.0}
+        headroom = {"6": 8.0, "2": 3.0}
         for strategy, expected in (
             ("dynamic", []),
             ("consume-first", ["2"]),
@@ -5600,9 +5716,93 @@ class TestDynamicStrategy:
             ordered, _, _, _ = h.engine._rank_candidates(**args)
             assert ordered == expected, (
                 f"strategy={strategy}: got {ordered}, want {expected} — #2 "
-                "is still at the wall (headroom 10, threshold 90) and only "
+                "is still at the wall (headroom 3, dynamic bar 97) and only "
                 "`dynamic` may refuse to land there"
             )
+
+    def test_a_headroom_candidate_with_hours_to_reset_is_admitted_under_dynamic(
+        self, temp_home
+    ):
+        """The owner's live case, 2026-09-19 (#321): account 4 at 7d 95%
+        (headroom 5) with its reset ~6h29m away, active at 7d 18% whose own
+        weekly reset is far out, and a second candidate with more headroom
+        (60) but a reset days out (still sooner than the active's, so the
+        consume-first reset-ordering leg admits it too). Under `dynamic`
+        the whole point is to spend a window before it resets, so #4 must
+        be admitted AND ranked ahead of #2's larger but far-off headroom
+        (`dynamic` ranks by soonest reset).
+
+        `trigger="dynamic"` is a white-box probe, same convention as the
+        no-room test above (`_rank_candidates_pass`'s landing gate) -- a
+        real dynamic tick's trigger classification never
+        literally produces "dynamic" (`_classify_dynamic_trigger` returns
+        "at-limit"/"proactive"/"dynamic-healthy" only, and the owner's own
+        healthy-active fleet classifies as "dynamic-healthy", which never
+        reaches this function at all -- see `_rank_dynamic_candidates`
+        instead). This pins the underlying comparison the gate makes;
+        `tests/test_tui.py`'s
+        `test_the_panel_admits_a_headroom_candidate_with_hours_to_reset_under_dynamic`
+        is the realistic, owner-visible check (the "Next best" panel).
+        Headroom 5.0 rather than 0.1 is what turns this from blocked to
+        admitted."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        usage = {
+            "7": _usage7(5.0, 18.0, _iso_at(now + 650000)),  # active: headroom 82, resets far out
+            "4": _usage7(5.0, 95.0, _iso_at(now + 23340)),   # headroom 5, resets ~6h29m
+            "2": _usage7(5.0, 40.0, _iso_at(now + 500000)),  # headroom 60, resets far out
+        }
+        headroom = {"7": 82.0, "4": 5.0, "2": 60.0}
+        args = self._args(
+            h, usage=usage, current="7", oauth_candidates=["4", "2"],
+            headroom=headroom, active_headroom=82.0,
+            trigger="dynamic", strategy="dynamic",
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert ordered == ["4", "2"], (
+            f"got {ordered} — #4 (headroom 5, reset ~6h29m) is exactly the "
+            "headroom `dynamic` exists to spend and must be admitted, "
+            "ranked ahead of #2's larger but far-off headroom"
+        )
+        kind, label = classify_candidate_block(
+            [("5h", 5.0), ("7d", 95.0)], proactive_switch_bar_pct("dynamic", 90.0)
+        )
+        assert (kind, label) == ("open", None), (
+            f"got ({kind!r}, {label!r}) — #4 must read 'open' under the "
+            "dynamic bar, not ('full', '7d')"
+        )
+
+    def test_CONTROL_the_same_snapshot_under_consume_first_keeps_the_configured_threshold(
+        self, temp_home
+    ):
+        """CONTROL: `proactive_switch_bar_pct` hands non-dynamic strategies
+        their configured threshold back unchanged. The IDENTICAL snapshot
+        the test above admits #4 from (headroom 5, 7d 95%, reset ~6h29m
+        out) must still exclude it under `consume-first` — #4 stays out on
+        the raw 90 threshold, #2 (open on every axis, sooner-resetting
+        peer) is the only admission. Not a `best`/`proactive` control: there
+        the hysteresis margin (candidate must beat the active by 10 points)
+        would refuse #4 regardless of which bar the landing gate reads,
+        proving nothing about the bar itself."""
+        h = EngineHarness(temp_home, strategy="consume-first")
+        now = h.clock.now
+        usage = {
+            "7": _usage7(5.0, 18.0, _iso_at(now + 650000)),
+            "4": _usage7(5.0, 95.0, _iso_at(now + 23340)),
+            "2": _usage7(5.0, 40.0, _iso_at(now + 500000)),
+        }
+        headroom = {"7": 82.0, "4": 5.0, "2": 60.0}
+        args = self._args(
+            h, usage=usage, current="7", oauth_candidates=["4", "2"],
+            headroom=headroom, active_headroom=82.0,
+            trigger="consume-first", strategy="consume-first",
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert ordered == ["2"], (
+            f"got {ordered} — #4 (headroom 5) is still at/over the "
+            "configured threshold (90) under `consume-first` and must stay "
+            "blocked; #2 is the only admission"
+        )
 
     def test_consume_first_switches_on_a_plain_proactive_trigger_dynamic_holds(
         self, temp_home
@@ -5651,7 +5851,14 @@ class TestDynamicStrategy:
         active NOT `about_to_wall` on this axis (the 5h/7d retry pass,
         where the active can hold real headroom even though the model gate
         that set the trigger spent it) — the other trigger the `all_above`
-        recovery axis reaches."""
+        recovery axis reaches. NOT moved to the new dynamic bar (#321):
+        headroom 10 also makes `best_candidate_headroom <= SPENT_HEADROOM_
+        PCT` (3) false, which is what keeps `by_recovery_axis`'s at-limit
+        disjunct off and routes this candidate through the `(trigger ==
+        "at-limit" and not about_to_wall)` disjunct this test actually
+        names -- moving to headroom 3 crosses that OTHER boundary too and
+        the row starts passing on `by_recovery_axis` alone, whether or not
+        the code this test names is even present."""
         h = EngineHarness(temp_home, strategy="dynamic")
         now = h.clock.now
         usage = {
@@ -5680,6 +5887,44 @@ class TestDynamicStrategy:
                 "at-limit escape must not bypass the landing bar for "
                 "dynamic just because `about_to_wall` is false on this axis"
             )
+
+    def test_the_at_limit_escape_never_bypasses_the_landing_bar_for_a_healthy_active(
+        self, temp_home
+    ):
+        """Mirrors `test_the_at_limit_escape_still_lands_when_the_active_
+        is_genuinely_spent` below with one flip: the active is healthy
+        (headroom 8, same as the test above -- NOT `about_to_wall`) while
+        the ONLY candidate is itself still walled (headroom 2, inside
+        `SPENT_HEADROOM_PCT`). `best_candidate_headroom <=
+        SPENT_HEADROOM_PCT` alone made `by_recovery_axis`'s at-limit
+        disjunct true, and an escape gated on that alone bypassed the
+        landing-health gate onto a still-walled candidate for an active
+        that was never actually stuck. The escape earns its bypass from
+        the ACTIVE being walled, not from the candidate being spent."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        usage = {
+            "6": {  # active: healthy, headroom 8 — NOT about_to_wall
+                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {  # candidate: spent-band, headroom 2 — itself still walled
+                "five_hour": {"pct": 98.0, "resets_at": _iso_at(now + 300)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"6": 8.0, "2": 2.0}
+        args = self._args(
+            h, usage=usage, current="6", oauth_candidates=["2"],
+            headroom=headroom, active_headroom=8.0,
+            trigger="at-limit", strategy="dynamic",
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert ordered == [], (
+            f"got {ordered} — the at-limit escape must not bypass the "
+            "landing bar onto a still-walled candidate (headroom 2) when "
+            "the active itself is healthy (headroom 8, not about_to_wall)"
+        )
 
     def test_the_at_limit_escape_still_lands_when_the_active_is_genuinely_spent(
         self, temp_home
@@ -5818,6 +6063,7 @@ class TestDynamicStrategy:
         )
         no_return = h.engine._no_return_account(
             "proactive", state, headroom, 10.0, recovered, settings, current="2",
+            usage=usage,
         )
         assert no_return is None, (
             f"got no_return={no_return!r} — a released bar must also clear "
@@ -5886,10 +6132,20 @@ class TestDynamicStrategy:
         healthy on the strength of an unrelated account's headroom — the
         exact bug this round fixed (an active pinned on a real wall while
         a real Fable-healthy candidate sat idle). Account 5 still does not
-        depart, but now because account 7 is COLD (never active) and its
-        model-gated headroom (25) does not clear `cold_switch_cost_pct`
-        (#375's own floor, orthogonal to this fix) — not because the
-        re-pick manufactured a healthier reading for account 5.
+        depart -- account 7 IS cold (never active) but its model-gated
+        headroom (25) DOES clear `cold_switch_cost_pct` (20), so it is a
+        real admissible partner; the hold is dwell (`since` is never
+        seeded, so it reads `None` for the whole test -- no switch ever
+        fires here to set it).
+
+        T0807 re-pin: before the cold fallback, a bar-clearing cold entry
+        could only enter `alternation_admissible` through the perishing
+        exemption (account 7's 7-day reset is 100h out, well after
+        account 5's ~14h, so that exemption never applied either) -- so
+        `partner` stayed `None` and the reason fell through to `cold`.
+        Now it is admitted directly and `partner is not None`, which reads
+        the same dwell-pending story `below-threshold` already tells for
+        a warm partner.
         """
         from claude_swap.autoswitch import _dynamic_active_headroom
 
@@ -5937,14 +6193,15 @@ class TestDynamicStrategy:
             "7's later-resetting weekly window must not admit it either"
         )
         assert h.active_number() == 5
-        # Every hold reads as `cold` (#375: `dynamic`'s proactive arm needs
-        # `about_to_wall` (SPENT_HEADROOM_PCT=3.0), and account 5's
-        # headroom (10, no longer widened by this round's fix) is nowhere
-        # near it either; account 7 is open but never active, so it lands
-        # cold and does not clear `cold_switch_cost_pct`) — never the
-        # plain-hysteresis "proactive" a fully-dropped re-pick would have
-        # taken (which would have switched to 7, not held).
-        assert all(r == "cold" for r in reasons), reasons
+        # T0807: every hold reads as `below-threshold` (#375: `dynamic`'s
+        # proactive arm needs `about_to_wall` (SPENT_HEADROOM_PCT=3.0),
+        # and account 5's headroom (10, no longer widened by this round's
+        # fix) is nowhere near it either; account 7 is a real admissible
+        # partner via the cold fallback, pending a dwell that never
+        # starts since no switch ever fires) — never the plain-hysteresis
+        # "proactive" a fully-dropped re-pick would have taken (which
+        # would have switched to 7, not held).
+        assert all(r == "below-threshold" for r in reasons), reasons
 
     def test_owner_fixture_holds_on_account_2_with_no_warm_partner(self, temp_home):
         """#375 superseded this fixture's premise: starting on account 2
@@ -5953,13 +6210,22 @@ class TestDynamicStrategy:
         never genuinely `about_to_wall` (headroom 6 > SPENT_HEADROOM_PCT's
         3). Under #375 `dynamic`'s proactive arm does not fire there, and
         no candidate is a warm alternation partner (none has ever been
-        active) — so the engine now holds on account 2."""
+        active) — so the engine now holds on account 2.
+
+        T0807: re-pinned, premise unchanged -- the fixture's five peers
+        (Fable 90/91/91/94%, headroom 10/9/9/6) are what the fallback now
+        makes reachable AT ALL (none was ever active, so every one of them
+        is cold), but every one of them is walled on the SAME Fable axis
+        the active reads on, and none clears `cold_switch_cost_pct`'s
+        20-point floor -- the fallback widens WHO is reachable, not WHAT
+        clears the floor, so the hold survives unchanged."""
         h = self._owner_harness(temp_home, active_num=2)
         fleet_usage = self._owner_fleet(h.clock.now)
         outcome = h.tick_with_usage(fleet_usage)
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — account 2's headroom (6) is not "
-            "`about_to_wall`, so #375's `dynamic` must not move"
+            "`about_to_wall`, and no peer clears the 20-point floor, so "
+            "#375/T0807's `dynamic` must not move"
         )
         assert h.active_number() == 2
 
@@ -6043,6 +6309,144 @@ class TestDynamicStrategy:
             "soonest-resetting candidate that clears the floor"
         )
 
+    def test_the_wall_is_taken_on_the_account_that_lifts_first_under_dynamic(
+        self, temp_home
+    ):
+        """T0938 item 1, `dynamic` twin of
+        `TestDecisionTable.test_the_wall_is_taken_on_the_account_that_lifts_first`.
+
+        The owner's live case: both accounts spent (97-100% used), and
+        `dynamic`'s own landing bar (97, #321) refused every peer with that
+        little headroom outright -- including inside the at-limit escape's
+        own `by_recovery_axis` case, which exists exactly to pick WHERE a
+        spent fleet is stuck. The engine parked on the active reading a
+        multi-hour wait while a peer reset in minutes. Both accounts spent
+        here too (headroom 0, the plainest case the bar swallowed): `dynamic`
+        must still switch onto the one that lifts first, and then hold there
+        once it has -- the peer is now the nearer reset, not the account just
+        vacated, so bouncing back would be strictly worse.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, hysteresis_pct=5.0, strategy="dynamic",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(100.0, 60.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        soonest = _usage7(100.0, 60.0)
+        soonest["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        usage = {"1": active, "2": soonest}
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            "dynamic must switch onto the peer that lifts first too -- the "
+            "landing bar exists to keep a proactive move off a still-walled "
+            "candidate, not to gate the at-limit escape"
+        )
+        assert h.active_number() == 2
+
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        payload = poll.to_json()
+        assert payload["switchBar"] == 97.0, payload
+        assert payload["threshold"] == 90.0, payload
+
+        # Then it waits: account 2 is now active, and it is ITSELF the
+        # nearer reset in the fleet (ten minutes vs. three hours), so the
+        # very next tick must not bounce back to account 1 -- it holds, and
+        # names account 2 as what it is waiting on.
+        h.events.clear()
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 2
+        exhausted = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
+        assert exhausted.waiting_on == {"number": 2, "email": "b@example.com"}, (
+            exhausted.waiting_on
+        )
+        assert "Account-2" in exhausted.human(), exhausted.human()
+
+    def test_a_peer_with_real_headroom_beats_a_fully_spent_one_under_dynamic(
+        self, temp_home
+    ):
+        """T1083: the at-limit escape's tier-0 key ranked two candidates
+        purely by which recovers sooner, even when one of them (headroom 0,
+        every window gone) cannot serve at all until then and the other
+        (headroom > 0) can serve right now. Measured live
+        (task-T1084/usage-poll-hypothesis.md): active spent on 5h, account 2
+        at 5h 97%/7d 72% (3 points of real headroom, 5h resetting in 30
+        minutes) lost to account 6 fully spent on its own 7d window (5h
+        0%/7d 100%, resetting in 10 minutes) purely because 10 minutes beats
+        30. A full account serves nothing until it resets, however soon; an
+        account at 0 < h serves now and must win regardless of whose reset
+        is closer.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, hysteresis_pct=5.0, strategy="dynamic",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(6, "f@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(100.0, 60.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        real_headroom = _usage7(97.0, 72.0)
+        real_headroom["five_hour"]["resets_at"] = _iso_at(now + 30 * 60)
+        real_headroom["seven_day"]["resets_at"] = _iso_at(now + 6 * 3600)
+        fully_spent = _usage7(0.0, 100.0)
+        fully_spent["seven_day"]["resets_at"] = _iso_at(now + 10 * 60)
+        usage = {"1": active, "2": real_headroom, "6": fully_spent}
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            f"landed on account {h.active_number()} instead of account 2 -- "
+            "a peer with real headroom (3 points) must beat one that is "
+            "fully spent (0), whatever their reset order"
+        )
+
+    def test_the_soonest_reset_wins_among_several_walled_candidates_under_dynamic(
+        self, temp_home
+    ):
+        """T0938 item 1, three-account version of the test above: with a
+        SINGLE walled candidate, that test only ever exercises the at-limit
+        escape's landing-gate bypass, never the tiered KEY (~3853) that
+        chooses BETWEEN two such candidates. Active, X and Y are all fully
+        spent (headroom 0, T1083: a peer with any real headroom left now
+        wins outright regardless of reset order, so this stays the "which
+        of several FULL peers" case) -- but Y's 5h window resets in ten
+        minutes against X's two hours. Among equally full peers the
+        recovery axis must still decide on reset time: `dynamic` switches
+        to Y, the soonest recovery.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, hysteresis_pct=5.0, strategy="dynamic",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "x@example.com")
+        h.seed(3, "y@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(100.0, 60.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        x = _usage7(100.0, 60.0)
+        x["five_hour"]["resets_at"] = _iso_at(now + 2 * 3600)
+        y = _usage7(100.0, 60.0)
+        y["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        usage = {"1": active, "2": x, "3": y}
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} instead of account 3 (Y) -- "
+            "among two equally full peers, Y's ten-minute reset must beat "
+            "X's own two-hour reset"
+        )
+
 
 class TestWarmthAndAlternation375:
     """#375 (event #375, owner 2026-09-07): `dynamic` drops the bare
@@ -6105,17 +6509,27 @@ class TestWarmthAndAlternation375:
     def test_f2_healthy_active_cold_candidate_above_floor_still_refused(
         self, temp_home
     ):
-        """Active not `about_to_wall` -- clearing the floor is not enough;
-        the reason is `cold` (refused: active not walled), distinct from
-        `below-floor` (refused: doesn't even clear the floor)."""
+        """Active not `about_to_wall` -- clearing the floor is not enough
+        on its own to switch.
+
+        T0807 re-pin: account 2 clears the landing floor now (20 --
+        headroom 50 against the active's 22), so it is a genuine
+        admissible partner (`partner is not None`), not merely a cold
+        entry the old reason-classifier noticed in passing. `since` is
+        unseeded (`None`), so the hold is dwell-pending, same story
+        `below-threshold` already tells elsewhere -- `cold` used to be
+        the label because cold entries could only reach `alternation_
+        admissible` through the perishing exemption; now that the floor
+        admits them directly, this is no longer distinct from a warm
+        partner pending dwell."""
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage(78.0) | {"seven_day": {"pct": 56.0}},
-            "2": _usage(50.0),  # cold, headroom 50 -- clears the floor easily
+            "2": _usage(50.0),  # cold, headroom 50 -- clears the floor
         })
         assert outcome is TickOutcome.NO_ACTION
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["cold"], reasons
+        assert reasons == ["below-threshold"], reasons
         assert h.active_number() == 1
 
     def test_m1_dynamic_healthy_hold_detail_has_no_false_comparison(
@@ -6148,18 +6562,68 @@ class TestWarmthAndAlternation375:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    def test_f2_walled_active_refuses_the_cold_candidate_below_floor(
+    def test_f2_walled_active_switches_to_the_cold_candidate_below_floor(
         self, temp_home
     ):
+        """#321 incident (2026-09-23): once the active is walled (headroom
+        in `(0, SPENT_HEADROOM_PCT]`), staying put is not an alternative --
+        the ordinary `cold_switch_cost_pct` floor never vetoes a cold
+        candidate here (ADR 0010, "Why never-wall beats warm-cache": "the
+        cold floor is a preference, never a veto" -- not R1, which is the
+        unrelated land-bar/hold-bar rule). Pre-fix this held at
+        `below-floor` for four ticks running
+        on the live fleet and only moved once the active hit 100%
+        (`at-limit`, onto the very candidate the floor had refused)."""
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
-            "2": _usage(96.0),  # cold, headroom 4 -- below the floor
+            "2": _usage(96.0),  # cold, headroom 4 -- below the 20 floor
         })
-        assert outcome is TickOutcome.NO_ACTION
-        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["below-floor"], reasons
-        assert h.active_number() == 1
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive", sw.trigger
+        assert h.active_number() == 2
+
+    def test_f2_walled_active_switches_to_a_cold_candidate_far_below_floor(
+        self, temp_home
+    ):
+        """Today's shape (2026-09-23): active at the top of the proactive
+        window (headroom 3), the only candidate cold with real headroom
+        (14) still well under the 20 floor. Must switch rather than hold
+        for `at-limit`."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(97.0),  # active, headroom 3 -- top of the proactive window
+            "2": _usage(86.0),  # cold, headroom 14 -- below the 20 floor
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive", sw.trigger
+        assert h.active_number() == 2
+
+    def test_f2_walled_active_prefers_the_floor_clearing_cold_candidate(
+        self, temp_home
+    ):
+        """The floor is a preference (ADR 0010, "Why never-wall beats
+        warm-cache": "a preference, never a veto"), so it must still ORDER
+        cold candidates, not just refuse to veto them. #2 is below the
+        floor (headroom 4) but resets soonest; #3 clears the floor
+        (headroom 50) but resets later. Landing on #2 risks a wall on
+        arrival -- its own headroom is under the ~19-point re-write cost
+        (`settings.cold_switch_cost_pct`); #3 could actually serve."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0),  # active, headroom 2 -- walled
+            "2": _usage7(96.0, 0.0, _iso_at(now + 3600)),
+            # cold, headroom 4 -- below the 20 floor, resets in 1h
+            "3": _usage7(50.0, 0.0, _iso_at(now + 6 * 86400)),
+            # cold, headroom 50 -- clears the floor, resets in 6d
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive", sw.trigger
+        assert h.active_number() == 3
 
     def test_f2_at_limit_escapes_to_a_below_floor_candidate(self, temp_home):
         h = self._harness(temp_home)
@@ -6184,13 +6648,11 @@ class TestWarmthAndAlternation375:
             "1": start - (chunk - 1.0),
             "2": start - 10.0,  # warm, real headroom
         })
-        # Within one `ALTERNATION_MAX_GIVEBACK_PCT` of each other in BOTH
-        # directions --
-        # the round trip this test is about is only alternation while it
-        # gives nothing material back (#321 follow-up). The old pair (50
-        # vs 70) handed back 20 points on the return leg, which the
-        # giveback bar now refuses; the engine consumes the richer account
-        # until the two converge and alternation resumes.
+        # Same usage on both ticks: this test isolates the DWELL TIMER
+        # (fires only once `alternation_chunk_seconds` has elapsed, then
+        # swings back once it elapses again on the departed side) from
+        # any headroom question -- both accounts clear the landing floor
+        # with room to spare.
         usage = {"1": _usage(50.0), "2": _usage(45.0)}
 
         outcome = h.tick_with_usage(usage)
@@ -6251,7 +6713,16 @@ class TestWarmthAndAlternation375:
 
     def test_f4_a_partner_exactly_at_the_ttl_boundary_is_cold(self, temp_home):
         """m3: pin `_is_warm`'s `<`, not `<=` -- exactly `now - ttl` reads
-        cold. A mutant flipping the comparison must fail this."""
+        cold. A mutant flipping the comparison must fail this.
+
+        T0807: cold is no longer unreachable (the fallback admits it once
+        it clears the floor), so admission alone can no longer tell warm
+        from cold here -- `_is_warm`'s boundary now decides PREFERENCE:
+        account 3, genuinely cold (never active) but holding MORE
+        headroom, must win the pick over account 2 sitting exactly at the
+        TTL. If 2 read warm here it would sort ahead of 3 in `warm_ordered
+        + cold_ordered` despite the lower headroom -- that wrong pick is
+        what this test catches now."""
         h = self._harness(temp_home)
         ttl = h.engine.settings.cache_ttl_seconds
         chunk = h.engine.settings.alternation_chunk_seconds
@@ -6259,16 +6730,29 @@ class TestWarmthAndAlternation375:
             "1": h.clock.now - chunk,   # past the chunk boundary already
             "2": h.clock.now - ttl,     # exactly at the TTL -- cold
         })
-        outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(30.0)})
-        assert outcome is TickOutcome.NO_ACTION, (
-            f"got {outcome} — a partner exactly at the TTL boundary is "
-            "cold, never a warm alternation pick"
+        outcome = h.tick_with_usage({
+            "1": _usage(50.0),
+            "2": _usage(30.0),   # cold, headroom 70
+            "3": _usage(10.0),   # cold too (never active), headroom 90 -- more
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a cold peer clearing the floor is reachable "
+            "now regardless of warmth"
         )
-        assert h.active_number() == 1
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} — account 2 sitting exactly "
+            "at the TTL boundary must not outrank account 3's real (and "
+            "greater) headroom by being misread as warm"
+        )
 
     def test_f4_a_partner_one_second_inside_the_ttl_is_warm(self, temp_home):
         """m3's other half: one second inside the boundary must still be
-        warm -- pins the same `<` from the other side."""
+        warm -- pins the same `<` from the other side.
+
+        T0807: account 3, genuinely cold (never active) and holding MORE
+        headroom than account 2, is added so the pin is on PREFERENCE, not
+        admission -- account 2 (warm) must still win the pick over a
+        richer cold rival, or `warm_ordered`'s priority is broken."""
         h = self._harness(temp_home)
         ttl = h.engine.settings.cache_ttl_seconds
         chunk = h.engine.settings.alternation_chunk_seconds
@@ -6276,12 +6760,153 @@ class TestWarmthAndAlternation375:
             "1": h.clock.now - chunk,       # past the chunk boundary already
             "2": h.clock.now - ttl + 1.0,   # one second inside -- warm
         })
-        outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(30.0)})
+        outcome = h.tick_with_usage({
+            "1": _usage(50.0),
+            "2": _usage(30.0),   # warm, headroom 70
+            "3": _usage(10.0),   # cold (never active), headroom 90 -- more
+        })
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — a partner one second inside the TTL must "
             "still be a warm alternation pick"
         )
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — the warm partner must win "
+            "over a cold rival with more headroom"
+        )
+
+    # -- T0807: a lapsed rotation restarts on a cold partner --------------
+
+    def test_bootstrap_alternation_restarts_on_a_cold_partner(self, temp_home):
+        """T0807: `alternation_admissible` used to be warm-only (plus the
+        perishing exemption), so a peer that has NEVER been active -- no
+        `last_active_at` entry at all, permanently cold -- was unreachable
+        by alternation no matter how much real headroom it carried; once
+        every warm partner cooled past the TTL the rotation could never
+        restart. Seeding only the ACTIVE's own arrival stamp (`last_
+        active_at` carries the current account alone) isolates the dwell
+        gate from the fix under test: the peer stays genuinely cold and
+        must still be taken once it clears the floor (20)."""
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {"1": h.clock.now - chunk})
+        usage = {"1": _usage(50.0), "2": _usage(55.0)}  # headroom 50 / 45
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a cold peer clearing the floor must restart "
+            "the rotation once no warm partner is admissible"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
         assert h.active_number() == 2
+
+        h.clock.advance(chunk)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — account 1 was stamped warm on departure, so "
+            "the return leg is ordinary warm alternation"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 1
+        state = h.state()
+        ttl = h.engine.settings.cache_ttl_seconds
+        assert h.clock.now - state["lastActiveAt"]["2"] < ttl, (
+            "both revisits must land inside cache_ttl_seconds"
+        )
+
+    def test_control_no_qualifying_cold_peer_holds(self, temp_home):
+        """CONTROL: a cold peer that never clears `cold_switch_cost_pct`
+        must still hold, even though the fallback now reaches cold
+        entries -- the fallback widens WHO is reachable, never WHAT
+        clears the floor."""
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {"1": h.clock.now - chunk})
+        outcome = h.tick_with_usage({
+            "1": _usage(50.0),  # active, headroom 50, healthy
+            "2": _usage(90.0),  # cold, headroom 10 -- below the 20pt floor
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a cold peer below the floor must not be "
+            "taken just because the fallback now reaches cold entries"
+        )
+        assert h.active_number() == 1
+
+    def test_policy_non_dynamic_strategy_never_alternates(self, temp_home):
+        """POLICY: the bootstrap fixture above, unchanged, under a non-
+        `dynamic` strategy -- `alternation` is `dynamic`-only, so no
+        switch fires at the chunk boundary regardless of the cold
+        fallback.
+
+        T0807: driven at the owner's 2026-09-19 wide-headroom-gap shape
+        (77 vs 28) that dropping `ALTERNATION_MAX_GIVEBACK_PCT` newly
+        admits under `dynamic`, to prove `best` still never alternates
+        there."""
+        h = self._harness(temp_home)
+        h.engine.settings = replace(h.engine.settings, strategy="best")
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {"1": h.clock.now - chunk})
+        outcome = h.tick_with_usage({"1": _usage(23.0), "2": _usage(72.0)})
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — `alternation` must not fire for a "
+            "non-`dynamic` strategy"
+        )
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert h.active_number() == 1
+
+    def test_cold_partner_at_the_bare_floor_is_not_worth_the_rewrite_cost(
+        self, temp_home
+    ):
+        """Correctness review of T0807: a cold landing pays the real
+        re-write cost -- `cold_switch_cost_pct` IS that measured cost
+        (settings.py's own docstring, ~19 5h-points) -- so a candidate
+        admitted at the bare floor (20) would arrive almost spent, a real
+        regression out of a voluntary move with no wall to escape.
+        Account 2's own floor is the only thing that can refuse it here
+        -- it clears the bare 20 but not the real, cost-adjusted one, so
+        it must be refused as `below-floor`, the same label a candidate
+        that never reached 20 at all gets. Pre-fix this candidate was
+        admitted (the bare floor alone) and SWITCHED."""
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {"1": h.clock.now - chunk})
+        outcome = h.tick_with_usage({
+            "1": _usage(70.0),  # active, headroom 30
+            "2": _usage(78.0),  # cold, headroom 22 -- clears 20, not 23
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a cold candidate that would arrive already "
+            "spent after paying the re-write cost must not be taken"
+        )
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], reasons
+        assert h.active_number() == 1
+
+    def test_cold_partner_clearing_the_real_floor_reads_below_threshold_not_cold(
+        self, temp_home
+    ):
+        """History: account 2 clears the cold half's real (cost-adjusted)
+        floor -- 30 well past 23 -- but under the removed
+        `ALTERNATION_MAX_GIVEBACK_PCT` bar the active's far larger
+        headroom (90) made that giveback (60) too much, so `partner`
+        stayed `None` and the reason read `cold`, not `below-floor`.
+
+        Reversed per the owner, 2026-09-19: with no giveback bar left,
+        the floor alone admits account 2 (`partner is not None`) --
+        `since` is never seeded here, so the hold is dwell-pending, the
+        same `below-threshold` story a warm partner pending dwell already
+        tells (see `test_f2_healthy_active_cold_candidate_above_floor_
+        still_refused`); `cold` no longer has a story to tell."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(10.0),  # active, headroom 90 -- very healthy
+            "2": _usage(70.0),  # cold, headroom 30 -- clears the real floor (>23)
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"], reasons
+        assert h.active_number() == 1
 
     # -- no-return bar on the proactive/about_to_wall arm -----------------
 
@@ -6490,43 +7115,101 @@ class TestWarmthAndAlternation375:
             "twice over before the TTL, with real margin"
         )
 
-    # -- the alternation giveback bar ------------------------------------
+    # -- alternation admits any partner past the landing floor -----------
 
-    def test_alternation_refuses_a_partner_that_gives_back_the_headroom(
+    def test_owner_20260919_alternates_at_a_wide_headroom_gap(
         self, temp_home
     ):
-        """Warmth may cost headroom, never a MATERIAL regression of it:
-        the arm's only admission bar was the absolute `cold_switch_cost_
-        pct` floor, with no reference to `active_headroom` at all, so a
-        90-headroom active departed for a 25-headroom warm partner. The
-        landing rule refuses the same move when asked directly; this arm
-        never reaches it (`dynamic_ordered is not None` short-circuits
-        `_rank_candidates_pass`), so the bar belongs here.
+        """The owner, 2026-09-19, from the live TUI: periodic cache-warm
+        rotation was not happening -- five accounts sat at 5h 0% while
+        one stayed active throughout. Measured on lmd42 against the
+        shipped ref: a warm partner at headroom 28 against an active at
+        headroom 77 (dwell elapsed) was refused 38 consecutive ticks,
+        all reading `no switch: below-threshold`, on the since-removed
+        `ALTERNATION_MAX_GIVEBACK_PCT` bar (77 - 28 = 49 against a bar
+        of 10). This reproduces that exact shape and its round trip.
+
+        That bar was unsatisfiable by construction: the only way a
+        partner becomes warm is by having just been the active, which
+        the engine leaves only at its own wall, so a freshly-warm
+        partner is always well below a healthy active -- the ceiling
+        refused exactly the partner the warmth mechanism just produced.
         """
         h = self._harness(temp_home)
         chunk = h.engine.settings.alternation_chunk_seconds
         self._seed_last_active_at(h, {
-            "1": h.clock.now - chunk,   # dwell elapsed
-            "2": h.clock.now - 10.0,    # warm
+            "1": h.clock.now - chunk,  # dwell elapsed
+            "2": h.clock.now - 10.0,   # warm
+        })
+        usage = {
+            "1": _usage(23.0),  # active, headroom 77
+            "2": _usage(72.0),  # warm, headroom 28 -- clears the floor (20)
+        }
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a warm partner clearing the landing floor "
+            "must be admitted regardless of the headroom gap"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 2
+        first_switch_at = h.clock.now
+
+        h.clock.advance(chunk)
+        h.events.clear()
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — must swing back once the next chunk "
+            "elapses on the still-warm departed account"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 1
+
+        ttl = h.engine.settings.cache_ttl_seconds
+        assert h.clock.now - first_switch_at <= ttl, (
+            "both switches must fall inside cache_ttl_seconds of each "
+            "other, or the departed account went cold before the swing "
+            "back"
+        )
+
+    def test_alternation_control_below_floor_partner_never_swapped_to(
+        self, temp_home
+    ):
+        """The control: a healthy active whose only peer cannot serve --
+        below `cold_switch_cost_pct`, with no reset info to perish
+        sooner on either side -- is never swapped to, even once the
+        dwell chunk has fully elapsed. Must go red if a later author
+        also drops the landing floor alongside the giveback ceiling this
+        task removes.
+        """
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,  # dwell elapsed
+            "2": h.clock.now - 10.0,   # warm
         })
         outcome = h.tick_with_usage({
-            "1": _usage(10.0),  # active, headroom 90
-            "2": _usage(75.0),  # warm, headroom 25 -- clears the floor (20)
+            "1": _usage(50.0),  # active, headroom 50 -- healthy
+            "2": _usage(85.0),  # warm, headroom 15 -- below the floor (20)
         })
         assert outcome is TickOutcome.NO_ACTION, (
-            f"got {outcome} — a 65-point giveback is not alternation; "
-            "the warm partner clears the absolute floor but hands back "
-            "far more headroom than `ALTERNATION_MAX_GIVEBACK_PCT`"
+            f"got {outcome} — a warm partner below the landing floor "
+            "must never be admitted, however long the dwell has elapsed"
         )
         assert h.active_number() == 1
 
     def test_alternation_still_fires_for_a_near_equal_warm_partner(
         self, temp_home
     ):
-        """The anti-repeal control: an alternating move is a downgrade by
-        construction, so the bar is ONE-SIDED (giveback only), never
-        `_rank_candidates_pass`'s two-sided margin. Green before and
-        after the fix -- if it goes red, the two-sided form was written.
+        """The anti-repeal control: alternation admits a candidate that
+        merely clears the landing floor, never `_rank_candidates_pass`'s
+        two-sided hysteresis margin (`h - active_headroom < hysteresis_
+        pct: continue`) -- an alternating move is a downgrade by
+        construction, so requiring the candidate to BEAT the active
+        would repeal alternation entirely. Green before and after the
+        fix -- if it goes red, the two-sided form was written.
         """
         h = self._harness(temp_home)
         chunk = h.engine.settings.alternation_chunk_seconds
@@ -6536,7 +7219,7 @@ class TestWarmthAndAlternation375:
         })
         outcome = h.tick_with_usage({
             "1": _usage(65.0),  # active, headroom 35
-            "2": _usage(72.0),  # warm, headroom 28 -- giveback 7 <= 10
+            "2": _usage(72.0),  # warm, headroom 28 -- clears the floor
         })
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — a near-equal warm partner is exactly the "
@@ -6546,31 +7229,301 @@ class TestWarmthAndAlternation375:
         assert sw.trigger == "alternation", sw.trigger
         assert h.active_number() == 2
 
-    def test_alternation_admits_a_giveback_of_exactly_the_bar(
+    # -- item 5 (T0758): a perishing window is exempt from the floor,
+    # and from warm-only sourcing -----------------------------------------
+
+    def test_the_owners_row_a_perishing_candidate_is_taken_over_a_distant_reset(
         self, temp_home
     ):
-        """The boundary is `<=`: exactly the bar is admitted."""
-        # Imported HERE, never at module scope: `_base_engine_results`
-        # (:2944) runs this whole module against the base commit's
-        # package, and a top-level import of a symbol base does not carry
-        # SKIPS both base-digest comparisons in silence.
-        from claude_swap.autoswitch import ALTERNATION_MAX_GIVEBACK_PCT
-
-        h = self._harness(temp_home)
+        """The owner's live trace (2026-09-19, dynamic, threshold 90): a
+        healthy active sat on a weekly reset days out while a COLD
+        candidate at 7d 95% (headroom 5) -- resetting in about 6h29m --
+        was never switched to. The absolute floor (`cold_switch_cost_
+        pct`) prices a switch against headroom that will still be there
+        later; that premise is false when the candidate's own window
+        expires first. `dynamic`'s job is to fill a window before it
+        resets, not let it lapse unspent.
+        """
+        h = self._harness(temp_home, threshold=90.0)
         chunk = h.engine.settings.alternation_chunk_seconds
-        give = ALTERNATION_MAX_GIVEBACK_PCT
-        self._seed_last_active_at(h, {
-            "1": h.clock.now - chunk,
-            "2": h.clock.now - 10.0,
-        })
-        outcome = h.tick_with_usage({
-            "1": _usage(60.0),          # active, headroom 40
-            "2": _usage(60.0 + give),   # warm, giveback exactly `give`
-        })
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})  # dwell elapsed; #2 stays cold
+        usage = {
+            "1": _usage7(0.0, 18.0, _iso_at(now + 5 * 86400)),   # active: headroom 82, resets in days
+            "2": _usage7(0.0, 95.0, _iso_at(now + 6.5 * 3600)),  # cold: headroom 5, resets in ~6.5h
+        }
+        outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.SWITCHED, (
-            f"got {outcome} — a giveback of exactly {give} is admitted"
+            f"got {outcome} — a perishing candidate must be taken even "
+            "cold and below the ordinary floor"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 2
+
+    def test_control_the_floor_still_binds_when_the_candidates_reset_is_later(
+        self, temp_home
+    ):
+        """Same two accounts, but #2's reset is LATER than #1's -- not
+        perishing, so today's floor still refuses it (`below-floor`, the
+        same hold this scenario reports without the fix)."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})
+        usage = {
+            "1": _usage7(0.0, 18.0, _iso_at(now + 1 * 3600)),    # active: headroom 82, resets sooner
+            "2": _usage7(0.0, 95.0, _iso_at(now + 10 * 86400)),  # cold: headroom 5, resets LATER
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — #2's reset is later than #1's, so it is "
+            "not perishing and the ordinary floor still applies"
+        )
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], reasons
+        assert h.active_number() == 1
+
+    def test_control_the_spent_floor_still_binds_for_a_perishing_candidate(
+        self, temp_home
+    ):
+        """A perishing candidate is still refused once its own headroom
+        sits at or below `SPENT_HEADROOM_PCT`: nothing worth taking, no
+        matter how soon it resets."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})
+        usage = {
+            "1": _usage7(0.0, 18.0, _iso_at(now + 5 * 86400)),  # active: headroom 82
+            "2": _usage7(0.0, 98.0, _iso_at(now + 1 * 3600)),   # headroom 2 -- at/under the spent floor
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — headroom 2 is at/under SPENT_HEADROOM_PCT "
+            "and must still be refused even though it perishes sooner"
+        )
+        assert h.active_number() == 1
+
+    def test_a_perishing_candidate_still_needs_a_real_active_reset(
+        self, temp_home
+    ):
+        """`_perishes_before_active` stays conservative when the ACTIVE's
+        own 7-day reset is unknown (no `resets_at` at all here, via the
+        bare `_usage()` helper): an unread datum must not waive the floor
+        for every candidate with a real reset -- it is never distinguish-
+        able from "never fetched" versus "genuinely nothing pending", and
+        only the first of those would justify it. The candidate side still
+        reads its own real, sooner reset; only the missing ACTIVE side
+        withholds the exemption."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        # Dwell satisfied: without it `since is None` alone forces
+        # NO_ACTION regardless of the exemption, and only the reason
+        # label (not the outcome) would discriminate this test.
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})
+        usage = {
+            "1": _usage(78.0),                              # active: headroom 22, NO 7d reset known
+            "2": _usage7(0.0, 96.0, _iso_at(now + 3600)),    # headroom 4, real reset in 1h
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — an unknown active reset must not unlock "
+            "the exemption; the ordinary floor still refuses headroom 4"
+        )
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], reasons
+        assert h.active_number() == 1
+
+    def test_a_perishing_warm_candidate_is_also_exempt_from_the_floor(
+        self, temp_home
+    ):
+        """The exemption is not cold-only: a WARM candidate that fails
+        the ordinary floor is admitted too once it perishes sooner --
+        `_clears_the_landing_floor`'s perishing branch covers
+        `warm_ordered + cold_ordered` alike, not a warm-only carve-out."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {
+            "1": now - chunk - 1.0,  # dwell elapsed
+            "2": now - 10.0,         # warm
+        })
+        usage = {
+            "1": _usage7(0.0, 18.0, _iso_at(now + 5 * 86400)),   # active: headroom 82, resets in days
+            "2": _usage7(0.0, 95.0, _iso_at(now + 6.5 * 3600)),  # warm: headroom 5, resets in ~6.5h
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a warm perishing candidate must be taken "
+            "even though it fails the ordinary floor"
         )
         assert h.active_number() == 2
+
+    def test_t0758_narrows_375s_own_motivating_fleet_once_dwell_is_satisfied(
+        self, temp_home
+    ):
+        """`TestOutcomeDigest375`'s motivating fleet (active headroom 22,
+        candidate headroom 4 resetting a day out against the active's 5)
+        pins `NO_ACTION` on a SINGLE tick with no dwell stamp -- that
+        fixture never seeds `lastActiveAt`, so the dwell gate holds it
+        regardless of the floor this change narrows, and that pin is
+        untouched by this change. This is the same shape WITH dwell
+        satisfied: T0758's carve-out reaches it too, deliberately -- #375
+        forbade chasing whichever window resets soonest regardless of
+        cost in general, and T0758 narrows exactly that rule for a
+        candidate whose own window would otherwise expire unspent. Named
+        explicitly so the two pins are never read as contradicting one
+        another by accident."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})  # dwell elapsed; #2 stays cold
+        usage = {
+            "1": _usage7(78.0, 56.0, _iso_at(now + 5 * 86400)),  # active: headroom 22
+            "2": _usage7(0.0, 96.0, _iso_at(now + 1 * 86400)),   # cold: headroom 4, resets a day out
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — #375's own motivating fleet, once dwell is "
+            "satisfied, is exactly the case T0758 carves out"
+        )
+        assert h.active_number() == 2
+
+    def test_a_perishing_switch_still_returns_at_the_next_chunk_boundary(
+        self, temp_home
+    ):
+        """Mirrors F3's own round trip (`test_f3_alternation_fires_at_
+        the_chunk_boundary_and_returns`): landing on a perishing candidate
+        is an ordinary alternation move, bounded by the same dwell/
+        cooldown machinery as any other -- it does not grant the
+        perishing account an extended, unbounded stay."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0})
+        usage = {
+            "1": _usage7(0.0, 18.0, _iso_at(now + 5 * 86400)),
+            "2": _usage7(0.0, 95.0, _iso_at(now + 6.5 * 3600)),
+        }
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED and h.active_number() == 2, (
+            f"setup: must have switched 1 -> 2, got {outcome!r} / "
+            f"{h.active_number()!r}"
+        )
+
+        h.clock.advance(chunk - 1.0)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.NO_ACTION, f"got {outcome} at chunk - 1s"
+        # "below-threshold" is what `warm_ordered` truthy already emits
+        # (account "1" is warm here, having just departed) -- pins this
+        # row to the ordinary dwell hold, not to some other reason string.
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"], reasons
+        assert h.active_number() == 2
+
+        h.clock.advance(1.0)  # now exactly at the chunk boundary
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — must alternate back once the next chunk "
+            "elapses on the still-warm departed account"
+        )
+        assert h.active_number() == 1
+
+    # -- T1850: the waiver covers the perishing window only ---------------
+
+    def test_t1850_a_perishing_candidate_must_still_clear_the_floor_on_its_5h_window(
+        self, temp_home
+    ):
+        """Measured 2026-10-05 17:15:54Z: active 49% headroom, warm partner
+        5h 86 / 7d 61 (headroom 14, 5h-bound) whose 7d resets before the
+        active's. The waiver's rationale is that the PERISHING (7d) room
+        expires unspent; here 7d held 39 points and the sub-floor 14 was
+        the 5h window, which does not perish. The floor still binds on the
+        non-perishing windows."""
+        h = self._harness(temp_home, threshold=90.0)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        now = h.clock.now
+        self._seed_last_active_at(h, {"1": now - chunk - 1.0, "2": now - 10.0})
+        outcome = h.tick_with_usage({
+            "1": _usage7(51.0, 50.0, _iso_at(now + 5 * 86400)),
+            "2": _usage7(86.0, 61.0, _iso_at(now + 3 * 86400)),
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} -- the 5h window (headroom 14) is under the "
+            "floor and does not perish, so the 7d waiver must not admit it"
+        )
+        assert h.active_number() == 1
+
+    # -- T1850: a hand switch is recorded and restarts the dwell ----------
+
+    def test_t1850_a_hand_switch_restarts_the_dwell_and_logs_itself(self, temp_home):
+        """Owner trace 2026-10-05: the engine stamped #5 at T, the owner
+        switched 2 -> 5 by hand at T+270 s (nothing stamped), and the dwell
+        read the engine's stale T (662 s), moving the owner off their
+        choice. A hand switch stamps both accounts at its own time, logs
+        itself, and leaves the no-return family (`lastSwitchTo`) alone."""
+        from claude_swap.settings import set_setting
+
+        h = self._harness(temp_home)
+        set_setting(h.switcher.backup_dir, "autoswitch.decisionLog", "true")
+        chunk = h.engine.settings.alternation_chunk_seconds
+        # The engine's own 1 -> 2 at T stamps both; 2 is live.
+        assert h.tick_with_usage(
+            {"1": _usage(97.0), "2": _usage(10.0)}
+        ) is TickOutcome.SWITCHED
+        assert h.engine._read_state()["lastSwitchTo"] == "2"
+        h.clock.advance(270.0)
+        h.switcher.switch_to("1", json_output=True, manual_source="tui")  # the hand 2 -> 1
+        assert h.engine._read_state()["lastSwitchTo"] == "2", (
+            "a hand switch must not write the no-return family"
+        )
+        log = (h.switcher.backup_dir / "autoswitch-decisions.log").read_text()
+        assert (
+            "Switched Account-2 -> Account-1 (acct1@example.invalid) (manual: tui)"
+            in log
+        ), log
+
+        usage = {"1": _usage(30.0), "2": _usage(30.0)}
+        h.clock.advance(392.0)  # T+662: the engine's stale stamp reads 662 s
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION, (
+            "the dwell must count from the hand arrival (392 s), not the "
+            "engine's stale stamp (662 s)"
+        )
+        h.clock.advance(chunk - 392.0)  # a full chunk after the hand arrival
+        h.events.clear()
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+
+    def test_t1850_a_hand_record_is_opt_in_and_never_the_engines(self, temp_home):
+        """Controls: the engine's own call (no `manual_source`) writes no hand line
+        and stamps nothing of its own accord; decisionLog off keeps the file
+        away but the stamp still lands; an already-active hand Enter logs
+        itself (non-JSON, as `cswap switch 1` runs) and stamps nothing."""
+        from claude_swap.settings import set_setting
+
+        h = self._harness(temp_home)
+        backup = h.switcher.backup_dir
+        log = backup / "autoswitch-decisions.log"
+        set_setting(backup, "autoswitch.decisionLog", "true")
+
+        h.switcher.switch_to("2", json_output=True)  # no source: the engine's shape
+        assert not log.exists() and "lastActiveAt" not in h.engine._read_state()
+
+        set_setting(backup, "autoswitch.decisionLog", "false")
+        h.switcher.switch(json_output=True, manual_source="menubar")  # rotates 2 -> 3
+        assert not log.exists(), "decisionLog off must not create the file"
+        assert set(h.engine._read_state()["lastActiveAt"]) == {"2", "3"}, (
+            "the stamp is not gated on decisionLog"
+        )
+
+        set_setting(backup, "autoswitch.decisionLog", "true")
+        h.switcher.switch_to("3", manual_source="cli")  # already on 3: nothing moves
+        assert log.read_text().count("no switch: already-active (manual: cli)") == 1
+        h.switcher.switch_to("3", force=True, manual_source="cli")  # a rewrite, not that
+        assert log.read_text().count("no switch: already-active (manual: cli)") == 1
 
 
 class TestConsumeFirstStrategy:
@@ -6633,7 +7586,7 @@ class TestConsumeFirstStrategy:
         move. Reverted by gating that guard to `dynamic_landing`: a walled
         consume-first active still declines a candidate whose weekly reset
         is merely later, exactly as base. Prompted by
-        usage-census-2026-09-07 lmd42.md §9's 171-row reset-preference
+        the 2026-09-07 usage census's §9 171-row reset-preference
         bucket, but NOT a replay of it: that census's own rows, at their
         annotated threshold (90), already switch on this branch's floor
         without this guard (`TestUsageCensus20260907Replay`).
@@ -7051,7 +8004,7 @@ class TestConsumeFirstStrategy:
 
 
 class TestUsageCensus20260907Replay:
-    """usage-census-2026-09-07/lmd42.md §9 names 225 "reachable wall" rows
+    """The 2026-09-07 usage census §9 names 225 "reachable wall" rows
     and annotates every one "(trig 90)" -- the fleet's own printed
     threshold. Replayed at that SAME threshold (not the higher one
     ``test_walled_consume_first_still_holds_for_a_merely_later_reset``
@@ -7104,14 +8057,14 @@ class TestUsageCensus20260907Replay:
         return outcome, h
 
     def test_row_39_reset_preference(self, temp_home):
-        # lmd42.md §9 row 39: active #4 91% (0/64/91), best candidate #6
+        # usage census §9 row 39: active #4 91% (0/64/91), best candidate #6
         # (1/55/77). No candidate resets sooner -> old code declined.
         outcome, h = self._replay(temp_home, (0.0, 91.0), (1.0, 77.0))
         assert outcome is TickOutcome.SWITCHED, outcome
         assert h.active_number() == 2
 
     def test_row_171_reset_preference(self, temp_home):
-        # lmd42.md §9 row 171: active #4 100% (94/85/100), best candidate
+        # usage census §9 row 171: active #4 100% (94/85/100), best candidate
         # #2 (0/37/51).
         outcome, h = self._replay(
             temp_home, (94.0, 85.0, 100.0), (0.0, 37.0, 51.0), model="Fable"
@@ -7120,7 +8073,7 @@ class TestUsageCensus20260907Replay:
         assert h.active_number() == 2
 
     def test_row_224_reset_preference(self, temp_home):
-        # lmd42.md §9 row 224: active #4 100% (8/86/100), best candidate
+        # usage census §9 row 224: active #4 100% (8/86/100), best candidate
         # #2 (15/60/82).
         outcome, h = self._replay(
             temp_home, (8.0, 86.0, 100.0), (15.0, 60.0, 82.0), model="Fable"
@@ -8622,17 +9575,20 @@ class TestHorizonAxisDoesNotFlap:
         # so the ratio release cannot fire and only the trigger check can
         # answer. A peer far ahead would pass for the wrong reason.
         headroom = {"1": 15.0, "2": 10.0, "3": 1.0}
+        usage = {n: _usage(100.0 - h) for n, h in headroom.items()}
         for trigger in ("at-limit", "failover"):
             for active in (10.0, None):
                 assert harness.engine._no_return_account(
-                    trigger, state, headroom, active, ["1", "3"], harness.settings
+                    trigger, state, headroom, active, ["1", "3"], harness.settings,
+                    usage=usage,
                 ) is None, (
                     f"trigger={trigger} active_headroom={active} barred the "
                     "account we left; an escape must reach every candidate"
                 )
         # The control: the SAME state bars on a proactive tick.
         assert harness.engine._no_return_account(
-            "proactive", state, headroom, 10.0, ["1", "3"], harness.settings
+            "proactive", state, headroom, 10.0, ["1", "3"], harness.settings,
+            usage=usage,
         ) == "1", "premise: these inputs are barred when the trigger allows it"
 
     @pytest.mark.parametrize(
@@ -8894,8 +9850,10 @@ class TestHorizonAxisDoesNotFlap:
         """
         state = {"lastSwitchFrom": 1}
         headroom = {"2": 10.0, "3": 40.0}       # slot 1 unreadable — absent
+        usage = {n: _usage(100.0 - h) for n, h in headroom.items()}
         assert harness.engine._no_return_account(
-            "proactive", state, headroom, 10.0, ["1", "3"], harness.settings
+            "proactive", state, headroom, 10.0, ["1", "3"], harness.settings,
+            usage=usage,
         ) == "1", (
             "an unreadable barred account must still bar — unknown headroom "
             "is not evidence it beats us"
@@ -9308,12 +10266,15 @@ class TestHorizonAxisDoesNotFlap:
         """
         state = {"lastSwitchFrom": "2", "leftHeadroom": 40.0, "leftRecoveryAt": None}
         headroom = {"2": 40.0}
+        usage = {n: _usage(100.0 - h) for n, h in headroom.items()}
         for trigger in ("proactive", "consume-first"):
             readable = harness.engine._no_return_account(
-                trigger, state, headroom, 2.0, recovered=True, settings=harness.settings
+                trigger, state, headroom, 2.0, recovered=True, settings=harness.settings,
+                usage=usage,
             )
             unreadable = harness.engine._no_return_account(
-                trigger, state, headroom, None, recovered=True, settings=harness.settings
+                trigger, state, headroom, None, recovered=True, settings=harness.settings,
+                usage=usage,
             )
             assert readable is None, f"premise: {trigger} releases when readable"
             assert unreadable is None, (
@@ -9393,9 +10354,10 @@ class TestHorizonAxisDoesNotFlap:
         """
         state = {"lastSwitchFrom": "2"}
         headroom = {"2": 5.0}
+        usage = {n: _usage(100.0 - h) for n, h in headroom.items()}
         no_return = harness.engine._no_return_account(
             "proactive", state, headroom, None, recovered=True,
-            settings=harness.settings,
+            settings=harness.settings, usage=usage,
         )
         assert no_return == "2", (
             "the barred peer at 5 pts is below the landing floor (10); an "
@@ -10604,10 +11566,12 @@ class TestTheReleasePredicateOneStateShapePerTest:
         """
         state = {"lastSwitchFrom": "2"}
         headroom = {"1": 0.0, "2": 100.0}
+        usage = {n: _usage(100.0 - h) for n, h in headroom.items()}
         for active in (0.0, None):
             for recovered in (True, False):
                 assert harness.engine._no_return_account(
-                    "at-limit", state, headroom, active, recovered, harness.settings
+                    "at-limit", state, headroom, active, recovered, harness.settings,
+                    usage=usage,
                 ) is None, (
                     "at-limit must escape the bar regardless of "
                     "active_headroom or the recovered predicate's answer"
@@ -14596,14 +15560,16 @@ class TestTheModelWindowBindsUnlessItBindsEverywhere:
         """The design intent #321 exists for, preserved: active #4 AND
         every candidate (#1, #3) are Fable-walled (100%) — a genuine
         fleet-wide model blackout. The retry must still drop the model set
-        and rank on 5h/7d: #1's 7d (92%) still blocks it there, #3's (79%)
-        does not, so #3 is the only admissible landing.
+        and rank on 5h/7d: #1's 7d (98%, moved from 92% to sit over the
+        dynamic landing bar -- 97, not the raw 90 threshold, #321) still
+        blocks it there, #3's (79%) does not, so #3 is the only admissible
+        landing.
         """
         cls = TestAModelWindowIsNotABlackout()
         h = EngineHarness(temp_home, model="Fable", threshold=90.0)
         usage = {
             "4": self._u(8, 86, 100, 100),
-            "1": self._u(0, 92, 100, 4),
+            "1": self._u(0, 98, 100, 4),
             "3": self._u(0, 79, 100, 3),
         }
         headroom = {n: oauth.account_headroom(v, ("Fable",)) for n, v in usage.items()}
@@ -15395,3 +16361,822 @@ class TestDynamicNeverWalls0010:
         assert consume_first > cap, (
             f"{consume_first}s — `consume-first` must keep its own sleep"
         )
+
+
+class TestPerAccountSwitchThreshold:
+    """An account's own switch threshold replaces the strategy's bar for THAT
+    account only, and composes with the strategy's ordering.
+
+    The field is seeded straight into the roster (not through the setter), so
+    a red run is the engine ignoring it rather than a missing method.
+    """
+
+    @staticmethod
+    def _set(h, num, pct):
+        data = h.switcher._get_sequence_data()
+        data["accounts"][str(num)]["switchThreshold"] = pct
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+    @staticmethod
+    def _use(h, pct, resets_in_s=None):
+        """5h at ``pct``; 7d at 10% resetting ``resets_in_s`` from now."""
+        window = {"pct": 10.0}
+        if resets_in_s is not None:
+            window["resets_at"] = _iso_at(h.clock.now + resets_in_s)
+        return {"five_hour": {"pct": pct}, "seven_day": window}
+
+    @staticmethod
+    def _harness(temp_home, strategy, threshold=98.0):
+        h = EngineHarness(temp_home, strategy=strategy, threshold=threshold)
+        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        return h
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first", "best"])
+    def test_the_active_leaves_at_its_own_threshold(self, temp_home, strategy):
+        h = self._harness(temp_home, strategy)
+        self._set(h, 1, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 50), "3": self._use(h, 50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert [e.trigger for e in h.events if e.kind == "switch"] == ["proactive"]
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first", "best"])
+    def test_control_without_the_field_the_active_stays(self, temp_home, strategy):
+        h = self._harness(temp_home, strategy)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 50), "3": self._use(h, 50),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
+    def test_a_peer_over_its_own_threshold_is_not_landed_on(self, temp_home, strategy):
+        h = self._harness(temp_home, strategy)
+        self._set(h, 2, 70.0)
+        # The active is walled at the default line. 2 resets soonest and has
+        # room, but sits over its own 70; 3 is the only peer under its line.
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 99, 9 * 86400),
+            "2": self._use(h, 75, 1 * 86400),
+            "3": self._use(h, 50, 5 * 86400),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
+    def test_a_peer_over_its_own_threshold_is_no_landing_for_a_merely_past_its_line_active(
+        self, temp_home, strategy
+    ):
+        """The only peer with room sits over its own 70 (and 3 is walled): an
+        active that merely passed its own 80 stays rather than hop onto it."""
+        h = self._harness(temp_home, strategy)
+        self._set(h, 1, 80.0)
+        self._set(h, 2, 70.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85, 9 * 86400),
+            "2": self._use(h, 75, 1 * 86400),
+            "3": self._use(h, 99, 5 * 86400),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
+    def test_control_without_a_peer_threshold_the_soonest_reset_wins(
+        self, temp_home, strategy
+    ):
+        h = self._harness(temp_home, strategy)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 99, 9 * 86400),
+            "2": self._use(h, 75, 1 * 86400),
+            "3": self._use(h, 50, 5 * 86400),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
+    def test_the_soonest_reset_ordering_is_unchanged(self, temp_home, strategy):
+        h = self._harness(temp_home, strategy)
+        self._set(h, 1, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85, 9 * 86400),
+            "2": self._use(h, 40, 5 * 86400),
+            "3": self._use(h, 60, 2 * 86400),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, "the sooner weekly reset still wins"
+
+    def test_an_own_threshold_above_the_strategys_keeps_the_account_landable(
+        self, temp_home
+    ):
+        """The bar replaces the strategy's in BOTH directions: 2 sits over the
+        strategy's 90 but under its own 98, so it still competes on reset."""
+        h = self._harness(temp_home, "consume-first", threshold=90.0)
+        self._set(h, 2, 98.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 95, 9 * 86400),
+            "2": self._use(h, 92, 1 * 86400),
+            "3": self._use(h, 50, 5 * 86400),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
+    def test_a_walled_active_still_takes_a_peer_over_its_own_threshold(
+        self, temp_home, strategy
+    ):
+        """A threshold is a preference, not a veto: the last peer with room is
+        taken before the active walls, not after."""
+        h = self._harness(temp_home, strategy)
+        self._set(h, 2, 70.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 99, 9 * 86400),
+            "2": self._use(h, 75, 5 * 86400),
+            "3": self._use(h, 99, 5 * 86400),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_dynamic_two_accounts_past_their_own_line_do_not_trade_places(
+        self, temp_home
+    ):
+        """Only an active at the REAL wall lifts a peer's own line, or two
+        accounts past theirs would swap every tick (the cooldown yields to an
+        account's own wall)."""
+        h = self._harness(temp_home, "dynamic")
+        self._set(h, 1, 80.0)
+        self._set(h, 2, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 85), "3": self._use(h, 99),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_dynamic_cooldown_yields_at_the_accounts_own_line(self, temp_home):
+        """Land bar and hold bar are one number per account, so the cooldown
+        yields at the account's own line exactly as it does at the default."""
+        h = self._harness(temp_home, "dynamic")
+        self._set(h, 1, 80.0)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 10))
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 50), "3": self._use(h, 50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_control_cooldown_still_holds_a_default_active_at_its_threshold(
+        self, temp_home
+    ):
+        h = self._harness(temp_home, "consume-first", threshold=80.0)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 10))
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 50), "3": self._use(h, 50),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == ["cooldown"]
+
+    @staticmethod
+    def _five(h, pct, resets_in_s):
+        """5h at ``pct`` resetting ``resets_in_s`` from now; 7d at 10%."""
+        return {
+            "five_hour": {"pct": pct, "resets_at": _iso_at(h.clock.now + resets_in_s)},
+            "seven_day": {"pct": 10.0},
+        }
+
+    @pytest.mark.parametrize("strategy", ["consume-first", "best"])
+    def test_control_a_fleet_all_past_the_threshold_takes_the_recovery_axis(
+        self, temp_home, strategy
+    ):
+        h = self._harness(temp_home, strategy, threshold=90.0)
+        outcome = h.tick_with_usage({
+            "1": self._five(h, 92, 4 * 3600),
+            "2": self._five(h, 95, 600),
+            "3": self._five(h, 95, 900),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize("strategy", ["consume-first", "best", "dynamic"])
+    def test_an_active_under_its_own_higher_line_is_not_a_fleet_in_trouble(
+        self, temp_home, strategy
+    ):
+        """The control's fleet, but the active's own line (98) sits above the
+        strategy's 90: at 92 it is not past its line, so peers returning
+        sooner must not pull it onto less room."""
+        h = self._harness(temp_home, strategy, threshold=90.0)
+        self._set(h, 1, 98.0)
+        outcome = h.tick_with_usage({
+            "1": self._five(h, 92, 4 * 3600),
+            "2": self._five(h, 95, 600),
+            "3": self._five(h, 95, 900),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    @staticmethod
+    def _api_key_harness(temp_home):
+        h = EngineHarness(
+            temp_home, strategy="dynamic", threshold=98.0,
+            include_api_key_accounts=True,
+        )
+        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "key@token.local")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["3"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        return h
+
+    def test_dynamic_an_active_past_its_own_line_does_not_spend_the_metered_last_resort(
+        self, temp_home
+    ):
+        """Every OAuth peer is past its own line and the active is not at the
+        real wall (15 left): it stays, as it would with no metered slot."""
+        h = self._api_key_harness(temp_home)
+        self._set(h, 1, 80.0)
+        self._set(h, 2, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 85), "2": self._use(h, 85), "3": "api key",
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_control_dynamic_an_active_at_the_real_wall_still_spends_it(
+        self, temp_home
+    ):
+        h = self._api_key_harness(temp_home)
+        self._set(h, 1, 80.0)
+        outcome = h.tick_with_usage({
+            "1": self._use(h, 98), "2": self._use(h, 99), "3": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_it_escalates_the_candidate_fetch_inside_its_own_band(self, temp_home):
+        """Active at 82 reads 17 under the global 98's escalation line (83),
+        so only its own 80 puts the candidates on a fresh fetch."""
+        h = self._harness(temp_home, "consume-first")
+        self._set(h, 1, 80.0)
+        entries = {
+            n: _entry_for(v, h.clock.now)
+            for n, v in {
+                "1": self._use(h, 82), "2": self._use(h, 50), "3": self._use(h, 50),
+            }.items()
+        }
+        fetch_sets: list[set] = []
+
+        def spying(*args, **kwargs):
+            fetch_sets.append(set(kwargs.get("fetch") or ()))
+            return entries
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=spying):
+            h.engine.tick()
+        assert {"2", "3"} <= set().union(*fetch_sets), fetch_sets
+
+    @pytest.mark.parametrize(
+        "strategy, own, shown",
+        [
+            ("dynamic", 90.0, 90.0),
+            ("dynamic", 99.0, 99.0),
+            ("dynamic", None, 97.0),
+            ("best", 80.0, 80.0),
+            ("best", None, 98.0),
+        ],
+    )
+    def test_the_poll_states_the_actives_own_bar(
+        self, temp_home, strategy, own, shown
+    ):
+        """The state line's "(switch at N%)" and the JSON `switchBar` are the
+        number the trigger compares the active against, which is its OWN line
+        when it has one: a reader checking usage against the logged bar would
+        otherwise take a refusal at 91% over a line of 90 for healthy."""
+        h = self._harness(temp_home, strategy)
+        if own is not None:
+            self._set(h, 1, own)
+        h.tick_with_usage({
+            "1": self._use(h, 50), "2": self._use(h, 50), "3": self._use(h, 50),
+        })
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.to_json()["switchBar"] == shown
+        assert f"switch at {pct_label(shown)}%" in poll.human()
+
+    @staticmethod
+    def _seven(pct):
+        return {"five_hour": {"pct": 5.0}, "seven_day": {"pct": pct}}
+
+    def test_a_peer_is_labelled_at_its_landing_bar_not_the_actives_line(
+        self, temp_home
+    ):
+        """Peer 2 at 7d 95% sits under dynamic's 97 and the engine lands on
+        it; the active's own 90 must not make the log call it "7d full"."""
+        h = self._harness(temp_home, "dynamic")
+        self._set(h, 1, 90.0)
+        h.tick_with_usage({
+            "1": self._use(h, 60), "2": self._seven(95.0), "3": self._use(h, 50),
+        })
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "#2: 5h 5% · 7d 95%" in poll.human()
+        assert "full" not in poll.human()
+
+    def test_a_peer_with_its_own_line_is_labelled_full_past_it(self, temp_home):
+        """The engine refuses to land on peer 2 past its own 70, so the log
+        says why, rather than reading it at the strategy's 98."""
+        h = self._harness(temp_home, "best")
+        self._set(h, 2, 70.0)
+        h.tick_with_usage({
+            "1": self._use(h, 60), "2": self._seven(75.0), "3": self._use(h, 50),
+        })
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "#2: 5h 5% · 7d 75% (7d full)" in poll.human()
+
+
+    # -- composing with the weekly line (autoswitch.weeklyThreshold) ----------
+
+    @staticmethod
+    def _weekly_harness(temp_home):
+        h = EngineHarness(
+            temp_home, strategy="best", threshold=98.0, weekly_threshold=97.0,
+            hysteresis_pct=5.0,
+        )
+        for n, email in ((1, "a@example.com"), (2, "b@example.com")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_an_own_threshold_is_the_5h_line_beside_a_weekly_line(self, temp_home):
+        h = self._weekly_harness(temp_home)
+        self._set(h, 1, 80.0)
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 85.0}, "seven_day": {"pct": 10.0}},
+            "2": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_an_own_threshold_leaves_the_weekly_windows_on_the_weekly_line(
+        self, temp_home
+    ):
+        h = self._weekly_harness(temp_home)
+        self._set(h, 1, 80.0)
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 90.0}},
+            "2": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}},
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "7d 90% used (switch at 97%)" in poll.human()
+
+    # A bar is an account's own 5h line; the headroom scale the lines are
+    # scored on stays ONE number for the fleet (lines.line_headroom's third
+    # argument), or a lower bar inflates a weekly window's score.
+
+    @staticmethod
+    def _composed_harness(
+        temp_home, strategy, hysteresis_pct=10.0, weekly_threshold=97.0
+    ):
+        h = EngineHarness(
+            temp_home, strategy=strategy, threshold=85.0,
+            weekly_threshold=weekly_threshold, hysteresis_pct=hysteresis_pct,
+        )
+        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_peers_own_line_does_not_inflate_its_weekly_window_in_the_gate(
+        self, temp_home
+    ):
+        # Both peers sit at 5h 50 / 7d 93: 18.5 policy points against the
+        # active's 10, short of the margin. 3's own 70 once rescaled its 7d
+        # window to 32.9 and got it admitted.
+        h = self._composed_harness(temp_home, "best")
+        self._set(h, 3, 70.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(90, 10), "2": _usage7(50, 93), "3": _usage7(50, 93),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_a_peers_own_line_does_not_inflate_its_weekly_window_in_the_rank(
+        self, temp_home, strategy
+    ):
+        # Equal peers rank by sequence order (2); 3's own 70 once put it first.
+        h = self._composed_harness(temp_home, strategy, hysteresis_pct=5.0)
+        self._set(h, 3, 70.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(90, 10), "2": _usage7(50, 93), "3": _usage7(50, 93),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_an_active_with_its_own_line_over_its_weekly_line_still_clears_hysteresis(
+        self, temp_home
+    ):
+        # 7d 98 over W97 is 10 policy points whatever the active's own 5h
+        # line (60 once made it 26.7 and refused the 30-point peer).
+        h = self._composed_harness(temp_home, "best")
+        self._set(h, 1, 60.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 98), "2": _usage7(70, 10), "3": _usage7(95, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize(
+        "weekly_threshold, winner", [(None, 3), (97.0, 2)]
+    )
+    def test_an_own_line_rescales_its_5h_score_only_under_a_weekly_line(
+        self, temp_home, weekly_threshold, winner
+    ):
+        # 3 (own 70, 5h 55) against 2 (5h 60, line 85). One line per account
+        # scores raw headroom: 45 beats 40, the roomier account wins. A weekly
+        # line scales every 5h score by the common anchor over the account's
+        # own 5h line (100 - 85 * 55 / 70 = 33.2), so 2's 40 wins.
+        h = self._composed_harness(
+            temp_home, "best", hysteresis_pct=5.0, weekly_threshold=weekly_threshold
+        )
+        self._set(h, 3, 70.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(90, 10), "2": _usage7(60, 10), "3": _usage7(55, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == winner
+
+class TestWeeklyThreshold:
+    """`autoswitch.weeklyThreshold`: a separate switch line for the 7d and
+    per-model windows, applied where the engine compares (lines.py) while
+    every logged number stays raw.
+
+    Fleet shapes are yunjeongiya's on #355: two accounts, threshold 85 —
+    account 3 at 5h 5 / 7d 93 was evacuated three ticks running (93 >= 85)
+    onto account 2 at 5h 95, which then hit its limit.
+
+    Not covered here, by design: with EVERY account over its lines the
+    all-above escape still ranks by binding reset (#342 / PR #473); and an
+    account over BOTH its lines reports the reset of the window with the
+    least policy headroom although it stays over on the other (T85/W97: 5h
+    99 resetting in an hour beside 7d 98 resetting in days) — "landable
+    again" is that escape fix's axis, not this change's.
+    """
+
+    _EMAILS = {1: "a@example.com", 2: "b@example.com", 3: "c@example.com"}
+
+    def _harness(self, temp_home, accounts=(1, 2), **settings_kwargs):
+        # `best` is the strategy these shapes were written for; the default is
+        # consume-first, which moves on reset order below the line.
+        kwargs = dict(
+            threshold=85.0, weekly_threshold=97.0, hysteresis_pct=10.0, strategy="best"
+        )
+        kwargs.update(settings_kwargs)
+        h = EngineHarness(temp_home, **kwargs)
+        for num in accounts:
+            h.seed(num, self._EMAILS[num])
+        h.make_live(self._EMAILS[accounts[0]], accounts[0])
+        return h
+
+    @staticmethod
+    def _reasons(h):
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    @staticmethod
+    def _details(h):
+        return [e.detail for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_s1_a_weekly_window_under_its_own_line_holds(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({"1": _usage7(5, 93), "2": _usage7(95, 47)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["below-threshold"]
+        # The detail quotes the comparison made: that window, its own line.
+        assert self._details(h) == ["7d 93% < 97%"]
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        payload = poll.to_json()
+        assert payload["windowsPct"]["1"] == {"5h": 5.0, "7d": 93.0}  # raw
+        assert payload["headroomPct"]["1"] == 7.0                      # raw
+        assert payload["threshold"] == 85.0
+        assert payload["weeklyThreshold"] == 97.0
+        assert "Account-1 (a@example.com): 7d 93% used (switch at 97%)" in poll.human()
+        assert "#2: 5h 95% · 7d 47%" in poll.human()                   # raw
+
+    def test_poll_event_omits_the_weekly_line_when_unset(self, temp_home):
+        h = self._harness(temp_home, weekly_threshold=None)
+        h.tick_with_usage({"1": _usage7(42, 10), "2": _usage7(5, 5)})
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "weeklyThreshold" not in poll.to_json()
+        assert "5h 42% used (switch at 85%)" in poll.human()
+
+    def test_poll_event_human_names_the_binding_window_and_its_line(self):
+        active = {"number": 1, "email": "a@example.com"}
+        with_windows = PollEvent(
+            active=active, headroom={"1": 7.0}, threshold=85.0,
+            windows={"1": {"5h": 5.0, "7d": 93.0}}, weekly_threshold=97.0,
+        )
+        assert "7d 93% used (switch at 97%)" in with_windows.human()
+        # No window data (older stores, sentinels): the account-wide form.
+        bare = PollEvent(active=active, headroom={"1": 7.0}, threshold=85.0,
+                         weekly_threshold=97.0)
+        assert "93% used (switch at 85%)" in bare.human()
+        default = PollEvent(
+            active=active, headroom={"1": 58.0}, threshold=90.0,
+            windows={"1": {"5h": 42.0, "7d": 10.0}},
+        )
+        assert "5h 42% used (switch at 90%)" in default.human()
+
+    def test_s2_a_weekly_bound_candidate_is_taken_over_a_5h_bound_active(
+        self, temp_home
+    ):
+        # Raw headroom 7 vs 5 fails the margin and parks on the 95% account
+        # until at-limit; policy headroom 18.5 vs 5 moves.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({"1": _usage7(95, 47), "2": _usage7(5, 93)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+
+    def test_s2_control_the_same_fleet_parks_without_a_weekly_line(self, temp_home):
+        h = self._harness(temp_home, weekly_threshold=None)
+        outcome = h.tick_with_usage({"1": _usage7(95, 47), "2": _usage7(5, 93)})
+        assert outcome is TickOutcome.BLOCKED
+        assert self._reasons(h) == ["no-qualifying-candidate"]
+
+    def test_an_active_over_its_weekly_line_still_clears_hysteresis(self, temp_home):
+        # A two-anchor rescale left 7d 98 at 14 policy points against a
+        # 5h 80 candidate's 20 (5.9 < 10: parked until at-limit, where
+        # today's engine switches). The third anchor sends the over-line band
+        # to 0 at exhaustion: 10 vs 20.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({"1": _usage7(5, 98), "2": _usage7(80, 47)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    @pytest.mark.parametrize("pct5", [86.7, 86.8])
+    def test_the_binding_flip_is_continuous(self, temp_home, pct5):
+        # Both 5.0 policy points: choosing the window by one score and
+        # ranking by another made the second read 13.2 and refuse.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({"1": _usage7(pct5, 99), "2": _usage7(80, 10)})
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_the_exact_boundary_at_the_weekly_line(self, temp_home):
+        # T92/W86/hyst 10: the active sits exactly AT its weekly line (8.0
+        # policy points) and the candidate exactly `hysteresis` better (18.0).
+        h = self._harness(temp_home, threshold=92.0, weekly_threshold=86.0)
+        outcome = h.tick_with_usage({"1": _usage7(0, 86), "2": _usage7(82, 0)})
+        assert outcome is TickOutcome.SWITCHED
+
+    @pytest.mark.parametrize(
+        "pct7,expected", [(96.9, TickOutcome.NO_ACTION), (97.0, TickOutcome.SWITCHED)]
+    )
+    def test_s3_the_weekly_window_binds_exactly_at_its_line(
+        self, temp_home, pct7, expected
+    ):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({"1": _usage7(5, pct7), "2": _usage7(5, 5)}) is expected
+
+    @pytest.mark.parametrize(
+        "pct7,expected", [(97.0, TickOutcome.BLOCKED), (96.9, TickOutcome.SWITCHED)]
+    )
+    def test_s3_a_candidate_at_its_weekly_line_is_not_landable(
+        self, temp_home, pct7, expected
+    ):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({"1": _usage7(95, 10), "2": _usage7(5, pct7)}) is expected
+
+    @pytest.mark.parametrize("base", [90.0, 95.0])
+    @pytest.mark.parametrize("window", ["5h", "7d"])
+    @pytest.mark.parametrize(
+        "offset,expected",
+        [(-0.1, TickOutcome.NO_ACTION), (0.0, TickOutcome.SWITCHED)],
+    )
+    def test_s4_with_weekly_unset_the_trigger_flips_where_the_scalar_did(
+        self, temp_home, base, window, offset, expected
+    ):
+        """The backward-compatibility control (PR #329's shape): with no
+        weekly line every window's line IS the threshold, on the boundary,
+        on both windows, and on a non-default threshold."""
+        h = self._harness(temp_home, threshold=base, weekly_threshold=None)
+        pct = base + offset
+        active = _usage7(pct, 0) if window == "5h" else _usage7(0, pct)
+        assert h.tick_with_usage({"1": active, "2": _usage7(0, 0)}) is expected
+
+    def _fetch_sets(self, h, active_usage, **lines):
+        entries = {
+            n: _entry_for(active_usage if n == "1" else _usage7(10, 10), h.clock.now)
+            for n in ("1", "2", "3")
+        }
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ) as collect:
+            h.engine._collect_scheduled_usage("1", **lines)
+        return [c.kwargs.get("fetch") for c in collect.call_args_list]
+
+    def test_s5_escalation_is_measured_against_each_windows_own_line(self, temp_home):
+        h = self._harness(temp_home, accounts=(1, 2, 3))
+        full = {"1", "2", "3"}
+        lines = dict(threshold=85.0, weekly_threshold=97.0)
+        assert full in self._fetch_sets(h, _usage7(20, 83), **lines)      # 83 >= 97 - 15
+        assert full not in self._fetch_sets(h, _usage7(20, 81), **lines)  # 81 < 82
+        assert full in self._fetch_sets(h, _usage7(20, 81), threshold=85.0)  # one line: 81 >= 70
+        # No threshold passed: BOTH lines come from the engine's own settings.
+        assert full not in self._fetch_sets(h, _usage7(20, 81))
+
+    def test_the_phase2_refetch_reads_fresh_windows(self, temp_home):
+        # consume-first decides on the stored snapshot, then re-decides on a
+        # full refetch: a candidate that crossed its weekly line since the
+        # snapshot must not be landed on.
+        h = self._harness(temp_home, accounts=(1, 2, 3), strategy="consume-first")
+        stored = {
+            "1": _usage7(5, 50, _R_LATER),
+            "2": _usage7(5, 90, _R_SOON),
+            "3": _usage7(5, 50, _R_LATEST),
+        }
+        fresh = {**stored, "2": _usage7(5, 97, _R_SOON)}
+        fetch_sets: list[set] = []
+
+        def collect(fetch=None, **_kwargs):
+            requested = set(fetch or ())
+            fetch_sets.append(requested)
+            view = fresh if requested == {"1", "2", "3"} else stored
+            return {num: _entry_for(v, h.clock.now) for num, v in view.items()}
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect):
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._reasons(h) == ["already-consuming-soonest"]
+        assert fetch_sets.count({"1", "2", "3"}) == 1  # phase 2 fired once
+
+    def test_s6_exhaustion_is_physical(self, temp_home):
+        h = self._harness(temp_home)
+        reset = _iso_at(h.clock.now + 3600)
+        outcome = h.tick_with_usage({"1": _usage7(5, 100, reset), "2": _usage7(5, 5)})
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_s6_an_exhausted_weekly_window_is_never_a_target(self, temp_home):
+        h = self._harness(temp_home, accounts=(1, 2, 3))
+        far = _iso_at(h.clock.now + 5 * 86400)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 10), "2": _usage7(5, 100, far), "3": _usage7(5, 50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_s6_the_all_exhausted_sleep_is_unchanged(self, temp_home):
+        # The ACTIVE returns first, so there is nowhere sooner to be: the spent
+        # wall switch (a peer that returns sooner takes the wall) does not fire.
+        h = self._harness(temp_home)
+        r1, r2 = h.clock.now + 3600, h.clock.now + 7200
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 100, _iso_at(r1)), "2": _usage7(5, 100, _iso_at(r2)),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert h.engine._sleep_until_ts == pytest.approx(r1 + poll_policy.RESET_SLACK_S)
+
+    def test_s7_the_lines_come_from_the_settings_object_not_the_file(self, temp_home):
+        # The #355 anchor bug class: an engine running `--threshold 85` while
+        # the file says 90, with the file's weekly line set to something that
+        # would evacuate 7d 93 if anything read it.
+        from claude_swap.settings import set_setting
+
+        h = self._harness(temp_home)
+        set_setting(h.switcher.backup_dir, "autoswitch.threshold", "90")
+        set_setting(h.switcher.backup_dir, "autoswitch.weeklyThreshold", "50")
+        outcome = h.tick_with_usage({"1": _usage7(5, 93), "2": _usage7(95, 47)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._details(h) == ["7d 93% < 97%"]
+        assert h.switcher._poll_inputs_override == (85.0, 97.0, ())
+
+    @pytest.mark.parametrize(
+        "active,expected,detail",
+        [
+            (_usage7(10, 85), TickOutcome.SWITCHED, None),
+            (_usage7(85, 10), TickOutcome.NO_ACTION, "5h 85% < 90%"),
+        ],
+    )
+    def test_a_weekly_line_below_the_5h_line_is_honoured(
+        self, temp_home, active, expected, detail
+    ):
+        # "Keep a weekly reserve": T90/W80 is a legitimate policy.
+        h = self._harness(temp_home, threshold=90.0, weekly_threshold=80.0)
+        assert h.tick_with_usage({"1": active, "2": _usage7(5, 5)}) is expected
+        if detail is not None:
+            assert self._details(h) == [detail]
+
+    @pytest.mark.parametrize(
+        "fable,weekly,expected,detail",
+        [
+            (90.0, 97.0, TickOutcome.NO_ACTION, "Fable 90% < 97%"),
+            (97.0, 97.0, TickOutcome.SWITCHED, None),
+            (90.0, None, TickOutcome.SWITCHED, None),
+        ],
+    )
+    def test_a_scoped_window_uses_the_weekly_line(
+        self, temp_home, fable, weekly, expected, detail
+    ):
+        h = self._harness(temp_home, weekly_threshold=weekly, model="Fable")
+        outcome = h.tick_with_usage({"1": _model_usage(5, fable), "2": _model_usage(5, 5)})
+        assert outcome is expected
+        if detail is not None:
+            assert self._details(h) == [detail]
+
+    @pytest.mark.parametrize(
+        "pct7,expected", [(93.0, TickOutcome.BLOCKED), (90.0, TickOutcome.SWITCHED)]
+    )
+    def test_hysteresis_is_measured_in_policy_headroom(self, temp_home, pct7, expected):
+        # Active 5h 90 -> 10 policy points. 7d 93 -> 18.5 (8.5 short of the
+        # margin); 7d 90 -> 21.1. Raw headroom (10 vs 7 / 10) refuses both.
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({"1": _usage7(90, 10), "2": _usage7(5, pct7)}) is expected
+
+    def test_ranking_sorts_by_policy_headroom(self, temp_home):
+        h = self._harness(temp_home, accounts=(1, 2, 3))
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 10), "2": _usage7(75, 10), "3": _usage7(5, 80),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        # 29.9 policy points beat 25; raw headroom (20 < 25) would pick 2.
+        assert h.active_number() == 3
+
+    def test_the_census_reads_each_windows_own_line(self, temp_home):
+        # A single-line census would call 7d 93 "over" too, flip to the
+        # all-above escape and take 3 by its sooner reset (the #342 shape).
+        h = self._harness(temp_home, accounts=(1, 2, 3))
+        outcome = h.tick_with_usage({
+            "1": _usage7(92, 10),
+            "2": _usage7(5, 93, _R_LATEST),
+            "3": _usage7(5, 98, _R_SOON),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_the_consume_first_hold_names_the_window(self, temp_home):
+        h = self._harness(temp_home, accounts=(1,), strategy="consume-first")
+        assert h.tick_with_usage({"1": _usage7(5, 93)}) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["below-threshold"]
+        assert self._details(h) == ["7d 93% < 97%"]
+
+    def test_the_no_return_release_reads_the_barred_accounts_own_lines(self, temp_home):
+        h = self._harness(temp_home)
+        state = {"lastSwitchFrom": "2"}
+        usage = {"2": _usage7(5, 93)}
+        released = h.engine._no_return_account(
+            "proactive", state, {"2": 7.0}, None, True, h.settings, None, usage=usage
+        )
+        assert released is None
+        held = h.engine._no_return_account(
+            "proactive", state, {"2": 7.0}, None, True,
+            AutoSwitchSettings(threshold=85.0), None, usage=usage,
+        )
+        assert held == "2"
+
+    def test_the_failover_landing_leg_reads_the_peers_own_lines(self):
+        class Fake(AutoSwitchEngine):
+            def __init__(self):
+                self._models = ()   # no self.settings: the parameter must do
+
+        e = Fake()
+        state = {
+            "lastSwitchFrom": "1",
+            "leftHeadroom": None,
+            "leftRecoveryAt": None,
+            "leftTrigger": "failover",
+        }
+        usage = {"1": _usage7(5, 93), "2": _usage7(95, 10)}
+        headroom = {"1": 7.0}
+        now = 1_000_000.0
+        assert e._left_account_recovered(
+            state, usage, headroom, 5.0,
+            AutoSwitchSettings(threshold=85.0, weekly_threshold=97.0), now, "2",
+        ) is True
+        assert e._left_account_recovered(
+            state, usage, headroom, 5.0, AutoSwitchSettings(threshold=85.0), now, "2",
+        ) is False
+
+    def test_binding_recovery_reads_the_window_with_the_least_policy_headroom(self):
+        from claude_swap.autoswitch import _binding_recovery_ts
+
+        now = 1_000_000.0
+        usage = {
+            "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 3600)},
+            "seven_day": {"pct": 93.0, "resets_at": _iso_at(now + 100 * 3600)},
+        }
+        assert _binding_recovery_ts(
+            usage, (), now, threshold=85.0, weekly_threshold=97.0
+        ) == pytest.approx(now + 3600)
+        # Today's max-pct answer without a weekly line.
+        assert _binding_recovery_ts(usage, (), now) == pytest.approx(now + 100 * 3600)
+        with pytest.raises(ValueError):
+            _binding_recovery_ts(usage, (), now, weekly_threshold=97.0)
+
+    def test_apply_threshold_keeps_the_weekly_pin(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine.apply_threshold(72.0)
+        assert h.switcher._poll_inputs_override == (72.0, 97.0, ())
+        assert h.engine.settings.weekly_threshold == 97.0

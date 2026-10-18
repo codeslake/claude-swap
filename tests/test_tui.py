@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import re
 import sys
 import threading
 import time
@@ -86,6 +87,7 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
+    switch_threshold: float | None = None,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -98,6 +100,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
+        switch_threshold=switch_threshold,
     )
 
 
@@ -125,6 +128,7 @@ class FakeSwitcher:
             (a.number for a in accounts if a.is_active), None
         )
         self.calls: list[tuple] = []
+        self.manual_sources: list[str | None] = []
         self.fetch_sets: list[set[str] | None] = []
 
     # -- surface the TUI consumes ------------------------------------------
@@ -141,9 +145,14 @@ class FakeSwitcher:
         return self.active
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        manual_source: str | None = None,
     ) -> dict:
         self.calls.append(("switch_to", str(identifier)))
+        self.manual_sources.append(manual_source)
         old = self.active
         self.active = str(identifier)
         self._accounts = [
@@ -160,8 +169,14 @@ class FakeSwitcher:
             "reason": "requested",
         }
 
-    def switch(self, strategy: str | None = None, json_output: bool = False) -> dict:
+    def switch(
+        self,
+        strategy: str | None = None,
+        json_output: bool = False,
+        manual_source: str | None = None,
+    ) -> dict:
         self.calls.append(("switch", strategy))
+        self.manual_sources.append(manual_source)
         return {"switched": False, "from": None, "to": None, "reason": "no-better-target"}
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
@@ -180,6 +195,16 @@ class FakeSwitcher:
         verb = "Disabled" if disabled else "Enabled"
         print(f"{verb} Account-{identifier}")
 
+    def set_account_switch_threshold(self, identifier: str, pct: float | None) -> None:
+        self.calls.append(("set_threshold", str(identifier), pct))
+        self._accounts = [
+            dataclasses.replace(a, switch_threshold=pct)
+            if a.number == str(identifier)
+            else a
+            for a in self._accounts
+        ]
+        print(f"Set Account-{identifier} switch threshold")
+
     def add_account(self, slot: int | None = None, assume_yes: bool = False) -> None:
         self.calls.append(("add", slot, assume_yes))
         print("Added Account 9: fresh@example.com")
@@ -195,9 +220,9 @@ class FakeSwitcher:
         print(f"Added Account {slot or 9}")
 
     def set_poll_policy_inputs(
-        self, threshold: float, models: tuple[str, ...]
+        self, threshold: float, weekly_threshold: float | None, models: tuple[str, ...]
     ) -> None:
-        self._poll_inputs_override = (threshold, models)
+        self._poll_inputs_override = (threshold, weekly_threshold, models)
 
     def clear_poll_policy_inputs(self) -> None:
         self._poll_inputs_override = None
@@ -906,6 +931,24 @@ class TestDashboard:
             # both the active card and the mini row carry the marker
             assert panel.count("(disabled)") == 2
 
+    async def test_switch_threshold_marker_on_active_card_and_mini(self, tmp_path):
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, switch_threshold=80.0),
+                make_account(2, switch_threshold=85.0),
+                make_account(3),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountsPanel
+
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            assert "switch at 80%" in panel and "switch at 85%" in panel
+            assert panel.count("switch at") == 2  # the strategy-default one is unmarked
+
     async def test_active_card_skips_absent_window_and_shows_scoped(self, tmp_path):
         fake = FakeSwitcher(
             [
@@ -967,6 +1010,7 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
+                "threshold-menu",
                 # No "pin-menu": the cloud pin row appears only when the
                 # optional extra is installed, which it is not in CI.
                 "remove-menu",
@@ -1083,6 +1127,7 @@ class TestDashboard:
             await pilot.press("down", "enter")
             await settle(pilot)
             assert ("switch_to", "2") in fake.calls
+            assert fake.manual_sources == ["tui"]  # the hand switch names itself
             assert isinstance(app.screen, DashboardScreen)  # popped back
             assert app.snapshot.active_number == "2"
 
@@ -1176,6 +1221,45 @@ class TestDashboard:
             await menu_select(pilot, "disable:2")
             await settle(pilot)
             assert ("set_disabled", "2", False) in fake.calls
+
+    async def test_threshold_menu_sets_and_clears_an_accounts_own_threshold(
+        self, tmp_path
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2, switch_threshold=85.0)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from textual.widgets import ListView, Static
+
+            from claude_swap.tui.widgets import MenuItem
+
+            def labels():
+                menu = app.screen.query_one("#menu", ListView)
+                return [
+                    item.query_one(Static).render().plain
+                    for item in menu.query(MenuItem)
+                ]
+
+            await menu_select(pilot, "threshold-menu")
+            rows = labels()
+            assert any("2" in r and "85%" in r for r in rows), rows
+            assert any("1" in r and "strategy" in r for r in rows), rows
+            await menu_select(pilot, "threshold:1")
+            await menu_select(pilot, "set-threshold:1:80")
+            await settle(pilot)
+            assert ("set_threshold", "1", 80.0) in fake.calls
+            # back at the root, not stranded in the submenu
+            menu = app.screen.query_one("#menu", ListView)
+            assert [i.action_id for i in menu.query(MenuItem)][0] == "switch"
+
+            await menu_select(pilot, "threshold-menu")
+            await menu_select(pilot, "threshold:2")
+            await menu_select(pilot, "set-threshold:2:default")
+            await settle(pilot)
+            assert ("set_threshold", "2", None) in fake.calls
 
     async def test_modal_arrow_keys_choose_button(self, tmp_path):
         fake = FakeSwitcher(
@@ -2245,13 +2329,21 @@ class TestAutoScreen:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
+            from claude_swap.tui.autoview import AutoScreen
+
+            await app.push_screen(AutoScreen())
             screen = app.screen
             assert screen._settings.strategy == "consume-first"  # the default
             from textual.widgets import Static
 
             summary = screen.query_one("#auto-summary", Static)
             assert "consume-first" in summary.render().plain
+            # CONTROL: a non-dynamic strategy still shows the configured
+            # threshold — without this, the dynamic-strategy assertion below
+            # would pass even if "threshold " never printed at all.
+            assert "threshold 90%" in summary.render().plain
+            # the one real key press: it proves the `s` binding reaches the
+            # action; the rest of the cycle calls the action directly.
             await pilot.press("s")
             await pilot.pause()
             assert screen._settings.strategy == "dynamic"
@@ -2261,20 +2353,79 @@ class TestAutoScreen:
             assert "dynamic (session)" in summary.render().plain
             assert "switch at 97%" in summary.render().plain
             assert app.threshold_pct == 97.0
-            await pilot.press("s")
-            await pilot.pause()
+            # dynamic's configured threshold is not the engine's real bar —
+            # at rest (not adjusting) the header must not claim it is.
+            assert "threshold" not in summary.render().plain
+            # A session OVERRIDE does not outlive the adjust mode: ending it
+            # (`enter`) returns to "at rest", where dynamic's header names
+            # only the bar in force, never the configured threshold, even
+            # though the override still steers ranking underneath.
+            screen.action_adjust_threshold()
+            assert "threshold 90%" in summary.render().plain  # shown while adjusting
+            screen.action_threshold_step(1)
+            assert screen._settings.threshold == 91.0
+            screen.action_adjust_done()
+            assert "threshold" not in summary.render().plain, (
+                f"a non-bar threshold leaked at rest under dynamic: "
+                f"{summary.render().plain!r}"
+            )
+            assert "switch at 97%" in summary.render().plain
+            screen.action_cycle_strategy()
             assert screen._settings.strategy == "best"
-            await pilot.press("s")
-            await pilot.pause()
+            screen.action_cycle_strategy()
             assert screen._settings.strategy == "consume-first"  # wraps around
+            screen.action_cycle_strategy()  # leave a non-default value to revert
             # the override lives in memory only — nothing was persisted
             assert not (tmp_path / "settings.json").exists()
-            await pilot.press("escape")
-            await settle(pilot)
             # the session strategy does not outlive the screen: a fresh open
             # reverts to the file value, same precedent as the threshold.
-            await self._open(pilot)
+            await app.pop_screen()
+            await app.push_screen(AutoScreen())
             assert app.screen._settings.strategy == "consume-first"
+
+    async def test_strategy_cycle_refreshes_a_strategy_gated_footer(
+        self, tmp_path, fake_engine
+    ):
+        from textual.binding import Binding
+        from textual.widgets import Footer
+        from textual.widgets._footer import FooterKey
+
+        from claude_swap.tui.autoview import AutoScreen
+
+        class GatedScreen(AutoScreen):
+            # no shipped binding gates on strategy; this stands in for one
+            BINDINGS = [Binding("c", "probe", "Probe")]
+
+            def check_action(self, action, parameters):
+                if action == "probe":
+                    return self._settings.strategy == "dynamic"
+                return super().check_action(action, parameters)
+
+            def action_probe(self) -> None:
+                pass
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await app.push_screen(GatedScreen())
+            await settle(pilot)
+
+            def footer_keys() -> list[str]:
+                footer = app.screen.query_one(Footer)
+                return [k.key for k in footer.query(FooterKey)]
+
+            assert "c" not in footer_keys()  # consume-first: gated off
+            await pilot.press("s")  # -> dynamic
+            await settle(pilot)
+            assert app.screen._settings.strategy == "dynamic"
+            assert "c" in footer_keys()
+            await pilot.press("s")  # -> best
+            await settle(pilot)
+            assert app.screen._settings.strategy == "best"
+            assert "c" not in footer_keys()
 
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine
@@ -2351,6 +2502,104 @@ class TestAutoScreen:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
+
+    async def test_candidates_rank_by_policy_headroom_under_a_weekly_line(
+        self, tmp_path, fake_engine
+    ):
+        """The 'Next best' list is the engine's own ordering: under a weekly
+        line a 7d 93% account outranks a 5h 95% one (18.5 vs 5 policy points;
+        raw pct would put it last), each row names the window that binds and
+        the line it is judged against, and the summary shows the line."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 85, "weeklyThreshold": 97},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(5.0, 93.0)),
+                make_account(3, entry=make_entry(95.0, 47.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+            assert re.search(r"7d\S*:93% \(line 97%\)", plain), plain
+            assert re.search(r"5h\S*:95% \(line 85%\)", plain), plain
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert "threshold 85%" in summary and "weekly 97%" in summary
+            assert app.weekly_threshold_pct == 97.0
+
+    async def test_candidates_follow_a_session_threshold_adjust(
+        self, tmp_path, fake_engine
+    ):
+        """The list ranks by the lines in force: a session adjust must re-rank
+        it and move the 5h rows' line label at once, not at the next snapshot.
+        At 85/97 the 7d 93% row (18.5 policy points) outranks the 5h 83% row
+        (17); at 88/97 it falls to 15.6 and the order flips."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 85, "weeklyThreshold": 97},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(83.0, 10.0)),
+                make_account(3, entry=make_entry(5.0, 93.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user3@example.com") < plain.index("user2@example.com")
+            assert re.search(r"5h\S*:83% \(line 85%\)", plain), plain
+            await pilot.press("t", "right", "right", "right")
+            await pilot.pause()
+            assert app.screen._settings.threshold == 88.0
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index("user3@example.com")
+            assert re.search(r"5h\S*:83% \(line 88%\)", plain), plain
+            assert re.search(r"7d\S*:93% \(line 97%\)", plain), plain
+
+    async def test_candidates_show_no_line_without_a_weekly_one(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(42.0, 10.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert re.search(r"5h\S*:42%", plain), plain
+            assert "(line" not in plain
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert "weekly" not in summary
+            assert app.weekly_threshold_pct is None
 
     async def test_candidates_ranking_honors_configured_model(
         self, tmp_path, fake_engine
@@ -2658,6 +2907,24 @@ class TestAccountsSnapshot:
         assert all(acc.usage.sentinel is not None for acc in snap.accounts)
         assert isinstance(snap.taken_at, float)
 
+    def test_snapshot_carries_an_accounts_own_switch_threshold(
+        self, temp_home, mock_claude_config
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["sequence"] = [1, 2]
+        data["accounts"] = {
+            "1": {"email": "test@example.com", "uuid": "test-uuid-1234"},
+            "2": {"email": "other@example.com", "uuid": "uuid-2"},
+        }
+        switcher._write_json(switcher.sequence_file, data)
+        switcher.set_account_switch_threshold("2", 85.0)
+
+        snap = switcher.accounts_snapshot(fetch=set())
+        assert [acc.switch_threshold for acc in snap.accounts] == [None, 85.0]
+
 
 # ---------------------------------------------------------------------------
 # CLI wiring
@@ -2854,13 +3121,21 @@ class TestNextBestMarksStaleUsage:
         with patch.object(AutoScreen, "app", property(lambda s: app)):
             return str(v._candidates_text(snap, active_number=active))
 
-    def test_a_backed_off_candidate_is_marked(self):
+    @pytest.mark.parametrize(
+        ("last_error", "mark", "other"),
+        [
+            ("http-429", "stale", "no plan"),
+            ("oauth_not_allowed_for_organization", "no plan", "stale"),
+        ],
+        ids=["transient", "lapsed-plan"],
+    )
+    def test_a_backed_off_candidate_is_marked(self, last_error, mark, other):
         stale_entry = UsageEntry(
             last_good=make_entry(0.0, 0.0).last_good,
             fetched_at=time.time() - 1000.0,
             age_s=1000.0,
             consecutive_failures=9,
-            last_error="http-429",
+            last_error=last_error,
             backoff_until=time.time() + 400.0,
             trust_extended=True,
         )
@@ -2875,7 +3150,8 @@ class TestNextBestMarksStaleUsage:
         out = self._render(snap, active="1")
         assert "user2@example.com" in out
         row2 = out[out.index("user2@example.com"):]
-        assert "stale" in row2, f"no stale mark on the backed-off row: {out!r}"
+        assert mark in row2, f"no {mark} mark on the backed-off row: {out!r}"
+        assert other not in row2, f"{other} on the {mark} row: {out!r}"
 
     def test_a_healthy_candidate_past_the_serve_ttl_is_not_marked(self):
         """I-c: a healthy row at age 300 s (no failures, no backoff) is a
@@ -3617,8 +3893,10 @@ class TestUnswitchableRowsAreListed:
                 "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
                 "scoped": [{"name": "Fable", "pct": 95.0}],
             }),
-            # Full block: 5h itself is genuinely exhausted, no model choice
-            # escapes it.
+            # Full block: 5h is genuinely exhausted (100%), no model choice
+            # escapes it. `full` means nothing-left, not merely over the
+            # bar -- see the parametrized test below: a blocked-but-not-
+            # exhausted window prints no marker.
             self._acct("3", "c@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 100.0}, "seven_day": {"pct": 5.0},
                 "scoped": [{"name": "Fable", "pct": 10.0}],
@@ -3736,6 +4014,48 @@ class TestUnswitchableRowsAreListed:
         assert out.index("noplan@x.com") < out.index("full@x.com"), out
         row = next(r for r in out.splitlines() if "noplan@x.com" in r)
         assert "5h" in row and row.endswith("no plan (subscription inactive)"), out
+
+    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
+    def test_the_full_label_is_reserved_for_actual_exhaustion(self, strategy):
+        """The owner's report, 2026-09-17: a 7d window at 92% printed `7d
+        full` against the configured threshold of 90 -- a claim of
+        nothing-left that was false. `full` means nothing left (pct
+        >= 100); a window under 100 prints no marker at all, however close
+        it sits to the landing bar (owner 2026-10-04: the `98% >= 97%`
+        wording was noise).
+
+        Parametrized so the rule holds under every strategy.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy=strategy, threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "hundred@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 100.0},
+            }),
+            self._acct("3", "ninetytwo@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 92.0},
+            }),
+            self._acct("4", "fifty@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 50.0},
+            }),
+            self._acct("5", "ninetyeight@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 98.0},
+            }),
+        ), active="1", settings=settings)
+
+        rows = {
+            email: next(line for line in out.split("\n") if email in line)
+            for email in (
+                "hundred@x.com", "ninetytwo@x.com", "fifty@x.com",
+                "ninetyeight@x.com",
+            )
+        }
+        assert "7d full" in rows["hundred@x.com"], rows["hundred@x.com"]
+        for email in ("ninetytwo@x.com", "fifty@x.com", "ninetyeight@x.com"):
+            assert "full" not in rows[email], rows[email]
+            assert ">=" not in rows[email], rows[email]
 
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a
@@ -4003,9 +4323,13 @@ class TestNeedsLoginIsReported:
 
     class _EmptySlotSwitcher(FakeSwitcher):
         def switch_to(
-            self, identifier: str, json_output: bool = False, force: bool = False
+            self,
+            identifier: str,
+            json_output: bool = False,
+            force: bool = False,
+            manual_source: str | None = None,
         ) -> dict:
-            payload = super().switch_to(identifier, json_output, force)
+            payload = super().switch_to(identifier, json_output, force, manual_source)
             payload["needsLogin"] = True
             payload["reason"] = "switched-needs-login"
             payload["message"] = (
@@ -4032,3 +4356,27 @@ class TestNeedsLoginIsReported:
             f"a switch that logged the machine out reported a plain success: "
             f"{seen!r}"
         )
+
+
+class TestWeeklyTick:
+    def test_the_weekly_rows_tick_at_the_weekly_line(self):
+        from claude_swap.tui.widgets import _BAR_TICK, account_card_text
+
+        acc = make_account(
+            1, active=True, entry=make_entry(50.0, 50.0, scoped=[("Fable", 50.0)])
+        )
+
+        def ticks(**lines):
+            plain = account_card_text(acc, 100, **lines).plain
+            rows = {
+                ln.split()[0]: ln
+                for ln in plain.splitlines()
+                if ln.strip().startswith(("5h", "7d", "Fable"))
+            }
+            return {label: ln.index(_BAR_TICK) for label, ln in rows.items()}
+
+        with_weekly = ticks(threshold=85.0, weekly_threshold=97.0)
+        assert with_weekly["7d"] > with_weekly["5h"]
+        assert with_weekly["Fable"] == with_weekly["7d"]
+        without = ticks(threshold=85.0)
+        assert without["5h"] == without["7d"] == without["Fable"] == with_weekly["5h"]

@@ -26,6 +26,7 @@ from claude_swap import oauth, printer, usage_store
 from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     STATE_FILENAME,
+    _binding_at,
     _binding_recovery_ts,
     _classify_dynamic_trigger,
     _dynamic_active_headroom,
@@ -286,7 +287,13 @@ def rank_switch_candidates(
             return "unreadable-active"
         if settings.strategy == "dynamic":
             return _classify_dynamic_trigger(active_headroom)
-        if (100.0 - active_headroom) < settings.threshold:
+        # Each window against its OWN line, as `_tick_inner` judges the active.
+        active_binding = _binding_at(usage.get(active_number), settings, models)
+        if (
+            not active_binding.over
+            if active_binding is not None
+            else (100.0 - active_headroom) < settings.threshold
+        ):
             return (
                 settings.strategy
                 if settings.strategy in CONSUME_FIRST_STRATEGIES
@@ -383,7 +390,9 @@ def rank_switch_candidates(
         not ordered
         and models
         and settings.strategy == "dynamic"
-        and _model_window_binds_everywhere(usage, models, settings.threshold)
+        and _model_window_binds_everywhere(
+            usage, models, settings.threshold, settings.weekly_threshold
+        )
     ):
         ordered, rank_axis = _rank_on((), trigger)
     if (
@@ -396,7 +405,12 @@ def rank_switch_candidates(
     return ordered, rank_axis, trigger, unmodeled
 
 
-def waiting_tail_key(usage: dict | None, models: tuple[str, ...], now: float) -> tuple:
+def waiting_tail_key(
+    usage: dict | None,
+    models: tuple[str, ...],
+    now: float,
+    settings: "AutoSwitchSettings",
+) -> tuple:
     """Sort key for a row the admission pass refused but that still has a
     usable window: every account with headroom in ALL its windows before
     every account with ANY window at or over 100% -- a full account is
@@ -407,7 +421,16 @@ def waiting_tail_key(usage: dict | None, models: tuple[str, ...], now: float) ->
     can rank this tier two different ways on the same snapshot.
     """
     full = 1 if binding_pct(usage, models) >= 100.0 else 0
-    return (full, _binding_recovery_ts(usage, models, now))
+    return (
+        full,
+        _binding_recovery_ts(
+            usage,
+            models,
+            now,
+            threshold=settings.threshold,
+            weekly_threshold=settings.weekly_threshold,
+        ),
+    )
 
 
 def is_no_plan(acc) -> bool:
@@ -469,7 +492,7 @@ def ordered_accounts(
         # can list this same unranked row in two different orders. Not the
         # 7-day reset alone: the window that actually blocks an account is
         # whichever is highest, and that is routinely the 5-hour one.
-        return (1,) + waiting_tail_key(acc.usage.last_good, models, now)
+        return (1,) + waiting_tail_key(acc.usage.last_good, models, now, settings)
 
     others.sort(key=lambda a: (bucket(a), a.number))  # matches the auto view's tie-break
     numbers = [acc.number for acc in others]
