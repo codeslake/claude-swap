@@ -1937,6 +1937,83 @@ class TestRankSwitchReasons:
             }, (settings.strategy, reasons)
 
 
+class TestRankSwitchOwnBars:
+    """An account's own switch threshold (#321's per-account bars) reaches the
+    panel's pass as it reaches the engine's tick (`self._bars`): the row
+    carries it as `switch_threshold`, and every bar the engine reads per
+    account is that number, never the strategy's."""
+
+    @staticmethod
+    def _rank(settings, *accounts):
+        snap = AccountsSnapshot(
+            accounts=list(accounts), active_number="1", taken_at=0.0
+        )
+        return snap, tui_data.rank_switch_candidates(snap, settings, time.time(), "1")
+
+    def test_best_refuses_a_candidate_past_its_own_bar(self):
+        """Active at 95%, #2 at 70% under its own bar of 60, #3 at 75% under
+        the strategy's 90: the engine refuses #2 (it would leave again next
+        tick) and lands on #3, so #2 must not head the list."""
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
+            settings,
+            make_account(1, active=True, entry=make_entry(95.0, 10.0)),
+            make_account(2, entry=make_entry(70.0, 10.0), switch_threshold=60.0),
+            make_account(3, entry=make_entry(75.0, 10.0)),
+        )
+        assert trigger == "proactive", trigger
+        assert ordered == ["3"], ordered
+        assert _autoview_order(snap, "1", settings) == ["3", "2"]
+
+    def test_best_leaves_an_active_at_its_own_bar(self):
+        """Active at 85% with its own bar of 80 under `best` (90): the engine
+        departs it (`departure_pct`), so the panel must not read it as
+        below the threshold and show nothing."""
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        _snap, (ordered, _axis, trigger, unmodeled) = self._rank(
+            settings,
+            make_account(
+                1, active=True, entry=make_entry(85.0, 10.0), switch_threshold=80.0
+            ),
+            make_account(2, entry=make_entry(10.0, 10.0)),
+        )
+        assert (trigger, unmodeled) == ("proactive", False)
+        assert ordered == ["2"], ordered
+
+    def test_dynamic_walls_the_active_at_its_own_bar_and_refuses_peers_past_theirs(
+        self,
+    ):
+        """Under `dynamic` an active with its own bar of 80 walls at headroom
+        20 (`_active_wall`), not 3: "proactive" there, and #2 (85%, past its
+        own bar of 80) is as unlandable as a spent peer."""
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        _snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
+            settings,
+            make_account(
+                1, active=True, entry=make_entry(80.0, 10.0), switch_threshold=80.0
+            ),
+            make_account(2, entry=make_entry(85.0, 10.0), switch_threshold=80.0),
+            make_account(3, entry=make_entry(50.0, 10.0)),
+        )
+        assert trigger == "proactive", trigger
+        assert ordered == ["3"], ordered
+
+    def test_dynamic_active_at_the_real_wall_lifts_the_peers_own_bars(self):
+        """Every peer past its own line, but the active at the REAL wall
+        (headroom 2 <= 3): the engine re-ranks without the bars rather than
+        ride to the limit (`_dynamic_rank`), and so does the panel."""
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        _snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
+            settings,
+            make_account(
+                1, active=True, entry=make_entry(98.0, 10.0), switch_threshold=80.0
+            ),
+            make_account(2, entry=make_entry(85.0, 10.0), switch_threshold=80.0),
+        )
+        assert trigger == "proactive", trigger
+        assert ordered == ["2"], ordered
+
+
 @pytest.mark.asyncio
 class TestSharedAccountOrder:
     """Dashboard/Switch/Watch render `ordered_accounts`; Remove/Disable keep slot order."""
@@ -2638,6 +2715,53 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
+    async def test_candidates_drop_the_model_gate_when_every_row_is_model_only(
+        self, tmp_path, fake_engine
+    ):
+        """Both candidates' ONLY over-bar window is the pinned model, exactly
+        the shape ``_rank_candidates`` (autoswitch.py) retries on 5h/7d alone
+        for — but that retry is `dynamic`-only (autoswitch.py:2400): `best`/
+        `consume-first` never rank on 5h/7d alone, so under those strategies
+        the panel must NOT drop the model gate either, even here. `strategy`
+        must be `dynamic` for the panel to take this path at all — ranking on
+        the model-gated axis here would name #2 (99% Fable) the worse account
+        when its real 5h is #3's better one: the two are on OPPOSITE sides of
+        `-Fable, +5h` vs `+Fable, -5h`. Both Fable values sit over the dynamic
+        landing bar (97, not the raw 90 threshold, #321), or #2 reads "open"
+        on the model axis directly and the model gate never needs to drop."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(
+                    2, entry=make_entry(20.0, 5.0, scoped=[("Fable", 99.0)])
+                ),
+                make_account(
+                    3, entry=make_entry(60.0, 5.0, scoped=[("Fable", 98.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            # #2's real 5h (20%) beats #3's (60%): once the model gate drops
+            # (neither #2 nor #3 has a 5h/7d window over the bar on its own),
+            # #2 must rank first — ranking on the model-gated axis instead
+            # would put #3 first (98% Fable < 99% Fable).
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+
     async def test_candidates_keep_the_model_gate_under_best_even_when_every_row_is_model_only(
         self, tmp_path, fake_engine
     ):
@@ -3207,6 +3331,7 @@ class TestUnswitchableRowsAreListed:
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
+        a.switch_threshold = None  # the row's default, not an auto-mocked float
         # A real UsageEntry, not a MagicMock -- `.decision_value()` (the
         # ranking pass's own read) is real code, not an auto-mocked
         # callable, and needs actual `sentinel`/`last_good`/`age_s` to

@@ -26,6 +26,7 @@ from claude_swap import oauth, printer, usage_store
 from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     STATE_FILENAME,
+    _about_to_wall,
     _binding_at,
     _binding_recovery_ts,
     _classify_dynamic_trigger,
@@ -33,6 +34,7 @@ from claude_swap.autoswitch import (
     _headroom_by_account,
     _model_window_binds_everywhere,
     _rank_dynamic_candidates,
+    _wall_headroom,
     rank_candidates_pass,
 )
 from claude_swap.exceptions import ClaudeSwitchError
@@ -259,6 +261,12 @@ def rank_switch_candidates(
     consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
     usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
     entries = {acc.number: acc.usage for acc in snap.accounts}
+    # Each account's own switch threshold, as the engine reads it (`_bars`).
+    bars = {
+        acc.number: acc.switch_threshold
+        for acc in snap.accounts
+        if acc.switch_threshold is not None
+    }
     oauth_candidates = [
         acc.number
         for acc in snap.accounts
@@ -286,13 +294,19 @@ def rank_switch_candidates(
         if active_headroom is None:
             return "unreadable-active"
         if settings.strategy == "dynamic":
-            return _classify_dynamic_trigger(active_headroom)
-        # Each window against its OWN line, as `_tick_inner` judges the active.
-        active_binding = _binding_at(usage.get(active_number), settings, models)
+            return _classify_dynamic_trigger(
+                active_headroom, _wall_headroom(bars.get(active_number))
+            )
+        # Each window against its OWN line, as `_tick_inner` judges the active:
+        # the active's own bar stands in for the strategy's (`departure_pct`).
+        departure_pct = bars.get(active_number, settings.threshold)
+        active_binding = _binding_at(
+            usage.get(active_number), settings, models, departure_pct
+        )
         if (
             not active_binding.over
             if active_binding is not None
-            else (100.0 - active_headroom) < settings.threshold
+            else (100.0 - active_headroom) < departure_pct
         ):
             return (
                 settings.strategy
@@ -335,8 +349,25 @@ def rank_switch_candidates(
         headroom = _headroom_by_account(usage, axis)
         warm, cold = _rank_dynamic_candidates(
             oauth_candidates, headroom, usage, now, last_active_at or {},
-            settings.cache_ttl_seconds, reasons, entries,
+            settings.cache_ttl_seconds, reasons, entries, bars,
         )
+        # Only an active at the REAL wall lifts the peers' own lines, on the
+        # `proactive` arm alone (`_dynamic_rank`); the healthy arm never does.
+        # The active reads as the engine passes it: widened on the model axis,
+        # its own unmodeled headroom on the retry.
+        if (
+            trigger == "proactive"
+            and not warm
+            and not cold
+            and _about_to_wall(
+                active_headroom if axis else headroom.get(active_number)
+            )
+        ):
+            reasons.clear()
+            warm, cold = _rank_dynamic_candidates(
+                oauth_candidates, headroom, usage, now, last_active_at or {},
+                settings.cache_ttl_seconds, reasons, entries,
+            )
         if trigger == "proactive":
             cold_floor = settings.cold_switch_cost_pct
             cold_clears = [n for n in cold if headroom[n] >= cold_floor]
@@ -371,6 +402,7 @@ def rank_switch_candidates(
             now=now,
             reasons=reasons,
             entries=entries,
+            bars=bars,
         )
         return ordered, rank_axis
 
@@ -378,12 +410,10 @@ def rank_switch_candidates(
     active_disabled = next(
         (acc.disabled for acc in snap.accounts if acc.number == active_number), False
     )
-    trigger = _trigger_for(
-        _dynamic_active_headroom(
-            settings, models, usage, active_number, model_headroom.get(active_number)
-        ),
-        active_disabled,
+    active_headroom = _dynamic_active_headroom(
+        settings, models, usage, active_number, model_headroom.get(active_number)
     )
+    trigger = _trigger_for(active_headroom, active_disabled)
     unmodeled = trigger in _UNMODELED_TRIGGERS
     ordered, rank_axis = _rank_on(models, trigger)
     if (

@@ -3889,9 +3889,9 @@ class AutoSwitchEngine:
         ``None`` when nothing ranked -- read off, never re-derived.
         ``reasons``, when given, receives a short plain-words cause per
         dropped candidate (the panel's side channel); the engine passes none.
-        ``bars`` is the engine's per-account switch thresholds
-        (``AutoSwitchEngine._bars``); the panel has none and every account
-        reads the strategy's bar.
+        ``bars`` is the per-account switch thresholds: the engine's
+        ``AutoSwitchEngine._bars``, which the panel rebuilds from each row's
+        ``switch_threshold``. An account without one reads the strategy's bar.
         """
         reasons = {} if reasons is None else reasons
         bars = {} if bars is None else bars
