@@ -1126,6 +1126,46 @@ class TestAutoCommand:
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
 
+    def test_weekly_threshold_flag_overrides_settings_json(self, temp_home):
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90.0, "weeklyThreshold": 95.0},
+        }))
+        self._run(["--once", "--weekly-threshold", "97"], temp_home)
+        engine = self.FakeEngine.instances[-1]
+        assert engine.settings.weekly_threshold == 97.0  # CLI wins
+        assert engine.settings.threshold == 90.0         # settings.json kept
+
+    def test_threshold_flag_keeps_the_configured_weekly_line(self, temp_home):
+        """Both lines come from the one settings object the engine holds —
+        `--threshold 85` must not drop a configured weekly line (the anchor
+        bug yunjeongiya hit on #355 came from two sources of truth)."""
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90.0, "weeklyThreshold": 97.0},
+        }))
+        self._run(["--once", "--threshold", "85"], temp_home)
+        engine = self.FakeEngine.instances[-1]
+        assert (engine.settings.threshold, engine.settings.weekly_threshold) == (85.0, 97.0)
+
+    def test_auto_help_mentions_the_weekly_line(self, temp_home, capsys):
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        assert "--weekly-threshold" in out
+        assert "switch at 90% used" in out  # the epilog's % renders literally
+
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
@@ -1775,3 +1815,50 @@ def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     home = Path(_subprocess_env()["HOME"])
     assert home.is_dir(), f"the isolated HOME is not a real directory: {home}"
     assert home.is_relative_to(tmp_path_factory.getbasetemp()), f"{home} escapes basetemp"
+
+
+class TestImportUsageCli:
+    def _dispatch(self, argv):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.transfer.import_usage") as import_fn, \
+             patch.object(sys, "argv", argv), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        return switcher_cls, import_fn
+
+    def test_subcommand_dispatches_with_its_hold(self):
+        switcher_cls, import_fn = self._dispatch(
+            ["cswap", "import-usage", "-", "--hold", "600"]
+        )
+        import_fn.assert_called_once_with(
+            switcher_cls.return_value, "-", hold_s=600.0
+        )
+
+    def test_no_hold_leaves_holds_alone(self):
+        switcher_cls, import_fn = self._dispatch(
+            ["cswap", "import-usage", "/tmp/usage.json"]
+        )
+        import_fn.assert_called_once_with(
+            switcher_cls.return_value, "/tmp/usage.json", hold_s=None
+        )
+
+    def test_zero_hold_reaches_the_import_to_lift_holds(self):
+        switcher_cls, import_fn = self._dispatch(
+            ["cswap", "import-usage", "-", "--hold", "0"]
+        )
+        import_fn.assert_called_once_with(
+            switcher_cls.return_value, "-", hold_s=0.0
+        )
+
+    @pytest.mark.parametrize("argv,message", [
+        (["cswap", "list", "--hold", "60"], "--hold can only be used with 'import-usage'"),
+        (["cswap", "import-usage", "-", "--hold", "-1"], "--hold must be a non-negative"),
+        (["cswap", "import-usage", "-", "--hold", "inf"], "--hold must be a non-negative"),
+    ])
+    def test_hold_is_validated(self, argv, message, capsys):
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
+        assert message in capsys.readouterr().err
