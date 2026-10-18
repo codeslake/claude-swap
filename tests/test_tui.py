@@ -2155,6 +2155,50 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
+    async def test_candidates_name_a_scoped_binding_window_and_its_line(
+        self, tmp_path, fake_engine
+    ):
+        """When the window that binds is a per-model one (autoswitch.model),
+        its row names it and the line it is judged against, like the 5h/7d
+        chips do. Without it the row reads 5h 10% / 7d 5% for an account the
+        list ranks by Fable 95%, and a scoped-only account reads a bare
+        'NN% used' with no window."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "model": "Fable", "strategy": "best",
+                "threshold": 85, "weeklyThreshold": 97,
+            },
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(
+                    2, entry=make_entry(10.0, 5.0, scoped=[("Fable", 95.0)])
+                ),
+                make_account(
+                    3,
+                    entry=make_entry(None, None, scoped=[("Fable", 90.0)]),
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            rows = {
+                n: next(ln for ln in plain.splitlines() if f"user{n}@" in ln)
+                for n in (2, 3)
+            }
+            assert re.search(r"Fable\S*:95% \(line 97%\)", rows[2]), rows[2]
+            assert re.search(r"Fable\S*:90% \(line 97%\)", rows[3]), rows[3]
+
     async def test_candidates_drain_soonest_seven_day_reset_first(
         self, tmp_path, fake_engine
     ):

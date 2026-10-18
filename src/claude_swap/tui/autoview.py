@@ -456,6 +456,11 @@ class AutoScreen(Screen):
                     for label, key in (("5h", "five_hour"), ("7d", "seven_day"))
                 ]
                 chips = [c for c in chips if c[2] is not None]
+                if binding.label not in ("5h", "7d"):
+                    # A per-model window binds: no top-level key (None reads
+                    # no countdown in window_chip_label), so chip it from the
+                    # binding itself, which also makes `chips` non-empty.
+                    chips.append((None, binding.label, binding.pct))
                 for i, (key, label, wpct) in enumerate(chips):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
                     entry.append(
@@ -468,11 +473,6 @@ class AutoScreen(Screen):
                             f" (line {pct_label(binding.line)}%)",
                             style=palette.muted,
                         )
-                if not chips:  # no window data at all — keep the old reading
-                    entry.append(
-                        f"  {binding.pct:3.0f}% used",
-                        style=palette.severity(binding.pct),
-                    )
                 key = (
                     consume_first_rank_key(
                         acc.usage.last_good,
