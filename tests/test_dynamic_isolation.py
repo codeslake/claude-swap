@@ -134,19 +134,21 @@ class TestDynamicNeverMovesBestOrConsumeFirst:
 
     def test_mutant_control_moves_every_digest(self, tmp_path, monkeypatch):
         """Not a vacuous pin: a real change to shared ranking code must move
-        every one of the four digests above. Inverts every account's
-        headroom (``100 - h``) — flips who looks healthy vs. blocked, which
-        a single anti-flap constant does not reliably do when a fixed fleet
-        only ever switches once."""
+        every one of the four digests above. Inverts every window's
+        utilization (``100 - pct``) at the one source both the headroom and
+        the per-window switch lines read — flips who looks healthy vs.
+        blocked, which a single anti-flap constant does not reliably do when
+        a fixed fleet only ever switches once."""
         from claude_swap import oauth
 
-        real_headroom = oauth.account_headroom
+        real_windows = oauth.relevant_windows
         monkeypatch.setattr(
             oauth,
-            "account_headroom",
-            lambda usage, models: (
-                None if (h := real_headroom(usage, models)) is None else 100.0 - h
-            ),
+            "relevant_windows",
+            lambda usage, models=(): [
+                (label, 100.0 - pct, resets_at)
+                for label, pct, resets_at in real_windows(usage, models)
+            ],
         )
         for i, ((strategy, model), golden) in enumerate(_GOLDEN.items()):
             got = _digest(tmp_path / f"m{i}", strategy, model, seed=_SEED)

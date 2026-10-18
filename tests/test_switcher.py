@@ -11901,7 +11901,8 @@ class TestAccountSwitchThreshold:
         s = self._switcher(temp_home)
         data = s._get_sequence_data()
         data["accounts"]["1"]["switchThreshold"] = value
-        s._write_json(s.sequence_file, data)
+        # Written raw, as a hand edit is: `_write_json` refuses NaN.
+        s.sequence_file.write_text(json.dumps(data))
         assert s.account_switch_thresholds() == {}
 
 
