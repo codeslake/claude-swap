@@ -2403,12 +2403,14 @@ class AutoSwitchEngine:
                 and active_value != USAGE_TOKEN_EXPIRED
             ):
                 last_active = entries.get(current)
-                last_active_headroom = oauth.account_headroom(
-                    last_active.last_good if last_active else None, self._models
+                # Each window against its OWN line, like the trigger above;
+                # None means the last read carried no window at all.
+                last_binding = self._binding(
+                    last_active.last_good if last_active else None, settings
                 )
                 if (
-                    last_active_headroom is not None
-                    and (100.0 - last_active_headroom) < settings.threshold
+                    last_binding is not None
+                    and not last_binding.over
                     and last_active.age_s is not None
                     and last_active.age_s <= WALL_FALLBACK_S
                 ):

@@ -12956,6 +12956,39 @@ class TestActiveUnknownIsNotReportedAsAnExhaustedFleet:
             f"{[type(e).__name__ for e in harness.events]}"
         )
 
+    def test_active_unknown_under_a_weekly_line_holds_on_the_binding_window(
+        self, harness
+    ):
+        """The hold tests the active's last read against EACH window's own
+        line, not the one raw threshold: 5h 5 / 7d 93 is 93% used overall
+        (over T85) but 7d sits under its W97 line, so the active is healthy
+        and the tick must hold, not report an exhausted fleet."""
+        harness.engine.settings = replace(
+            harness.engine.settings,
+            unhealthy_ticks=1, threshold=85.0, weekly_threshold=97.0,
+        )
+        entries = {
+            "1": UsageEntry(
+                last_good=_usage7(5.0, 93.0),
+                fetched_at=harness.clock.now - 5000.0,
+                age_s=5000.0,
+                consecutive_failures=1,
+                last_error="http-429",
+            ),
+            "2": _entry_for(_usage(100.0), harness.clock.now),
+            "3": _entry_for(_usage(100.0), harness.clock.now),
+        }
+        outcome = harness.tick_with_entries(entries)
+        assert outcome is TickOutcome.BLOCKED
+        assert not [e for e in harness.events if isinstance(e, AllExhaustedEvent)], (
+            "the active's last read was under its own weekly line -- the "
+            "fleet was never measured exhausted"
+        )
+        assert any(
+            isinstance(e, NoSwitchEvent) and "active usage unknown" in e.detail
+            for e in harness.events
+        ), [type(e).__name__ for e in harness.events]
+
     def test_a_known_spent_active_still_reports_all_exhausted(self, harness):
         """CONTROL: a genuinely spent (not unknown) active must be
         unaffected -- the new guard only reads on `active_headroom is None`.
@@ -13071,7 +13104,7 @@ class TestActiveUnknownIsNotReportedAsAnExhaustedFleet:
         WALL_FALLBACK_S (it proves nothing about the active NOW); a last read
         AT/ABOVE the threshold (deleting the `< settings.threshold` comparison
         must fail this); and no last-good reading at all (deleting the
-        `last_active_headroom is not None` guard must fail this)."""
+        `last_binding is not None` guard must fail this)."""
         harness.engine.settings = replace(harness.engine.settings, unhealthy_ticks=1)
         if kind == "disabled":
             harness.switcher.set_account_disabled("1", True)
