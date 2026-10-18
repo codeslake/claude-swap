@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import sys
 import tempfile
@@ -33,17 +34,27 @@ _logger = logging.getLogger("claude-swap")
 class AutoSwitchSettings:
     """Policy knobs for the auto-switch engine (``cswap auto``).
 
-    ``threshold`` is binding-window utilization (max of the 5h/7d percentages):
-    at or above it the engine looks for a better account. 90 rather than 95
-    leaves margin for the macOS ~30s Keychain pickup tail and for heavy
-    subagent turns burning past the mark before a swap lands. A proactive
-    candidate must itself sit below the threshold (never land somewhere that
-    re-triggers next tick) and beat the active account's utilization by at
-    least ``hysteresis_pct``, so two accounts hovering at the line never
-    ping-pong while a strictly better account is always taken.
+    ``threshold`` is the switch line for the 5-hour window and, while
+    ``weekly_threshold`` is unset, for every window: each of an account's
+    usage windows (5h, 7d, and any per-model window named by ``model``) is
+    judged against its own line, and the engine looks for a better account
+    once any of them is at or over it. 90 rather than 95 leaves margin for the
+    macOS ~30s Keychain pickup tail and for heavy subagent turns burning past
+    the mark before a swap lands. ``weekly_threshold`` gives the 7-day window
+    and the per-model windows (they all reset weekly) their own line: the
+    weekly window is the budget, so it is worth running closer to its ceiling
+    than the 5-hour window, which recycles in hours. A proactive candidate
+    must itself sit below each of its lines (never land somewhere that
+    re-triggers next tick) and beat the active account by at least
+    ``hysteresis_pct`` points of headroom measured against those lines, so two
+    accounts hovering at the line never ping-pong while a strictly better
+    account is always taken.
     """
 
     threshold: float = 90.0
+    # Switch line for the 7-day window and every per-model scoped window.
+    # None = ``threshold`` governs every window (the default, today's policy).
+    weekly_threshold: float | None = None
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
@@ -106,7 +117,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     for spec in (
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
-            help="Switch when the binding 5h/7d window reaches this pct",
+            help="Switch when the 5h window (or any window, if no weekly line) reaches this pct",
+        ),
+        SettingSpec(
+            "autoswitch", "weeklyThreshold", "weekly_threshold", "float", 50.0, 99.9,
+            help="Switch line for the 7d and per-model windows (unset: threshold)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -118,7 +133,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
-            help="A target must beat the active account by this many pct",
+            help="A target must beat the active account by this many pct of headroom",
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
@@ -177,8 +192,17 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
 
-    def num(value, default: float, lo: float, hi: float) -> float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+    def num(value, default: float | None, lo: float, hi: float) -> float | None:
+        # json.loads accepts NaN/Infinity literals and min/max pass NaN
+        # through unclamped, so a non-finite float is garbage too (a NaN line
+        # would silently never be crossed). Floats only: an int is always
+        # finite, and isfinite() would overflow on one too large for a float
+        # — the clamp below handles that without ever converting it.
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or (isinstance(value, float) and not math.isfinite(value))
+        ):
             return default
         return float(min(max(value, lo), hi))
 
@@ -327,8 +351,15 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
         value = int(raw_value) if spec.kind == "int" else float(raw_value)
     except ValueError:
         noun = "an integer" if spec.kind == "int" else "a number"
+        # An optional number has no spelling for "unset" here; point at the
+        # command that clears it instead of leaving "none" as a dead end.
+        hint = (
+            f"; use 'cswap config unset {spec.dotted}' to clear it"
+            if spec.default is None
+            else ""
+        )
         raise ConfigError(
-            f"{spec.dotted} expects {noun}, got '{raw_value}'"
+            f"{spec.dotted} expects {noun}, got '{raw_value}'{hint}"
         ) from None
     if not spec.lo <= value <= spec.hi:
         raise ConfigError(
@@ -440,6 +471,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     overrides = {}
     for attr, field in (
         ("threshold", "threshold"),
+        ("weekly_threshold", "weekly_threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
