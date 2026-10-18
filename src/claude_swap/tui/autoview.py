@@ -36,6 +36,7 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
+from claude_swap.lines import BindingWindow, binding_window
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
@@ -74,6 +75,15 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 
 
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
+
+
+def _line_note(binding: BindingWindow | None, label: str, weekly: float | None) -> str:
+    """The "(line 97%)" note after the BINDING window's chip, once a weekly line
+    makes the lines differ: the raw pct stays, and the line it is judged
+    against is named only where it is not the one number in the header."""
+    if weekly is None or binding is None or label != binding.label:
+        return ""
+    return f" (line {pct_label(binding.line)}%)"
 
 
 class AutoScreen(Screen):
@@ -132,6 +142,9 @@ class AutoScreen(Screen):
         self._configured_threshold = self._settings.threshold
         self.app.threshold_pct = self._settings.threshold
         self._configured_strategy = self._settings.strategy
+        # The weekly line is not session-adjustable, so this is only the same
+        # sync-to-the-file correction; nothing to restore on unmount.
+        self.app.weekly_threshold_pct = self._settings.weekly_threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
@@ -218,6 +231,10 @@ class AutoScreen(Screen):
         self.app.threshold_pct = value
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
+        # The Next best list ranks by the lines in force, so it must follow
+        # the session value now rather than at the next snapshot: under a
+        # weekly line the order and the 5h rows' "(line N%)" both move.
+        self._on_snapshot(self.app.snapshot)
 
     def action_cycle_strategy(self) -> None:
         # Session-only, exactly like `t`/threshold above: never written to
@@ -250,6 +267,10 @@ class AutoScreen(Screen):
         text.append(f" · {self._settings.strategy}")
         if self._settings.strategy != self._configured_strategy:
             text.append(" (session)", style=palette.muted)
+        if self._settings.weekly_threshold is not None:
+            text.append(
+                f" · weekly {pct_label(self._settings.weekly_threshold)}%"
+            )
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
@@ -356,10 +377,15 @@ class AutoScreen(Screen):
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
         """Switch targets ranked the way the engine's strategy would rank them."""
-        # Same window set as the engine (autoswitch.model included), so the
-        # displayed ranking can never disagree with the account it picks.
+        # Same window set AND the same lines as the engine: autoswitch.model,
+        # the threshold (the session value — `_settings` is what
+        # `_set_threshold` replaces) and the weekly line, so the displayed
+        # ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
-        models = parse_model_names(self._settings.model) if self._settings else ()
+        settings = self._settings
+        models = parse_model_names(settings.model) if settings else ()
+        threshold = settings.threshold if settings else 90.0
+        weekly = settings.weekly_threshold if settings else None
         # Same strategy the engine ticks on, so the panel's order can never
         # disagree with the account a tick would actually switch to.
         consume_first = bool(
@@ -383,7 +409,6 @@ class AutoScreen(Screen):
         # and a "full" block stays blocked either way.
         rank_models = models
         if models and self._settings and self._settings.strategy == "dynamic":
-            threshold = self._settings.threshold
             for acc in snap.accounts:
                 if (
                     acc.number == active_number
@@ -398,7 +423,7 @@ class AutoScreen(Screen):
                         acc.usage.last_good, models
                     )
                 )
-                kind, _ = classify_candidate_block(windows, threshold)
+                kind, _ = classify_candidate_block(windows, threshold, weekly)
                 if kind == "open":
                     break
             else:
@@ -431,16 +456,19 @@ class AutoScreen(Screen):
             row_windows[acc.number] = oauth.relevant_windows(acc.usage.last_good, models)
         # The column set is the union of window names over every chip row, in
         # first-seen order; a row without a window gets a blank cell, so no
-        # later column moves. (label text, pct text) widths per column.
-        chip_width: dict[str, tuple[int, int]] = {}
+        # later column moves. (label text, pct text, `(line X%)` note) widths per
+        # column; the note is part of its column so the chips after it stay put.
+        chip_width: dict[str, tuple[int, int, int]] = {}
         for windows in row_windows.values():
+            bound = binding_window(windows, threshold, weekly)
             for label, wpct, resets_at in windows:
-                label_w, pct_w = chip_width.get(label, (0, 0))
+                label_w, pct_w, note_w = chip_width.get(label, (0, 0, 0))
                 chip_width[label] = (
                     max(label_w, len(data.chip_label(
                         label, data.reset_text({"resets_at": resets_at}, now)
                     ))),
                     max(pct_w, len(f"{wpct:.0f}%")),
+                    max(note_w, len(_line_note(bound, label, weekly))),
                 )
         # 5h and 7d lead whatever row came first (sorted is stable, so the
         # rest keep first-seen order).
@@ -476,7 +504,9 @@ class AutoScreen(Screen):
                 lines[acc.number] = entry
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
-            pct = binding_pct(acc.usage.last_good, models)
+            binding = binding_window(
+                oauth.relevant_windows(acc.usage.last_good, models), threshold, weekly
+            )
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
             entry.append(f"{acc.email:<{email_width}}", style=palette.foreground)
@@ -485,9 +515,9 @@ class AutoScreen(Screen):
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
                 ranked.append(((998.0,), acc.number))
-            elif pct is None:
+            elif binding is None:
                 # An extra-usage (pay-as-you-go) account has no 5h/7d window,
-                # so binding_pct answers None — but it is not unknown, it has
+                # so binding_window answers None — but it is not unknown, it has
                 # a SPEND budget, and the watch screen already renders it.
                 # `relevant_windows` excludes spend on purpose (a separate
                 # axis from a rate-limit window), so this row was the only
@@ -516,12 +546,12 @@ class AutoScreen(Screen):
                 windows = row_windows[acc.number]
                 have = {label: (wpct, resets_at) for label, wpct, resets_at in windows}
                 shown = False
-                for i, (label, (label_w, pct_w)) in enumerate(
+                for i, (label, (label_w, pct_w, note_w)) in enumerate(
                     chip_width.items() if windows else ()
                 ):
                     sep = "  " if i == 0 else " · " if shown else "   "
                     if label not in have:
-                        entry.append(" " * (len(sep) + label_w + pct_w))
+                        entry.append(" " * (len(sep) + label_w + pct_w + note_w))
                         continue
                     wpct, resets_at = have[label]
                     label_text = data.chip_label(
@@ -536,9 +566,11 @@ class AutoScreen(Screen):
                         style=palette.muted,
                     )
                     entry.append(pct_text, style=palette.severity(wpct))
+                    entry.append(
+                        _line_note(binding, label, weekly).ljust(note_w),
+                        style=palette.muted,
+                    )
                     shown = True
-                if not windows:  # no window data at all — keep the old reading
-                    entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
                 # a model-only block (the engine's fallback ranks around it),
@@ -551,19 +583,27 @@ class AutoScreen(Screen):
                 kind, blocked_model = "open", None
                 if self._settings:
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows), self._settings.threshold
+                        ((label, p) for label, p, _ in windows), threshold, weekly
                     )
                 if kind == "model":
                     entry.append(f"  {blocked_model}-only", style=palette.muted)
                 elif kind == "full":
                     entry.append(f"  {blocked_model} full", style=palette.muted)
-                rank_pct = binding_pct(acc.usage.last_good, rank_models)
+                rank_binding = binding_window(
+                    oauth.relevant_windows(acc.usage.last_good, rank_models),
+                    threshold,
+                    weekly,
+                ) or binding
                 key = (
                     consume_first_rank_key(
-                        acc.usage.last_good, self._settings.threshold, now, rank_models
+                        acc.usage.last_good,
+                        threshold,
+                        now,
+                        rank_models,
+                        weekly_threshold=weekly,
                     )
                     if consume_first
-                    else (pct if rank_pct is None else rank_pct,)
+                    else (-rank_binding.line_headroom,)
                 )
                 ranked.append((key, acc.number))
             # The chip block's blank cells only exist to line up what follows
