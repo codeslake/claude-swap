@@ -16951,6 +16951,78 @@ class TestPerAccountSwitchThreshold:
         poll = next(e for e in h.events if isinstance(e, PollEvent))
         assert "7d 90% used (switch at 97%)" in poll.human()
 
+    # A bar is an account's own 5h line; the headroom scale the lines are
+    # scored on stays ONE number for the fleet (lines.line_headroom's third
+    # argument), or a lower bar inflates a weekly window's score.
+
+    @staticmethod
+    def _composed_harness(
+        temp_home, strategy, hysteresis_pct=10.0, weekly_threshold=97.0
+    ):
+        h = EngineHarness(
+            temp_home, strategy=strategy, threshold=85.0,
+            weekly_threshold=weekly_threshold, hysteresis_pct=hysteresis_pct,
+        )
+        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_peers_own_line_does_not_inflate_its_weekly_window_in_the_gate(
+        self, temp_home
+    ):
+        # Both peers sit at 5h 50 / 7d 93: 18.5 policy points against the
+        # active's 10, short of the margin. 3's own 70 once rescaled its 7d
+        # window to 32.9 and got it admitted.
+        h = self._composed_harness(temp_home, "best")
+        self._set(h, 3, 70.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(90, 10), "2": _usage7(50, 93), "3": _usage7(50, 93),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_a_peers_own_line_does_not_inflate_its_weekly_window_in_the_rank(
+        self, temp_home, strategy
+    ):
+        # Equal peers rank by sequence order (2); 3's own 70 once put it first.
+        h = self._composed_harness(temp_home, strategy, hysteresis_pct=5.0)
+        self._set(h, 3, 70.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(90, 10), "2": _usage7(50, 93), "3": _usage7(50, 93),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_an_active_with_its_own_line_over_its_weekly_line_still_clears_hysteresis(
+        self, temp_home
+    ):
+        # 7d 98 over W97 is 10 policy points whatever the active's own 5h
+        # line (60 once made it 26.7 and refused the 30-point peer).
+        h = self._composed_harness(temp_home, "best")
+        self._set(h, 1, 60.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 98), "2": _usage7(70, 10), "3": _usage7(95, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_without_a_weekly_line_an_own_line_gates_but_never_rescales(
+        self, temp_home
+    ):
+        # One line per account: 3 (own 70, 5h 55) keeps its 45 raw points
+        # against 2's 40, so the strategy still takes the roomier account.
+        h = self._composed_harness(
+            temp_home, "best", hysteresis_pct=5.0, weekly_threshold=None
+        )
+        self._set(h, 3, 70.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(90, 10), "2": _usage7(60, 10), "3": _usage7(55, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
 class TestWeeklyThreshold:
     """`autoswitch.weeklyThreshold`: a separate switch line for the 7d and
     per-model windows, applied where the engine compares (lines.py) while
@@ -17030,6 +17102,16 @@ class TestWeeklyThreshold:
             windows={"1": {"5h": 42.0, "7d": 10.0}},
         )
         assert "5h 42% used (switch at 90%)" in default.human()
+
+    def test_dynamic_does_not_quote_a_weekly_line_it_does_not_leave_on(self, temp_home):
+        # dynamic leaves at its own ~97% bar, so 7d 96 under W95 holds: the
+        # log must not print "(switch at 95%)" beside it.
+        h = self._harness(temp_home, strategy="dynamic", weekly_threshold=95.0)
+        outcome = h.tick_with_usage({"1": _usage7(5, 96), "2": _usage7(5, 5)})
+        assert outcome is TickOutcome.NO_ACTION
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "7d 96% used (switch at 97%)" in poll.human()
+        assert "weeklyThreshold" not in poll.to_json()
 
     def test_s2_a_weekly_bound_candidate_is_taken_over_a_5h_bound_active(
         self, temp_home

@@ -89,10 +89,14 @@ def binding_window(
     windows: Iterable[tuple[str, float, str | None]],
     threshold: float,
     weekly_threshold: float | None = None,
+    anchor: float | None = None,
 ) -> BindingWindow | None:
     """The window with the least policy headroom, over-line windows first;
     ties keep the first in ``relevant_windows`` order (5h, 7d, then scoped).
-    ``None`` when the account reports no window.
+    ``None`` when the account reports no window. ``anchor`` is
+    ``line_headroom``'s third argument (default ``threshold``): a caller whose
+    ``threshold`` is one account's own 5h line passes the fleet's common
+    value, or two accounts would score the same window on different scales.
 
     Over-line first makes ``binding.over == any(window at/over its line)``
     hold by construction, so the trigger, the landing gate and the all-above
@@ -103,10 +107,12 @@ def binding_window(
     """
     best: BindingWindow | None = None
     best_key: tuple[bool, float] | None = None
+    if anchor is None:
+        anchor = threshold
     for label, pct, resets_at in windows:
         line = window_line(label, threshold, weekly_threshold)
         window = BindingWindow(
-            label, pct, line, resets_at, line_headroom(pct, line, threshold)
+            label, pct, line, resets_at, line_headroom(pct, line, anchor)
         )
         key = (not window.over, window.line_headroom)
         if best_key is None or key < best_key:

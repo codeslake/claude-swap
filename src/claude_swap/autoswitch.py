@@ -196,6 +196,16 @@ def proactive_switch_bar_pct(strategy: str, threshold: float) -> float:
     return threshold
 
 
+def _line_anchor(settings: AutoSwitchSettings) -> float | None:
+    """The one number every account's windows are scored against
+    (``lines.line_headroom``'s anchor), so an own bar -- an account's own 5h
+    LINE -- moves where it is over, never how its weekly window scores.
+    ``None`` without a weekly line: one line per account, raw headroom."""
+    if settings.weekly_threshold is None:
+        return None
+    return proactive_switch_bar_pct(settings.strategy, settings.threshold)
+
+
 # Strategies that rank by soonest weekly reset rather than most headroom.
 # `dynamic` shares consume-first's ranking key (and every gate keyed on the
 # below-threshold "consume-first" trigger, which this literal also drives —
@@ -683,7 +693,8 @@ class PollEvent(AutoSwitchEvent):
     # design" into "could not read". Additive field.
     spend: dict[str, dict] = field(default_factory=dict)
     # The switch line of the weekly windows (7d and per-model) when one is
-    # configured; ``threshold`` stays the 5h window's. Additive field, emitted
+    # configured and the strategy leaves on it (not ``dynamic``);
+    # ``threshold`` stays the 5h window's. Additive field, emitted
     # only when set. Every pct above stays RAW: the lines are applied where
     # the engine compares, never to the numbers it logs.
     weekly_threshold: float | None = None
@@ -1034,6 +1045,7 @@ def consume_first_rank_key(
     models: Sequence[str] = (),
     *,
     weekly_threshold: float | None = None,
+    anchor: float | None = None,
 ) -> tuple:
     """Consume-first sort key for one candidate account.
 
@@ -1055,6 +1067,7 @@ def consume_first_rank_key(
         oauth.relevant_windows(usage if isinstance(usage, dict) else None, models),
         threshold,
         weekly_threshold,
+        anchor,
     )
     over = binding.over if binding is not None else (100.0 - h) >= threshold
     lh = binding.line_headroom if binding is not None else h
@@ -2089,7 +2102,11 @@ class AutoSwitchEngine:
                 threshold=settings.threshold,
                 switch_bar=self._bars.get(current, bar),
                 landing_bars={num: self._bars.get(num, bar) for num in headroom},
-                weekly_threshold=settings.weekly_threshold,
+                # `dynamic` leaves at `switch_bar` and ranks landings on raw
+                # headroom: the weekly line is not its switch line.
+                weekly_threshold=(
+                    None if settings.strategy == "dynamic" else settings.weekly_threshold
+                ),
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -4326,6 +4343,7 @@ class AutoSwitchEngine:
                 key = consume_first_rank_key(
                     usage.get(num), cand_bar, now, models,
                     weekly_threshold=settings.weekly_threshold,
+                    anchor=_line_anchor(settings),
                 )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
@@ -4799,7 +4817,8 @@ class AutoSwitchEngine:
         it, so the binding and the headroom beside it read ONE set.
         ``threshold`` replaces ``settings.threshold`` as the 5h line (and the
         weekly lines while no weekly line is set): an account's own switch
-        threshold, or the strategy's bar (#321)."""
+        threshold, or the strategy's bar (#321). The score stays on
+        ``_line_anchor``'s one scale."""
         return binding_window(
             oauth.relevant_windows(
                 value if isinstance(value, dict) else None,
@@ -4807,6 +4826,7 @@ class AutoSwitchEngine:
             ),
             settings.threshold if threshold is None else threshold,
             settings.weekly_threshold,
+            _line_anchor(settings),
         )
 
     def _over(
