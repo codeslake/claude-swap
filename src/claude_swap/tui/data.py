@@ -242,6 +242,16 @@ def read_last_active_at(backup_dir: Path) -> dict:
     return last_active_at if isinstance(last_active_at, dict) else {}
 
 
+def switch_bars(snap: AccountsSnapshot) -> dict[str, float]:
+    """Each account's own switch threshold, as the engine reads it (`_bars`);
+    an account without one is absent and takes the strategy's bar."""
+    return {
+        acc.number: acc.switch_threshold
+        for acc in snap.accounts
+        if acc.switch_threshold is not None
+    }
+
+
 def rank_switch_candidates(
     snap: AccountsSnapshot,
     settings: "AutoSwitchSettings",
@@ -261,12 +271,7 @@ def rank_switch_candidates(
     consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
     usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
     entries = {acc.number: acc.usage for acc in snap.accounts}
-    # Each account's own switch threshold, as the engine reads it (`_bars`).
-    bars = {
-        acc.number: acc.switch_threshold
-        for acc in snap.accounts
-        if acc.switch_threshold is not None
-    }
+    bars = switch_bars(snap)
     oauth_candidates = [
         acc.number
         for acc in snap.accounts

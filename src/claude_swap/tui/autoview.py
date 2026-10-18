@@ -29,13 +29,13 @@ from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
+    _binding_at,
     classify_candidate_block,
     model_block_label,
     pct_label,
     proactive_switch_bar_pct,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
-from claude_swap.lines import binding_window
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -413,7 +413,7 @@ class AutoScreen(Screen):
         models = parse_model_names(self._settings.model) if self._settings else ()
         settings = self._settings or AutoSwitchSettings()
         weekly = settings.weekly_threshold
-        # THE BAR EVERY ADMISSION/LABEL DECISION BELOW READS (#321): under
+        # THE STRATEGY'S BAR, EVERY ROW'S FALLBACK (#321; see `row_bar`): under
         # `dynamic` this is `proactive_switch_bar_pct`'s 97, not the raw
         # `settings.threshold` — a candidate with hours left on its reset
         # is headroom `dynamic` exists to spend, not a blocked one. Every
@@ -422,6 +422,7 @@ class AutoScreen(Screen):
         # directly, which can be `None` before `on_mount` loads it) so the
         # bar can never read a DIFFERENT strategy than the ranking below.
         bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
+        bars = data.switch_bars(snap)
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
         now = time.time()
@@ -483,9 +484,10 @@ class AutoScreen(Screen):
                 lines[acc.number] = entry
                 ranked.append(((1001.0,), acc.number))
                 continue
-            binding = binding_window(
-                oauth.relevant_windows(acc.usage.last_good, models), bar, weekly
-            )
+            # THIS row's bar: its own threshold when it has one, as the engine
+            # lands on it (`_rank_candidates_pass`), else the strategy's.
+            row_bar = bars.get(acc.number, bar)
+            binding = _binding_at(acc.usage.last_good, settings, models, row_bar)
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
             entry.append(acc.email, style=palette.foreground)
@@ -574,8 +576,8 @@ class AutoScreen(Screen):
                 # a model-only block (the engine's fallback ranks around it).
                 # The CLASSIFICATION (open/model/full) reads the same way
                 # here as in the decision log — same helper,
-                # `classify_candidate_block`, the same strategy-aware `bar`
-                # the engine's own landing gate reads (#321). It still does
+                # `classify_candidate_block`, the same row bar the engine's
+                # own landing gate reads (#321). It still does
                 # not fold in the engine's other, separate, stricter landing
                 # floor -- `cold_switch_cost_pct` in autoswitch.py -- a
                 # candidate clearing this label can still fail that one. The
@@ -590,7 +592,7 @@ class AutoScreen(Screen):
                 kind = "open"
                 if self._settings:
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows), bar, weekly,
+                        ((label, p) for label, p, _ in windows), row_bar, weekly,
                     )
                     if kind == "model":
                         entry.append(

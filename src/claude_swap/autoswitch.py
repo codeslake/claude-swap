@@ -4908,33 +4908,15 @@ class AutoSwitchEngine:
         self,
         value: dict | str | None,
         settings: AutoSwitchSettings,
-        models: Sequence[str] | None = None,
         *,
         threshold: float | None = None,
     ) -> BindingWindow | None:
         """The window binding this account under the tick's lines (see
-        ``_binding_at``), or None when it reports no window. Reads only
-        ``models`` (default ``self._models``) and the ``settings`` it is
-        handed, never ``self.settings``: a tick snapshots its settings once,
-        and the ranking helpers are exercised directly on bare engines. A
-        caller ranking on another window set (dynamic's 5h/7d retry) passes
-        it, so the binding and the headroom beside it read ONE set."""
-        return _binding_at(
-            value, settings, self._models if models is None else models, threshold
-        )
-
-    def _over(
-        self,
-        value: dict | str | None,
-        settings: AutoSwitchSettings,
-        models: Sequence[str] | None = None,
-        threshold: float | None = None,
-    ) -> bool | None:
-        """Whether any window is at or over its line (``_binding``'s
-        verdict); None when the account reports no window."""
-        return _over_at(
-            value, settings, self._models if models is None else models, threshold
-        )
+        ``_binding_at``), or None when it reports no window. Reads
+        ``self._models`` and the ``settings`` it is handed, never
+        ``self.settings``: a tick snapshots its settings once, and the
+        ranking helpers are exercised directly on bare engines."""
+        return _binding_at(value, settings, self._models, threshold)
 
     def _in_cooldown(self, state: dict) -> bool:
         """Time-gate a rapid re-switch.

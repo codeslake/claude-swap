@@ -1582,8 +1582,8 @@ def _warm_fixture_accounts():
     ]
 
 
-def _autoview_order(snap, active, settings, last_active_at=None):
-    """The account numbers "Next best" renders, in its own displayed order."""
+def _autoview_text(snap, active, settings, last_active_at=None):
+    """The "Next best" panel's rendered text."""
     from unittest.mock import MagicMock, patch
 
     from claude_swap.tui.autoview import AutoScreen
@@ -1594,7 +1594,12 @@ def _autoview_order(snap, active, settings, last_active_at=None):
     v._last_active_at = last_active_at or {}
     app = MagicMock(current_theme=CSWAP_DARK)
     with patch.object(AutoScreen, "app", property(lambda s: app)):
-        rendered = str(v._candidates_text(snap, active_number=active))
+        return str(v._candidates_text(snap, active_number=active))
+
+
+def _autoview_order(snap, active, settings, last_active_at=None):
+    """The account numbers "Next best" renders, in its own displayed order."""
+    rendered = _autoview_text(snap, active, settings, last_active_at)
     others = [acc.number for acc in snap.accounts if acc.number != active]
     return sorted(others, key=lambda n: rendered.index(f"user{n}@example.com"))
 
@@ -1979,6 +1984,30 @@ class TestRankSwitchOwnBars:
         )
         assert (trigger, unmodeled) == ("proactive", False)
         assert ordered == ["2"], ordered
+
+    def test_a_row_reads_its_own_bar_in_its_line_chip_and_its_block(self):
+        """The row text is the engine's reading too: #2 (5h 70%, own bar 60)
+        under best/90 beside a 97 weekly line is refused at 60, so its chip
+        names line 60 (not the strategy's 90) and the block is the window's,
+        not an unexplained "not a candidate"."""
+        settings = AutoSwitchSettings(
+            strategy="best", threshold=90.0, weekly_threshold=97.0
+        )
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(95.0, 10.0)),
+                make_account(2, entry=make_entry(70.0, 10.0), switch_threshold=60.0),
+                make_account(3, entry=make_entry(75.0, 10.0)),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        rows = _autoview_text(snap, "1", settings).split("\n")
+        row2 = next(r for r in rows if "user2@example.com" in r)
+        row3 = next(r for r in rows if "user3@example.com" in r)
+        assert re.search(r"5h\S*:70% \(line 60%\)", row2), row2
+        assert "not a candidate" not in row2, row2
+        assert re.search(r"5h\S*:75% \(line 90%\)", row3), row3
 
     def test_dynamic_walls_the_active_at_its_own_bar_and_refuses_peers_past_theirs(
         self,
