@@ -5655,6 +5655,38 @@ class TestConsumeFirstProbesAnUnknownReset:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == trigger
 
+    @pytest.mark.parametrize(
+        "weekly,picks",
+        [
+            # A: 5h 50 / 7d 88 (raw 12, line headroom 22.9 under W97); B: 5h
+            # 84 / 7d 10 (raw 16, line headroom 16, one point from its 5h
+            # line). The probe's key puts -inf in the reset field, so the
+            # pick IS the switch target: raw headroom parks on B.
+            (97.0, 2),
+            # No weekly line: raw headroom IS the line headroom, B wins.
+            (None, 3),
+        ],
+    )
+    def test_the_probe_pick_ranks_headroom_against_each_windows_own_line(
+        self, temp_home, weekly, picks
+    ):
+        h = EngineHarness(
+            temp_home, strategy="consume-first", threshold=85.0,
+            weekly_threshold=weekly,
+        )
+        for num, email in ((1, "a"), (2, "b"), (3, "c")):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(50, 88),   # UNKNOWN reset
+            "3": _usage7(84, 10),   # UNKNOWN reset
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == picks
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "probe"
+
     def test_an_elapsed_reset_is_treated_as_a_probe_candidate(
         self, temp_home
     ):
@@ -5688,7 +5720,7 @@ class TestConsumeFirstProbesAnUnknownReset:
         active = _usage7(20.0, 97.0, _R_LATER)
         usage = {"3": _usage7(20.0, 100.0, _R_LATEST)}
         target = autoswitch_mod.select_probe_target(
-            usage, ["3"], (), active, {}, 1_000_000.0
+            usage, ["3"], (), active, {}, 1_000_000.0, 90.0, None
         )
         assert target is None, (
             f"got {target!r} — a future, known reset must never be "

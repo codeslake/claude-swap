@@ -734,11 +734,15 @@ def select_probe_target(
     active_usage: dict | str | None,
     probe_cooldown: dict[str, float] | None,
     now: float,
+    threshold: float,
+    weekly_threshold: float | None,
 ) -> str | None:
     """Which account (if any) this fleet admits as this tick's probe
     target: the readable candidate with the most headroom whose weekly
     reset is unknown or has already elapsed, and which is not cooling down
-    from a previous probe.
+    from a previous probe. Headroom is the binding window's against its own
+    line (``consume_first_rank_key``'s ``-lh``), so the pick is the account
+    the rank key would order first; with one line it is the raw headroom.
 
     ONE FUNCTION, TWO READERS — ``_rank_candidates_pass`` calls it (already
     narrowed to candidates that cleared its own servability/no-return/
@@ -776,7 +780,12 @@ def select_probe_target(
             h = 0.0
         if probe_cooldown.get(num, 0.0) > now:
             continue
-        pool.append((h, num))
+        binding = binding_window(
+            oauth.relevant_windows(value if isinstance(value, dict) else None, models),
+            threshold,
+            weekly_threshold,
+        )
+        pool.append((binding.line_headroom if binding is not None else h, num))
     if not pool:
         return None
     _, num = max(pool, key=lambda t: t[0])
@@ -1793,8 +1802,10 @@ class AutoSwitchEngine:
             # from BOTH. Keyed on the strategy, not on whether the number
             # widened: with equal headroom a model window over a weekly line
             # below the 5h line would force a departure dynamic exists to
-            # refuse. A readable headroom means a readable window, so the
-            # account-wide fallback is unreachable; kept as the exact old test.
+            # refuse. The account-wide fallback below is REACHABLE under
+            # dynamic with models and scoped-only usage (`_drop_rolled_windows`
+            # can leave only a scoped window): the model-gated headroom reads
+            # it while the 5h/7d binding finds no window. Do not delete it.
             active_binding = self._binding(
                 usage.get(current),
                 settings,
@@ -3350,12 +3361,19 @@ class AutoSwitchEngine:
                 )
             qualifying.append((key, num))
         # AT MOST ONE PROBE PER DECISION. `select_probe_target` picks the
-        # most RAW headroom among `probe_candidates` (the key's `-lh` is the
-        # same number while the lines are equal) -- the shared function this
-        # pass and the "Next best" panel both call, so neither re-derives the
-        # predicate.
+        # most LINE headroom among `probe_candidates` (the key's `-lh`, so the
+        # probe is the account the key would order first) -- the shared
+        # function this pass and the "Next best" panel both call, so neither
+        # re-derives the predicate.
         probe_num = select_probe_target(
-            usage, probe_candidates, models, usage.get(current), probe_cooldown, now
+            usage,
+            probe_candidates,
+            models,
+            usage.get(current),
+            probe_cooldown,
+            now,
+            settings.threshold,
+            settings.weekly_threshold,
         )
         if probe_num is not None:
             qualifying.append((

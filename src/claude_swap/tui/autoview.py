@@ -483,6 +483,8 @@ class AutoScreen(Screen):
                 active_value,
                 self._engine._last_probe_cooldown if self._engine is not None else None,
                 now,
+                threshold,
+                weekly,
             )
         # Chip columns are keyed by WINDOW NAME, never by position: two rows
         # can have different-length window lists built from that account's
