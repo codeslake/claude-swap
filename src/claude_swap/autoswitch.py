@@ -677,6 +677,10 @@ class PollEvent(AutoSwitchEvent):
     # threshold, else the strategy's bar), for `_describe`. Not serialized;
     # a number it lacks falls back to `switch_bar`.
     landing_bars: dict[str, float] = field(default_factory=dict)
+    # The tick's strategy, for `human()`: under `dynamic` the active leaves on
+    # raw headroom against its own bar, so the weekly line is not the line it
+    # is quoted against. Not serialized.
+    strategy: str | None = None
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
     # accounts whose usage is unknown this tick. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
@@ -768,7 +772,7 @@ class PollEvent(AutoSwitchEvent):
             binding = binding_window(
                 ((label, pct, None) for label, pct in wins.items()),
                 bar,
-                self.weekly_threshold,
+                None if self.strategy == "dynamic" else self.weekly_threshold,
             )
             used = f"{binding.label} {binding.pct:.0f}% used"
             line = binding.line
@@ -2091,7 +2095,12 @@ class AutoSwitchEngine:
             current,
             quarantined,
             threshold=self._bars.get(current, settings.threshold),
-            weekly_threshold=settings.weekly_threshold,
+            # `dynamic` leaves on raw headroom against the own bar, every
+            # window alike (`_classify_dynamic_trigger`): a weekly line would
+            # put the escalation band above a switch the trigger already makes.
+            weekly_threshold=(
+                None if settings.strategy == "dynamic" else settings.weekly_threshold
+            ),
         )
         bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
         self._emit(
@@ -2101,6 +2110,7 @@ class AutoSwitchEngine:
                 threshold=settings.threshold,
                 switch_bar=self._bars.get(current, bar),
                 landing_bars={num: self._bars.get(num, bar) for num in headroom},
+                strategy=settings.strategy,
                 weekly_threshold=settings.weekly_threshold,
                 fetch_errors={
                     num: entry.last_error
