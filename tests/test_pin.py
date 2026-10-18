@@ -1661,18 +1661,20 @@ class TestTheWiringCanAlwaysBeRemoved:
     def test_the_untimed_deadline_is_a_total_not_a_per_path_allowance(
         self, tmp_path, monkeypatch
     ):
-        """Two live-held locks: 9.29s unmutated vs 18.03s
-        with ``timeout = DEFAULT_TIMEOUT_S * len(paths)`` — exactly the 2x
-        regression the shared-deadline comment says this was added to fix, on
-        the UNTIMED call (``clear_wiring(sw)``, no explicit ``timeout``).
+        """The UNTIMED call (``clear_wiring(sw)``, no explicit ``timeout``)
+        resolves ``DEFAULT_TIMEOUT_S`` itself, and that is a TOTAL for all the
+        configs: with ``timeout = DEFAULT_TIMEOUT_S * len(paths)`` two held
+        locks froze it for 2x the default (18.03s against 9.29s), the multiple
+        of the configs the shared-deadline comment says this was added to fix.
 
         Every other test here passes an explicit ``timeout``, so none of them
-        exercises the branch that resolves ``DEFAULT_TIMEOUT_S`` itself. Fast
-        by construction: ``DEFAULT_TIMEOUT_S`` is shrunk before the call, so
-        the whole test runs in under a second rather than 9-18.
-        """
-        import time
+        exercises that branch.
 
+        WHAT IS ASSERTED IS THE ALLOWANCE HANDED TO THE FIRST LOCK, never the
+        elapsed wall time: with two paths the fair share is half the total,
+        and the doubled total hands over all of it. A wall-time bar failed on
+        a Windows CI runner (0.83s against 0.65s) on unchanged code.
+        """
         import claude_swap.claude_locks as claude_locks
         import claude_swap.paths as paths
         from claude_swap import pin
@@ -1683,9 +1685,21 @@ class TestTheWiringCanAlwaysBeRemoved:
         monkeypatch.setattr(paths, "get_global_config_path", lambda: session)
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: default)
         # Shrink the DEFAULT this function resolves internally when no
-        # timeout is passed — the mutation under test doubles WHATEVER this
-        # is, so a small value keeps the doubled case fast too.
+        # timeout is passed, so both held locks time out in under a second.
         monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.4)
+
+        real_proper_lockfile = claude_locks.proper_lockfile
+        shares = []
+
+        @contextlib.contextmanager
+        def _recording_lockfile(lock_dir, **kwargs):
+            shares.append(kwargs["timeout"])
+            with real_proper_lockfile(lock_dir, **kwargs):
+                yield
+
+        # `clear_wiring` imports `proper_lockfile` inside its own body, so the
+        # module attribute is what each call re-resolves to.
+        monkeypatch.setattr(claude_locks, "proper_lockfile", _recording_lockfile)
 
         # BOTH locks live-held, for real: a stubbed lock would not exercise
         # clear_wiring's own per-path share arithmetic.
@@ -1694,20 +1708,20 @@ class TestTheWiringCanAlwaysBeRemoved:
         session_lock.mkdir()
         default_lock.mkdir()
         try:
-            start = time.monotonic()
             changed = pin.clear_wiring(ClaudeAccountSwitcher())  # no timeout
-            elapsed = time.monotonic() - start
         finally:
             session_lock.rmdir()
             default_lock.rmdir()
 
         assert not changed, "fixture invalid: nothing should have been removed"
-        # 1x the (shrunk) default plus slack, never 2x it — the doubled
-        # mutation reliably clears this bar (0.8s and up against a 0.4s
-        # DEFAULT_TIMEOUT_S here; the fix stays under ~0.5s).
-        assert elapsed < 0.65, (
+        assert len(shares) == 2, "fixture invalid: both configs must be attempted"
+        # Fair share: half the total, at most. 0.75 sits between that (0.2s
+        # here, less by the microseconds already spent) and the doubled
+        # total's whole 0.4s, so neither side depends on how fast the host is.
+        assert shares[0] < claude_locks.DEFAULT_TIMEOUT_S * 0.75, (
             f"the untimed deadline behaved as a PER-PATH allowance, not a "
-            f"total: {elapsed:.2f}s against a shrunk default of 0.4s"
+            f"total: the first of two locks was given {shares[0]:.3f}s of a "
+            f"{claude_locks.DEFAULT_TIMEOUT_S}s default"
         )
 
     def test_the_launch_path_does_not_wait_on_the_config_lock(
