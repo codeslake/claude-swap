@@ -71,15 +71,19 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
-        # The auto-switch threshold, drawn as a tick on the status strip's
-        # bars everywhere. Missing/invalid settings fall back to the default.
+        # The auto-switch lines, drawn as ticks on the status strip's bars
+        # everywhere: the threshold on the 5h row, the weekly line (when
+        # set) on the 7d and per-model rows. Missing/invalid settings fall
+        # back to the default.
         try:
             _settings = load_settings(switcher.backup_dir)
             self.threshold_pct: float | None = proactive_switch_bar_pct(
                 _settings.strategy, _settings.threshold
             )
+            self.weekly_threshold_pct: float | None = _settings.weekly_threshold
         except Exception:
             self.threshold_pct = None
+            self.weekly_threshold_pct = None
         try:
             self._theme_name = load_ui_settings(switcher.backup_dir).theme
         except Exception:
