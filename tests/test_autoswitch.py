@@ -16728,6 +16728,43 @@ class TestPerAccountSwitchThreshold:
         poll = next(e for e in h.events if isinstance(e, PollEvent))
         assert "7d 90% used (switch at 97%)" in poll.human()
 
+    def test_dynamic_states_its_own_bar_for_every_window_beside_a_weekly_line(
+        self, temp_home
+    ):
+        """`dynamic` leaves on raw headroom against the account's own 80, the
+        weekly line playing no part: the line says 80, not the 97 it never
+        compares the 7d window against (the JSON keeps the line itself)."""
+        h = self._composed_harness(temp_home, "dynamic")
+        self._set(h, 1, 80.0)
+        h.tick_with_usage({
+            "1": _usage7(10, 85), "2": _usage7(10, 50), "3": _usage7(10, 50),
+        })
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.to_json()["switchBar"] == 80.0
+        assert poll.to_json()["weeklyThreshold"] == 97.0
+        assert "7d 85% used (switch at 80%)" in poll.human()
+
+    @pytest.mark.parametrize("pct7, escalates", [(81.0, True), (64.0, False)])
+    def test_dynamic_escalates_inside_its_own_band_beside_a_weekly_line(
+        self, temp_home, pct7, escalates
+    ):
+        """Active at 7d 81 under its own 80 triggers `proactive` (19 left, the
+        wall is 20); the weekly 97 puts the escalation band at 82, so the
+        candidates it ranks on were never refetched."""
+        h = self._composed_harness(temp_home, "dynamic")
+        self._set(h, 1, 80.0)
+        values = {"1": _usage7(10, pct7), "2": _usage7(10, 50), "3": _usage7(10, 50)}
+        entries = {n: _entry_for(v, h.clock.now) for n, v in values.items()}
+        fetch_sets: list[set] = []
+
+        def spying(*args, **kwargs):
+            fetch_sets.append(set(kwargs.get("fetch") or ()))
+            return entries
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=spying):
+            h.engine.tick()
+        assert ({"1", "2", "3"} in fetch_sets) is escalates, fetch_sets
+
     # A bar is an account's own 5h line; the headroom scale the lines are
     # scored on stays ONE number for the fleet (lines.line_headroom's third
     # argument), or a lower bar inflates a weekly window's score.
