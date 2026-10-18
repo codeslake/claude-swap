@@ -13153,6 +13153,29 @@ class TestWeeklyThreshold:
             assert self._details(h) == [detail]
 
     @pytest.mark.parametrize(
+        "strategy,fable,stays_on",
+        [
+            # Headroom is 15 on the model-gated and the 5h/7d bases alike, so
+            # dynamic's widening does not fire at 82 (it does at 86, where
+            # the model window is read as no wall); the trigger must read the
+            # same 5h/7d windows at both. `best` keeps the model wall.
+            ("dynamic", 82.0, 1),
+            ("dynamic", 86.0, 1),
+            ("best", 82.0, 2),
+        ],
+    )
+    def test_dynamic_does_not_depart_for_a_model_window_over_its_weekly_line(
+        self, temp_home, strategy, fable, stays_on
+    ):
+        h = self._harness(
+            temp_home, threshold=90.0, weekly_threshold=80.0,
+            model="Fable", strategy=strategy,
+        )
+        active = {**_usage7(85, 10), "scoped": [{"name": "Fable", "pct": fable}]}
+        h.tick_with_usage({"1": active, "2": _usage7(5, 5)})
+        assert h.active_number() == stays_on
+
+    @pytest.mark.parametrize(
         "fable,weekly,expected,detail",
         [
             (90.0, 97.0, TickOutcome.NO_ACTION, "Fable 90% < 97%"),

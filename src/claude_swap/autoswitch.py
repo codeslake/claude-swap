@@ -1634,14 +1634,17 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             # Each window against its OWN line, the closest one decides (see
-            # lines.py), on the window set `active_headroom` was read on: a
-            # dynamic widening drops the model window from BOTH. A readable
-            # headroom means a readable window, so the account-wide fallback is
-            # unreachable; kept as the exact old test.
+            # lines.py), on the window set `active_headroom` was read on:
+            # under dynamic that is always 5h/7d, the model window dropped
+            # from BOTH. Keyed on the strategy, not on whether the number
+            # widened: with equal headroom a model window over a weekly line
+            # below the 5h line would force a departure dynamic exists to
+            # refuse. A readable headroom means a readable window, so the
+            # account-wide fallback is unreachable; kept as the exact old test.
             active_binding = self._binding(
                 usage.get(current),
                 settings,
-                () if active_headroom != headroom.get(current) else None,
+                () if settings.strategy == "dynamic" and self._models else None,
             )
             below = (
                 not active_binding.over
@@ -3041,7 +3044,7 @@ class AutoSwitchEngine:
                 )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
-                # back to `-h` when the label is unknown (usage without window
+                # back to `-lh` when the label is unknown (usage without window
                 # data) or the candidate does not report that window, so an
                 # account we cannot compare on the escape axis is ordered by
                 # the binding number rather than dropped.
