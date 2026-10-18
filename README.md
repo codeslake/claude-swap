@@ -87,6 +87,7 @@ Let claude-swap watch your usage and switch for you. When the active account's 5
 ```bash
 cswap auto                     # foreground loop, polls every 60s
 cswap auto --threshold 80      # switch earlier
+cswap auto --weekly-threshold 97   # let the weekly window run higher before switching
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
@@ -100,6 +101,7 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
 - An API outage (a burst of server errors on the active account's requests) moves it off immediately, whether or not it's below the threshold — the cooldown and hysteresis above don't apply, since it's the API that's failing, not the account. The account it left is held out of rotation for 15 minutes so it isn't switched straight back onto while the outage continues. Needs the `cswap-pin` request trace armed (off by default) on cswap-pin 0.1.148 or newer; it's a silent no-op on an older pin, or with the trace off.
 - **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `consume-first` (default) proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted. `best` stays put until the active account nears its limit, then moves to the account with the most quota left.
+- **A separate line for the weekly windows** (`--weekly-threshold 97`, or `cswap config set autoswitch.weeklyThreshold 97`): one threshold compared against the busiest window forces the same number on windows that want different ones — the 5-hour window recycles in hours (an overshoot costs one interrupted turn), while the weekly window is the budget (quota unspent before its reset is gone). With a weekly line, the 7-day window and any per-model window (`--model`) are judged against it and the threshold keeps governing the 5-hour window; every window is compared against its own line, so 7d 93% under a 97 line holds while 5h 95% under an 85 line switches, and the log names the window it measured (`7d 93% < 97%`). Points on different windows are not the same amount of work — the lines are comparable, the clocks are not.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
@@ -277,6 +279,7 @@ Tool preferences live in `settings.json` in the backup root; `cswap config` read
 cswap config                              # list effective settings ("(default)" = not set)
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
+cswap config set autoswitch.weeklyThreshold 97  # own switch line for the 7-day/per-model windows
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
@@ -362,13 +365,14 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
-or a managed API key (`sk-ant-api...`) and you don't want to log in via the browser
+or a Console API key (`sk-ant-api03-...` workspace key, `sk-ant-usr-...` personal
+key, or a service-account key) and you don't want to log in via the browser
 flow first — useful on headless servers or when receiving a token from another
 machine — register it directly. The token type is auto-detected:
 
 ```bash
 cswap add-token sk-ant-oat01-...             # OAuth setup-token
-cswap add-token sk-ant-api03-...             # managed API key
+cswap add-token sk-ant-api03-...             # API key (any Console key family)
 cswap add-token sk-ant-oat01-... --slot 3
 cswap add-token - --slot 3                   # read token from stdin
 cswap add-token --email user@example.com     # optional label override
@@ -377,11 +381,14 @@ cswap add-token --email user@example.com     # optional label override
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 
-**API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
-(the kind Claude Code uses after `/login` with a key) rather than an OAuth
-setup-token. It switches like any other account; since API keys have no subscription
-quota, they show no usage and the usage-aware `switch` strategies never skip them as
-rate-limited.
+**API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token
+(`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses
+after `/login` with a key) rather than an OAuth setup-token. It switches like any
+other account; since API keys have no subscription quota, they show no usage and the
+usage-aware `switch` strategies never skip them as rate-limited. Create personal and
+service-account keys scoped to a single workspace: a multi-workspace key needs an
+`anthropic-workspace-id` header on every request, which Claude Code does not add for
+a stored key.
 
 ## Uninstall
 

@@ -7,14 +7,19 @@ typed events handed to an ``on_event`` callback; the CLI renders them as
 human lines or JSONL, and any future frontend (TUI dashboard, menubar) can
 consume the same stream.
 
-Policy in one paragraph: when the active account's *binding window* (the
-higher of its 5h/7d utilization) crosses ``settings.threshold``, switch to
-the candidate with the most headroom — proactively, so the old account is
+Policy in one paragraph: when any of the active account's usage windows (5h,
+7d, and the per-model windows named by ``settings.model``) reaches its own
+switch line — ``settings.threshold``, or ``settings.weekly_threshold`` for
+the windows that reset weekly once that is set — switch to the candidate with
+the most headroom measured against those lines (see ``lines.py``; with one
+line it is plain ``100 - max pct``) — proactively, so the old account is
 still valid while a running Claude Code picks the new one up (this is what
 makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
-``hysteresis_pct`` below the threshold so two accounts hovering at the line
-never ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate
-(bypassed only when the active account is hard at its limit). Before
+below every one of their lines and beat the active account by
+``hysteresis_pct`` points so two accounts hovering at a line never
+ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate (bypassed
+only when the active account is hard at its limit). Physical questions —
+exhausted, at its limit, when does quota return — read the raw percentages. Before
 activation the target's token is *freshened* (refreshed if it expires within
 10 minutes — twice Claude Code's refresh buffer, so a running Claude Code's
 under-lock re-read sees a fresh token and aborts its own refresh); a target
@@ -50,6 +55,7 @@ from claude_swap.json_output import (
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
 )
+from claude_swap.lines import BindingWindow, binding_window, window_line
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import decision_logger
 from claude_swap.poll_policy import (
@@ -458,9 +464,9 @@ class _CandidateDead(Exception):
 # threshold distance, urgent mode, 429 recovery) lives in poll_policy, is
 # persisted in the usage store by whichever collector fetched, and is shared
 # by every surface. The engine escalates to a full candidate refresh only
-# when a switch could actually be near: active utilization within
-# ESCALATION_MARGIN_PCT of the threshold, or active usage unknown (failover
-# needs fresh candidate data). The consume-first trigger can fire outside
+# when a switch could actually be near: one of the active account's windows
+# within ESCALATION_MARGIN_PCT of its own switch line, or active usage unknown
+# (failover needs fresh candidate data). The consume-first trigger can fire outside
 # that escalation band; there it decides provisionally on the stored
 # snapshot and escalates at commit time, when a switch would actually fire
 # (the two-phase commit in _tick_inner).
@@ -482,6 +488,19 @@ def pct_label(value: float) -> str:
     Displayed comparisons must format BOTH sides with this helper — mixing
     formatters can render an impossible "85.5556% < 85.555555%"."""
     return f"{value:.10g}"
+
+
+def _below_line_detail(
+    binding: BindingWindow | None, active_headroom: float, threshold: float
+) -> str:
+    """The below-threshold hold, quoting the comparison the engine made: the
+    binding window's own pct against its own line ("7d 93% < 97%"), so the
+    detail cannot read as a contradiction once the lines differ. The
+    account-wide form is only for an account with no readable window, which
+    a readable headroom rules out."""
+    if binding is None:
+        return f"{pct_label(100.0 - active_headroom)}% < {pct_label(threshold)}%"
+    return f"{binding.label} {pct_label(binding.pct)}% < {pct_label(binding.line)}%"
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +545,11 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # The switch line of the weekly windows (7d and per-model) when one is
+    # configured; ``threshold`` stays the 5h window's. Additive field, emitted
+    # only when set. Every pct above stays RAW: the lines are applied where
+    # the engine compares, never to the numbers it logs.
+    weekly_threshold: float | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -537,6 +561,8 @@ class PollEvent(AutoSwitchEvent):
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
             fields["windowsPct"] = self.windows
+        if self.weekly_threshold is not None:
+            fields["weeklyThreshold"] = self.weekly_threshold
         return fields
 
     def _describe(self, num: str) -> str:
@@ -554,7 +580,21 @@ class PollEvent(AutoSwitchEvent):
             return "poll: no active account"
         num = self.active.get("number")
         h = self.headroom.get(str(num))
-        if h is not None:
+        line = self.threshold
+        wins = self.windows.get(str(num))
+        if wins:
+            # Name the binding window and quote ITS line: "93% used (switch
+            # at 85%)" reads as a contradiction once the weekly window has a
+            # line of its own, and the bare pct hid which window bound (the
+            # #115 ambiguity). Same rule as the engine's trigger.
+            binding = binding_window(
+                ((label, pct, None) for label, pct in wins.items()),
+                self.threshold,
+                self.weekly_threshold,
+            )
+            used = f"{binding.label} {binding.pct:.0f}% used"
+            line = binding.line
+        elif h is not None:
             used = f"{100 - h:.0f}% used"
         else:
             err = self.fetch_errors.get(str(num))
@@ -567,7 +607,7 @@ class PollEvent(AutoSwitchEvent):
         tail = f" | others: {others}" if others else ""
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(self.threshold)}%){tail}"
+            f"(switch at {pct_label(line)}%){tail}"
         )
 
 
@@ -794,6 +834,8 @@ def consume_first_rank_key(
     threshold: float,
     now: float,
     models: Sequence[str] = (),
+    *,
+    weekly_threshold: float | None = None,
 ) -> tuple:
     """Consume-first sort key for one candidate account.
 
@@ -807,22 +849,44 @@ def consume_first_rank_key(
     if h is None:
         h = 0.0
     reset_ts = _seven_day_reset_ts(usage, now)
+    # Landing health and the tie-break against each window's OWN line (lines.py); with one
+    # line ``over`` is ``100 - h >= threshold`` and ``line_headroom`` is ``h``, bit for bit.
+    binding = binding_window(
+        oauth.relevant_windows(usage if isinstance(usage, dict) else None, models),
+        threshold,
+        weekly_threshold,
+    )
+    over = binding.over if binding is not None else (100.0 - h) >= threshold
+    lh = binding.line_headroom if binding is not None else h
     return (
         0 if h > SPENT_HEADROOM_PCT else 1,
-        0 if (100.0 - h) < threshold else 1,
+        1 if over else 0,
         reset_ts if reset_ts is not None else float("inf"),
-        -h,
+        -lh,
     )
 
 
 def _binding_recovery_ts(
-    usage: dict | str | None, models: Sequence[str], now: float
+    usage: dict | str | None,
+    models: Sequence[str],
+    now: float,
+    *,
+    threshold: float | None = None,
+    weekly_threshold: float | None = None,
 ) -> float:
     """When this account's *binding* window comes back, as a sort key.
 
+    The binding window is the one holding the account back — the window with
+    the least headroom against its own switch line (``lines.binding_window``),
+    which with one line is simply the highest utilization among the windows
+    that gate it (the same set ``account_headroom`` measures, so ranking and
+    headroom can never disagree about which window matters). Its reset is the
+    moment the account becomes useful again. With a weekly line both lines
+    are required; without one the threshold cannot change the answer.
+
     TWO RULES, and which one applies depends on whether anything is AT a
-    limit. Below 100 the binding window is the highest-utilization one and its
-    own reset is the answer. Once any window is at or over 100 the account is
+    limit. Below 100 the binding window is the one above (the highest utilization
+    with one line) and its own reset is the answer. Once any window is at or over 100 the account is
     back only when the LAST of those blockers resets, which is a different
     window whenever a weekly limit is spent alongside a five-hour one.
 
@@ -854,6 +918,13 @@ def _binding_recovery_ts(
     # resets. Take the binding PCT: `max(windows)` returns the FIRST of a tie
     # and `relevant_windows` emits 5h before 7d.
     binding = max(w[1] for w in windows)
+    # A WEEKLY LINE moves which window binds below the limit (lines.binding_window).
+    if weekly_threshold is not None and binding < 100.0:
+        if threshold is None:
+            raise ValueError("threshold is required alongside weekly_threshold")
+        resets_at = binding_window(windows, threshold, weekly_threshold).resets_at
+        ts = _parse_reset_ts(resets_at)
+        return ts if ts is not None and ts > now else float("inf")
     # At or above the limit every blocker counts -- exactly the set
     # `limiting_reset_ts` reads, which is what announces from here. Below it
     # the max-pct tie binds. Narrowing the at-limit case to the tie makes the
@@ -873,25 +944,28 @@ def _binding_recovery_ts(
 
 def _every_account_above_threshold(
     candidates: Sequence[str],
-    headroom: dict[str, float | None],
-    active_headroom: float | None,
-    threshold: float,
+    over: dict[str, bool | None],
+    active_over: bool | None,
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
-    the threshold — the state where "land somewhere healthy" has no answer.
+    their own switch lines — the state where "land somewhere healthy" has no
+    answer.
 
-    Requires the active account's own headroom to be known: without it we do
-    not know we are in this state, and guessing here would relax the landing
-    rule on an ordinary tick. An unmeasured candidate does not block the
-    verdict (it may be healthy, but it cannot be *chosen* either — the caller
-    skips ``None`` headroom) as long as at least one candidate was measured.
+    Requires the active account's own verdict to be known (``None`` = no
+    readable window): without it we do not know we are in this state, and
+    guessing here would relax the landing rule on an ordinary tick. An
+    unmeasured candidate does not block the verdict (it may be healthy, but it
+    cannot be *chosen* either — the caller skips unreadable rows) as long as
+    at least one candidate was measured. Reads the same per-window verdict as
+    the trigger and the landing gate, so the three cannot disagree about what
+    "above the threshold" means.
     """
-    if active_headroom is None or (100.0 - active_headroom) < threshold:
+    if not active_over:
         return False
-    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    measured = [over.get(n) for n in candidates if over.get(n) is not None]
     if not measured:
         return False
-    return all((100.0 - h) >= threshold for h in measured)
+    return all(measured)
 
 
 def _ref(number: str, email: str) -> dict:
@@ -978,10 +1052,12 @@ class AutoSwitchEngine:
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
-        # Poll plans written by the collector must key on the same threshold/
+        # Poll plans written by the collector must key on the same lines/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
-        switcher.set_poll_policy_inputs(settings.threshold, self._models)
+        switcher.set_poll_policy_inputs(
+            settings.threshold, settings.weekly_threshold, self._models
+        )
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -1741,7 +1817,12 @@ class AutoSwitchEngine:
 
         if current is None:
             self._emit(
-                PollEvent(active=None, headroom={}, threshold=settings.threshold)
+                PollEvent(
+                    active=None,
+                    headroom={},
+                    threshold=settings.threshold,
+                    weekly_threshold=settings.weekly_threshold,
+                )
             )
             if self.switcher.has_live_login():
                 # Live login exists but cswap doesn't manage it: never act —
@@ -1777,7 +1858,11 @@ class AutoSwitchEngine:
             raise _EngineStopped()
 
         entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold, overloaded=is_overloaded
+            current,
+            quarantined,
+            threshold=settings.threshold,
+            weekly_threshold=settings.weekly_threshold,
+            overloaded=is_overloaded,
         )
         # T1313: the collect pass above can itself settle a login restore
         # (`_resync_rotated_backup`'s no-drift return) mid-pass -- if the
@@ -1801,6 +1886,7 @@ class AutoSwitchEngine:
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
+                weekly_threshold=settings.weekly_threshold,
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -1838,6 +1924,7 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        active_binding: BindingWindow | None = None
         # A DISABLED ACTIVE IS NOT A LANDING SPOT. `disable` withdraws a slot
         # from automatic selection and `switchable_account_numbers()` honours
         # that for CANDIDATES, but nothing applied it to the slot the engine is
@@ -1869,17 +1956,24 @@ class AutoSwitchEngine:
         elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
-            utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            # Each window against its OWN line, the closest one decides (see
+            # lines.py). A readable headroom means a readable window, so the
+            # account-wide fallback is unreachable; kept as the exact old test.
+            active_binding = self._binding(usage.get(current), settings)
+            below = (
+                not active_binding.over
+                if active_binding is not None
+                else (100.0 - active_headroom) < settings.threshold
+            )
+            if below:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
                             # Both sides through pct_label: .0f utilization could
                             # display an impossible "100% < 99.9%".
-                            detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                            detail=_below_line_detail(
+                                active_binding, active_headroom, settings.threshold
                             ),
                         )
                     )
@@ -1890,6 +1984,7 @@ class AutoSwitchEngine:
                 # a sooner-resetting account with room actually exists.
                 trigger = "consume-first"
             else:
+                # Exhaustion is physical: at-limit reads the raw headroom.
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
@@ -1988,9 +2083,8 @@ class AutoSwitchEngine:
             self._emit(
                 NoSwitchEvent(
                     reason="below-threshold",
-                    detail=(
-                        f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                    detail=_below_line_detail(
+                        active_binding, active_headroom, settings.threshold
                     ),
                 )
             )
@@ -2076,6 +2170,7 @@ class AutoSwitchEngine:
                 recovered,
                 kw["settings"],
                 kw["current"],
+                usage=kw["usage"],
             )
             ranked = self._rank_candidates(
                 no_return=no_return, overload_backoff=overload_backoff, **kw
@@ -2251,7 +2346,7 @@ class AutoSwitchEngine:
                     NoSwitchEvent(
                         reason="no-qualifying-candidate",
                         detail=(
-                            "no candidate is below the threshold and better "
+                            "no candidate is below its switch lines and better "
                             "than the active account by the hysteresis "
                             "margin, or usage is unreadable this tick"
                         ),
@@ -2347,7 +2442,13 @@ class AutoSwitchEngine:
         # consume-first that is the phase-2 refetch, not the stale one.
         left_snapshot = (
             active_headroom,
-            _binding_recovery_ts(usage.get(current), self._models, decided_now),
+            _binding_recovery_ts(
+                usage.get(current),
+                self._models,
+                decided_now,
+                threshold=settings.threshold,
+                weekly_threshold=settings.weekly_threshold,
+            ),
         )
         transient_failure = False
         systemic = ""
@@ -2472,6 +2573,8 @@ class AutoSwitchEngine:
         recovered: bool,
         settings: AutoSwitchSettings,
         current: str | None = None,
+        *,
+        usage: dict[str, dict | str | None],
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -2573,15 +2676,15 @@ class AutoSwitchEngine:
             if active_headroom is not None:
                 if left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO:
                     return None               # beats us outright; not a flip
-            elif (
-                settings is not None
-                and left_headroom > 100.0 - settings.threshold
-            ):
+            elif settings is not None:
                 # An unreadable active must not be silently scored as "the
                 # peer does not beat it" -- same landing-eligible fallback
                 # `_left_account_recovered` uses when it, too, has no active
-                # to compare against.
-                return None
+                # to compare against: would the ranking accept the peer as a
+                # landing spot, i.e. is it under every one of its own lines?
+                left = self._binding(usage.get(barred), settings)
+                if left is not None and not left.over:
+                    return None
         return barred
 
     def _left_account_recovered(
@@ -2619,9 +2722,10 @@ class AutoSwitchEngine:
         departure — there is no `leftHeadroom` to diff against and never was
         — so the two signals that do not depend on the active's LIVE state
         are (1) whether the peer, right now, would itself be a healthy place
-        to land: `h > 100 - settings.threshold`, the same "would the ranking
-        accept this as a landing spot" test `_rank_candidates` already runs
-        (`:1617`) on every candidate, reused rather than inventing a fresh
+        to land: under every one of its own switch lines (`not
+        binding.over`), the same "would the ranking accept this as a landing
+        spot" test the landing gate in `_rank_candidates` already runs on
+        every candidate, reused rather than inventing a fresh
         constant; and (2), when the landing floor cannot answer, whether the
         peer's own binding reset is meaningfully sooner than the active's.
         The landing floor is the exact complement of
@@ -2634,7 +2738,8 @@ class AutoSwitchEngine:
         floor should land on: sweeping mutations of this same leg for the
         ordinary path showed an absolute floor is silently reintroducible
         with a green suite, so this is not free of that risk either — the
-        difference is this constant is `settings.threshold`, not a
+        difference is this constant is the user's own switch lines
+        (`settings.threshold`, `settings.weekly_threshold`), not a
         hardcoded number, so a
         user's OWN policy decides how conservative the hold is, and it moves
         when they change it (pinned directly, below). Deliberately MORE
@@ -2755,9 +2860,10 @@ class AutoSwitchEngine:
             # that proved it. Two legs, both read-only against CURRENT state
             # (no departure baseline exists to diff against):
             #
-            #   landing   `h > 100 - settings.threshold` -- would the
-            #             ranking accept this peer as a landing spot right
-            #             now (`_rank_candidates`, :1636)?
+            #   landing   `not peer.over` -- under every one of its own
+            #             lines: would the ranking accept this peer as a
+            #             landing spot right now (the landing gate in
+            #             `_rank_candidates`)?
             #   recovery  the peer's binding reset is meaningfully sooner
             #             than the ACTIVE's binding reset -- the same axis
             #             `_recovery_is_useful` switches to once headroom
@@ -2773,10 +2879,23 @@ class AutoSwitchEngine:
             # when a nearer window starts binding, never as a side effect
             # of the active spending down -- the failure mode a bare
             # dominance leg has, guarded directly in the mutation table.
-            if h is not None and h > 100.0 - settings.threshold:
+            peer = self._binding(usage.get(barred), settings)
+            if peer is not None and not peer.over:
                 return True
-            peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
-            active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
+            peer_recovery_ts = _binding_recovery_ts(
+                usage.get(barred),
+                self._models,
+                now,
+                threshold=settings.threshold,
+                weekly_threshold=settings.weekly_threshold,
+            )
+            active_recovery_ts = _binding_recovery_ts(
+                usage.get(current),
+                self._models,
+                now,
+                threshold=settings.threshold,
+                weekly_threshold=settings.weekly_threshold,
+            )
             # The active's recovery must be a REAL measurement, not merely
             # "larger". `_binding_recovery_ts` returns `inf` in exactly THREE
             # states, and they do not mean the same thing: no relevant window
@@ -2838,8 +2957,10 @@ class AutoSwitchEngine:
             if active_headroom is not None:
                 if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
                     return True
-            elif h > 100.0 - settings.threshold:
-                return True
+            else:
+                peer = self._binding(usage.get(barred), settings)
+                if peer is not None and not peer.over:
+                    return True
         if (
             isinstance(left_headroom, (int, float))
             and h is not None
@@ -2851,7 +2972,13 @@ class AutoSwitchEngine:
         # schedule around. Moving off it onto a real reset IS the improvement.
         was = left_recovery if isinstance(left_recovery, (int, float)) else float("inf")
         return (
-            _binding_recovery_ts(usage.get(barred), self._models, now)
+            _binding_recovery_ts(
+                usage.get(barred),
+                self._models,
+                now,
+                threshold=settings.threshold,
+                weekly_threshold=settings.weekly_threshold,
+            )
             < was - RECOVERY_HYSTERESIS_S
         )
 
@@ -2914,8 +3041,25 @@ class AutoSwitchEngine:
         # account is at/over the threshold, so a single healthy peer still
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
+        # One binding window per account under THIS snapshot's lines — the
+        # consume-first phase-2 refetch hands in fresh `usage`, so nothing the
+        # trigger computed is reused here.
+        bindings = {
+            num: self._binding(usage.get(num), settings)
+            for num in (*oauth_candidates, current)
+        }
+        active_binding = bindings[current]
+        # Policy headroom against the active's own lines, for the hysteresis
+        # gate and the sort keys below; raw when it reports no window.
+        active_lh = (
+            active_binding.line_headroom
+            if active_binding is not None
+            else active_headroom
+        )
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates,
+            {num: (b.over if b is not None else None) for num, b in bindings.items()},
+            active_binding.over if active_binding is not None else None,
         )
         # THE BINDING WINDOW, not the five-hour one. "About to stop answering"
         # is distance to the NEAREST wall, which is what `account_headroom`
@@ -2950,7 +3094,13 @@ class AutoSwitchEngine:
             default=0.0,
         )
         active_recovery_ts = (
-            _binding_recovery_ts(usage.get(current), self._models, now)
+            _binding_recovery_ts(
+                usage.get(current),
+                self._models,
+                now,
+                threshold=settings.threshold,
+                weekly_threshold=settings.weekly_threshold,
+            )
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
@@ -3007,7 +3157,13 @@ class AutoSwitchEngine:
                 continue
             any_known = True          # it EXISTS and is readable either way
             recovery_ts = (
-                _binding_recovery_ts(usage.get(num), self._models, now)
+                _binding_recovery_ts(
+                    usage.get(num),
+                    self._models,
+                    now,
+                    threshold=settings.threshold,
+                    weekly_threshold=settings.weekly_threshold,
+                )
                 if all_above
                 else 0.0
             )
@@ -3054,15 +3210,25 @@ class AutoSwitchEngine:
                 continue  # the account we just left; see _no_return_account
             if now < ((overload_backoff or {}).get(num) or 0):
                 continue  # backed off after an `overloaded` departure; see _perform
+            binding = bindings[num]
+            # Policy headroom against the candidate's own lines, and whether
+            # any of them is reached; raw `h` / the single line when it
+            # reports no window (a readable headroom rules that out).
+            lh = binding.line_headroom if binding is not None else h
+            over = (
+                binding.over
+                if binding is not None
+                else (100.0 - h) >= settings.threshold
+            )
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
             if by_recovery_axis or trigger in ("proactive", "consume-first"):
-                # Landing must be healthy: an account at/over the threshold
-                # would re-trigger on the very next tick. At-limit and failover
-                # are escapes that skip this whole block — any account with real
-                # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                # Landing must be healthy: an account at/over any of its own
+                # lines would re-trigger on the very next tick. At-limit and
+                # failover are escapes that skip this whole block — any account
+                # with real headroom beats a blocked or dead one.
+                if over and not all_above:
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
@@ -3140,8 +3306,11 @@ class AutoSwitchEngine:
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back).
-                    if h - active_headroom < settings.hysteresis_pct:
+                    # qualifies; near-line pairs can't flap back). Measured in
+                    # policy headroom, so a 7d 93% candidate under a 97 line
+                    # beats a 5h 95% active under 85 — raw headroom (7 vs 5)
+                    # would park on the account about to hit its limit.
+                    if lh - active_lh < settings.hysteresis_pct:
                         continue
             if by_recovery_axis:
                 # Ranked on the axis its own gate decided, and TIERED so the two
@@ -3195,11 +3364,15 @@ class AutoSwitchEngine:
                 # spent-but-healthy over it, so no ONE fleet can hold both --
                 # and it takes both to order a pair differently.
                 key = consume_first_rank_key(
-                    usage.get(num), settings.threshold, now, self._models
+                    usage.get(num),
+                    settings.threshold,
+                    now,
+                    self._models,
+                    weekly_threshold=settings.weekly_threshold,
                 )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
-                # back to `-h` when the label is unknown (usage without window
+                # back to `-lh` when the label is unknown (usage without window
                 # data) or the candidate does not report that window, so an
                 # account we cannot compare on the escape axis is ordered by
                 # the binding number rather than dropped.
@@ -3238,7 +3411,7 @@ class AutoSwitchEngine:
                 # `SPENT_HEADROOM_PCT` is the module's own "can this serve".
                 key = (
                     0 if h > SPENT_HEADROOM_PCT else 1,
-                    -max(escape_h if escape_h is not None else h, 0.0),
+                    -max(escape_h if escape_h is not None else lh, 0.0),
                     recovery_ts,
                 )
             qualifying.append((key, num))
@@ -3271,6 +3444,7 @@ class AutoSwitchEngine:
         *,
         threshold: float | None = None,
         overloaded: bool = False,
+        weekly_threshold: float | None = None,
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
@@ -3280,9 +3454,10 @@ class AutoSwitchEngine:
         never-fetched, then oldest fetch; a due row has no decision value, so
         one left queued would drop out of the ranking); everyone else is
         served from the usage store. Phase B refetches ALL candidates and recomputes
-        before any switch decision when a switch could be near: active
-        utilization within ``ESCALATION_MARGIN_PCT`` of the threshold, or
-        active usage unknown (failover must not run on stale candidate data).
+        before any switch decision when a switch could be near: one of the
+        active account's windows within ``ESCALATION_MARGIN_PCT`` of its own
+        switch line, or active usage unknown (failover must not run on stale
+        candidate data).
         At-limit, proactive, and ordinary unknown-usage failover selection
         never runs on the pre-escalation snapshot — those triggers imply the
         escalation condition. Neither ``disabled-active`` nor ``overloaded``
@@ -3429,10 +3604,23 @@ class AutoSwitchEngine:
         active_headroom = oauth.account_headroom(
             active_value if isinstance(active_value, dict) else None, self._models
         )
-        # The caller's tick-snapshotted threshold, so one tick fetches and
-        # decides on the same value even if apply_threshold() lands mid-tick.
+        # The caller's tick-snapshotted lines, so one tick fetches and decides
+        # on the same values even if apply_threshold() lands mid-tick. No
+        # threshold means "the engine's own" for BOTH lines: None is a legal
+        # weekly value, so it cannot mean "not passed".
         if threshold is None:
             threshold = self.settings.threshold
+            weekly_threshold = self.settings.weekly_threshold
+        # Any window of the active within the margin of ITS OWN line: a 5h
+        # window closing on its line under a flat, higher weekly window is a
+        # switch that is near, whatever the binding max says. With one line
+        # this is exactly "binding utilization within the margin".
+        near_a_line = any(
+            pct >= window_line(label, threshold, weekly_threshold) - ESCALATION_MARGIN_PCT
+            for label, pct, _ in oauth.relevant_windows(
+                active_value if isinstance(active_value, dict) else None, self._models
+            )
+        )
         escalate = bool(candidates) and (
             # A disabled or overloaded active switches on ANY headroom,
             # including one well below the band, which satisfies neither leg
@@ -3442,10 +3630,7 @@ class AutoSwitchEngine:
             self.switcher.is_account_disabled(current)
             or overloaded
             or (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
-            or (
-                active_headroom is not None
-                and 100.0 - active_headroom >= threshold - ESCALATION_MARGIN_PCT
-            )
+            or (active_headroom is not None and near_a_line)
         )
         if escalate:
             escalation_fetch = {current, *candidates}
@@ -3646,6 +3831,22 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _binding(
+        self, value: dict | str | None, settings: AutoSwitchSettings
+    ) -> BindingWindow | None:
+        """The window binding this account under the tick's lines (see
+        ``lines.binding_window``), or None when it reports no window. Reads
+        only ``self._models`` and the ``settings`` it is handed, never
+        ``self.settings``: a tick snapshots its settings once, and the ranking
+        helpers are exercised directly on bare engines."""
+        return binding_window(
+            oauth.relevant_windows(
+                value if isinstance(value, dict) else None, self._models
+            ),
+            settings.threshold,
+            settings.weekly_threshold,
+        )
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")
@@ -3919,7 +4120,9 @@ class AutoSwitchEngine:
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(threshold, self._models)
+        self.switcher.set_poll_policy_inputs(
+            threshold, self.settings.weekly_threshold, self._models
+        )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

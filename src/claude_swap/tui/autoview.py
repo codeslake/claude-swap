@@ -25,14 +25,15 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
-    binding_pct,
     consume_first_rank_key,
     pct_label,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
+from claude_swap.lines import binding_window
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -129,6 +130,9 @@ class AutoScreen(Screen):
         self._configured_threshold = self._settings.threshold
         self._configured_strategy = self._settings.strategy
         self.app.threshold_pct = self._settings.threshold
+        # The weekly line is not session-adjustable, so this is only the same
+        # sync-to-the-file correction; nothing to restore on unmount.
+        self.app.weekly_threshold_pct = self._settings.weekly_threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
@@ -217,6 +221,10 @@ class AutoScreen(Screen):
         self.app.threshold_pct = value
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
+        # The Next best list ranks by the lines in force, so it must follow
+        # the session value now rather than at the next snapshot: under a
+        # weekly line the order and the 5h rows' "(line N%)" both move.
+        self._on_snapshot(self.app.snapshot)
 
     def action_toggle_cache_aware(self) -> None:
         # Persisted, unlike `t`: the pin is another process and reads the
@@ -251,6 +259,10 @@ class AutoScreen(Screen):
             text.append(" (session)", style=palette.muted)
         if self._configured_strategy == "dynamic":
             text.append(f" · cache-aware {'on' if self._settings.cache_aware else 'off'}")
+        if self._settings.weekly_threshold is not None:
+            text.append(
+                f" · weekly {pct_label(self._settings.weekly_threshold)}%"
+            )
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
@@ -357,10 +369,15 @@ class AutoScreen(Screen):
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
         """Switch targets ranked the way the engine's strategy would rank them."""
-        # Same window set as the engine (autoswitch.model included), so the
-        # displayed ranking can never disagree with the account it picks.
+        # Same window set AND the same lines as the engine: autoswitch.model,
+        # the threshold (the session value — `_settings` is what
+        # `_set_threshold` replaces) and the weekly line, so the displayed
+        # ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
-        models = parse_model_names(self._settings.model) if self._settings else ()
+        settings = self._settings
+        models = parse_model_names(settings.model) if settings else ()
+        threshold = settings.threshold if settings else 90.0
+        weekly = settings.weekly_threshold if settings else None
         # Same strategy the engine ticks on, so the panel's order can never
         # disagree with the account a tick would actually switch to.
         consume_first = bool(
@@ -397,7 +414,9 @@ class AutoScreen(Screen):
                 lines[acc.number] = entry
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
-            pct = binding_pct(acc.usage.last_good, models)
+            binding = binding_window(
+                oauth.relevant_windows(acc.usage.last_good, models), threshold, weekly
+            )
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
             entry.append(acc.email, style=palette.foreground)
@@ -406,9 +425,9 @@ class AutoScreen(Screen):
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
                 ranked.append(((998.0,), acc.number))
-            elif pct is None:
+            elif binding is None:
                 # An extra-usage (pay-as-you-go) account has no 5h/7d window,
-                # so binding_pct answers None — but it is not unknown, it has
+                # so binding_window answers None — but it is not unknown, it has
                 # a SPEND budget, and the watch screen already renders it.
                 # `relevant_windows` excludes spend on purpose (a separate
                 # axis from a rate-limit window), so this row was the only
@@ -444,14 +463,26 @@ class AutoScreen(Screen):
                         style=palette.muted,
                     )
                     entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
+                    if weekly is not None and label == binding.label:
+                        entry.append(
+                            f" (line {pct_label(binding.line)}%)",
+                            style=palette.muted,
+                        )
                 if not chips:  # no window data at all — keep the old reading
-                    entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
+                    entry.append(
+                        f"  {binding.pct:3.0f}% used",
+                        style=palette.severity(binding.pct),
+                    )
                 key = (
                     consume_first_rank_key(
-                        acc.usage.last_good, self._settings.threshold, now, models
+                        acc.usage.last_good,
+                        threshold,
+                        now,
+                        models,
+                        weekly_threshold=weekly,
                     )
                     if consume_first
-                    else (pct,)
+                    else (-binding.line_headroom,)
                 )
                 ranked.append((key, acc.number))
             lines[acc.number] = entry

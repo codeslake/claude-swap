@@ -148,7 +148,7 @@ Examples:
         "--no-share",
         action="store_true",
         help=(
-            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents "
+            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents/rules "
             "from ~/.claude into the session profile (and remove previously "
             "shared items)"
         ),
@@ -617,8 +617,9 @@ Exit codes with --once:
   3  blocked: wanted to switch but no viable target / all exhausted
 
 Examples:
-  cswap auto                       # foreground loop, switch at 90%% used
+  cswap auto                       # foreground loop, switch at 90% used
   cswap auto --threshold 80        # switch earlier
+  cswap auto --weekly-threshold 97 # let the weekly window run higher before switching
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
@@ -648,8 +649,19 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="PCT",
         help=(
-            "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "Switch when the active account's 5h window (or any window, "
+            "without a weekly line) reaches this utilization (50-99.9; "
+            "default 90)"
+        ),
+    )
+    parser.add_argument(
+        "--weekly-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Separate switch line for the 7-day and per-model weekly windows "
+            "(50-99.9; default: the threshold). A flag cannot unset a "
+            "configured value; use 'cswap config unset'"
         ),
     )
     parser.add_argument(
@@ -699,7 +711,7 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     args = parser.parse_args(argv)
 
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
@@ -758,10 +770,15 @@ Defaults live in settings.json in the backup root; flags override them.
             sys.exit(engine.tick().value)
 
         if not args.json:
+            weekly = (
+                f", weekly {pct_label(settings.weekly_threshold)}%"
+                if settings.weekly_threshold is not None
+                else ""
+            )
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
-                    f"every {settings.interval_seconds:.0f}s"
+                    f"Auto-switch running: threshold {pct_label(settings.threshold)}%"
+                    f"{weekly}, every {settings.interval_seconds:.0f}s"
                     # THE ENGINE, NOT THE REQUEST. A demoted engine has
                     # `dry_run` True while `args.dry_run` is False, and this
                     # line then announces switching to somebody watching a
@@ -823,6 +840,7 @@ Examples:
   cswap config                              # list effective settings
   cswap config get autoswitch.threshold
   cswap config set autoswitch.threshold 80
+  cswap config set autoswitch.weeklyThreshold 97  # own line for the 7d/per-model windows
   cswap config unset autoswitch.threshold   # back to the default
   cswap config path                         # where settings.json lives
         """,

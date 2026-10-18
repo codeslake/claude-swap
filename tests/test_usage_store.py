@@ -1114,7 +1114,7 @@ class TestNoPlanSlot:
     def commit(self, store):
         """Commit a fetch outcome with the plan the switcher computes for it."""
         stub = SimpleNamespace(
-            _usage_store=store, _poll_policy_inputs=lambda: (90.0, ())
+            _usage_store=store, _poll_policy_inputs=lambda: (90.0, None, ())
         )
 
         def commit(error, claims=None, **kw):
@@ -1180,7 +1180,7 @@ class TestNoPlanSlot:
         assert pre["1"].poll_interval_s == NO_PLAN_POLL_INTERVAL_S
         moved = {"five_hour": {"pct": 40.0}, "seven_day": {"pct": 10.0}}
         stub = SimpleNamespace(
-            _usage_store=store, _poll_policy_inputs=lambda: (90.0, ())
+            _usage_store=store, _poll_policy_inputs=lambda: (90.0, None, ())
         )
         plans = ClaudeAccountSwitcher._plans_after_fetch(
             stub,
@@ -1211,7 +1211,7 @@ class TestNoPlanSlot:
         assert pre["1"].poll_interval_s == CANDIDATE_MAX_INTERVAL_S
         usage = {"five_hour": {"pct": new_pct}, "seven_day": {"pct": 10.0}}
         stub = SimpleNamespace(
-            _usage_store=store, _poll_policy_inputs=lambda: (90.0, ())
+            _usage_store=store, _poll_policy_inputs=lambda: (90.0, None, ())
         )
         plans = ClaudeAccountSwitcher._plans_after_fetch(
             stub,
