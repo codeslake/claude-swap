@@ -5687,6 +5687,29 @@ class TestConsumeFirstProbesAnUnknownReset:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "probe"
 
+    def test_the_probe_pick_is_the_account_the_rank_key_orders_first(
+        self, temp_home
+    ):
+        # T85/W99: A (5h 0 / 7d 98) has 2 points of raw headroom, under the
+        # servable floor, yet 15.86 line headroom against its 99 line; B (5h
+        # 84.5 / 7d 10) has 15.5 of both. The key's first tier is servability,
+        # so it orders B first. Only one probe is admitted per decision, so a
+        # pick on line headroom alone drops B and switches onto A.
+        h = EngineHarness(
+            temp_home, strategy="consume-first", threshold=85.0,
+            weekly_threshold=99.0,
+        )
+        for num, email in ((1, "a"), (2, "b"), (3, "c")):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(0, 98),     # UNKNOWN reset
+            "3": _usage7(84.5, 10),  # UNKNOWN reset
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
     def test_an_elapsed_reset_is_treated_as_a_probe_candidate(
         self, temp_home
     ):

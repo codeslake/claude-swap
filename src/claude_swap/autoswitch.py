@@ -740,9 +740,10 @@ def select_probe_target(
     """Which account (if any) this fleet admits as this tick's probe
     target: the readable candidate with the most headroom whose weekly
     reset is unknown or has already elapsed, and which is not cooling down
-    from a previous probe. Headroom is the binding window's against its own
-    line (``consume_first_rank_key``'s ``-lh``), so the pick is the account
-    the rank key would order first; with one line it is the raw headroom.
+    from a previous probe. The pick is the pool member that
+    ``consume_first_rank_key`` orders first (servability, then line headroom
+    against each window's own line); with one line that is the most raw
+    headroom.
 
     ONE FUNCTION, TWO READERS — ``_rank_candidates_pass`` calls it (already
     narrowed to candidates that cleared its own servability/no-return/
@@ -766,27 +767,27 @@ def select_probe_target(
     if active_reset_ts is None:
         return None
     probe_cooldown = probe_cooldown or {}
-    pool: list[tuple[float, str]] = []
+    pool: list[tuple[tuple, str]] = []
     for num in oauth_candidates:
         value = usage.get(num)
         if not _seven_day_reset_unmeasured(value):
             continue
         if probe_cooldown.get(num, 0.0) > now:
             continue
-        binding = binding_window(
-            oauth.relevant_windows(value if isinstance(value, dict) else None, models),
-            threshold,
-            weekly_threshold,
-        )
-        # Resolving unknown headroom is what a probe is FOR -- unlike every
-        # other reader of headroom, this one must not refuse a candidate for
-        # having no window. Same 0.0 substitute `consume_first_rank_key`
-        # already uses for the identical "no number to rank on" problem.
-        pool.append((binding.line_headroom if binding is not None else 0.0, num))
+        # The ranking's own key. Every pool member has an unmeasured reset,
+        # so its reset field is ``inf`` for all of them and the order equals
+        # the ``probe=True`` key's, which is left for the one winner (its
+        # callers read ``probe=True`` as "admitted"). A candidate with no
+        # window reads 0.0 headroom there, so a probe is never refused for it.
+        pool.append((
+            consume_first_rank_key(
+                value, threshold, now, models, weekly_threshold=weekly_threshold
+            ),
+            num,
+        ))
     if not pool:
         return None
-    _, num = max(pool, key=lambda t: t[0])
-    return num
+    return min(pool, key=lambda t: t[0])[1]
 
 
 def consume_first_rank_key(
