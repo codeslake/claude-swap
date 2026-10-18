@@ -4425,7 +4425,7 @@ class TestDeadTokenQuarantine:
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
-        switcher._poll_inputs_override = (90.0, ("Fable",))
+        switcher._poll_inputs_override = (90.0, None, ("Fable",))
         store = switcher._usage_store
         now = time.time()
 
@@ -13754,3 +13754,56 @@ class TestUsageRowsFollowTheRoster:
         switcher._collect_usage_entries(info, fetch=set())
 
         assert set(self._rows(switcher)) == {"2", "8"}
+
+
+class TestPollPolicyInputsCarryTheWeeklyLine:
+    """The poll planner must see the same two switch lines the engine decides
+    with: pinned by a hosted engine, else read from the settings file through
+    the existing mtime memo."""
+
+    def test_inputs_come_from_the_file_then_the_pin_then_the_file_again(
+        self, temp_home
+    ):
+        import os
+
+        from claude_swap.settings import set_setting, settings_path
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        set_setting(switcher.backup_dir, "autoswitch.threshold", "85")
+        set_setting(switcher.backup_dir, "autoswitch.weeklyThreshold", "97")
+        set_setting(switcher.backup_dir, "autoswitch.model", "Fable")
+        assert switcher._poll_policy_inputs() == (85.0, 97.0, ("Fable",))
+
+        # A later edit is picked up through the mtime key (bumped explicitly
+        # so a same-second rewrite cannot hide behind filesystem granularity).
+        set_setting(switcher.backup_dir, "autoswitch.weeklyThreshold", "99")
+        path = settings_path(switcher.backup_dir)
+        later = path.stat().st_mtime + 5
+        os.utime(path, (later, later))
+        assert switcher._poll_policy_inputs() == (85.0, 99.0, ("Fable",))
+
+        switcher.set_poll_policy_inputs(80.0, None, ())
+        assert switcher._poll_policy_inputs() == (80.0, None, ())
+        switcher.clear_poll_policy_inputs()
+        assert switcher._poll_policy_inputs() == (85.0, 99.0, ("Fable",))
+
+    def test_plans_after_fetch_hands_the_planner_both_lines(self, temp_home):
+        from claude_swap import poll_policy
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._poll_inputs_override = (85.0, 97.0, ("Fable",))
+        info = {"2": (2, "test@example.com", "Org", "", True, "", "")}
+        record = FetchRecord(usage={"five_hour": {"pct": 5.0}, "seven_day": {"pct": 93.0}})
+        with patch.object(
+            poll_policy, "plan_after_fetch", return_value=(1.0, 2.0)
+        ) as plan:
+            plans = switcher._plans_after_fetch({"2": record}, {}, info)
+        assert plans == {"2": (1.0, 2.0)}
+        kwargs = plan.call_args.kwargs
+        assert kwargs["threshold"] == 85.0
+        assert kwargs["weekly_threshold"] == 97.0
+        assert kwargs["models"] == ("Fable",)
+        assert kwargs["is_active"] is True
