@@ -17008,20 +17008,25 @@ class TestPerAccountSwitchThreshold:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    def test_without_a_weekly_line_an_own_line_gates_but_never_rescales(
-        self, temp_home
+    @pytest.mark.parametrize(
+        "weekly_threshold, winner", [(None, 3), (97.0, 2)]
+    )
+    def test_an_own_line_rescales_its_5h_score_only_under_a_weekly_line(
+        self, temp_home, weekly_threshold, winner
     ):
-        # One line per account: 3 (own 70, 5h 55) keeps its 45 raw points
-        # against 2's 40, so the strategy still takes the roomier account.
+        # 3 (own 70, 5h 55) against 2 (5h 60, line 85). One line per account
+        # scores raw headroom: 45 beats 40, the roomier account wins. A weekly
+        # line scales every 5h score by the common anchor over the account's
+        # own 5h line (100 - 85 * 55 / 70 = 33.2), so 2's 40 wins.
         h = self._composed_harness(
-            temp_home, "best", hysteresis_pct=5.0, weekly_threshold=None
+            temp_home, "best", hysteresis_pct=5.0, weekly_threshold=weekly_threshold
         )
         self._set(h, 3, 70.0)
         outcome = h.tick_with_usage({
             "1": _usage7(90, 10), "2": _usage7(60, 10), "3": _usage7(55, 10),
         })
         assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 3
+        assert h.active_number() == winner
 
 class TestWeeklyThreshold:
     """`autoswitch.weeklyThreshold`: a separate switch line for the 7d and
@@ -17102,16 +17107,6 @@ class TestWeeklyThreshold:
             windows={"1": {"5h": 42.0, "7d": 10.0}},
         )
         assert "5h 42% used (switch at 90%)" in default.human()
-
-    def test_dynamic_does_not_quote_a_weekly_line_it_does_not_leave_on(self, temp_home):
-        # dynamic leaves at its own ~97% bar, so 7d 96 under W95 holds: the
-        # log must not print "(switch at 95%)" beside it.
-        h = self._harness(temp_home, strategy="dynamic", weekly_threshold=95.0)
-        outcome = h.tick_with_usage({"1": _usage7(5, 96), "2": _usage7(5, 5)})
-        assert outcome is TickOutcome.NO_ACTION
-        poll = next(e for e in h.events if isinstance(e, PollEvent))
-        assert "7d 96% used (switch at 97%)" in poll.human()
-        assert "weeklyThreshold" not in poll.to_json()
 
     def test_s2_a_weekly_bound_candidate_is_taken_over_a_5h_bound_active(
         self, temp_home

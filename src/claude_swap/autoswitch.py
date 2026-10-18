@@ -693,8 +693,7 @@ class PollEvent(AutoSwitchEvent):
     # design" into "could not read". Additive field.
     spend: dict[str, dict] = field(default_factory=dict)
     # The switch line of the weekly windows (7d and per-model) when one is
-    # configured and the strategy leaves on it (not ``dynamic``);
-    # ``threshold`` stays the 5h window's. Additive field, emitted
+    # configured; ``threshold`` stays the 5h window's. Additive field, emitted
     # only when set. Every pct above stays RAW: the lines are applied where
     # the engine compares, never to the numbers it logs.
     weekly_threshold: float | None = None
@@ -2102,11 +2101,7 @@ class AutoSwitchEngine:
                 threshold=settings.threshold,
                 switch_bar=self._bars.get(current, bar),
                 landing_bars={num: self._bars.get(num, bar) for num in headroom},
-                # `dynamic` leaves at `switch_bar` and ranks landings on raw
-                # headroom: the weekly line is not its switch line.
-                weekly_threshold=(
-                    None if settings.strategy == "dynamic" else settings.weekly_threshold
-                ),
+                weekly_threshold=settings.weekly_threshold,
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
