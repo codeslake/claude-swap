@@ -771,13 +771,6 @@ def select_probe_target(
         value = usage.get(num)
         if not _seven_day_reset_unmeasured(value):
             continue
-        h = oauth.account_headroom(value if isinstance(value, dict) else None, models)
-        # Resolving unknown headroom is what a probe is FOR -- unlike every
-        # other reader of headroom, this one must not refuse a candidate for
-        # not having it. Same substitute `consume_first_rank_key` already
-        # uses for the identical "no number to rank on" problem.
-        if h is None:
-            h = 0.0
         if probe_cooldown.get(num, 0.0) > now:
             continue
         binding = binding_window(
@@ -785,7 +778,11 @@ def select_probe_target(
             threshold,
             weekly_threshold,
         )
-        pool.append((binding.line_headroom if binding is not None else h, num))
+        # Resolving unknown headroom is what a probe is FOR -- unlike every
+        # other reader of headroom, this one must not refuse a candidate for
+        # having no window. Same 0.0 substitute `consume_first_rank_key`
+        # already uses for the identical "no number to rank on" problem.
+        pool.append((binding.line_headroom if binding is not None else 0.0, num))
     if not pool:
         return None
     _, num = max(pool, key=lambda t: t[0])
