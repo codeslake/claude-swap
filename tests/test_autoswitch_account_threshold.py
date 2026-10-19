@@ -40,6 +40,7 @@ from claude_swap.autoswitch import (
 from claude_swap.settings import AutoSwitchSettings
 
 from tests.test_autoswitch import (
+    _R_LATER,
     _R_LATEST,
     _R_SOON,
     EngineHarness,
@@ -769,6 +770,31 @@ class TestPollEventCarriesTheActiveThreshold:
         assert f"< {pct_label(rendered)}%" in _details(h)[0]
 
 
+class TestPollEventLabelsEachCandidateOnItsOwnLine:
+    """`(X full)` for a candidate is judged against that candidate's own line,
+    not the active account's (`PollEvent.threshold`)."""
+
+    def test_a_plain_candidate_is_not_judged_on_the_actives_override(
+        self, temp_home
+    ):
+        """Active on a 60 line; 2 at 75% is under the global 90 it lands on."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("1", 60.0)
+        h.engine = h._make_engine()
+        h.tick_with_usage({"1": _usage(40.0), "2": _usage(75.0), "3": _usage(10.0)})
+        assert "full" not in _polls(h)[0]._describe("2")
+
+    def test_an_override_candidate_is_judged_on_its_own_line(self, temp_home):
+        """2 at 92% under its own 95 line is open; 3 at 92% on the 90 is full."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_threshold("2", 95.0)
+        h.engine = h._make_engine()
+        h.tick_with_usage({"1": _usage(40.0), "2": _usage(92.0), "3": _usage(92.0)})
+        poll = _polls(h)[0]
+        assert "full" not in poll._describe("2")
+        assert "(5h full)" in poll._describe("3")
+
+
 class TestDepartureGateDetailString:
     """The departure gate's detail string quotes the *active account's own*
     effective threshold.
@@ -1316,3 +1342,48 @@ class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
             outcome, _ = _tick(h, [self._snapshot(active=60.0)])
         assert outcome is TickOutcome.ERROR
         assert any(isinstance(e, ErrorEvent) for e in h.events)
+
+
+class TestConsumeFirstRanksOnEachAccountsOwnLine:
+    """The consume-first key's landing-health tier and `-lh` tie-break are read
+    against the candidate's own line, on the global ruler. Passing the global
+    line for every candidate makes an override's 'over' wrong both ways."""
+
+    def test_an_override_account_under_its_own_line_keeps_the_soonest_reset(
+        self, temp_home
+    ):
+        """2 sits at 92% on a 95 line: under it, so its sooner weekly reset
+        wins. On the global 90 it read as over and fell behind 3."""
+        h = _fleet(temp_home, strategy="consume-first")
+        h.switcher.set_account_threshold("2", 95.0)
+        h.engine = h._make_engine()
+        outcome = h.tick_with_usage({
+            "1": _usage7(99.0, 0.0, _R_LATEST),
+            "2": _usage7(92.0, 0.0, _R_SOON),
+            "3": _usage7(50.0, 0.0, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 2
+
+    def test_an_escape_does_not_land_on_an_account_over_its_own_line(
+        self, temp_home
+    ):
+        """`failover` skips the landing gate, so the key's tier is all that
+        keeps 2 (85% on an 80 line, under the global 90) behind 3."""
+        h = _fleet(temp_home, strategy="consume-first")
+        thresholds = ThresholdMap({"2": 80.0}, GLOBAL)
+        ordered, *_ = h.engine._rank_candidates(
+            trigger="failover",
+            consume_first=True,
+            oauth_candidates=["2", "3"],
+            no_return=None,
+            usage={"1": None, "2": _usage7(85.0, 0.0, _R_SOON),
+                   "3": _usage7(60.0, 0.0, _R_LATER)},
+            headroom={"1": None, "2": 15.0, "3": 40.0},
+            current="1",
+            active_headroom=None,
+            settings=h.settings,
+            now=h.clock.now,
+            thresholds=thresholds,
+        )
+        assert ordered[0] == "3"

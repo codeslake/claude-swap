@@ -615,10 +615,11 @@ class AutoScreen(Screen):
                 key = (
                     consume_first_rank_key(
                         acc.usage.last_good,
-                        threshold,
+                        line,
                         now,
                         rank_models,
                         weekly_threshold=weekly,
+                        scale=threshold,
                     )
                     if consume_first
                     else (-rank_binding.line_headroom,)

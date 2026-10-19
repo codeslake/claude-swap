@@ -367,6 +367,9 @@ class PollEvent(AutoSwitchEvent):
     # only when set. Every pct above stays RAW: the lines are applied where
     # the engine compares, never to the numbers it logs.
     weekly_threshold: float | None = None
+    # account number → that account's own switch line, for `_describe`. Not
+    # serialized; a number it lacks falls back to ``threshold``.
+    lines: dict[str, float] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -390,7 +393,9 @@ class PollEvent(AutoSwitchEvent):
             # only its pinned model's window (which the engine's fallback in
             # `_rank_candidates` can rank around; see `classify_candidate_block`).
             kind, model = classify_candidate_block(
-                wins.items(), self.threshold, self.weekly_threshold
+                wins.items(),
+                self.lines.get(num, self.threshold),
+                self.weekly_threshold,
             )
             if kind == "full":
                 text += f" ({model} full)"
@@ -660,6 +665,7 @@ def consume_first_rank_key(
     models: Sequence[str] = (),
     *,
     weekly_threshold: float | None = None,
+    scale: float | None = None,
 ) -> tuple:
     """Consume-first sort key for one candidate account.
 
@@ -667,7 +673,8 @@ def consume_first_rank_key(
     servable (``h > SPENT_HEADROOM_PCT``) before landing-healthy — then
     soonest 7-day reset, most headroom breaking ties. Pulled out so a display
     built from this key can never disagree with the account the engine would
-    switch to.
+    switch to. ``threshold`` is the account's own line and ``scale`` the global
+    one it is measured against (``lines.binding_window``).
     """
     h = oauth.account_headroom(usage, models)
     if h is None:
@@ -679,6 +686,7 @@ def consume_first_rank_key(
         oauth.relevant_windows(usage if isinstance(usage, dict) else None, models),
         threshold,
         weekly_threshold,
+        scale=scale,
     )
     over = binding.over if binding is not None else (100.0 - h) >= threshold
     lh = binding.line_headroom if binding is not None else h
@@ -1673,6 +1681,7 @@ class AutoSwitchEngine:
                 # render as "the threshold" must be the one the departure
                 # gate below actually used, or the UI contradicts the engine.
                 threshold=thresholds[current],
+                lines={num: thresholds[num] for num in headroom},
                 weekly_threshold=settings.weekly_threshold,
                 fetch_errors={
                     num: entry.last_error
@@ -3196,10 +3205,11 @@ class AutoSwitchEngine:
                 # and it takes both to order a pair differently.
                 key = consume_first_rank_key(
                     usage.get(num),
-                    settings.threshold,
+                    thresholds[num],
                     now,
                     models,
                     weekly_threshold=settings.weekly_threshold,
+                    scale=settings.threshold,
                 )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls

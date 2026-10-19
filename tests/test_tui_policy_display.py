@@ -28,6 +28,7 @@ from claude_swap.tui.widgets import account_card_text, mini_account_text
 
 from tests.test_tui import (
     FakeSwitcher,
+    _iso_in,
     fake_engine,  # noqa: F401 - the auto screen's engine fixture, used by name
     make_account,
     make_app,
@@ -233,4 +234,43 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             )
             assert "5h:50% (line 60%)" in golden_form(
                 self._row(plain, "user2@example.com")
+            )
+
+
+@pytest.mark.asyncio
+class TestNextBestConsumeFirstKeyUsesTheAccountsOwnLine:
+    """Under consume-first the panel's key reads each account against its own
+    line, as the engine's ranking does. Account 2 sits at 5h 92% under a 95%
+    line of its own with the sooner weekly reset; on the global 90 it read as
+    over and fell behind account 3."""
+
+    async def test_an_account_under_its_own_line_keeps_the_soonest_reset(
+        self, tmp_path, fake_engine
+    ):
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90, "strategy": "consume-first"},
+        }))
+        later = make_entry(50.0, 10.0)
+        later.last_good["seven_day"]["resets_at"] = _iso_in(86400 * 5)
+        app = make_app(FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(99.0, 20.0)),
+                with_policy(
+                    make_account(2, entry=make_entry(92.0, 10.0)), threshold=95.0
+                ),
+                make_account(3, entry=later),
+            ],
+            tmp_path,
+        ))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("g")
+            await pilot.pause()
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
             )
