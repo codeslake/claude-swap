@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import stat
+import os
 import sys
 from pathlib import Path
 
@@ -304,6 +305,10 @@ class TestAtomicWriteThroughSymlink:
         assert link.is_symlink(), "the dotfiles link must survive the write"
         assert json.loads(tracked.read_text()) == {"written": "through"}
 
+    @pytest.mark.skipif(
+        not hasattr(os.path, "ALLOW_MISSING"),
+        reason="pre-3.12.11 resolver refuses a dangling link",
+    )
     def test_dangling_link_writes_where_it_points(self, tmp_path):
         target = tmp_path / "gone" / "settings.json"
         link = tmp_path / "settings.json"
@@ -325,7 +330,6 @@ class TestAtomicWriteThroughSymlink:
         another mount — the write fails outright. Assert the placement
         directly; staging two filesystems in a unit test is not portable."""
         import tempfile
-        from claude_swap import settings as S
         repo = tmp_path / "repo"; repo.mkdir()
         live = tmp_path / "live"; live.mkdir()
         tracked = repo / "settings.json"; tracked.write_text("{}")
@@ -333,7 +337,7 @@ class TestAtomicWriteThroughSymlink:
         seen = []
         real_mkstemp = tempfile.mkstemp
         monkeypatch.setattr(
-            S.tempfile, "mkstemp",
+            tempfile, "mkstemp",
             lambda *a, **kw: (seen.append(kw.get("dir")), real_mkstemp(*a, **kw))[1],
         )
 

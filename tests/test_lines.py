@@ -165,3 +165,47 @@ class TestBindingWindow:
         # more usage look healthier here (5.0 -> 13.2 policy points).
         assert _binding(86.7, 99.0, 85.0, 97.0).line_headroom == 5.0
         assert _binding(86.8, 99.0, 85.0, 97.0).line_headroom == 5.0
+
+
+class TestBindingWindowScale:
+    """``scale`` separates an account's own line from the ruler its room is
+    measured on, so accounts on different lines are scored on one scale.
+
+    The engine passes each account's effective threshold as the line and the
+    global threshold as the scale; without ``scale`` the line is its own ruler,
+    exactly as before.
+    """
+
+    WINDOW = [("5h", 50.0, "2024-01-05T00:00:00Z")]
+
+    def test_a_scale_scores_the_room_on_that_ruler(self):
+        found = binding_window(self.WINDOW, 60.0, scale=90.0)
+        assert found.line_headroom == 25.0
+        assert found.line_headroom == line_headroom(50.0, 60.0, 90.0)
+
+    def test_no_scale_is_the_line_as_its_own_ruler(self):
+        assert binding_window(self.WINDOW, 60.0).line_headroom == 50.0
+
+    def test_a_scale_equal_to_the_line_is_plain_headroom(self):
+        assert binding_window(self.WINDOW, 60.0, scale=60.0).line_headroom == 50.0
+
+    def test_scale_moves_only_the_room(self):
+        plain = binding_window(self.WINDOW, 60.0)
+        for scale in (50.0, 85.0, 90.0, 95.0):
+            found = binding_window(self.WINDOW, 60.0, scale=scale)
+            assert (found.label, found.pct, found.line, found.resets_at, found.over) == (
+                plain.label, plain.pct, plain.line, plain.resets_at, plain.over
+            )
+
+    def test_scale_is_keyword_only(self):
+        with pytest.raises(TypeError):
+            binding_window(self.WINDOW, 60.0, None, 90.0)
+
+    def test_the_scale_can_change_which_window_binds(self):
+        # 5h 73.3% on a 55.5 line and 7d 94% on a 90 weekly line tie at 6.0 on
+        # the 90 scale (first window wins the tie); on the 55.5 ruler the 7d
+        # window has 26.7 against the 5h window's 26.700000000000003. Every
+        # site that asks which window binds must pass the same scale.
+        windows = list(oauth.relevant_windows(_usage7(73.3, 94.0)))
+        assert binding_window(windows, 55.5, 90.0, scale=90.0).label == "5h"
+        assert binding_window(windows, 55.5, 90.0).label == "7d"
