@@ -436,7 +436,9 @@ class AutoScreen(Screen):
                         acc.usage.last_good, models
                     )
                 )
-                kind, _ = classify_candidate_block(windows, threshold, weekly)
+                kind, _ = classify_candidate_block(
+                    windows, thresholds[acc.number], weekly
+                )
                 if kind == "open":
                     break
             else:
@@ -680,7 +682,7 @@ class AutoScreen(Screen):
                             (label, p) for label, p, reset in chips
                             if reset is None or reset.startswith("resets ")
                         ),
-                        threshold,
+                        line,
                         weekly,
                     )
                     if kind == "model":

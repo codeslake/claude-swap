@@ -480,8 +480,8 @@ class SwitchEvent(AutoSwitchEvent):
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
         if self.trigger == "probe":
             # The reason, named in plain words, with the trigger literal
-            # still the LAST parenthesized token on the line -- the manager's
-            # decision-log watcher anchors its trigger match there
+            # still the LAST parenthesized token on the line -- a decision-log
+            # consumer anchors its trigger match there
             # (`\(([a-z-]+)\)\s*$`), so anything added must go before it.
             return f"{prefix} {src} -> {dst} (7d reset unknown) (probe)"
         return f"{prefix} {src} -> {dst} ({self.trigger})"
