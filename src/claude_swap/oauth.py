@@ -328,9 +328,15 @@ def _parse_token_account(resp_data: dict) -> dict | None:
     }
 
 
+_TIER_KEYS = (
+    "subscriptionType", "rateLimitTier", "subscriptionTypeSource", "subscriptionTypeVerifiedAt"
+)
+
+
 def carry_tier(credentials: str, *donors: str) -> str:
     """Give a blob with no ``subscriptionType`` the tier of the first donor blob that has one.
 
+    The donor's source and verifiedAt travel with its tier, so a Claude Code sourced donor keeps its source.
     Pure, no request, never raises: it runs under the credential locks and
     right after a grant POST, where a failure must not cost the successor.
     """
@@ -341,7 +347,7 @@ def carry_tier(credentials: str, *donors: str) -> str:
             for donor in donors:
                 tier = extract_oauth_data(donor) or {}
                 if tier.get("subscriptionType") is not None:
-                    blob.update({k: tier[k] for k in ("subscriptionType", "rateLimitTier") if k in tier})
+                    blob.update({k: tier[k] for k in _TIER_KEYS if k in tier})
                     return json.dumps(data)
     except Exception as e:
         _logger.debug("Tier carry skipped: %r", e)
@@ -349,25 +355,29 @@ def carry_tier(credentials: str, *donors: str) -> str:
 
 
 def fill_missing_tier(credentials: str) -> str:
-    """Fill a blob's missing ``subscriptionType`` / ``rateLimitTier`` from the profile.
+    """Fill a blob's tier from the slot's own profile and stamp it ``sign_in``.
 
-    Claude Code fills both only from ``GET /api/oauth/profile`` inside its own
-    token refresh, which cswap's refreshes pre-empt; without them it shows
-    "Claude API" and can hide /remote-control. A blob that has a
-    ``subscriptionType`` is returned as is, with no request. Best effort: any
-    failure, and an organization type with no ``subscriptionType`` mapping,
-    returns ``credentials`` unchanged. One network request: never call it
-    between a grant POST and the successor's persist, or under a lock.
+    Claude Code fills the tier only from ``GET /api/oauth/profile`` inside its
+    own token refresh, which cswap's refreshes pre-empt; without it it shows
+    "Claude API" and can hide /remote-control. It also fetches that profile for
+    a blob with a ``subscriptionType`` and no source, and through the pin the
+    profile is the PINNED account's: the stamp keeps that tier off the slot. A
+    blob with a source and a ``rateLimitTier`` is returned as is, with no
+    request, and so is any failure or an organization type with no
+    ``subscriptionType`` mapping. One network request: never call it between
+    a grant POST and the successor's persist, or under a lock.
     """
     try:
         data = json.loads(credentials)
         blob = data["claudeAiOauth"]
-        if blob.get("subscriptionType") is not None:
+        if blob.get("subscriptionTypeSource") and blob.get("rateLimitTier") is not None:
             return credentials
         profile = fetch_oauth_profile(blob["accessToken"]) or {}
         if "subscriptionType" not in profile:
             return credentials
         blob.update({k: profile[k] for k in ("subscriptionType", "rateLimitTier") if k in profile})
+        # No verifiedAt: CC's own sign_in writer stores none and its save helpers drop it.
+        blob["subscriptionTypeSource"] = "sign_in"
         return json.dumps(data)
     except Exception as e:
         _logger.debug("Tier fill skipped: %r", e)

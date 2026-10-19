@@ -586,40 +586,80 @@ class TestTryRefreshOAuthCredentials:
         assert "subscriptionType" not in json.loads(outcome.credentials)["claudeAiOauth"]
 
     @pytest.mark.no_oauth_profile_fake
-    @pytest.mark.parametrize("profile, filled", [
-        ({"account": {"uuid": "u"}, "organization": {
+    @pytest.mark.parametrize("extra, profile, filled", [
+        ({}, {"account": {"uuid": "u"}, "organization": {
             "organization_type": "claude_max", "rate_limit_tier": "default_claude_max_20x"}},
-         {"subscriptionType": "max", "rateLimitTier": "default_claude_max_20x"}),
-        ({"account": {"uuid": "u"}, "organization": {
+         {"subscriptionType": "max", "rateLimitTier": "default_claude_max_20x",
+          "subscriptionTypeSource": "sign_in"}),
+        ({}, {"account": {"uuid": "u"}, "organization": {
             "organization_type": "claude_free", "rate_limit_tier": "default"}}, {}),
-        (urllib.error.URLError("down"), {}),
-    ], ids=["max", "unmapped-type", "network"])
-    def test_fill_missing_tier_from_the_profile(self, profile, filled):
+        ({}, urllib.error.URLError("down"), {}),
+        # cswap wrote this one itself, so it has no source: CC would fetch the
+        # PINNED account's profile for it. The slot's own profile corrects and stamps it.
+        ({"subscriptionType": "pro", "rateLimitTier": "default_claude_ai"},
+         {"account": {"uuid": "u"}, "organization": {
+             "organization_type": "claude_max", "rate_limit_tier": "default_claude_max_20x"}},
+         {"subscriptionType": "max", "rateLimitTier": "default_claude_max_20x",
+          "subscriptionTypeSource": "sign_in"}),
+        ({"subscriptionType": "pro", "rateLimitTier": None, "subscriptionTypeSource": "profile"},
+         {"account": {"uuid": "u"}, "organization": {
+             "organization_type": "claude_max", "rate_limit_tier": "default_claude_max_20x"}},
+         {"subscriptionType": "max", "rateLimitTier": "default_claude_max_20x",
+          "subscriptionTypeSource": "sign_in"}),
+    ], ids=["max", "unmapped-type", "network", "unsourced-pro", "pro-without-tier"])
+    def test_fill_missing_tier_from_the_profile(self, extra, profile, filled):
         resp = MagicMock()
         resp.read.return_value = json.dumps(profile).encode() if isinstance(profile, dict) else b""
         resp.__enter__ = lambda s: s
         resp.__exit__ = MagicMock(return_value=False)
+        credentials = json.loads(self._make_credentials())
+        credentials["claudeAiOauth"].update(extra)
         with patch(
             "claude_swap.oauth.urllib.request.urlopen",
             side_effect=profile if isinstance(profile, Exception) else None,
             return_value=resp,
         ) as urlopen:
-            result = oauth.fill_missing_tier(self._make_credentials())
+            result = oauth.fill_missing_tier(json.dumps(credentials))
 
         blob = json.loads(result)["claudeAiOauth"]
         assert blob["refreshToken"] == "old-refresh"
-        assert {k: blob[k] for k in ("subscriptionType", "rateLimitTier") if k in blob} == filled
+        keys = ("subscriptionType", "rateLimitTier", "subscriptionTypeSource")
+        if filled:
+            assert {k: blob[k] for k in keys} == filled
+            # CC's own sign_in writer stores no verifiedAt, and its save helpers drop it
+            # from a sign_in blob: a written one would be ignored and then stripped.
+            assert "subscriptionTypeVerifiedAt" not in blob
+        else:
+            assert result == json.dumps(credentials)
+        assert urlopen.call_count == 1  # one own-profile GET, whatever it answered
         assert urlopen.call_args[0][0].headers["Authorization"] == "Bearer old-access"
 
     @pytest.mark.no_oauth_profile_fake
     @pytest.mark.parametrize("credentials", [
         "not json",
-        '{"claudeAiOauth": {"accessToken": "t", "subscriptionType": "pro"}}',
+        '{"claudeAiOauth": {"accessToken": "t", "subscriptionType": "pro",'
+        ' "subscriptionTypeSource": "profile", "rateLimitTier": "default_claude_ai"}}',
+        '{"claudeAiOauth": {"accessToken": "t", "subscriptionType": "pro",'
+        ' "subscriptionTypeSource": "sign_in", "rateLimitTier": "default_claude_ai"}}',
     ])
     def test_fill_missing_tier_leaves_other_input_alone(self, credentials):
         with patch("claude_swap.oauth.urllib.request.urlopen") as urlopen:
             assert oauth.fill_missing_tier(credentials) == credentials
         urlopen.assert_not_called()
+
+    def test_carry_tier_copies_the_donors_source_and_verified_at_as_they_are(self):
+        keys = ("subscriptionType", "rateLimitTier", "subscriptionTypeSource",
+                "subscriptionTypeVerifiedAt")
+        sourced = {"subscriptionType": "max", "rateLimitTier": "t20",
+                   "subscriptionTypeSource": "profile", "subscriptionTypeVerifiedAt": 1700000000000}
+        for donor, carried in ((sourced, sourced), (
+                {"subscriptionType": "max", "rateLimitTier": "t20"},
+                {"subscriptionType": "max", "rateLimitTier": "t20"})):  # nothing invented
+            result = oauth.carry_tier(
+                self._make_credentials(), json.dumps({"claudeAiOauth": {"accessToken": "d", **donor}})
+            )
+            blob = json.loads(result)["claudeAiOauth"]
+            assert {k: blob[k] for k in keys if k in blob} == carried
 
     def test_invalid_grant_body_on_400_is_permanent(self):
         err = self._http_error(400, b'{"error": "invalid_grant"}')
