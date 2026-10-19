@@ -143,6 +143,12 @@ class FakeSwitcher:
     def current_account_number(self) -> str | None:
         return self.active
 
+    def account_policies(self) -> dict:
+        return {}
+
+    def switchable_account_numbers(self) -> list[str]:
+        return []
+
     def switch_to(
         self, identifier: str, json_output: bool = False, force: bool = False
     ) -> dict:
@@ -2537,6 +2543,7 @@ class TestUnswitchableRowsAreListed:
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
+        a.policy.threshold = None
         return a
 
     def _render(self, snap, active):

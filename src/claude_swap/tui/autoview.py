@@ -370,9 +370,11 @@ class AutoScreen(Screen):
     ) -> Text:
         """Switch targets ranked the way the engine's strategy would rank them."""
         # Same window set AND the same lines as the engine: autoswitch.model,
-        # the threshold (the session value — `_settings` is what
-        # `_set_threshold` replaces) and the weekly line, so the displayed
-        # ranking can never disagree with the account it picks.
+        # each account's own line (its policy threshold, else the session
+        # threshold — `_settings` is what `_set_threshold` replaces), the
+        # weekly line, and the session threshold as the ruler every account is
+        # scored on, so the displayed ranking can never disagree with the
+        # account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         settings = self._settings
         models = parse_model_names(settings.model) if settings else ()
@@ -414,8 +416,14 @@ class AutoScreen(Screen):
                 lines[acc.number] = entry
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
+            line = (
+                acc.policy.threshold if acc.policy.threshold is not None else threshold
+            )
             binding = binding_window(
-                oauth.relevant_windows(acc.usage.last_good, models), threshold, weekly
+                oauth.relevant_windows(acc.usage.last_good, models),
+                line,
+                weekly,
+                scale=threshold,
             )
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
@@ -468,7 +476,9 @@ class AutoScreen(Screen):
                         style=palette.muted,
                     )
                     entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
-                    if weekly is not None and label == binding.label:
+                    if (
+                        weekly is not None or acc.policy.threshold is not None
+                    ) and label == binding.label:
                         entry.append(
                             f" (line {pct_label(binding.line)}%)",
                             style=palette.muted,
@@ -476,10 +486,11 @@ class AutoScreen(Screen):
                 key = (
                     consume_first_rank_key(
                         acc.usage.last_good,
-                        threshold,
+                        line,
                         now,
                         models,
                         weekly_threshold=weekly,
+                        scale=threshold,
                     )
                     if consume_first
                     else (-binding.line_headroom,)
