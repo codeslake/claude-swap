@@ -651,7 +651,8 @@ class AutoScreen(Screen):
                     (0, ordered_rank[acc.number]) if acc.number in ordered_rank
                     else (998.0,) if acc.disabled
                     else (1,) + data.waiting_tail_key(
-                        acc.usage.last_good, models, admission_now, settings
+                        acc.usage.last_good, models, admission_now, settings,
+                        bars.get(acc.number, settings.threshold),
                     )
                 )
                 ranked.append((key, acc.number))

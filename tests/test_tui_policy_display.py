@@ -20,14 +20,20 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import time
 
 import pytest
 
-from claude_swap.models import AccountPolicy
+from claude_swap.models import AccountPolicy, AccountsSnapshot
+from claude_swap.settings import AutoSwitchSettings
+from claude_swap.tui import data as tui_data
 from claude_swap.tui.widgets import account_card_text, mini_account_text
+from claude_swap.usage_store import UsageEntry
 
 from tests.test_tui import (
     FakeSwitcher,
+    _autoview_order,
+    _iso_in,
     fake_engine,  # noqa: F401 - the auto screen's engine fixture, used by name
     make_account,
     make_app,
@@ -51,12 +57,9 @@ NOW = 1000.0
 
 
 def with_policy(acc, **kwargs):
-    """Attach an ``AccountPolicy`` to a snapshot from ``tests.test_tui``.
-
-    ``make_account`` predates the policy field and takes no ``policy=``
-    argument; ``test_tui.py`` is upstream's and stays byte-unchanged, so the
-    snapshot is rebuilt here instead of the helper being widened.
-    """
+    """Attach an ``AccountPolicy(**kwargs)`` to a snapshot from
+    ``tests.test_tui``: ``make_account(policy=...)`` for an account already
+    built."""
     return dataclasses.replace(acc, policy=AccountPolicy(**kwargs))
 
 
@@ -232,7 +235,9 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
         sit under the dynamic bar (97) but over their own 80 line on Fable, so
         neither is open and the ranking drops the model: 2's real 5h (20%)
         beats 3's (60%). Judged on the bar, both read open, the model gate
-        stays, and 3 (Fable 84) ranks first."""
+        stays, nobody is admitted, and both fall to the waiting tail, whose
+        order here coincides with the right one: so the ranking itself is
+        asserted, empty without the per-account lines."""
         (tmp_path / "settings.json").write_text(json.dumps({
             "schemaVersion": 1,
             "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
@@ -261,8 +266,50 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             await settle(pilot)
             from textual.widgets import Static
 
+            ordered, *_ = tui_data.rank_switch_candidates(
+                fake.accounts_snapshot(), app.screen._settings, time.time(), "1"
+            )
+            assert ordered == ["2", "3"]
             plain = app.screen.query_one("#candidates", Static).render().plain
             assert plain.index("user2@example.com") < plain.index(
                 "user3@example.com"
             )
 
+
+class TestWaitingTailReadsEachAccountsOwnLine:
+    """Both screens order the refused candidates by the soonest binding
+    recovery, read on each account's own line as the engine reads it: "3" sits
+    over its own 60% five-hour line, so the 5h binds and recovers in 2h. Read
+    on the global 90 it would bind on the 7d and recover in 3 days, behind "2",
+    which is over the weekly line and recovers in 1."""
+
+    @staticmethod
+    def _entry(five_hour, five_hour_resets, seven_day, seven_day_resets):
+        return UsageEntry(
+            last_good={
+                "five_hour": {"pct": five_hour, "resets_at": _iso_in(five_hour_resets)},
+                "seven_day": {"pct": seven_day, "resets_at": _iso_in(seven_day_resets)},
+            },
+            fetched_at=time.time(),
+            age_s=0.0,
+        )
+
+    def test_the_tail_orders_by_recovery_on_the_accounts_own_line(self):
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=self._entry(95.0, 600, 20.0, 86400)),
+                make_account(2, entry=self._entry(10.0, 7200, 98.0, 86400)),
+                with_policy(
+                    make_account(3, entry=self._entry(70.0, 7200, 90.0, 86400 * 3)),
+                    threshold=60.0,
+                ),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(
+            strategy="best", threshold=90.0, weekly_threshold=97.0
+        )
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "3", "2"]
+        assert order[1:] == _autoview_order(snap, "1", settings)

@@ -35,6 +35,7 @@ from claude_swap.autoswitch import (
     _headroom_by_account,
     _model_window_binds_everywhere,
     _rank_dynamic_candidates,
+    _ruler,
     _wall_headroom,
     rank_candidates_pass,
 )
@@ -449,6 +450,7 @@ def waiting_tail_key(
     models: tuple[str, ...],
     now: float,
     settings: "AutoSwitchSettings",
+    line: float,
 ) -> tuple:
     """Sort key for a row the admission pass refused but that still has a
     usable window: every account with headroom in ALL its windows before
@@ -457,7 +459,9 @@ def waiting_tail_key(
     outrank one usable right now. Soonest binding recovery breaks ties
     inside each half. `ordered_accounts` and the auto view's own
     `_candidates_text` (autoview.py) both call this, or the two screens
-    can rank this tier two different ways on the same snapshot.
+    can rank this tier two different ways on the same snapshot. ``line`` is
+    the account's own switch threshold (``ThresholdMap[num]``), read on
+    ``_ruler``'s scale as the engine's recovery reads are.
     """
     full = 1 if binding_pct(usage, models) >= 100.0 else 0
     return (
@@ -466,8 +470,9 @@ def waiting_tail_key(
             usage,
             models,
             now,
-            threshold=settings.threshold,
+            threshold=line,
             weekly_threshold=settings.weekly_threshold,
+            scale=_ruler(settings),
         ),
     )
 
@@ -501,6 +506,7 @@ def ordered_accounts(
     )
     ordered_rank = {num: i for i, num in enumerate(ordered)}
     models = parse_model_names(settings.model)
+    bars = ThresholdMap(switch_bars(snap), settings.threshold)
 
     def bucket(acc) -> tuple:
         if not acc.switchable:
@@ -531,7 +537,9 @@ def ordered_accounts(
         # can list this same unranked row in two different orders. Not the
         # 7-day reset alone: the window that actually blocks an account is
         # whichever is highest, and that is routinely the 5-hour one.
-        return (1,) + waiting_tail_key(acc.usage.last_good, models, now, settings)
+        return (1,) + waiting_tail_key(
+            acc.usage.last_good, models, now, settings, bars[acc.number]
+        )
 
     others.sort(key=lambda a: (bucket(a), a.number))  # matches the auto view's tie-break
     numbers = [acc.number for acc in others]
