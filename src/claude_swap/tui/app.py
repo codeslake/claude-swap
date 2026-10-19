@@ -342,11 +342,11 @@ class CswapApp(App):
             partial(self.switcher.set_account_disabled, number, target),
         )
 
-    def do_set_switch_threshold(self, number: str, pct: float | None) -> None:
+    def do_set_account_threshold(self, number: str, pct: float | None) -> None:
         """Give the account its own switch threshold (``None``: the strategy's)."""
         self._start_action(
             f"Set switch threshold of account {number}",
-            partial(self.switcher.set_account_switch_threshold, number, pct),
+            partial(self.switcher.set_account_threshold, number, pct),
         )
 
     def confirm_remove(self, number: str, email: str) -> None:

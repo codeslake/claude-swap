@@ -70,7 +70,7 @@ def run_action(fn: Callable[[], dict | None]) -> ActionResult:
         ), contextlib.redirect_stderr(buf):
             try:
                 payload = fn()
-            except ClaudeSwitchError as e:
+            except (ClaudeSwitchError, ValueError) as e:
                 print(f"Error: {e}")
                 return ActionResult(False, buf.getvalue())
             except EOFError:

@@ -26,7 +26,7 @@ from claude_swap.json_output import (
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_TOKEN_EXPIRED,
 )
-from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.models import AccountPolicy, AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import STALE_OK_S, UsageEntry
@@ -86,7 +86,7 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
-    switch_threshold: float | None = None,
+    policy: AccountPolicy = AccountPolicy(),
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -99,7 +99,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
-        switch_threshold=switch_threshold,
+        policy=policy,
     )
 
 
@@ -194,10 +194,10 @@ class FakeSwitcher:
         verb = "Disabled" if disabled else "Enabled"
         print(f"{verb} Account-{identifier}")
 
-    def set_account_switch_threshold(self, identifier: str, pct: float | None) -> None:
+    def set_account_threshold(self, identifier: str, pct: float | None) -> None:
         self.calls.append(("set_threshold", str(identifier), pct))
         self._accounts = [
-            dataclasses.replace(a, switch_threshold=pct)
+            dataclasses.replace(a, policy=AccountPolicy(threshold=pct))
             if a.number == str(identifier)
             else a
             for a in self._accounts
@@ -930,11 +930,11 @@ class TestDashboard:
             # both the active card and the mini row carry the marker
             assert panel.count("(disabled)") == 2
 
-    async def test_switch_threshold_marker_on_active_card_and_mini(self, tmp_path):
+    async def test_threshold_badge_on_active_card_and_mini(self, tmp_path):
         fake = FakeSwitcher(
             [
-                make_account(1, active=True, switch_threshold=80.0),
-                make_account(2, switch_threshold=85.0),
+                make_account(1, active=True, policy=AccountPolicy(threshold=80.0)),
+                make_account(2, policy=AccountPolicy(threshold=85.0)),
                 make_account(3),
             ],
             tmp_path,
@@ -945,8 +945,8 @@ class TestDashboard:
             from claude_swap.tui.widgets import AccountsPanel
 
             panel = app.screen.query_one(AccountsPanel).render().plain
-            assert "switch at 80%" in panel and "switch at 85%" in panel
-            assert panel.count("switch at") == 2  # the strategy-default one is unmarked
+            assert "th 80%" in panel and "th 85%" in panel
+            assert len(re.findall(r"th \d+%", panel)) == 2  # the default-line one is unmarked
 
     async def test_active_card_skips_absent_window_and_shows_scoped(self, tmp_path):
         fake = FakeSwitcher(
@@ -1225,7 +1225,7 @@ class TestDashboard:
         self, tmp_path
     ):
         fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2, switch_threshold=85.0)],
+            [make_account(1, active=True), make_account(2, policy=AccountPolicy(threshold=85.0))],
             tmp_path,
         )
         app = make_app(fake)
@@ -2333,7 +2333,7 @@ class TestAccountsSnapshot:
         assert all(acc.usage.sentinel is not None for acc in snap.accounts)
         assert isinstance(snap.taken_at, float)
 
-    def test_snapshot_carries_an_accounts_own_switch_threshold(
+    def test_snapshot_carries_an_accounts_own_threshold(
         self, temp_home, mock_claude_config
     ):
         switcher = ClaudeAccountSwitcher()
@@ -2346,10 +2346,10 @@ class TestAccountsSnapshot:
             "2": {"email": "other@example.com", "uuid": "uuid-2"},
         }
         switcher._write_json(switcher.sequence_file, data)
-        switcher.set_account_switch_threshold("2", 85.0)
+        switcher.set_account_threshold("2", 85.0)
 
         snap = switcher.accounts_snapshot(fetch=set())
-        assert [acc.switch_threshold for acc in snap.accounts] == [None, 85.0]
+        assert [acc.policy.threshold for acc in snap.accounts] == [None, 85.0]
 
 
 # ---------------------------------------------------------------------------
@@ -2633,6 +2633,7 @@ class TestUnswitchableRowsAreListed:
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
+        a.policy = AccountPolicy()
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
         return a
