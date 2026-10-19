@@ -89,6 +89,8 @@ def binding_window(
     windows: Iterable[tuple[str, float, str | None]],
     threshold: float,
     weekly_threshold: float | None = None,
+    *,
+    scale: float | None = None,
 ) -> BindingWindow | None:
     """The window with the least policy headroom, over-line windows first;
     ties keep the first in ``relevant_windows`` order (5h, 7d, then scoped).
@@ -100,13 +102,23 @@ def binding_window(
     per-window check. The ordering is the SAME one the engine ranks and
     applies hysteresis on: choosing the window by one score and ranking by
     another made 0.1 more usage look healthier whenever the choice flipped.
+
+    ``scale`` is the threshold the headroom is measured on, ``T`` in
+    ``line_headroom``; it defaults to ``threshold``. An account on a line of
+    its own passes that line as ``threshold`` and the global threshold as
+    ``scale``, so accounts on different lines are scored on one ruler and
+    their headroom compares directly. Each window's line and ``over`` do
+    not depend on it. In exact arithmetic neither does the window chosen,
+    but at a floating-point tie the rounding does, so every caller that
+    selects a window for one account must pass the same ``scale``.
     """
     best: BindingWindow | None = None
     best_key: tuple[bool, float] | None = None
+    ruler = threshold if scale is None else scale
     for label, pct, resets_at in windows:
         line = window_line(label, threshold, weekly_threshold)
         window = BindingWindow(
-            label, pct, line, resets_at, line_headroom(pct, line, threshold)
+            label, pct, line, resets_at, line_headroom(pct, line, ruler)
         )
         key = (not window.over, window.line_headroom)
         if best_key is None or key < best_key:

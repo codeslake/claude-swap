@@ -2722,8 +2722,12 @@ class TestUnswitchableRowsAreListed:
     def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
               sentinel=None, usage=None):
         from unittest.mock import MagicMock
+        from claude_swap.models import AccountPolicy
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
+        # A real policy: the panel reads `policy.threshold` as a number or None,
+        # and a MagicMock attribute is neither.
+        a.policy = AccountPolicy()
         if usage is not None:
             a.usage = usage
         else:

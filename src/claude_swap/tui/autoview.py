@@ -30,6 +30,7 @@ from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     AutoSwitchEngine,
     AutoSwitchEvent,
+    ThresholdMap,
     binding_pct,
     classify_candidate_block,
     consume_first_rank_key,
@@ -78,11 +79,12 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
 
-def _line_note(binding: BindingWindow | None, label: str, weekly: float | None) -> str:
+def _line_note(binding: BindingWindow | None, label: str, differs: bool) -> str:
     """The "(line 97%)" note after the BINDING window's chip, once a weekly line
-    makes the lines differ: the raw pct stays, and the line it is judged
-    against is named only where it is not the one number in the header."""
-    if weekly is None or binding is None or label != binding.label:
+    or the account's own threshold makes the lines differ: the raw pct stays,
+    and the line it is judged against is named only where it is not the one
+    number in the header."""
+    if not differs or binding is None or label != binding.label:
         return ""
     return f" (line {pct_label(binding.line)}%)"
 
@@ -379,14 +381,24 @@ class AutoScreen(Screen):
     ) -> Text:
         """Switch targets ranked the way the engine's strategy would rank them."""
         # Same window set AND the same lines as the engine: autoswitch.model,
-        # the threshold (the session value — `_settings` is what
-        # `_set_threshold` replaces) and the weekly line, so the displayed
-        # ranking can never disagree with the account it picks.
+        # each account's own line (its policy threshold, else the session
+        # threshold — `_settings` is what `_set_threshold` replaces), the
+        # weekly line, and the session threshold as the ruler every account is
+        # scored on, so the displayed ranking can never disagree with the
+        # account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         settings = self._settings
         models = parse_model_names(settings.model) if settings else ()
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
+        thresholds = ThresholdMap(
+            {
+                acc.number: acc.policy.threshold
+                for acc in snap.accounts
+                if acc.policy.threshold is not None
+            },
+            threshold,
+        )
         # Same strategy the engine ticks on, so the panel's order can never
         # disagree with the account a tick would actually switch to.
         consume_first = bool(
@@ -485,6 +497,7 @@ class AutoScreen(Screen):
                 now,
                 threshold,
                 weekly,
+                thresholds,
             )
         # Chip columns are keyed by WINDOW NAME, never by position: two rows
         # can have different-length window lists built from that account's
@@ -504,7 +517,10 @@ class AutoScreen(Screen):
                 continue
             windows = oauth.relevant_windows(acc.usage.last_good, models)
             row_windows[acc.number] = windows
-            bound = binding_window(windows, threshold, weekly)
+            bound = binding_window(
+                windows, thresholds[acc.number], weekly, scale=threshold
+            )
+            differs = weekly is not None or acc.number in thresholds
             for label, wpct, resets_at in windows:
                 width = len(
                     data.chip_label(
@@ -515,7 +531,7 @@ class AutoScreen(Screen):
                         ),
                         wpct,
                     )
-                ) + len(f"{wpct:.0f}%") + len(_line_note(bound, label, weekly))
+                ) + len(f"{wpct:.0f}%") + len(_line_note(bound, label, differs))
                 chip_width[label] = max(chip_width.get(label, 0), width)
         for acc in snap.accounts:
             if acc.number == active_number:
@@ -546,8 +562,12 @@ class AutoScreen(Screen):
                 lines[acc.number] = entry
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
+            line = thresholds[acc.number]
             binding = binding_window(
-                oauth.relevant_windows(acc.usage.last_good, models), threshold, weekly
+                oauth.relevant_windows(acc.usage.last_good, models),
+                line,
+                weekly,
+                scale=threshold,
             )
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
@@ -613,7 +633,9 @@ class AutoScreen(Screen):
                     # differ, the BINDING window's chip also names the line it
                     # is judged against. Inside the chip's column (counted in
                     # `chip_width`), so the chips after it stay put.
-                    note = _line_note(binding, label, weekly)
+                    note = _line_note(
+                        binding, label, weekly is not None or acc.number in thresholds
+                    )
                     entry.append(note, style=palette.muted)
                     # Never on the LAST chip: nothing after it needs
                     # aligning, and padding it would leave trailing
@@ -667,13 +689,15 @@ class AutoScreen(Screen):
                         entry.append(f"  {blocked_model} full", style=palette.muted)
                 rank_binding = binding_window(
                     oauth.relevant_windows(acc.usage.last_good, rank_models),
-                    threshold,
+                    line,
                     weekly,
+                    scale=threshold,
                 ) or binding
                 key = (
                     consume_first_rank_key(
-                        acc.usage.last_good, threshold, now, rank_models,
+                        acc.usage.last_good, line, now, rank_models,
                         weekly_threshold=weekly, probe=(acc.number == probe_num),
+                        scale=threshold,
                     )
                     if consume_first
                     else (-rank_binding.line_headroom,)
