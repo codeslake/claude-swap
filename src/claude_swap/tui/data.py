@@ -26,6 +26,7 @@ from claude_swap import oauth, printer, usage_store
 from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     STATE_FILENAME,
+    ThresholdMap,
     _about_to_wall,
     _binding_at,
     _binding_recovery_ts,
@@ -246,9 +247,9 @@ def switch_bars(snap: AccountsSnapshot) -> dict[str, float]:
     """Each account's own switch threshold, as the engine reads it (`_bars`);
     an account without one is absent and takes the strategy's bar."""
     return {
-        acc.number: acc.switch_threshold
+        acc.number: acc.policy.threshold
         for acc in snap.accounts
-        if acc.switch_threshold is not None
+        if acc.policy.threshold is not None
     }
 
 
@@ -271,7 +272,9 @@ def rank_switch_candidates(
     consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
     usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
     entries = {acc.number: acc.usage for acc in snap.accounts}
-    bars = switch_bars(snap)
+    # The engine's own tick map (`_resolve_thresholds`): `.get` reads the
+    # overrides only, `[num]` falls back to the global threshold.
+    bars = ThresholdMap(switch_bars(snap), settings.threshold)
     oauth_candidates = [
         acc.number
         for acc in snap.accounts
@@ -407,7 +410,7 @@ def rank_switch_candidates(
             now=now,
             reasons=reasons,
             entries=entries,
-            bars=bars,
+            thresholds=bars,
         )
         return ordered, rank_axis
 
@@ -416,7 +419,8 @@ def rank_switch_candidates(
         (acc.disabled for acc in snap.accounts if acc.number == active_number), False
     )
     active_headroom = _dynamic_active_headroom(
-        settings, models, usage, active_number, model_headroom.get(active_number)
+        settings, models, usage, active_number, model_headroom.get(active_number),
+        bars,
     )
     trigger = _trigger_for(active_headroom, active_disabled)
     unmodeled = trigger in _UNMODELED_TRIGGERS
@@ -426,7 +430,7 @@ def rank_switch_candidates(
         and models
         and settings.strategy == "dynamic"
         and _model_window_binds_everywhere(
-            usage, models, settings.threshold, settings.weekly_threshold
+            usage, models, settings.threshold, settings.weekly_threshold, bars
         )
     ):
         ordered, rank_axis = _rank_on((), trigger)

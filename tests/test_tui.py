@@ -26,7 +26,7 @@ from claude_swap.json_output import (
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_TOKEN_EXPIRED,
 )
-from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.models import AccountPolicy, AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
@@ -87,7 +87,7 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
-    switch_threshold: float | None = None,
+    policy: AccountPolicy = AccountPolicy(),
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -100,7 +100,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
-        switch_threshold=switch_threshold,
+        policy=policy,
     )
 
 
@@ -195,10 +195,10 @@ class FakeSwitcher:
         verb = "Disabled" if disabled else "Enabled"
         print(f"{verb} Account-{identifier}")
 
-    def set_account_switch_threshold(self, identifier: str, pct: float | None) -> None:
+    def set_account_threshold(self, identifier: str, pct: float | None) -> None:
         self.calls.append(("set_threshold", str(identifier), pct))
         self._accounts = [
-            dataclasses.replace(a, switch_threshold=pct)
+            dataclasses.replace(a, policy=AccountPolicy(threshold=pct))
             if a.number == str(identifier)
             else a
             for a in self._accounts
@@ -867,6 +867,15 @@ class TestRunAction:
         assert not result.ok
         assert "boom" in result.output
 
+    def test_a_value_error_is_not_swallowed(self):
+        """Only `ClaudeSwitchError` is an action's reported failure; a stray
+        `ValueError` is a bug and must not read as a clean "Error: ..." line."""
+        def fn():
+            raise ValueError("bug")
+
+        with pytest.raises(ValueError):
+            tui_data.run_action(fn)
+
     def test_unexpected_input_becomes_eoferror(self):
         def fn():
             input("should not block")
@@ -931,11 +940,11 @@ class TestDashboard:
             # both the active card and the mini row carry the marker
             assert panel.count("(disabled)") == 2
 
-    async def test_switch_threshold_marker_on_active_card_and_mini(self, tmp_path):
+    async def test_threshold_badge_on_active_card_and_mini(self, tmp_path):
         fake = FakeSwitcher(
             [
-                make_account(1, active=True, switch_threshold=80.0),
-                make_account(2, switch_threshold=85.0),
+                make_account(1, active=True, policy=AccountPolicy(threshold=80.0)),
+                make_account(2, policy=AccountPolicy(threshold=85.0)),
                 make_account(3),
             ],
             tmp_path,
@@ -946,8 +955,8 @@ class TestDashboard:
             from claude_swap.tui.widgets import AccountsPanel
 
             panel = app.screen.query_one(AccountsPanel).render().plain
-            assert "switch at 80%" in panel and "switch at 85%" in panel
-            assert panel.count("switch at") == 2  # the strategy-default one is unmarked
+            assert "th 80%" in panel and "th 85%" in panel
+            assert len(re.findall(r"th \d+%", panel)) == 2  # the default-line one is unmarked
 
     async def test_active_card_skips_absent_window_and_shows_scoped(self, tmp_path):
         fake = FakeSwitcher(
@@ -1226,7 +1235,7 @@ class TestDashboard:
         self, tmp_path
     ):
         fake = FakeSwitcher(
-            [make_account(1, active=True), make_account(2, switch_threshold=85.0)],
+            [make_account(1, active=True), make_account(2, policy=AccountPolicy(threshold=85.0))],
             tmp_path,
         )
         app = make_app(fake)
@@ -1260,6 +1269,27 @@ class TestDashboard:
             await menu_select(pilot, "set-threshold:2:default")
             await settle(pilot)
             assert ("set_threshold", "2", None) in fake.calls
+
+    async def test_a_rejected_threshold_is_reported_not_raised(self, tmp_path):
+        """`set_account_threshold` rejects a value out of range with
+        `ValueError`; the action reports it like any switcher error."""
+
+        class Rejecting(FakeSwitcher):
+            def set_account_threshold(self, identifier, pct):
+                raise ValueError("threshold must be between 50 and 99.9")
+
+        app = make_app(Rejecting([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "threshold-menu")
+            await menu_select(pilot, "threshold:1")
+            await menu_select(pilot, "set-threshold:1:80")
+            await settle(pilot)
+            from claude_swap.tui.modals import OutputModal
+
+            assert isinstance(app.screen, OutputModal)
+            assert not app.busy
+            assert "between 50 and 99.9" in app.screen._output
 
     async def test_modal_arrow_keys_choose_button(self, tmp_path):
         fake = FakeSwitcher(
@@ -1945,7 +1975,7 @@ class TestRankSwitchReasons:
 class TestRankSwitchOwnBars:
     """An account's own switch threshold (#321's per-account bars) reaches the
     panel's pass as it reaches the engine's tick (`self._bars`): the row
-    carries it as `switch_threshold`, and every bar the engine reads per
+    carries it as `policy.threshold`, and every bar the engine reads per
     account is that number, never the strategy's."""
 
     @staticmethod
@@ -1963,7 +1993,7 @@ class TestRankSwitchOwnBars:
         snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
             settings,
             make_account(1, active=True, entry=make_entry(95.0, 10.0)),
-            make_account(2, entry=make_entry(70.0, 10.0), switch_threshold=60.0),
+            make_account(2, entry=make_entry(70.0, 10.0), policy=AccountPolicy(threshold=60.0)),
             make_account(3, entry=make_entry(75.0, 10.0)),
         )
         assert trigger == "proactive", trigger
@@ -1978,7 +2008,7 @@ class TestRankSwitchOwnBars:
         _snap, (ordered, _axis, trigger, unmodeled) = self._rank(
             settings,
             make_account(
-                1, active=True, entry=make_entry(85.0, 10.0), switch_threshold=80.0
+                1, active=True, entry=make_entry(85.0, 10.0), policy=AccountPolicy(threshold=80.0)
             ),
             make_account(2, entry=make_entry(10.0, 10.0)),
         )
@@ -1996,7 +2026,7 @@ class TestRankSwitchOwnBars:
         snap = AccountsSnapshot(
             accounts=[
                 make_account(1, active=True, entry=make_entry(95.0, 10.0)),
-                make_account(2, entry=make_entry(70.0, 10.0), switch_threshold=60.0),
+                make_account(2, entry=make_entry(70.0, 10.0), policy=AccountPolicy(threshold=60.0)),
                 make_account(3, entry=make_entry(75.0, 10.0)),
             ],
             active_number="1",
@@ -2019,9 +2049,9 @@ class TestRankSwitchOwnBars:
         _snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
             settings,
             make_account(
-                1, active=True, entry=make_entry(80.0, 10.0), switch_threshold=80.0
+                1, active=True, entry=make_entry(80.0, 10.0), policy=AccountPolicy(threshold=80.0)
             ),
-            make_account(2, entry=make_entry(85.0, 10.0), switch_threshold=80.0),
+            make_account(2, entry=make_entry(85.0, 10.0), policy=AccountPolicy(threshold=80.0)),
             make_account(3, entry=make_entry(50.0, 10.0)),
         )
         assert trigger == "proactive", trigger
@@ -2035,9 +2065,9 @@ class TestRankSwitchOwnBars:
         _snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
             settings,
             make_account(
-                1, active=True, entry=make_entry(98.0, 10.0), switch_threshold=80.0
+                1, active=True, entry=make_entry(98.0, 10.0), policy=AccountPolicy(threshold=80.0)
             ),
-            make_account(2, entry=make_entry(85.0, 10.0), switch_threshold=80.0),
+            make_account(2, entry=make_entry(85.0, 10.0), policy=AccountPolicy(threshold=80.0)),
         )
         assert trigger == "proactive", trigger
         assert ordered == ["2"], ordered
@@ -3060,7 +3090,7 @@ class TestAccountsSnapshot:
         assert all(acc.usage.sentinel is not None for acc in snap.accounts)
         assert isinstance(snap.taken_at, float)
 
-    def test_snapshot_carries_an_accounts_own_switch_threshold(
+    def test_snapshot_carries_an_accounts_own_threshold(
         self, temp_home, mock_claude_config
     ):
         switcher = ClaudeAccountSwitcher()
@@ -3073,10 +3103,10 @@ class TestAccountsSnapshot:
             "2": {"email": "other@example.com", "uuid": "uuid-2"},
         }
         switcher._write_json(switcher.sequence_file, data)
-        switcher.set_account_switch_threshold("2", 85.0)
+        switcher.set_account_threshold("2", 85.0)
 
         snap = switcher.accounts_snapshot(fetch=set())
-        assert [acc.switch_threshold for acc in snap.accounts] == [None, 85.0]
+        assert [acc.policy.threshold for acc in snap.accounts] == [None, 85.0]
 
 
 # ---------------------------------------------------------------------------
@@ -3360,7 +3390,7 @@ class TestUnswitchableRowsAreListed:
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
-        a.switch_threshold = None  # the row's default, not an auto-mocked float
+        a.policy = AccountPolicy()  # the row's default, not an auto-mocked threshold
         # A real UsageEntry, not a MagicMock -- `.decision_value()` (the
         # ranking pass's own read) is real code, not an auto-mocked
         # callable, and needs actual `sentinel`/`last_good`/`age_s` to

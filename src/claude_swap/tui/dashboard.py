@@ -128,7 +128,7 @@ class DashboardScreen(Screen):
         entries: MenuEntries = []
         for acc in (snap.accounts if snap else ()):
             name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
-            own = acc.switch_threshold
+            own = acc.policy.threshold
             state = "strategy's" if own is None else f"{own:g}%"
             entries.append((f"{acc.number}  {name}   {state}", f"threshold:{acc.number}"))
         entries.append(_BACK)
@@ -227,7 +227,7 @@ class DashboardScreen(Screen):
             await self._push_menu(f"account {number}", self._threshold_value_entries(number))
         elif action_id.startswith("set-threshold:"):
             _, number, value = action_id.split(":")
-            app.do_set_switch_threshold(number, None if value == "default" else float(value))
+            app.do_set_account_threshold(number, None if value == "default" else float(value))
             await self._pop_menu()
             await self._pop_menu()
         else:

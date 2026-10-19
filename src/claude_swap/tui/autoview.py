@@ -406,7 +406,9 @@ class AutoScreen(Screen):
         """Switch targets ranked the way the engine's strategy would rank them,
         by headroom against each window's own switch line."""
         # Same window set AND the same lines as the engine (autoswitch.model,
-        # the session threshold and the weekly line) -- for the ranking KEY.
+        # each account's own line (its policy threshold, else the strategy's
+        # bar), the weekly line, and that bar as the ruler every account is
+        # scored on) -- for the ranking KEY.
         # Not a guarantee the order agrees end to end: see below, the
         # engine's own tick can rank on a different axis.
         palette = Palette.from_theme(self.app.current_theme)
@@ -555,7 +557,9 @@ class AutoScreen(Screen):
                     entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
                     # Once the lines differ, name the one the BINDING window is
                     # judged against; the raw pct stays.
-                    if weekly is not None and label == binding.label:
+                    if (
+                        weekly is not None or acc.policy.threshold is not None
+                    ) and label == binding.label:
                         entry.append(
                             f" (line {pct_label(binding.line)}%)", style=palette.muted
                         )

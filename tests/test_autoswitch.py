@@ -16374,7 +16374,7 @@ class TestPerAccountSwitchThreshold:
     @staticmethod
     def _set(h, num, pct):
         data = h.switcher._get_sequence_data()
-        data["accounts"][str(num)]["switchThreshold"] = pct
+        data["accounts"][str(num)]["threshold"] = pct
         h.switcher._write_json(h.switcher.sequence_file, data)
 
     @staticmethod
@@ -16822,16 +16822,14 @@ class TestPerAccountSwitchThreshold:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    @pytest.mark.parametrize(
-        "weekly_threshold, winner", [(None, 3), (97.0, 2)]
-    )
-    def test_an_own_line_rescales_its_5h_score_only_under_a_weekly_line(
-        self, temp_home, weekly_threshold, winner
+    @pytest.mark.parametrize("weekly_threshold", [None, 97.0])
+    def test_an_own_line_rescales_its_5h_score_with_or_without_a_weekly_line(
+        self, temp_home, weekly_threshold
     ):
-        # 3 (own 70, 5h 55) against 2 (5h 60, line 85). One line per account
-        # scores raw headroom: 45 beats 40, the roomier account wins. A weekly
-        # line scales every 5h score by the common anchor over the account's
-        # own 5h line (100 - 85 * 55 / 70 = 33.2), so 2's 40 wins.
+        # 3 (own 70, 5h 55) against 2 (5h 60, line 85). Every account is scored
+        # on the strategy's one ruler, so room under 3's own line counts as
+        # 100 - 85 * 55 / 70 = 33.2 against 2's 40, and 2 wins whether or not a
+        # weekly line is set. Raw headroom (45 beats 40) would pick 3.
         h = self._composed_harness(
             temp_home, "best", hysteresis_pct=5.0, weekly_threshold=weekly_threshold
         )
@@ -16840,7 +16838,7 @@ class TestPerAccountSwitchThreshold:
             "1": _usage7(90, 10), "2": _usage7(60, 10), "3": _usage7(55, 10),
         })
         assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == winner
+        assert h.active_number() == 2
 
 class TestWeeklyThreshold:
     """`autoswitch.weeklyThreshold`: a separate switch line for the 7d and
