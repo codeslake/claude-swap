@@ -223,3 +223,46 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
                 "user2@example.com"
             )
             assert "50% (line 60%)" in self._row(plain, "user2@example.com")
+
+    async def test_a_candidate_blocked_on_its_own_line_counts_in_the_model_wall_check(
+        self, tmp_path, fake_engine
+    ):
+        """Under dynamic the panel ranks on 5h/7d alone once no candidate is
+        open on the model axis, as the engine's retry does. Candidates 2 and 3
+        sit under the dynamic bar (97) but over their own 80 line on Fable, so
+        neither is open and the ranking drops the model: 2's real 5h (20%)
+        beats 3's (60%). Judged on the bar, both read open, the model gate
+        stays, and 3 (Fable 84) ranks first."""
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                with_policy(
+                    make_account(
+                        2, entry=make_entry(20.0, 5.0, scoped=[("Fable", 85.0)])
+                    ),
+                    threshold=80.0,
+                ),
+                with_policy(
+                    make_account(
+                        3, entry=make_entry(60.0, 5.0, scoped=[("Fable", 84.0)])
+                    ),
+                    threshold=80.0,
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+

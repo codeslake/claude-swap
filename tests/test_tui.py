@@ -866,6 +866,15 @@ class TestRunAction:
         assert not result.ok
         assert "boom" in result.output
 
+    def test_a_value_error_is_not_swallowed(self):
+        """Only `ClaudeSwitchError` is an action's reported failure; a stray
+        `ValueError` is a bug and must not read as a clean "Error: ..." line."""
+        def fn():
+            raise ValueError("bug")
+
+        with pytest.raises(ValueError):
+            tui_data.run_action(fn)
+
     def test_unexpected_input_becomes_eoferror(self):
         def fn():
             input("should not block")
@@ -1259,6 +1268,27 @@ class TestDashboard:
             await menu_select(pilot, "set-threshold:2:default")
             await settle(pilot)
             assert ("set_threshold", "2", None) in fake.calls
+
+    async def test_a_rejected_threshold_is_reported_not_raised(self, tmp_path):
+        """`set_account_threshold` rejects a value out of range with
+        `ValueError`; the action reports it like any switcher error."""
+
+        class Rejecting(FakeSwitcher):
+            def set_account_threshold(self, identifier, pct):
+                raise ValueError("threshold must be between 50 and 99.9")
+
+        app = make_app(Rejecting([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "threshold-menu")
+            await menu_select(pilot, "threshold:1")
+            await menu_select(pilot, "set-threshold:1:80")
+            await settle(pilot)
+            from claude_swap.tui.modals import OutputModal
+
+            assert isinstance(app.screen, OutputModal)
+            assert not app.busy
+            assert "between 50 and 99.9" in app.screen._output
 
     async def test_modal_arrow_keys_choose_button(self, tmp_path):
         fake = FakeSwitcher(

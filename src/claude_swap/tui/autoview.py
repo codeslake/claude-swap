@@ -455,7 +455,10 @@ class AutoScreen(Screen):
                         acc.usage.last_good, models
                     )
                 )
-                kind, _ = classify_candidate_block(windows, bar, weekly)
+                own = acc.policy.threshold
+                kind, _ = classify_candidate_block(
+                    windows, bar if own is None else own, weekly
+                )
                 if kind == "open":
                     break
             else:

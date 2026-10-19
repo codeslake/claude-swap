@@ -19,6 +19,7 @@ from textual.worker import WorkerState
 
 from claude_swap import printer
 from claude_swap.autoswitch import proactive_switch_bar_pct
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.models import AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
@@ -344,10 +345,16 @@ class CswapApp(App):
 
     def do_set_account_threshold(self, number: str, pct: float | None) -> None:
         """Give the account its own switch threshold (``None``: the strategy's)."""
-        self._start_action(
-            f"Set switch threshold of account {number}",
-            partial(self.switcher.set_account_threshold, number, pct),
-        )
+
+        def set_threshold() -> None:
+            # The setter rejects an out-of-range value with ValueError;
+            # `run_action` reports only `ClaudeSwitchError`.
+            try:
+                self.switcher.set_account_threshold(number, pct)
+            except ValueError as e:
+                raise ClaudeSwitchError(str(e)) from e
+
+        self._start_action(f"Set switch threshold of account {number}", set_threshold)
 
     def confirm_remove(self, number: str, email: str) -> None:
         self.push_screen(

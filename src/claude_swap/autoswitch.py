@@ -1235,6 +1235,7 @@ def _dynamic_active_headroom(
     usage: dict[str, dict | str | None],
     current: str,
     active_headroom: float | None,
+    thresholds: Mapping[str, float] | None = None,
 ) -> float | None:
     """Widen ``active_headroom`` to the unmodeled 5h/7d value under
     ``dynamic``, so the trigger classification and every re-rank this tick
@@ -1258,7 +1259,7 @@ def _dynamic_active_headroom(
     if settings.strategy != "dynamic" or not models or active_headroom is None:
         return active_headroom
     if not _model_window_binds_everywhere(
-        usage, models, settings.threshold, settings.weekly_threshold
+        usage, models, settings.threshold, settings.weekly_threshold, thresholds
     ):
         return active_headroom
     unmodeled = _headroom_by_account(usage, ()).get(current)
@@ -1329,6 +1330,7 @@ def _model_window_binds_everywhere(
     models: tuple[str, ...],
     threshold: float,
     weekly_threshold: float | None = None,
+    lines: Mapping[str, float] | None = None,
 ) -> bool:
     """True only when the model window blocks every account in ``usage``
     (model-gated) and at least one of them is blocked ONLY by that window
@@ -1354,11 +1356,15 @@ def _model_window_binds_everywhere(
     every genuinely model-only-walled account (measured 2026-09-08: a
     spend-only slot #8 held `all accounts exhausted` while a real Fable
     candidate's 5h/7d sat open).
+
+    ``lines`` holds per-account overrides (the tick's ``ThresholdMap``): an
+    account is judged on its own line, the one the ranking lands it on, any
+    other on ``threshold``.
     """
     if not models:
         return False
     saw_model_only_wall = False
-    for value in usage.values():
+    for num, value in usage.items():
         windows = [
             (label, pct)
             for label, pct, _ in oauth.relevant_windows(
@@ -1367,7 +1373,9 @@ def _model_window_binds_everywhere(
         ]
         if not windows:
             continue
-        outcome, _ = classify_candidate_block(windows, threshold, weekly_threshold)
+        outcome, _ = classify_candidate_block(
+            windows, (lines or {}).get(num, threshold), weekly_threshold
+        )
         if outcome == "open":
             return False
         if outcome == "model":
@@ -2294,7 +2302,7 @@ class AutoSwitchEngine:
         # below re-derives `active_headroom` from a fresh `headroom` too —
         # calling the same helper there is what keeps them on one axis.
         active_headroom = _dynamic_active_headroom(
-            settings, self._models, usage, current, active_headroom
+            settings, self._models, usage, current, active_headroom, thresholds
         )
         # adr/0010 R2: two margins of the bar, on the SAME widened reading
         # the trigger is classified from. `dynamic` only, so `best` and
@@ -2535,7 +2543,8 @@ class AutoSwitchEngine:
                 and not cold_ordered
                 and self._models
                 and _model_window_binds_everywhere(
-                    usage, self._models, settings.threshold, settings.weekly_threshold
+                    usage, self._models, settings.threshold,
+                    settings.weekly_threshold, thresholds,
                 )
             ):
                 # A MODEL WINDOW IS NOT A BLACKOUT (#321) — ONLY where it
@@ -2640,7 +2649,8 @@ class AutoSwitchEngine:
                 and not cold_ordered
                 and self._models
                 and _model_window_binds_everywhere(
-                    usage, self._models, settings.threshold, settings.weekly_threshold
+                    usage, self._models, settings.threshold,
+                    settings.weekly_threshold, thresholds,
                 )
             ):
                 # A MODEL WINDOW IS NOT A BLACKOUT (#321), same retry as the
@@ -2878,8 +2888,9 @@ class AutoSwitchEngine:
                             usage.get(n),
                             self._models,
                             now,
-                            threshold=settings.threshold,
+                            threshold=thresholds[n],
                             weekly_threshold=settings.weekly_threshold,
+                            scale=_ruler(settings),
                         ),
                         0 if _is_warm(n, last_active_at, now, settings.cache_ttl_seconds) else 1,
                     ),
@@ -3092,7 +3103,8 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = _dynamic_active_headroom(
-                settings, self._models, usage, current, headroom.get(current)
+                settings, self._models, usage, current, headroom.get(current),
+                thresholds,
             )
             decided_now = self.clock()
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
@@ -3817,14 +3829,15 @@ class AutoSwitchEngine:
         # must land on whatever the strategy would actually pick, same as an
         # ordinary departure — hiding the best candidate here just delays
         # the correct switch by a tick or two of cooldown. `active_headroom`
-        # and `settings.threshold` are already in hand; no new state.
+        # and the active's line `thresholds[current]` are already in hand; no
+        # new state.
         left_for_reset = (
             settings.strategy == "dynamic"
             and state.get("leftTrigger") in CONSUME_FIRST_STRATEGIES
         )
         active_at_threshold = (
             active_headroom is not None
-            and active_headroom <= 100.0 - settings.threshold
+            and active_headroom <= 100.0 - thresholds[current]
         )
         if h is not None:
             if active_headroom is not None:
@@ -3939,7 +3952,8 @@ class AutoSwitchEngine:
             not ordered
             and self._models
             and _model_window_binds_everywhere(
-                usage, self._models, settings.threshold, settings.weekly_threshold
+                usage, self._models, settings.threshold,
+                settings.weekly_threshold, thresholds,
             )
         ):
             fallback_headroom = _headroom_by_account(usage, ())
@@ -4555,7 +4569,8 @@ class AutoSwitchEngine:
                 # Fable-100 active passed over a Fable-89/5h-40/7d-65
                 # candidate for a Fable-10/5h-91 one).
                 #
-                # DELIBERATELY `settings.threshold`, NOT `bar` (#321).
+                # DELIBERATELY THE ACCOUNT'S OWN LINE (`settings.threshold`
+                # when it has none), NOT `bar` (#321).
                 # `bar == 100 - SPENT_HEADROOM_PCT` for dynamic exactly, so
                 # `h > SPENT_HEADROOM_PCT and (100.0 - h) >= bar` would read
                 # `h > 3 and h <= 3` -- always false, silently disabling
@@ -4574,7 +4589,7 @@ class AutoSwitchEngine:
                 # checks `h <= SPENT_HEADROOM_PCT` FIRST, so this is only
                 # ever consulted once that has already failed.
                 dynamic_self_walled = dynamic_landing and self._over(
-                    usage.get(num), settings, models
+                    usage.get(num), settings, models, thresholds[num]
                 )
                 # THREE TIERS, NOT TWO. Folding "genuinely unservable" (h <=
                 # SPENT_HEADROOM_PCT) and "self-walled but has real spare
