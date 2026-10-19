@@ -328,11 +328,6 @@ def _parse_token_account(resp_data: dict) -> dict | None:
     }
 
 
-_TIER_KEYS = (
-    "subscriptionType", "rateLimitTier", "subscriptionTypeSource", "subscriptionTypeVerifiedAt"
-)
-
-
 def carry_tier(credentials: str, *donors: str) -> str:
     """Give a blob with no ``subscriptionType`` the tier of the first donor blob that has one.
 
@@ -347,7 +342,8 @@ def carry_tier(credentials: str, *donors: str) -> str:
             for donor in donors:
                 tier = extract_oauth_data(donor) or {}
                 if tier.get("subscriptionType") is not None:
-                    blob.update({k: tier[k] for k in _TIER_KEYS if k in tier})
+                    keys = ("subscriptionType", "rateLimitTier", "subscriptionTypeSource", "subscriptionTypeVerifiedAt")
+                    blob.update({k: tier[k] for k in keys if k in tier})
                     return json.dumps(data)
     except Exception as e:
         _logger.debug("Tier carry skipped: %r", e)
