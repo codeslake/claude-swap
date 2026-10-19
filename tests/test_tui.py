@@ -2444,8 +2444,10 @@ class TestUnswitchableRowsAreListed:
     def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
               sentinel=None):
         from unittest.mock import MagicMock
+        from claude_swap.models import AccountPolicy
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
+        a.policy = AccountPolicy()
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
         return a
@@ -2793,6 +2795,21 @@ class TestUnswitchableRowsAreListed:
             }),
         ), active="1", settings=settings)
         assert "Fable-only" in out, out
+        assert "  5h full" in out, out
+
+    def test_the_block_label_judges_an_account_on_its_own_line(self):
+        """5h 50% is under the global 90 but over this account's own 40, and
+        the engine's landing gate reads it as blocked: so must the label."""
+        from claude_swap.models import AccountPolicy
+        from claude_swap.settings import AutoSwitchSettings
+
+        own = self._acct("2", "own@x.com", switchable=True, last_good={
+            "five_hour": {"pct": 50.0}, "seven_day": {"pct": 5.0},
+        })
+        own.policy = AccountPolicy(threshold=40.0)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True), own,
+        ), active="1", settings=AutoSwitchSettings(threshold=90.0))
         assert "  5h full" in out, out
 
     def test_the_panel_chips_include_the_window_its_label_names(self):

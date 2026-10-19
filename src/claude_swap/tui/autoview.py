@@ -77,11 +77,12 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
 
-def _line_note(binding: BindingWindow | None, label: str, weekly: float | None) -> str:
+def _line_note(binding: BindingWindow | None, label: str, noted: bool) -> str:
     """The "(line 97%)" note after the BINDING window's chip, once a weekly line
-    makes the lines differ: the raw pct stays, and the line it is judged
-    against is named only where it is not the one number in the header."""
-    if weekly is None or binding is None or label != binding.label:
+    or the account's own threshold makes the lines differ: the raw pct stays,
+    and the line it is judged against is named only where it is not the one
+    number in the header."""
+    if not noted or binding is None or label != binding.label:
         return ""
     return f" (line {pct_label(binding.line)}%)"
 
@@ -378,14 +379,23 @@ class AutoScreen(Screen):
     ) -> Text:
         """Switch targets ranked the way the engine's strategy would rank them."""
         # Same window set AND the same lines as the engine: autoswitch.model,
-        # the threshold (the session value — `_settings` is what
-        # `_set_threshold` replaces) and the weekly line, so the displayed
-        # ranking can never disagree with the account it picks.
+        # each account's own line (its policy threshold, else the session
+        # threshold — `_settings` is what `_set_threshold` replaces), the
+        # weekly line, and the session threshold as the ruler every account is
+        # scored on, so the displayed ranking can never disagree with the
+        # account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         settings = self._settings
         models = parse_model_names(settings.model) if settings else ()
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
+
+        def line_of(acc) -> float:
+            return acc.policy.threshold if acc.policy.threshold is not None else threshold
+
+        def noted(acc) -> bool:
+            return weekly is not None or acc.policy.threshold is not None
+
         # Same strategy the engine ticks on, so the panel's order can never
         # disagree with the account a tick would actually switch to.
         consume_first = bool(
@@ -423,7 +433,7 @@ class AutoScreen(Screen):
                         acc.usage.last_good, models
                     )
                 )
-                kind, _ = classify_candidate_block(windows, threshold, weekly)
+                kind, _ = classify_candidate_block(windows, line_of(acc), weekly)
                 if kind == "open":
                     break
             else:
@@ -459,8 +469,11 @@ class AutoScreen(Screen):
         # later column moves. (label text, pct text, `(line X%)` note) widths per
         # column; the note is part of its column so the chips after it stay put.
         chip_width: dict[str, tuple[int, int, int]] = {}
-        for windows in row_windows.values():
-            bound = binding_window(windows, threshold, weekly)
+        for acc in snap.accounts:
+            windows = row_windows.get(acc.number)
+            if windows is None:
+                continue
+            bound = binding_window(windows, line_of(acc), weekly, scale=threshold)
             for label, wpct, resets_at in windows:
                 label_w, pct_w, note_w = chip_width.get(label, (0, 0, 0))
                 chip_width[label] = (
@@ -468,7 +481,7 @@ class AutoScreen(Screen):
                         label, data.reset_text({"resets_at": resets_at}, now)
                     ))),
                     max(pct_w, len(f"{wpct:.0f}%")),
-                    max(note_w, len(_line_note(bound, label, weekly))),
+                    max(note_w, len(_line_note(bound, label, noted(acc)))),
                 )
         # 5h and 7d lead whatever row came first (sorted is stable, so the
         # rest keep first-seen order).
@@ -504,8 +517,12 @@ class AutoScreen(Screen):
                 lines[acc.number] = entry
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
+            line = line_of(acc)
             binding = binding_window(
-                oauth.relevant_windows(acc.usage.last_good, models), threshold, weekly
+                oauth.relevant_windows(acc.usage.last_good, models),
+                line,
+                weekly,
+                scale=threshold,
             )
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
@@ -567,7 +584,7 @@ class AutoScreen(Screen):
                     )
                     entry.append(pct_text, style=palette.severity(wpct))
                     entry.append(
-                        _line_note(binding, label, weekly).ljust(note_w),
+                        _line_note(binding, label, noted(acc)).ljust(note_w),
                         style=palette.muted,
                     )
                     shown = True
@@ -583,7 +600,7 @@ class AutoScreen(Screen):
                 kind, blocked_model = "open", None
                 if self._settings:
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows), threshold, weekly
+                        ((label, p) for label, p, _ in windows), line, weekly
                     )
                 if kind == "model":
                     entry.append(f"  {blocked_model}-only", style=palette.muted)
@@ -591,8 +608,9 @@ class AutoScreen(Screen):
                     entry.append(f"  {blocked_model} full", style=palette.muted)
                 rank_binding = binding_window(
                     oauth.relevant_windows(acc.usage.last_good, rank_models),
-                    threshold,
+                    line,
                     weekly,
+                    scale=threshold,
                 ) or binding
                 key = (
                     consume_first_rank_key(
