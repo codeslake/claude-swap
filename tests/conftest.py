@@ -888,6 +888,8 @@ def pytest_collection_modifyitems(items):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
 
 
-def pytest_sessionfinish():
-    # Skip the exit-time collection over the heap the session built.
+@pytest.hookimpl(trylast=True)
+def pytest_unconfigure():
+    # Skip the exit-time collection over the heap the session built; trylast so
+    # pytest's own end-of-run sweep for unraisable exceptions collects first.
     gc.freeze()
