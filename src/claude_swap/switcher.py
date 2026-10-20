@@ -10,7 +10,6 @@ import re
 import shutil
 import threading
 import sys
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -52,15 +51,21 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
-from claude_swap.fsutil import read_text_with_retry, replace_with_retry
+from claude_swap.fsutil import (
+    atomic_write_bytes,
+    atomic_write_text,
+    read_text_with_retry,
+)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
+    AccountPolicy,
     AccountSnapshot,
     AccountsSnapshot,
     Platform,
     SwitchTransaction,
     get_timestamp,
+    normalize_account_threshold,
     normalize_alias,
 )
 from claude_swap.printer import (
@@ -511,8 +516,8 @@ class ClaudeAccountSwitcher:
         MODE. `shutil.copy2` preserves the source mode. Measured on a 0644
         `~/.claude.json` holding `primaryApiKey`: the replacement got 0600 from
         `_write_json` and the salvage stayed 0644, so the secret ended up
-        world-readable in a file cswap created. Copied without metadata and
-        chmod'ed 0600 explicitly.
+        world-readable in a file cswap created. Written through
+        ``atomic_write_bytes``: 0600 from creation, never at the umask mode.
 
         COLLISION. The stamp is second-resolution and `copy2` onto an existing
         name overwrites. Two failed switches inside one second left ONE file —
@@ -541,9 +546,7 @@ class ClaudeAccountSwitcher:
             salvage = path.with_name(f"{stem}.{n}")
             n += 1
         try:
-            shutil.copy(path, salvage)          # NOT copy2: mode is set below
-            if sys.platform != "win32":
-                os.chmod(salvage, 0o600)
+            atomic_write_bytes(salvage, path.read_bytes())
         except OSError as e:
             raise SwitchError(
                 f"{path} could not be parsed and the salvage copy failed "
@@ -561,35 +564,22 @@ class ClaudeAccountSwitcher:
         return salvage
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write JSON file with validation."""
-        content = json.dumps(data, indent=2)
+        """Write a JSON file atomically: 0600 temp beside the target, rename.
 
-        # Write to temp file first. mkstemp creates it 0600 beside the target
-        # (same filesystem, so the rename below stays atomic), so the payload
-        # is never on disk at the umask-derived mode.
-        fd, temp_name = tempfile.mkstemp(
-            dir=str(path.parent), prefix=f"{path.stem}.", suffix=".tmp"
-        )
-        temp_path = Path(temp_name)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-
-        # Validate written content
+        The mode goes on the temp, so the rename is the final commit and
+        nothing can fail after the file is published (a chmod on the final
+        path could raise with the write already live, making callers roll
+        back around committed metadata); a publish that fails removes the
+        temp instead of stranding it beside the target. ``allow_nan=False``:
+        ``json.dumps`` would happily emit ``NaN`` or ``Infinity``, which
+        Claude Code's ``JSON.parse`` rejects -- in ``~/.claude.json`` that is
+        a corrupted config, so it is refused here, before anything is written.
+        """
         try:
-            json.loads(temp_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            temp_path.unlink()
-            raise ConfigError("Generated invalid JSON")
-
-        # Permissions go on the temp file so the rename below is the final,
-        # atomic commit: nothing can fail after the file is published (a
-        # chmod on the final path could raise with the write already live,
-        # making callers roll back around committed metadata).
-        if sys.platform != "win32":
-            os.chmod(temp_path, 0o600)
-        # Not shutil.move: on Windows it falls back to copy-then-delete when
-        # the target exists, rewriting it in place while readers may open it.
-        replace_with_retry(temp_path, path)
+            content = json.dumps(data, indent=2, allow_nan=False)
+        except ValueError as e:
+            raise ConfigError(f"Generated invalid JSON: {e}")
+        atomic_write_text(path, content)
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
@@ -950,9 +940,8 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Write account config to backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        config_file.write_text(config, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_file, 0o600)
+        # Atomic: a torn backup config is a broken future restore.
+        atomic_write_text(config_file, config)
 
     # -- public accessors for session mode (claude_swap.session) ---------
 
@@ -1275,7 +1264,8 @@ class ClaudeAccountSwitcher:
         """
         for path in staging.values():
             try:
-                path.unlink()
+                # missing_ok: a claim the create never reached holds nothing.
+                path.unlink(missing_ok=True)
             except OSError as e:
                 self._logger.error(f"Could not remove swap staging copy: {e}")
                 warning(
@@ -1305,13 +1295,38 @@ class ClaudeAccountSwitcher:
         whose mid-write failures this protects against).
         """
         staged: dict[str, Path] = {}
+        fd = -1
+
+        def abort() -> None:
+            # Remove only what THIS call created -- after closing a descriptor
+            # no file object took over: on Windows an open file cannot be
+            # unlinked, so the discard would otherwise fail exactly then.
+            nonlocal fd
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = -1
+            self._discard_staging(staged)
+
         try:
             for num, (creds, config) in material.items():
                 for kind, content in (("creds", creds), ("config", config)):
                     if not content:
                         continue
                     path = self.credentials_dir / f".swap-staging-{kind}-{num}.json"
-                    if path.exists():
+                    # Claimed BEFORE the create: a signal delivered inside
+                    # os.open raises once the file already exists, so a record
+                    # made afterwards can miss a file that is there (#268).
+                    key = f"{kind}-{num}"
+                    staged[key] = path
+                    try:
+                        fd = os.open(
+                            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                        )
+                    except FileExistsError:
+                        del staged[key]  # not ours: never remove it
                         raise ConfigError(
                             f"Found leftover staging from an interrupted swap: "
                             f"{path}. It holds that slot's pre-swap credentials "
@@ -1319,19 +1334,25 @@ class ClaudeAccountSwitcher:
                             f"accounts still work (`cswap list`), then delete "
                             f"the file and retry."
                         )
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fd = -1  # the file object owns the descriptor now
                         fh.write(content)
-                    staged[f"{kind}-{num}"] = path
         except ConfigError:
-            # Leftover found: remove only what THIS call created.
-            self._discard_staging(staged)
+            # Leftover found.
+            abort()
             raise
         except OSError as e:
-            self._discard_staging(staged)
+            abort()
             raise ConfigError(
                 f"Could not stage swap material, nothing was changed: {e}"
             )
+        except BaseException:
+            # A Ctrl-C reaches neither handler above, and the caller never
+            # receives the dict to clean up: same policy. A leftover would
+            # hold plaintext credentials and wedge the next same-email swap
+            # behind the refusal above.
+            abort()
+            raise
         return staged
 
     def _swap_session_dirs(
@@ -1777,6 +1798,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    policy=self._policy_from_data(seq_data, n),
                 )
             )
         return AccountsSnapshot(
@@ -1864,6 +1886,58 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(str(account_num))
         return bool(record and record.get("disabled"))
 
+    @staticmethod
+    def _policy_from_data(data: dict, account_num: str) -> AccountPolicy:
+        """Per-account auto-switch overrides from already-loaded data.
+
+        A staticmethod for the same reason ``_disabled_from_data`` is one: the
+        engine reads every slot's policy inside a single pass over one
+        ``_get_sequence_data()`` result, and a method that re-entered the store
+        per slot would turn one file read into N.
+
+        **Degrades, never raises.** The strict validator runs at the write
+        boundary (``set_account_threshold``); by the time a value is in the
+        file it may have been hand-edited, and a corrupt record must leave the
+        account on the global default rather than crash the auto-switch loop.
+        An unusable threshold reads as ``None``, which is exactly "inherit".
+
+        Args:
+            data: An already-loaded ``sequence.json`` mapping.
+            account_num: Slot number, as ``str`` or ``int``.
+
+        Returns:
+            The slot's :class:`AccountPolicy`, or the default if the record or
+            its keys are missing or unusable.
+        """
+        record = data.get("accounts", {}).get(str(account_num))
+        if not record:
+            return AccountPolicy()
+        raw = record.get("threshold")
+        threshold: float | None
+        if raw is None:
+            threshold = None
+        else:
+            try:
+                threshold = normalize_account_threshold(raw)
+            except ValueError:
+                # Hand-edited garbage, out-of-range, NaN/inf: inherit the
+                # global default rather than propagate an unusable number.
+                threshold = None
+        return AccountPolicy(threshold=threshold)
+
+    def account_policies(self) -> dict[str, AccountPolicy]:
+        """Every managed slot's auto-switch policy, from one sequence read.
+
+        Keyed by slot number in sequence order. The auto-switch engine calls
+        this once per tick and resolves effective thresholds from the result,
+        so it must not re-enter the store per account.
+        """
+        data = self._get_sequence_data() or {}
+        return {
+            str(num): self._policy_from_data(data, str(num))
+            for num in data.get("sequence", [])
+        }
+
     def is_account_disabled(self, account_num: str) -> bool:
         """Whether a slot is currently held out of rotation."""
         data = self._get_sequence_data() or {}
@@ -1877,6 +1951,95 @@ class ClaudeAccountSwitcher:
             for num in data.get("sequence", [])
             if self._disabled_from_data(data, str(num))
         ]
+
+    def _resolve_for_policy_write(self, identifier: str) -> tuple[str, str, dict, dict]:
+        """Resolve an identifier and fetch its record, ready for a policy write.
+
+        Called by :meth:`set_account_threshold`. Every
+        raising path here happens **before** any write, so a rejected call
+        leaves ``sequence.json`` byte-identical.
+
+        Returns:
+            ``(account_num, email, data, record)``.
+
+        Raises:
+            ConfigError: No accounts are managed yet, or the email is ambiguous.
+            AccountNotFoundError: The identifier matches no managed account.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+
+        # resolve_account migrates org fields and hard-errors on ambiguity.
+        account_num, email, _ = self.resolve_account(identifier)
+
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        return account_num, email, data, record
+
+    def set_account_threshold(self, identifier: str, threshold: object | None) -> None:
+        """Set or clear one account's own switch-away threshold.
+
+        The per-account value replaces ``autoswitch.threshold`` for this
+        account only, in both directions: the departure gate uses the *active*
+        account's value to decide when to leave, and the landing gate uses each
+        *candidate's* own value to decide whether it is an acceptable target.
+        Reserving headroom on one shared account therefore no longer means
+        taxing the whole fleet with a global cap set to the strictest member's.
+
+        ``threshold=None`` removes the override and returns the account to the
+        global default. The key is popped rather than written as ``null``, so a
+        fleet that has never set a policy keeps a ``sequence.json`` byte-identical
+        to one from before this feature existed.
+
+        Args:
+            identifier: Slot number, email, or alias.
+            threshold: Percentage in ``[ACCOUNT_THRESHOLD_MIN,
+                ACCOUNT_THRESHOLD_MAX]``, or ``None`` to clear.
+
+        Raises:
+            ConfigError: No accounts are managed yet, or the email is ambiguous.
+            AccountNotFoundError: The identifier matches no managed account.
+            ValueError: The value is not a number in range. Raised *before* any
+                write, so a rejected value leaves the store untouched.
+        """
+        # Validate first: a bad value must never reach the file. Resolution
+        # order matters only in that both checks precede the single write.
+        normalized = None if threshold is None else normalize_account_threshold(threshold)
+
+        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+
+        current = record.get("threshold")
+        if normalized is None and "threshold" not in record:
+            print(dimmed(
+                f"Account-{account_num} ({email}) has no threshold override "
+                f"— already using the global default."
+            ))
+            return
+        if normalized is not None and current == normalized:
+            print(dimmed(
+                f"Account-{account_num} ({email}) is already at {normalized:g}%."
+            ))
+            return
+
+        if normalized is None:
+            record.pop("threshold", None)
+        else:
+            record["threshold"] = normalized
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+
+        if normalized is None:
+            self._logger.info(f"Cleared threshold for account {account_num}: {email}")
+            print(f"{accent('Cleared')} threshold for Account-{account_num} ({email}) "
+                  f"— now using the global default.")
+        else:
+            self._logger.info(
+                f"Set threshold {normalized:g} for account {account_num}: {email}"
+            )
+            print(f"{accent('Set')} Account-{account_num} ({email}) "
+                  f"threshold to {normalized:g}%.")
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         """Hold an account out of rotation (``disabled=True``) or return it.
@@ -5563,6 +5726,7 @@ class ClaudeAccountSwitcher:
                     ),
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
                 )
             )
@@ -7045,11 +7209,10 @@ class ClaudeAccountSwitcher:
                 except Exception:
                     if config_written and rollback_config_text is not None:
                         try:
-                            config_path.write_text(
-                                rollback_config_text, encoding="utf-8"
-                            )
-                            if sys.platform != "win32":
-                                os.chmod(config_path, 0o600)
+                            # By rename, never in place: a running Claude Code
+                            # watches ~/.claude.json, and a truncate-then-write
+                            # shows it an empty file (#419).
+                            atomic_write_text(config_path, rollback_config_text)
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback config: {e}"

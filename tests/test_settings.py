@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import stat
+import os
 import sys
 from pathlib import Path
 
@@ -16,9 +17,11 @@ from claude_swap.settings import (
     atomic_write_json,
     AutoSwitchSettings,
     UiSettings,
+    UpdateSettings,
     effective_settings,
     load_settings,
     load_ui_settings,
+    load_update_settings,
     merged_with_cli,
     save_settings,
     set_setting,
@@ -166,6 +169,27 @@ class TestUiSettings:
         assert load_ui_settings(tmp_path) == UiSettings(show_org_tag=False)
 
 
+class TestUpdateSettings:
+    def test_missing_file_checks(self, tmp_path: Path):
+        assert load_update_settings(tmp_path) == UpdateSettings(check=True)
+
+    def test_reads_false(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"updates": {"check": False}}))
+        assert load_update_settings(tmp_path).check is False
+
+    def test_non_boolean_falls_back_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"updates": {"check": "false"}}))
+        assert load_update_settings(tmp_path).check is True
+
+    def test_set_and_unset_updates_check(self, tmp_path: Path):
+        assert set_setting(tmp_path, "updates.check", "false") is False
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "updates": {"check": False}}
+        assert load_update_settings(tmp_path).check is False
+        assert unset_setting(tmp_path, "updates.check") is True
+        assert "updates" not in json.loads(settings_path(tmp_path).read_text())
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         by_section: dict[str, set[str]] = {}
@@ -177,9 +201,16 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["updates"] == {
+            f.name for f in UpdateSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "ui": UiSettings(),
+            "updates": UpdateSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 
@@ -317,6 +348,10 @@ class TestAtomicWriteThroughSymlink:
         assert link.is_symlink(), "the dotfiles link must survive the write"
         assert json.loads(tracked.read_text()) == {"written": "through"}
 
+    @pytest.mark.skipif(
+        not hasattr(os.path, "ALLOW_MISSING"),
+        reason="pre-3.12.11 resolver refuses a dangling link",
+    )
     def test_dangling_link_writes_where_it_points(self, tmp_path):
         target = tmp_path / "gone" / "settings.json"
         link = tmp_path / "settings.json"
@@ -338,7 +373,6 @@ class TestAtomicWriteThroughSymlink:
         another mount — the write fails outright. Assert the placement
         directly; staging two filesystems in a unit test is not portable."""
         import tempfile
-        from claude_swap import settings as S
         repo = tmp_path / "repo"; repo.mkdir()
         live = tmp_path / "live"; live.mkdir()
         tracked = repo / "settings.json"; tracked.write_text("{}")
@@ -346,7 +380,7 @@ class TestAtomicWriteThroughSymlink:
         seen = []
         real_mkstemp = tempfile.mkstemp
         monkeypatch.setattr(
-            S.tempfile, "mkstemp",
+            tempfile, "mkstemp",
             lambda *a, **kw: (seen.append(kw.get("dir")), real_mkstemp(*a, **kw))[1],
         )
 

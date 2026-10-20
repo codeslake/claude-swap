@@ -2,7 +2,7 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch`` and ``ui`` sections; other sections can be added additively.
+``autoswitch``, ``ui`` and ``updates`` sections; other sections can be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
@@ -17,12 +17,11 @@ import logging
 import math
 import os
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -80,7 +79,20 @@ class UiSettings:
     show_org_tag: bool = True
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class UpdateSettings:
+    """Update notification (``updates`` section). ``check`` turns the daily
+    PyPI lookup behind the "newer version available" hint on or off;
+    ``cswap upgrade`` works either way."""
+
+    check: bool = True
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "updates": UpdateSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -92,7 +104,7 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch", "ui")
+    section: str  # top-level JSON section ("autoswitch", "ui", "updates")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
     kind: str  # "float" | "int" | "bool" | "choice"
@@ -160,6 +172,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "ui", "showOrgTag", "show_org_tag", "bool",
             help="Show the [org] tag beside accounts in the TUI "
             "(when off, kept only to tell same-email accounts apart)",
+        ),
+        SettingSpec(
+            "updates", "check", "check", "bool",
+            help="Check PyPI once a day and print a hint when a newer release exists",
         ),
     )
 }
@@ -284,6 +300,23 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         show_org_tag = default.show_org_tag
     return UiSettings(theme=theme, show_org_tag=show_org_tag)
+
+
+def load_update_settings(backup_root: Path) -> UpdateSettings:
+    """Load the updates section; missing/corrupt file or non-boolean → default."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("updates")
+    default = UpdateSettings()
+    if not isinstance(section, dict):
+        return default
+    check = section.get("check", default.check)
+    if not isinstance(check, bool):
+        _logger.warning(
+            "settings.json: updates.check %r is not true or false; using %r",
+            check, default.check,
+        )
+        return default
+    return UpdateSettings(check=check)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -457,6 +490,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "updates": load_update_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
@@ -511,24 +545,9 @@ def atomic_write_json(path: Path, data: dict) -> None:
       ours to chmod. The written file still gets 0600, and ``mkstemp``
       creates it 0600 to begin with, so the secret is never exposed.
     """
-    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    target = publish_target(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
         # `path.parent`, NOT the target's: see the docstring.
         os.chmod(path.parent, 0o700)
-    fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
-    try:
-        os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
-        os.close(fd)
-        fd = -1
-        replace_with_retry(tmp_path, str(target))
-        if sys.platform != "win32":
-            os.chmod(str(target), 0o600)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(target, json.dumps(data, indent=2))
