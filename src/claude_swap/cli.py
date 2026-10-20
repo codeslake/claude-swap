@@ -21,7 +21,7 @@ from claude_swap.printer import (
     muted,
     warning,
 )
-from claude_swap.settings import load_ui_settings
+from claude_swap.settings import load_ui_settings, load_update_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -1700,8 +1700,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # Passive update notification (never fails). Skipped after --purge so we
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
-    # in case the dispatch is later refactored to fall through.
-    if not args.purge and not args.upgrade and not args.json:
+    # in case the dispatch is later refactored to fall through. Skipped when
+    # `updates.check` is false, so no request goes to PyPI at all.
+    if (
+        not args.purge
+        and not args.upgrade
+        and not args.json
+        and load_update_settings(paths.get_backup_root()).check
+    ):
         from claude_swap.update_check import check_for_update
 
         msg = check_for_update(__version__)

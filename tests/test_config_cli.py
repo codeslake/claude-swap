@@ -50,6 +50,7 @@ class TestConfigList:
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
+            "updates.check",
         ):
             assert key in out
         # From the schema, not a literal: a bare count drifts every time a
@@ -96,6 +97,7 @@ class TestConfigList:
         assert by_key["autoswitch.weeklyThreshold"]["value"] is None
         assert by_key["autoswitch.weeklyThreshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
+        assert by_key["updates.check"]["value"] is True
 
 
 class TestConfigSetGet:
