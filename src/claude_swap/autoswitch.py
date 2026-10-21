@@ -1601,6 +1601,7 @@ class AutoSwitchEngine:
         # arrive on top of itself; non-reentrant it double-released the lock.
         self._stop_lock = threading.RLock()
         self._unhealthy_ticks = 0
+        self._health_account: str | None = None
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
         # longer than the normal interval.
@@ -2088,7 +2089,9 @@ class AutoSwitchEngine:
         self._tick_thread_id = threading.get_ident()
         self._tick_in_flight.clear()
         try:
-            return self._tick_inner()
+            outcome = self._tick_inner()
+            self._persist_health_counters(self._health_account)
+            return outcome
         except _EngineStopped:
             # THE one place a mid-tick stop becomes an outcome. Every
             # checkpoint raises rather than carrying its own copy of "emit
@@ -2186,6 +2189,65 @@ class AutoSwitchEngine:
             self._models,
         )
 
+    def _load_health_counters(self, state: dict, current: str) -> None:
+        """Seed the unreadable-active counters from the state file.
+
+        They are persisted so a fresh engine per tick (``auto --once``) keeps
+        counting toward failover instead of restarting at zero. Counters left
+        by another account, or by a tick longer ago than twice the idle-hold cap,
+        are dropped. Until the managed active account changes the in-memory values
+        are authoritative, so dry-run (which never persists) and long gaps
+        between loop ticks keep their progress.
+        """
+        ticks = state.get("unhealthyTicks")
+        since = state.get("idleHoldSince")
+        at = state.get("healthTickAt")
+        fresh = (
+            state.get("healthAccount") == current
+            and isinstance(at, (int, float))
+            and not isinstance(at, bool)
+            and 0 <= self.clock() - at <= 2 * IDLE_HOLD_MAX_S
+        )
+        self._unhealthy_ticks = (
+            ticks
+            if fresh
+            and isinstance(ticks, int)
+            and not isinstance(ticks, bool)
+            and ticks > 0
+            else 0
+        )
+        self._idle_hold_since = (
+            float(since)
+            if fresh
+            and isinstance(since, (int, float))
+            and not isinstance(since, bool)
+            else None
+        )
+
+    def _persist_health_counters(self, current: str | None) -> None:
+        if self.dry_run:
+            return
+        ticks, since = self._unhealthy_ticks, self._idle_hold_since
+        now = self.clock()
+
+        def store(state: dict) -> None:
+            if current is not None and (ticks or since is not None):
+                state["unhealthyTicks"] = ticks
+                state["idleHoldSince"] = since
+                state["healthAccount"] = current
+                state["healthTickAt"] = now
+            else:
+                for key in (
+                    "unhealthyTicks", "idleHoldSince", "healthAccount",
+                    "healthTickAt",
+                ):
+                    state.pop(key, None)
+
+        stored = self._read_state()
+        if not (ticks or since is not None) and "healthAccount" not in stored:
+            return
+        self._mutate_state(store)
+
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
@@ -2212,6 +2274,12 @@ class AutoSwitchEngine:
         )
 
         current = self.switcher.current_account_number()
+        # A tick with no managed active account keeps the current context;
+        # a different account reseeds from the state file so its counts are
+        # never inherited from the previous one.
+        if current is not None and current != self._health_account:
+            self._load_health_counters(state, current)
+            self._health_account = current
         if current is None:
             self._emit(
                 PollEvent(
