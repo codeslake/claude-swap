@@ -1917,13 +1917,15 @@ class TestATransientErrnoIsNotFatalToTheHold:
             raise KeyboardInterrupt("injected inside the probe")
 
         monkeypatch.setattr(claude_locks, "_mtime_quantum_ns", interrupted)
+        # The probe runs on the first tick, so the hold has to reach one.
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
         escaped: list = []
         monkeypatch.setattr(
             threading, "excepthook", lambda a: escaped.append(a.exc_type))
         lock = tmp_path / "target.lock"
         try:
             with claude_locks.proper_lockfile(lock, timeout=2):
-                pass
+                reached.wait(10)
         except KeyboardInterrupt:
             pass
         assert not lock.exists(), (
@@ -1945,6 +1947,57 @@ class TestATransientErrnoIsNotFatalToTheHold:
             "the quantum probe's failure escaped the heartbeat thread, which "
             f"ends it and freezes the lock's mtime: {escaped}"
         )
+
+    def test_no_probe_file_outlives_the_release(self, tmp_path, monkeypatch):
+        """The release is not joined to the heartbeat, so a probe running
+        outside the stamp mutex leaves `.mtime-probe-*` in the parent after
+        the `with` ends (win32, where `test_takeover_leaves_no_takeover_dir`
+        saw it). A probe that holds its file open for 0.3s makes it visible."""
+        monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        started = threading.Event()
+
+        def slow_probe(directory):
+            fd, name = tempfile.mkstemp(dir=directory, prefix=".mtime-probe-")
+            os.close(fd)
+            started.set()
+            time.sleep(0.3)
+            os.unlink(name)
+            return 1
+
+        monkeypatch.setattr(claude_locks, "_mtime_quantum_ns", slow_probe)
+        with claude_locks.proper_lockfile(tmp_path / "target.lock", timeout=2):
+            assert started.wait(10), "premise: the probe never ran"
+        assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+    def test_a_tick_that_lost_the_race_to_the_release_does_not_probe(
+        self, tmp_path, monkeypatch
+    ):
+        """A tick whose wait timed out just before the release set the stop
+        flag reaches the mutex after the release has returned. A probe there
+        would leave its file behind for good, so the tick must look again."""
+        monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.0137)
+        released, ticks, probed = threading.Event(), [], []
+
+        class LateTick(threading.Event):
+            def wait(self, timeout=None):
+                if timeout != 0.0137:
+                    return super().wait(timeout)
+                ticks.append(threading.current_thread())
+                released.wait(10)
+                return False  # "timed out", though the flag has since been set
+
+        monkeypatch.setattr(threading, "Event", LateTick)
+        monkeypatch.setattr(
+            claude_locks, "_mtime_quantum_ns", lambda _d: probed.append(1) or 1)
+        with claude_locks.proper_lockfile(tmp_path / "target.lock", timeout=2):
+            pass
+        released.set()
+        assert _wait_for(lambda: ticks), "premise: no tick was ever reached"
+        ticks[0].join(10)
+        assert not ticks[0].is_alive(), "premise: the tick never finished"
+        assert probed == [], "a tick after the release ran the probe"
 
     @pytest.mark.parametrize(
         "fs_quantum", [1, 100, 1_000_000, 1_000_000_000])

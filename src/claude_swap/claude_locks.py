@@ -560,8 +560,6 @@ def proper_lockfile(
 
     def _touch() -> None:
         nonlocal adopt_stamp, last_stamp, stamp_quantum, unproven
-        if stamp_quantum is None:
-            stamp_quantum = _quantum_for_heartbeat(lock_dir.parent)
         # ABSENCE IS TERMINAL; EVERY OTHER ERRNO IS TRANSIENT. One `except
         # OSError: return` over both syscalls meant a single EIO or ESTALE --
         # the ordinary errnos on a network `~/.claude` -- ended the heartbeat
@@ -569,6 +567,12 @@ def proper_lockfile(
         # a waiter may take over as stale, mid-swap.
         while not stop_touching.wait(TOUCH_INTERVAL_S):
             with _tick_guard:
+                if stamp_quantum is None:
+                    # UNDER THE MUTEX, AND ONLY IF THE RELEASE HAS NOT RUN: it is
+                    # not joined, so a probe after it leaves its file behind.
+                    if stop_touching.is_set():
+                        return
+                    stamp_quantum = _quantum_for_heartbeat(lock_dir.parent)
                 try:
                     if not _ours(strict=False):
                         return  # taken over; refreshing it keeps THEIR lock alive
