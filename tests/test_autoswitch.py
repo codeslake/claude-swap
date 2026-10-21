@@ -1253,6 +1253,25 @@ class TestDecisionTable:
         assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
         assert harness.state()["unhealthyTicks"] == 1
 
+    @pytest.mark.parametrize(
+        "settle", [LoginRestoreOutcome.RESTORED, LoginRestoreOutcome.WAITING]
+    )
+    def test_a_settle_tick_on_a_fresh_engine_keeps_the_persisted_counters(
+        self, harness, settle
+    ):
+        # The settle gate returns before the reseed, so a fresh engine has
+        # no health account yet and must not persist its empty counters.
+        unknown = {"1": None, "2": _usage(10), "3": _usage(50)}
+        harness.tick_with_usage(unknown)
+        before = harness.state()
+        assert before["unhealthyTicks"] == 1
+        harness.engine = harness._make_engine()
+        with patch.object(
+            harness.engine, "_settle_or_arm_wait", return_value=settle
+        ):
+            assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
+        assert harness.state() == before
+
     def test_count_built_on_one_account_is_not_saved_under_the_next(self, harness):
         unknown = {"1": None, "2": None, "3": _usage(50)}
         harness.tick_with_usage(unknown)

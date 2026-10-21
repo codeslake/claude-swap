@@ -1175,6 +1175,9 @@ class AutoSwitchEngine:
         # this tick -- the settle floor hasn't passed yet, so the next tick
         # should land just past it rather than on the ordinary cadence.
         self._settle_wait_until: float | None = None
+        # Per-tick: the first settle gate returned before the health reseed,
+        # so the counters in memory are not yet this account's.
+        self._tick_settled = False
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -1704,7 +1707,8 @@ class AutoSwitchEngine:
         self._tick_in_flight.clear()
         try:
             outcome = self._tick_inner()
-            self._persist_health_counters(self._health_account)
+            if not self._tick_settled:
+                self._persist_health_counters(self._health_account)
             return outcome
         except _EngineStopped:
             # THE one place a mid-tick stop becomes an outcome. Every
@@ -1942,9 +1946,10 @@ class AutoSwitchEngine:
         # Code's own `/login` write is non-atomic); either way this tick
         # decides nothing from a `current` that is about to change or that
         # cannot yet be acted on.
-        if self._settle_or_arm_wait() in (
+        self._tick_settled = self._settle_or_arm_wait() in (
             LoginRestoreOutcome.RESTORED, LoginRestoreOutcome.WAITING,
-        ):
+        )
+        if self._tick_settled:
             return TickOutcome.NO_ACTION
 
         # Read once, ahead of the trace block below, which needs THIS
