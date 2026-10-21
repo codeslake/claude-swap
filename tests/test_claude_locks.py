@@ -541,6 +541,25 @@ class TestProperLockfile:
             assert time.time() - lock_dir.stat().st_mtime < 5.0
         assert not takeover.exists()
 
+    @pytest.mark.parametrize("kind", ["file", "dangling_symlink"])
+    def test_a_non_directory_at_the_guard_path_is_swept_like_a_dead_guard(
+        self, lock_dir, kind
+    ):
+        """A file or a symlink left at the guard path by another tool is swept
+        like a dead guard directory; otherwise every takeover times out."""
+        lock_dir.mkdir()
+        takeover = lock_dir.with_name(lock_dir.name + claude_locks.TAKEOVER_SUFFIX)
+        if kind == "file":
+            takeover.write_text("")
+        else:
+            takeover.symlink_to(lock_dir.parent / "nowhere")
+        past = time.time() - 30
+        os.utime(lock_dir, (past, past))
+        os.utime(takeover, (past, past), follow_symlinks=False)
+        with proper_lockfile(lock_dir, timeout=0.5):
+            pass
+        assert not takeover.is_symlink() and not takeover.exists()
+
 
 class _ForcedTakeoverRace:
     """Stand-in for ``claude_locks.os`` that forces the #420 interleaving:

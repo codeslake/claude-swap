@@ -121,8 +121,11 @@ def _remove_if_still_stale(lock_dir: Path, staleness: float) -> bool:
         os.mkdir(takeover)
     except FileExistsError:
         try:
-            if time.time() - os.stat(takeover).st_mtime > TAKEOVER_STALENESS_S:
-                os.rmdir(takeover)  # its holder died mid-takeover
+            if time.time() - os.lstat(takeover).st_mtime > TAKEOVER_STALENESS_S:
+                try:
+                    os.rmdir(takeover)  # its holder died mid-takeover
+                except NotADirectoryError:
+                    os.unlink(takeover)  # a file or symlink; not ours to keep
         except OSError:
             pass
         return False
