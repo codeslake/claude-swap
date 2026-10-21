@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -541,12 +542,26 @@ class TestProperLockfile:
             assert time.time() - lock_dir.stat().st_mtime < 5.0
         assert not takeover.exists()
 
-    @pytest.mark.parametrize("kind", ["file", "dangling_symlink"])
-    def test_a_non_directory_at_the_guard_path_is_swept_like_a_dead_guard(
-        self, lock_dir, kind
+    @pytest.mark.parametrize("dead", [True, False], ids=["dead", "fresh"])
+    @pytest.mark.parametrize(
+        "kind",
+        [
+            "file",
+            pytest.param(
+                "dangling_symlink",
+                marks=pytest.mark.skipif(
+                    sys.platform == "win32", reason="the link itself cannot be aged"
+                ),
+            ),
+        ],
+    )
+    def test_a_non_directory_at_the_guard_path_is_swept_only_once_dead(
+        self, lock_dir, kind, dead
     ):
         """A file or a symlink left at the guard path by another tool is swept
-        like a dead guard directory; otherwise every takeover times out."""
+        like a dead guard directory, and only once it is older than
+        TAKEOVER_STALENESS_S; otherwise every takeover times out, or a live
+        takeover's guard is stolen."""
         lock_dir.mkdir()
         takeover = lock_dir.with_name(lock_dir.name + claude_locks.TAKEOVER_SUFFIX)
         if kind == "file":
@@ -555,10 +570,16 @@ class TestProperLockfile:
             takeover.symlink_to(lock_dir.parent / "nowhere")
         past = time.time() - 30
         os.utime(lock_dir, (past, past))
-        os.utime(takeover, (past, past), follow_symlinks=False)
-        with proper_lockfile(lock_dir, timeout=0.5):
-            pass
-        assert not takeover.is_symlink() and not takeover.exists()
+        if dead:
+            os.utime(takeover, (past, past), follow_symlinks=kind == "file")
+            with proper_lockfile(lock_dir, timeout=0.5):
+                pass
+            assert not takeover.is_symlink() and not takeover.exists()
+        else:
+            with pytest.raises(ClaudeCodeLockTimeout):
+                with proper_lockfile(lock_dir, timeout=0.5):
+                    pass
+            assert takeover.is_symlink() or takeover.exists()
 
 
 class _ForcedTakeoverRace:
@@ -809,12 +830,11 @@ class TestEveryArmOfTheLoopBacksOff:
                 pass
 
         assert tries["n"] > 1, "premise: the loop must have retried at all"
-        # 10, on the sibling's arithmetic MINUS ONE. A flat 0.05s over a 0.3s
-        # budget is 6 attempts HERE: the sibling counts `mkdir`, which runs
-        # before the deadline check and so gets one extra call on the final
-        # iteration, while this counts `rmdir`, which runs after it. 10 leaves
-        # headroom without tolerating the 5x shrink the sleep-total bound
-        # cannot see. Same upward tail as its siblings.
+        # A flat 0.05s over a 0.3s budget is 6 attempts HERE: the sibling
+        # counts `mkdir`, which runs before the deadline check and so gets one
+        # extra call on the final iteration, while this counts `rmdir`, which
+        # runs after it. 20 is the sibling's bound, for the same upward tail
+        # on a coarse timer.
         assert tries["n"] <= 20, (
             f"{tries['n']} rmdir attempts in a 0.3s budget — the arm that "
             "cannot remove a stale lock backed off less than it claims to"
@@ -828,9 +848,7 @@ class TestEveryArmOfTheLoopBacksOff:
         NAMED FOR THE ARM IT REACHES. A dangling symlink answers
         FileExistsError to `mkdir`, so this drives the arm where the READ-BACK
         stat raises ENOENT -- not a name swept between `mkdir` and `stat`.
-        The two are one `except` on this branch and two on the merged tree,
-        where the swept-name arm has its own back-off that this case never
-        touches.
+        Both are the one `except FileNotFoundError` arm in the loop.
 
         The wall-clock form this replaces could only see a FLATTENING. With a
         budget under the flat constant, `min(0.05, timeout)` and
