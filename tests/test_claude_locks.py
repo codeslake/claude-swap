@@ -481,6 +481,120 @@ class TestProperLockfile:
         _assert_backed_off(slept, budget, least=2, remainder=0.005,
                            what="jitter clamp")
 
+    def test_two_waiters_cannot_both_take_over_one_stale_lock(
+        self, lock_dir, monkeypatch
+    ):
+        """#420: two waiters that saw the same dead holder must not both end
+        up holding the lock. The second used to remove the first's fresh lock
+        as if it were the stale one, then take it as well."""
+        lock_dir.mkdir()
+        past = time.time() - 30
+        os.utime(lock_dir, (past, past))
+        monkeypatch.setattr(claude_locks, "os", _ForcedTakeoverRace(lock_dir))
+
+        inside = most = 0
+        count = threading.Lock()
+        finished: list[bool] = []
+        errors: list[BaseException] = []
+
+        def waiter() -> None:
+            nonlocal inside, most
+            try:
+                with proper_lockfile(lock_dir, timeout=5.0):
+                    with count:
+                        inside += 1
+                        most = max(most, inside)
+                    time.sleep(0.3)
+                    with count:
+                        inside -= 1
+                finished.append(True)
+            except BaseException as e:  # surfaced by the asserts below
+                errors.append(e)
+
+        threads = [threading.Thread(target=waiter) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+        assert errors == []
+        assert len(finished) == 2  # both still get the lock, one at a time
+        assert most == 1
+
+    def test_takeover_leaves_no_takeover_dir(self, lock_dir):
+        lock_dir.mkdir()
+        past = time.time() - 30
+        os.utime(lock_dir, (past, past))
+        with proper_lockfile(lock_dir, timeout=2.0):
+            pass
+        assert sorted(p.name for p in lock_dir.parent.iterdir()) == []
+
+    def test_dead_takeover_dir_does_not_block_takeover(self, lock_dir):
+        """A waiter killed mid-takeover leaves the takeover directory behind;
+        once that is older than TAKEOVER_STALENESS_S it is cleared."""
+        lock_dir.mkdir()
+        takeover = lock_dir.with_name(lock_dir.name + claude_locks.TAKEOVER_SUFFIX)
+        takeover.mkdir()
+        past = time.time() - 30
+        os.utime(lock_dir, (past, past))
+        os.utime(takeover, (past, past))
+        with proper_lockfile(lock_dir, timeout=2.0):
+            assert time.time() - lock_dir.stat().st_mtime < 5.0
+        assert not takeover.exists()
+
+
+class _ForcedTakeoverRace:
+    """Stand-in for ``claude_locks.os`` that forces the #420 interleaving:
+    both waiters stat the same stale lock before either removes it, and the
+    second waiter's takeover (its takeover-directory mkdir, or before the
+    fix its rmdir) waits until the first waiter has retaken the lock."""
+
+    def __init__(self, lock_dir: Path) -> None:
+        self._lock_dir = str(lock_dir)
+        self._takeover_dir = self._lock_dir + claude_locks.TAKEOVER_SUFFIX
+        self._both_saw_stale = threading.Barrier(2, timeout=5)
+        self._retaken = threading.Event()
+        self._statted: set[int] = set()
+        self._first_taker: int | None = None
+        self._removals = 0
+        self._guard = threading.Lock()
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def mkdir(self, path, *args, **kwargs):
+        if str(path) == self._takeover_dir:
+            me = threading.get_ident()
+            with self._guard:
+                if self._first_taker is None:
+                    self._first_taker = me
+                later = me != self._first_taker
+            if later:
+                self._retaken.wait(2)
+        result = os.mkdir(path, *args, **kwargs)
+        if str(path) == self._lock_dir:
+            self._retaken.set()
+        return result
+
+    def stat(self, path, *args, **kwargs):
+        result = os.stat(path, *args, **kwargs)
+        if str(path) == self._lock_dir:
+            me = threading.get_ident()
+            with self._guard:
+                first = me not in self._statted
+                self._statted.add(me)
+            if first:
+                self._both_saw_stale.wait()
+        return result
+
+    def rmdir(self, path, *args, **kwargs):
+        if str(path) == self._lock_dir:
+            with self._guard:
+                self._removals += 1
+                second = self._removals == 2
+            if second:
+                self._retaken.wait(2)
+        return os.rmdir(path, *args, **kwargs)
+
 
 class TestLockPaths:
     def test_default_paths(self, temp_home, monkeypatch):
@@ -733,112 +847,6 @@ class TestEveryArmOfTheLoopBacksOff:
         _assert_backed_off(slept, budget)
 
 
-class TestTheTakeoverGuardIsInsideTheTimeout:
-    """`timeout` bounds the whole call, and the guard is the one place it did not.
-
-    The clamped sleeps in the retry loop exist so a deadline crossed
-    mid-iteration cannot overrun. The takeover's own `FileLock` was handed a
-    fixed wait instead of the remaining budget, so a contended guard added up
-    to its own timeout ON TOP, once per call -- and a single switch takes
-    three of these locks.
-    """
-
-    def test_a_contended_guard_does_not_outlive_the_budget(self, tmp_path, monkeypatch):
-        target = tmp_path / "target.lock"
-        target.mkdir()
-        stale = time.time() - 100
-        os.utime(target, (stale, stale))
-        guard = target.parent / f"{target.name}.takeover"
-
-        # `elapsed` cannot tell the clamped guard from the jitter arm's own
-        # clamp beside it, so the number alone does not say which arm produced
-        # it. Recording the budgets ties it to this arm AND to the regime in
-        # which the two forms differ.
-        budgets = []
-        real_take_over = claude_locks._take_over_stale
-
-        def recording(*a, **k):
-            budgets.append(k["budget"])
-            return real_take_over(*a, **k)
-
-        monkeypatch.setattr(claude_locks, "_take_over_stale", recording)
-
-        # Past the first iteration, which costs the cap plus the declined-
-        # takeover back-off. Only the SECOND call separates the two forms.
-        budget = claude_locks._TAKEOVER_GUARD_S + 0.2
-        margin = 0.15
-
-        held = threading.Event()
-        release = threading.Event()
-
-        def hold():
-            # OUTLASTS THE BUDGET, which is derived from the cap: a fixed hold
-            # is a second small-side band. Measured, at a 5s hold and a cap of
-            # 5.0 the peer let go mid-run, the takeover succeeded, and the case
-            # reported `DID NOT RAISE` -- the shape of the very defect this
-            # branch fixes, on correct code.
-            with claude_locks.FileLock(guard, timeout=5):
-                held.set()
-                release.wait(budget + 5)
-
-        t = threading.Thread(target=hold, daemon=True)
-        t.start()
-        assert held.wait(5), "premise: the peer must hold the guard"
-        # THE PEER'S FLOCK IS REAL, THE WAITING IS NOT: `elapsed` below is
-        # scripted time, so the clamped and unclamped forms separate exactly
-        # instead of by a margin a loaded runner can eat.
-        _scripted_time(monkeypatch, budget)
-        try:
-            started = time.monotonic()
-            with pytest.raises(ClaudeCodeLockTimeout):
-                with proper_lockfile(target, timeout=budget, staleness=1.0):
-                    pass
-            elapsed = time.monotonic() - started
-        finally:
-            release.set()
-            t.join(5)
-
-        # THE REGIME, as the INEQUALITY rather than its solved value: clamped
-        # costs `budget`, unclamped `2*cap + the declined-takeover back-off`,
-        # and they must separate by more than `margin`. Writing the solved
-        # `> 0.30` hid that it is a function of all three, so moving the margin
-        # or the budget sizing re-opened the blind band in silence. Everything
-        # here is a constant the code under test cannot move, so this stays a
-        # precondition rather than a detector wearing one's label. The back-off
-        # is READ, not guessed, so no value of it leaves a band.
-        assert (
-            2 * claude_locks._TAKEOVER_GUARD_S + claude_locks._DECLINE_BACKOFF_S
-            > budget + margin
-        ), (
-            "premise: the cap is too small for the clamped and unclamped forms "
-            "to separate by more than the margin this case allows"
-        )
-        assert len(budgets) >= 2, (
-            "premise: only one iteration ran, and on the first one "
-            f"`min(cap, remaining)` and `min(cap, timeout)` agree: {budgets}"
-        )
-        assert elapsed < budget + margin, (
-            f"waited {elapsed:.3f}s on a {budget}s budget -- the takeover "
-            f"guard is not clamped to the remaining time"
-        )
-
-    def test_the_guard_waits_no_longer_than_the_guard_constant(
-        self, tmp_path, monkeypatch
-    ):
-        """A default of `_TAKEOVER_GUARD_S` would freeze the import value."""
-        seen = []
-        real = claude_locks.FileLock
-
-        def recording(path, **kw):
-            seen.append(kw["timeout"])
-            return real(path, **kw)
-
-        monkeypatch.setattr(claude_locks, "FileLock", recording)
-        monkeypatch.setattr(claude_locks, "_TAKEOVER_GUARD_S", 7.0)
-        gone = tmp_path / "gone.lock"
-        assert claude_locks._take_over_stale(gone, 60.0, budget=60.0) is True
-        assert seen == [7.0], f"the guard waited {seen} under a cap of 7.0"
-
 class TestADeadlineCanPassMidIterationForEveryArm:
     """The floor under each arm's clamp, which nothing here exercised.
 
@@ -968,106 +976,6 @@ def test_a_second_freeze_after_a_recovery_is_reported_again(
     )
 
 
-class TestTheStaleTakeoverDoesNotRemoveASuccessorsLock:
-    """`os.stat` decides and `os.rmdir` acts; a peer can win the same race
-    in between and create ITS lock at this name. Removing that puts two
-    processes in the critical section at once."""
-
-    def test_a_corpse_is_removed_and_a_fresh_lock_is_left_alone(self, tmp_path):
-        lock_dir = tmp_path / "target.lock"
-        staleness = 60.0
-
-        # CONTROL, and the positive arm: a genuine corpse IS taken over, so
-        # a False below cannot be a takeover that never works at all.
-        lock_dir.mkdir()
-        past = time.time() - 10 * staleness
-        os.utime(lock_dir, (past, past))
-        assert claude_locks._take_over_stale(lock_dir, staleness, budget=60.0) is True
-        assert not lock_dir.exists()
-
-        # THE ARM UNDER TEST: by the time the removal runs, a peer has
-        # retaken the name. Its directory is fresh, and removing it would
-        # leave that peer holding a lock this process is about to recreate.
-        lock_dir.mkdir()
-        assert claude_locks._take_over_stale(lock_dir, staleness, budget=60.0) is False, (
-            "DEFECT: a directory that is no longer stale was removed -- a "
-            "peer that won the takeover race holds it, and taking it away "
-            "puts both processes inside the critical section"
-        )
-        assert lock_dir.exists(), "the successor's lock must survive"
-
-    def test_the_decide_and_remove_window_is_exclusive(self, tmp_path):
-        """The re-read is only half the fix; the other half is that two
-        waiters cannot be inside this window at once.
-
-        Without the exclusion the re-read still reads a corpse in both
-        processes, both remove it, and the second one removes whatever the
-        first has already created.
-        """
-        from claude_swap.locking import FileLock
-
-        lock_dir = tmp_path / "target.lock"
-        staleness = 60.0
-        lock_dir.mkdir()
-        past = time.time() - 10 * staleness
-        os.utime(lock_dir, (past, past))
-        guard = lock_dir.parent / f"{lock_dir.name}.takeover"
-
-        peer = FileLock(guard, timeout=0.5)
-        assert peer.acquire(), "premise: the peer must hold the guard first"
-        try:
-            # A small `budget`: a contended guard is waited on for the smaller
-            # of it and `_TAKEOVER_GUARD_S`, and the wait is all this costs.
-            assert claude_locks._take_over_stale(lock_dir, staleness, budget=0.05) is False, (
-                "DEFECT: a second waiter entered the decide-and-remove window "
-                "while a peer was inside it. Both then remove the corpse and "
-                "the loser's fresh lock goes with it, putting two processes "
-                "in the critical section"
-            )
-            assert lock_dir.exists(), "the corpse must be left for the peer"
-        finally:
-            peer.release()
-
-        # CONTROL: with the guard free the SAME corpse is taken over, so the
-        # False above cannot be a takeover that never works at all.
-        assert claude_locks._take_over_stale(lock_dir, staleness, budget=60.0) is True
-        assert not lock_dir.exists()
-
-    def test_a_vanished_lock_is_free_to_take(self, tmp_path):
-        """The caller's next mkdir decides; a False here cost it a back-off
-        before a mkdir that would have succeeded."""
-        assert claude_locks._take_over_stale(tmp_path / "gone.lock", 60.0, budget=60.0) is True
-
-    def test_a_lock_that_vanishes_at_the_rmdir_is_free_too(self, tmp_path, monkeypatch):
-        """Absence is absence whichever syscall meets it.
-
-        The stat arm above says so; the rmdir arm is the same fact one
-        `except` later, and it answered False -- so a corpse that Claude Code
-        (which takes no lock of ours) swept between our stat and our rmdir
-        cost a back-off before a mkdir that would have succeeded, and handed
-        the name to whoever was not backing off.
-        """
-        lock_dir = tmp_path / "target.lock"
-        lock_dir.mkdir()
-        past = time.time() - 600
-        os.utime(lock_dir, (past, past))
-        real_rmdir = os.rmdir
-
-        def swept_first(path, *a, **k):
-            if os.fspath(path) == os.fspath(lock_dir):
-                real_rmdir(path)  # it really does go: the name IS free after
-                raise FileNotFoundError(errno.ENOENT, "swept before our rmdir")
-            return real_rmdir(path, *a, **k)
-
-        monkeypatch.setattr(claude_locks.os, "rmdir", swept_first)
-        got = claude_locks._take_over_stale(lock_dir, 60.0, budget=60.0)
-        assert not lock_dir.exists(), "premise: the name must actually be free"
-        assert got is True, (
-            "the rmdir arm reported a free name as taken; the caller backs "
-            "off before a mkdir that would have succeeded"
-        )
-
-
 class TestCcRefreshLockProtocol:
     """Claude Code 2.1.218 guards its OAuth refresh with TWO locks —
     ``<config-home>/.oauth_refresh.lock`` (primary) then the legacy
@@ -1112,7 +1020,7 @@ class TestCcRefreshLockProtocol:
         while CC is still trying for it and burns CC's whole retry budget
         instead of failing it cheaply on the primary.
 
-        One stale corpse at either path -- exactly what `_take_over_stale`
+        One stale corpse at either path -- exactly what the stale takeover
         exists to handle -- makes that path's `mkdir` run twice, so the
         recorder must count what SUCCEEDED. Recording the ATTEMPT put a
         third entry in the list and fired the premise below on an ordinary
