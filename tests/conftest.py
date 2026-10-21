@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import gc
 import json
 import os
@@ -888,8 +889,9 @@ def pytest_collection_modifyitems(items):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
 
 
-@pytest.hookimpl(trylast=True)
-def pytest_unconfigure():
-    # Skip the exit-time collection over the heap the session built; trylast so
-    # pytest's own end-of-run sweep for unraisable exceptions collects first.
-    gc.freeze()
+def pytest_configure():
+    # A disposable xdist worker skips the exit-time collection of the heap the
+    # session built. atexit runs after pytest's whole cleanup stack, the final
+    # unraisable-exception sweep included; the controller and -n 0 never freeze.
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        atexit.register(gc.freeze)
