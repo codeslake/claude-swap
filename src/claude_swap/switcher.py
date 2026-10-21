@@ -5857,6 +5857,14 @@ class ClaudeAccountSwitcher:
                         # _clear_managed_key) — the config lock covers just
                         # this write. A timeout here is a live-write failure
                         # (the grant is already consumed), not a defer.
+                        # A successor built from the backup (or the
+                        # collector's read) carries that snapshot's shared
+                        # fields (mcpOAuth, ...); the live store's are current.
+                        live_write = working
+                        if refresh_input != live:
+                            live_write = self._prepare_credentials_for_activation(
+                                working, live
+                            )
                         with claude_config_lock():
                             # A REFUSAL IS A DEFERRAL: it leaves the live
                             # store on bytes this pass judged unusable, which
@@ -5865,7 +5873,7 @@ class ClaudeAccountSwitcher:
                                 account_num, refresh_input, live
                             )
                             if live_ok:
-                                self._write_credentials(working)  # active store — CC reads this
+                                self._write_credentials(live_write)  # active store — CC reads this
                     except Exception:
                         live_ok = False
                         self._logger.warning(
