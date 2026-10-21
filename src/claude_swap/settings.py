@@ -229,7 +229,8 @@ def _overlay(base: dict, local: dict) -> dict:
 
 def _diff(data: dict, base: dict) -> dict:
     """What ``_overlay(base, result)`` needs to equal ``data``: changed or new
-    keys, and ``None`` for each key ``data`` dropped from ``base``."""
+    keys, and ``None`` for each key ``data`` dropped from ``base``. A dropped
+    section is tombstoned key by key, so keys the base adds to it later show."""
     out: dict = {}
     for key, value in data.items():
         old = base.get(key)
@@ -240,7 +241,9 @@ def _diff(data: dict, base: dict) -> dict:
             out[key].update({k: None for k in old if k not in value})
         else:
             out[key] = value
-    out.update({k: None for k in base if k not in data})
+    for key, old in base.items():
+        if key not in data:
+            out[key] = {k: None for k in old} if isinstance(old, dict) and old else None
     return out
 
 

@@ -473,7 +473,7 @@ class TestLocalOverlay:
                 {"pinnedEmail": None, "pinnedOrganizationUuid": None},
                 id="neighbour-kept",
             ),
-            pytest.param(_PIN, None, id="whole-section-gone"),
+            pytest.param(_PIN, {"pinnedEmail": None, "pinnedOrganizationUuid": None}, id="emptied-section"),
         ],
     )
     def test_clearing_a_base_pin_leaves_a_tombstone(self, tmp_path, base_section, local_section):
@@ -484,6 +484,23 @@ class TestLocalOverlay:
         merged = _read_raw(settings_path(tmp_path)).get("remoteControl", {})
         assert "pinnedEmail" not in merged
         assert merged.get("debugSlowMs") == base_section.get("debugSlowMs")
+
+    def test_a_cleared_pin_section_still_sees_keys_the_base_adds_later(self, tmp_path):
+        _base(tmp_path, {"remoteControl": _PIN})
+        _pin(tmp_path, None)
+        _base(tmp_path, {"remoteControl": {**_PIN, "debugSlowMs": 1500}})
+        assert _read_raw(settings_path(tmp_path))["remoteControl"] == {"debugSlowMs": 1500}
+
+    def test_unsetting_the_last_base_key_still_sees_keys_the_base_adds_later(self, tmp_path):
+        _base(tmp_path, {"autoswitch": {"threshold": 80}})
+        assert unset_setting(tmp_path, "autoswitch.threshold") is True
+        _base(tmp_path, {"autoswitch": {"threshold": 80, "strategy": "best"}})
+        assert _read_raw(settings_path(tmp_path))["autoswitch"] == {"strategy": "best"}
+
+    def test_dropping_an_empty_base_section_removes_it(self, tmp_path):
+        _base(tmp_path, {"a": {}, "b": 1})
+        atomic_write_json(settings_path(tmp_path), {"b": 1})
+        assert _read_raw(settings_path(tmp_path)) == {"b": 1}
 
     def test_set_writes_local_only(self, tmp_path):
         before = _base(tmp_path, {"schemaVersion": 1, "autoswitch": {"threshold": 80}})
