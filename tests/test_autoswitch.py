@@ -1195,9 +1195,13 @@ class TestDecisionTable:
         usage = {"1": None, "2": _usage(10), "3": _usage(50)}
         assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert harness.state()["unhealthyTicks"] == 1
+        harness.engine.stop()  # free LIVE, as a real --once exit does
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        harness.engine.stop()
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(usage) is TickOutcome.SWITCHED
         assert harness.active_number() == 2
 
@@ -1205,7 +1209,9 @@ class TestDecisionTable:
         held = {"1": USAGE_TOKEN_EXPIRED, "2": _usage(10), "3": _usage(20)}
         harness.tick_with_usage(held)
         harness.clock.advance(IDLE_HOLD_MAX_S + 1)
+        harness.engine.stop()
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(held) is TickOutcome.NO_ACTION
         assert harness.state()["unhealthyTicks"] == 1
         assert not any(
@@ -1219,11 +1225,15 @@ class TestDecisionTable:
         harness.tick_with_usage(unknown)
         assert harness.state()["unhealthyTicks"] == 2
         harness.clock.advance(2 * IDLE_HOLD_MAX_S + 1)
+        harness.engine.stop()
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
         assert harness.state()["unhealthyTicks"] == 1
         harness.engine._mutate_state(lambda s: s.update(healthAccount="2"))
+        harness.engine.stop()
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
         assert harness.state()["unhealthyTicks"] == 1
 
@@ -1238,7 +1248,9 @@ class TestDecisionTable:
         state = harness.state()
         assert state["healthAccount"] == "2"
         assert state["unhealthyTicks"] == 1
+        harness.engine.stop()
         harness.engine = harness._make_engine()
+        assert not harness.engine.dry_run
         assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
         assert harness.state()["unhealthyTicks"] == 2
 
