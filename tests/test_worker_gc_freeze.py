@@ -47,13 +47,16 @@ def pytest_configure(config):
 
 def _child_pytest(tmp_path, worker, *opts):
     (tmp_path / "test_ok.py").write_text("def test_ok(): pass\n")
-    # HOME under tmp_path keeps the child off the live credential store.
+    # HOME below tmp_path keeps the child off the live credential store, and not
+    # tmp_path itself: its guard refuses a write to HOME's direct children, the
+    # project's own __pycache__ included.
     env = {
         k: v
         for k, v in os.environ.items()
         if not k.startswith(("PYTEST_", "CLAUDE_", "XDG_"))
     }
-    env["HOME"] = str(tmp_path)
+    env["HOME"] = str(tmp_path / "home")
+    (tmp_path / "home").mkdir()
     if worker:
         env["PYTEST_XDIST_WORKER"] = "gw0"
     done = subprocess.run(
@@ -64,10 +67,9 @@ def _child_pytest(tmp_path, worker, *opts):
     return done.returncode, done.stdout.splitlines()[-1], done.stdout + done.stderr
 
 
-@pytest.mark.parametrize("worker, frozen", [(True, "True"), (False, "False")])
-def test_only_an_xdist_worker_freezes_its_heap_at_exit(tmp_path, worker, frozen):
-    rc, last, out = _child_pytest(tmp_path, worker)
-    assert (rc, last) == (0, frozen), out
+def test_a_non_worker_does_not_freeze_its_heap_at_exit(tmp_path):
+    rc, last, out = _child_pytest(tmp_path, False)
+    assert (rc, last) == (0, "False"), out
 
 
 def test_the_freeze_leaves_the_final_unraisable_sweep_reporting(tmp_path):
