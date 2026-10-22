@@ -2827,6 +2827,32 @@ class TestSuspectDrop:
         assert new["seven_day"]["resets_at"] != prior["seven_day"]["resets_at"]
         assert new["seven_day"]["resets_at"] in said
 
+    @pytest.mark.parametrize(
+        "lose",
+        [
+            lambda u: u.pop("seven_day"),
+            lambda u: u["seven_day"].update(pct=None),
+            lambda u: u.pop("scoped"),
+        ],
+        ids=["seven_day absent", "seven_day pct None", "scoped absent"],
+    )
+    def test_a_window_the_reading_loses_is_held_like_a_drop(
+        self, store, clock, caplog, lose
+    ):
+        prior = self._reading(clock, 0.0, 100.0, 100.0)
+        store.record({"1": FetchRecord(usage=prior)}, IDENT)
+        clock.advance(80.0)
+        new = json.loads(json.dumps(prior))
+        new["five_hour"]["pct"] = 3.0
+        lose(new)
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            store.record({"1": FetchRecord(usage=new)}, IDENT)
+
+        held = store.entries(IDENT)["1"].decision_value()
+        assert held == {**prior, "five_hour": new["five_hour"]}
+        assert self._stamp(store) is True
+        assert "None%" in " ".join(r.getMessage() for r in caplog.records)
+
     def test_a_drop_after_the_prior_reset_is_a_genuine_reset(self, store, clock):
         prior = self._reading(clock, 0.0, 100.0, 100.0)
         store.record({"1": FetchRecord(usage=prior)}, IDENT)

@@ -655,44 +655,52 @@ def _hold_suspect_drops(
     """``new`` with each window that contradicts ``prior`` replaced by its prior
     entry, and the ``(label, prior_entry, new_entry)`` replaced.
 
-    A drop with the prior window's reset still ahead cannot be a reset, so it
-    is held once as a bad answer (one numeric 0% from the endpoint read as an
-    idle account for two minutes, 2026-10-22); once the reset has passed it is
-    a genuine one and never held.
+    A drop (or a window now absent or non-numeric) with the prior window's
+    reset still ahead cannot be a reset, so it is held once as a bad answer
+    (one numeric 0% from the endpoint read as an idle account for two minutes,
+    2026-10-22); once the reset has passed it is a genuine one and never held.
     """
     if not isinstance(prior, dict) or not isinstance(new, dict):
         return new, []
     held: list[tuple] = []
 
     def check(label: object, old: object, cur: object) -> object:
-        if not (isinstance(old, dict) and isinstance(cur, dict)):
+        if not isinstance(old, dict):
             return cur
-        was, now_pct = old.get("pct"), cur.get("pct")
+        was = old.get("pct")
+        now_pct = cur.get("pct") if isinstance(cur, dict) else None
         ts = parse_reset_ts(old.get("resets_at"))
+        # A window the reading omits or leaves non-numeric is a drop too.
         if (
             isinstance(was, (int, float))
-            and isinstance(now_pct, (int, float))
             and ts is not None
             and now < ts
-            and was - now_pct >= SUSPECT_DROP_PCT
+            and (
+                not isinstance(now_pct, (int, float))
+                or was - now_pct >= SUSPECT_DROP_PCT
+            )
         ):
-            held.append((label, old, cur))
+            held.append((label, old, cur if isinstance(cur, dict) else {}))
             return old
         return cur
 
     out = dict(new)
     for key in ("five_hour", "seven_day"):
-        if key in new:
-            out[key] = check(key, prior.get(key), new[key])
+        if (cur := check(key, prior.get(key), new.get(key))) is not None:
+            out[key] = cur
     old_scoped, new_scoped = prior.get("scoped"), new.get("scoped")
-    if isinstance(old_scoped, list) and isinstance(new_scoped, list):
-        by_name = {s.get("name"): s for s in old_scoped if isinstance(s, dict)}
-        out["scoped"] = [
-            check(s.get("name"), by_name.get(s.get("name")), s)
-            if isinstance(s, dict)
-            else s
-            for s in new_scoped
-        ]
+    old_scoped = old_scoped if isinstance(old_scoped, list) else []
+    new_scoped = new_scoped if isinstance(new_scoped, list) else []
+    by_name = {s.get("name"): s for s in old_scoped if isinstance(s, dict)}
+    kept = [
+        check(s.get("name"), by_name.get(s.get("name")), s) if isinstance(s, dict) else s
+        for s in new_scoped
+    ]
+    seen = {s.get("name") for s in new_scoped if isinstance(s, dict)}
+    # A prior window the new list omits comes back (`check` returns it only if held).
+    kept += [o for n, o in by_name.items() if n not in seen and check(n, o, None) is o]
+    if kept:
+        out["scoped"] = kept
     return out, held
 
 
