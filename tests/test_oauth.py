@@ -2403,6 +2403,100 @@ class TestAFailedCaLoadIsNotCached:
             "disagree")
 
 
+class TestDaemonSslContext:
+    """In the pin daemon the egress is a re-signing hop, so the pin's own
+    `_verifying_context` decides what is trusted; everywhere else the
+    roots-plus-ca.pem context is unchanged."""
+
+    DAEMON = "cswap_pin.proxy"
+
+    @pytest.fixture(autouse=True)
+    def _fresh_slot(self, monkeypatch):
+        from claude_swap import pin
+
+        monkeypatch.setattr(oauth, "_PIN_CTX_SLOT", None)
+        monkeypatch.setattr(pin, "ca_path_for_trust", lambda: None)
+
+    def _as_main(self, monkeypatch, spec_name, impl):
+        import sys
+        import types
+
+        from claude_swap import pin
+
+        spec = None if spec_name is None else types.SimpleNamespace(name=spec_name)
+        monkeypatch.setitem(sys.modules, "__main__",
+                            types.SimpleNamespace(__spec__=spec))
+        monkeypatch.setattr(pin, "_live_impl", lambda: impl)
+
+    @staticmethod
+    def _impl(verifying):
+        import types
+
+        return types.SimpleNamespace(_DAEMON_MODULE_NAMES=("cswap_pin.proxy",),
+                                     _verifying_context=verifying)
+
+    def test_a_non_daemon_main_keeps_the_cached_pin_context(self, monkeypatch):
+        from claude_swap import pin
+
+        sentinel = ssl.create_default_context()
+        self._as_main(monkeypatch, "claude_swap.__main__",
+                      self._impl(lambda: sentinel))
+
+        assert pin.daemon_ssl_context() is None
+        first = oauth._pin_aware_ssl_context()
+        assert first is not sentinel
+        assert oauth._pin_aware_ssl_context() is first
+
+    def test_the_daemon_gets_the_pins_verifying_context(self, monkeypatch):
+        from claude_swap import pin
+
+        sentinel = ssl.create_default_context()
+        self._as_main(monkeypatch, self.DAEMON, self._impl(lambda: sentinel))
+
+        assert pin.daemon_ssl_context() is sentinel
+        assert oauth._pin_aware_ssl_context() is sentinel
+        assert oauth._PIN_CTX_SLOT is None, (
+            "the daemon context went into the slot keyed on the pin CA alone")
+
+    @pytest.mark.parametrize("case", [
+        "no-spec", "no-impl", "no-names", "no-verifying", "raises"])
+    def test_anything_missing_or_raising_falls_back(self, monkeypatch, case):
+        import types
+
+        from claude_swap import pin
+
+        def boom():
+            raise RuntimeError("pin refactored")
+
+        impl = {
+            "no-impl": None,
+            "no-names": types.SimpleNamespace(_verifying_context=boom),
+            "no-verifying": types.SimpleNamespace(
+                _DAEMON_MODULE_NAMES=(self.DAEMON,)),
+        }.get(case, self._impl(boom))
+        self._as_main(monkeypatch, None if case == "no-spec" else self.DAEMON, impl)
+
+        assert pin.daemon_ssl_context() is None
+        ctx = oauth._pin_aware_ssl_context()
+        assert isinstance(ctx, ssl.SSLContext)
+        assert oauth._pin_aware_ssl_context() is ctx
+
+    def test_a_pin_that_asks_the_host_back_does_not_recurse(self, monkeypatch):
+        """cswap-pin 0.1.309 and 0.1.310 answer `_verifying_context` with the
+        host's own `_pin_aware_ssl_context`, which would be this same call."""
+        asked = []
+
+        def asks_the_host():
+            asked.append(1)
+            return oauth._pin_aware_ssl_context()
+
+        self._as_main(monkeypatch, self.DAEMON, self._impl(asks_the_host))
+
+        ctx = oauth._pin_aware_ssl_context()
+        assert asked == [1], f"the impl was entered {len(asked)} times"
+        assert isinstance(ctx, ssl.SSLContext)
+
+
 class TestLoginExpiresAtIso:
     def test_refresh_token_expiry_is_reported_as_iso_utc(self):
         creds = json.dumps({"claudeAiOauth": {

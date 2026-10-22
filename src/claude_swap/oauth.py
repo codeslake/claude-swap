@@ -951,7 +951,17 @@ def _pin_aware_ssl_context():
 
     NEVER RAISES and never returns None: with no pin installed, or an
     unreadable CA, the caller still gets an ordinary verifying context.
+
+    INSIDE THE PIN DAEMON the egress is a re-signing hop, not the pin, so this
+    context fails on it; the pin's own `_verifying_context` trusts what that
+    hop presents and is returned instead, uncached.
     """
+    from claude_swap import pin as _pin
+
+    ctx = _pin.daemon_ssl_context()
+    if ctx is not None:
+        return ctx
+
     # Built once per CA, not per call: `create_default_context()` loads the
     # whole system trust store and this sits on the polling path. Nothing in
     # the result changes unless the pin's CA file does, so the cache is keyed

@@ -26,6 +26,8 @@ import inspect
 import json
 import logging
 import os
+import sys
+import threading
 from types import ModuleType
 
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError
@@ -1316,6 +1318,37 @@ def ca_path_for_trust():
     tell them apart should not use this.
     """
     return _ask("ca_path_for_trust")
+
+
+_DAEMON_CTX = threading.local()
+
+
+def daemon_ssl_context():
+    """The pin's own verifying context when THIS process is the pin daemon.
+
+    The daemon's egress is a re-signing hop, so the roots-plus-ca.pem context
+    cannot verify what it presents; the pin's `_verifying_context` trusts it.
+    The test is the main module's spec name, not a flag: under `python -m` the
+    daemon is `__main__` and this seam imports a second copy of the module.
+
+    None on any doubt (extra absent, a name missing, anything raising), which
+    is the caller's behaviour without this. Re-entry is None too: cswap-pin
+    0.1.309 and 0.1.310 answer `_verifying_context` with the host's
+    `_pin_aware_ssl_context`, which is the call that got us here.
+    """
+    if getattr(_DAEMON_CTX, "busy", False):
+        return None
+    _DAEMON_CTX.busy = True
+    try:
+        name = sys.modules["__main__"].__spec__.name
+        impl = _live_impl()
+        if impl is not None and name in impl._DAEMON_MODULE_NAMES:
+            return impl._verifying_context()
+    except Exception:  # noqa: BLE001 (an optional extra cannot break a caller)
+        pass
+    finally:
+        _DAEMON_CTX.busy = False
+    return None
 
 
 def live_bridge_names() -> "dict[str, str] | None":
