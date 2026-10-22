@@ -644,6 +644,58 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
     return min(resets) if resets else None
 
 
+# A success whose window reads this many points below the prior reading while
+# that window's own reset is still ahead contradicts it (`record`).
+SUSPECT_DROP_PCT = 25.0
+
+
+def _hold_suspect_drops(
+    prior: object, new: object, now: float
+) -> tuple[object, list[tuple]]:
+    """``new`` with each window that contradicts ``prior`` replaced by its prior
+    entry, and the ``(label, prior_entry, new_entry)`` replaced.
+
+    A drop with the prior window's reset still ahead cannot be a reset, so it
+    is held once as a bad answer (one numeric 0% from the endpoint read as an
+    idle account for two minutes, 2026-10-22); once the reset has passed it is
+    a genuine one and never held.
+    """
+    if not isinstance(prior, dict) or not isinstance(new, dict):
+        return new, []
+    held: list[tuple] = []
+
+    def check(label: object, old: object, cur: object) -> object:
+        if not (isinstance(old, dict) and isinstance(cur, dict)):
+            return cur
+        was, now_pct = old.get("pct"), cur.get("pct")
+        ts = parse_reset_ts(old.get("resets_at"))
+        if (
+            isinstance(was, (int, float))
+            and isinstance(now_pct, (int, float))
+            and ts is not None
+            and now < ts
+            and was - now_pct >= SUSPECT_DROP_PCT
+        ):
+            held.append((label, old, cur))
+            return old
+        return cur
+
+    out = dict(new)
+    for key in ("five_hour", "seven_day"):
+        if key in new:
+            out[key] = check(key, prior.get(key), new[key])
+    old_scoped, new_scoped = prior.get("scoped"), new.get("scoped")
+    if isinstance(old_scoped, list) and isinstance(new_scoped, list):
+        by_name = {s.get("name"): s for s in old_scoped if isinstance(s, dict)}
+        out["scoped"] = [
+            check(s.get("name"), by_name.get(s.get("name")), s)
+            if isinstance(s, dict)
+            else s
+            for s in new_scoped
+        ]
+    return out, held
+
+
 def _reset_ts_to_resets_at(ts: float) -> str:
     """Epoch seconds as the ISO-8601 ``resets_at`` string ``oauth`` writes and
     ``poll_policy.parse_reset_ts`` reads back (same pattern as
@@ -1371,7 +1423,28 @@ class UsageStore:
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
-                row["lastGood"] = rec.usage
+                usage, held = rec.usage, []
+                # Hold once: a stamped row's next success is believed as is,
+                # so a vendor's early reset never reads full for days.
+                if not row.get("suspectDrop"):
+                    usage, held = _hold_suspect_drops(
+                        row.get("lastGood"), rec.usage, now
+                    )
+                row["suspectDrop"] = bool(held)
+                if held:
+                    _logger.info(
+                        "Account %s: this reading contradicts the prior one "
+                        "with the prior reset still ahead, so the prior is "
+                        "kept for one fetch: %s",
+                        num,
+                        "; ".join(
+                            f"{label} {old.get('pct')}% (resets "
+                            f"{old.get('resets_at')}) -> {cur.get('pct')}% "
+                            f"(resets {cur.get('resets_at')})"
+                            for label, old, cur in held
+                        ),
+                    )
+                row["lastGood"] = usage
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction
                 # so no collector can slip into a record→replan gap.

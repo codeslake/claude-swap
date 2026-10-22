@@ -2777,3 +2777,73 @@ class TestAdopt:
         store.adopt({"2": (USAGE, 0.0)}, IDENT)
         row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["2"]
         assert (row["email"], row["organizationUuid"]) == IDENT["2"]
+
+
+class TestSuspectDrop:
+    """T2872: a success whose window reads far below the prior reading while
+    that window's own reset is still ahead is held once, then believed."""
+
+    @staticmethod
+    def _reading(clock, five, seven, fable, *, reset_s=86_400.0):
+        from datetime import datetime, timezone
+
+        def iso(ahead):
+            return (
+                datetime.fromtimestamp(clock.now + ahead, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        at = iso(reset_s)
+        return {
+            "five_hour": {"pct": five, "resets_at": iso(3600.0)},
+            "seven_day": {"pct": seven, "resets_at": at},
+            "scoped": [{"name": "Fable", "pct": fable, "resets_at": at}],
+        }
+
+    @staticmethod
+    def _stamp(store):
+        row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["1"]
+        return row.get("suspectDrop")
+
+    def test_a_far_lower_window_with_its_reset_ahead_is_held_once(
+        self, store, clock, caplog
+    ):
+        prior = self._reading(clock, 0.0, 100.0, 100.0)
+        store.record({"1": FetchRecord(usage=prior)}, IDENT)
+        clock.advance(80.0)
+        new = self._reading(clock, 3.0, 0.0, 0.0, reset_s=86_400.0 - 80.0)
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            store.record({"1": FetchRecord(usage=new)}, IDENT)
+
+        held = store.entries(IDENT)["1"].decision_value()
+        assert held["seven_day"] == prior["seven_day"]
+        assert held["scoped"] == prior["scoped"]
+        assert held["five_hour"] == new["five_hour"]  # the rest is taken
+        assert self._stamp(store) is True
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "Fable" in said and "100" in said
+        assert prior["seven_day"]["resets_at"] in said
+        assert new["seven_day"]["resets_at"] in said
+
+    def test_a_drop_after_the_prior_reset_is_a_genuine_reset(self, store, clock):
+        prior = self._reading(clock, 0.0, 100.0, 100.0)
+        store.record({"1": FetchRecord(usage=prior)}, IDENT)
+        clock.advance(86_400.0)  # the prior 7d window has ended
+        new = self._reading(clock, 0.0, 0.0, 0.0)
+        store.record({"1": FetchRecord(usage=new)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == new
+        assert not self._stamp(store)
+
+    def test_the_next_contradicting_success_is_believed_and_clears_the_stamp(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, 100.0, 100.0))}, IDENT)
+        clock.advance(80.0)
+        new = self._reading(clock, 0.0, 0.0, 0.0)
+        store.record({"1": FetchRecord(usage=new)}, IDENT)
+        assert self._stamp(store) is True
+        clock.advance(80.0)
+        store.record({"1": FetchRecord(usage=new)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == new
+        assert not self._stamp(store)
