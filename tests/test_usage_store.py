@@ -2812,7 +2812,7 @@ class TestSuspectDrop:
         prior = self._reading(clock, 0.0, 100.0, 100.0)
         store.record({"1": FetchRecord(usage=prior)}, IDENT)
         clock.advance(80.0)
-        new = self._reading(clock, 3.0, 0.0, 0.0, reset_s=86_400.0 - 80.0)
+        new = self._reading(clock, 3.0, 0.0, 0.0)
         with caplog.at_level(logging.INFO, logger="claude-swap"):
             store.record({"1": FetchRecord(usage=new)}, IDENT)
 
@@ -2824,6 +2824,7 @@ class TestSuspectDrop:
         said = " ".join(r.getMessage() for r in caplog.records)
         assert "Fable" in said and "100" in said
         assert prior["seven_day"]["resets_at"] in said
+        assert new["seven_day"]["resets_at"] != prior["seven_day"]["resets_at"]
         assert new["seven_day"]["resets_at"] in said
 
     def test_a_drop_after_the_prior_reset_is_a_genuine_reset(self, store, clock):
