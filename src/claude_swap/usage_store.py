@@ -655,7 +655,7 @@ def _hold_suspect_drops(
     """``new`` with each window that contradicts ``prior`` replaced by its prior
     entry, and the ``(label, prior_entry, new_entry)`` replaced.
 
-    A drop (or a window now absent or non-numeric) with the prior window's
+    A drop (a window now absent or non-numeric reads as 0%) with the prior window's
     reset still ahead cannot be a reset, so it is held once as a bad answer
     (one numeric 0% from the endpoint read as an idle account for two minutes,
     2026-10-22); once the reset has passed it is a genuine one and never held.
@@ -670,15 +670,13 @@ def _hold_suspect_drops(
         was = old.get("pct")
         now_pct = cur.get("pct") if isinstance(cur, dict) else None
         ts = parse_reset_ts(old.get("resets_at"))
-        # A window the reading omits or leaves non-numeric is a drop too.
+        # A window the reading omits or leaves non-numeric counts as 0%.
         if (
             isinstance(was, (int, float))
             and ts is not None
             and now < ts
-            and (
-                not isinstance(now_pct, (int, float))
-                or was - now_pct >= SUSPECT_DROP_PCT
-            )
+            and was - (now_pct if isinstance(now_pct, (int, float)) else 0.0)
+            >= SUSPECT_DROP_PCT
         ):
             held.append((label, old, cur if isinstance(cur, dict) else {}))
             return old

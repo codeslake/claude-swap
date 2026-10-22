@@ -2853,6 +2853,26 @@ class TestSuspectDrop:
         assert self._stamp(store) is True
         assert "None%" in " ".join(r.getMessage() for r in caplog.records)
 
+    @pytest.mark.parametrize(
+        "prior_args, reset_s, advance, lose",
+        [
+            ((0.0, 10.0, 0.0), 86_400.0, 80.0, lambda u: u.pop("scoped")),
+            ((0.0, 100.0, 100.0), 100.0, 200.0, lambda u: u.pop("seven_day")),
+        ],
+        ids=["low scoped window absent", "ended 7d window absent"],
+    )
+    def test_a_lost_window_that_is_no_real_drop_is_not_held(
+        self, store, clock, prior_args, reset_s, advance, lose
+    ):
+        prior = self._reading(clock, *prior_args, reset_s=reset_s)
+        store.record({"1": FetchRecord(usage=prior)}, IDENT)
+        clock.advance(advance)
+        new = json.loads(json.dumps(prior))
+        lose(new)
+        store.record({"1": FetchRecord(usage=new)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == new
+        assert not self._stamp(store)
+
     def test_a_drop_after_the_prior_reset_is_a_genuine_reset(self, store, clock):
         prior = self._reading(clock, 0.0, 100.0, 100.0)
         store.record({"1": FetchRecord(usage=prior)}, IDENT)
