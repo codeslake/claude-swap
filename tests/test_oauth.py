@@ -1604,53 +1604,8 @@ class TestFetchOauthProfile:
         )
 
 
-class TestBridgeTitleRestoreRunsWithoutTheProxy:
-    """The restore must not depend on the proxy it exists to survive.
-
-    cswap-pin already implements it, with exactly one caller —
-    `_sweep_bridges_after_connect` — so it fires only when a
-    `POST /v1/code/sessions` REACHES the proxy. Measured: all 24
-    claude processes carried HTTPS_PROXY=127.0.0.1:9901 (CCF), because Claude
-    Code reads ~/.claude.json's env block once at boot and the pin wiring
-    landed after they exec'd. Nothing reached the proxy, nothing was restored,
-    and a session sat under `Fix Claude AI session naming issue` until it was
-    renamed by hand.
-
-    WHAT IS TESTED HERE IS THE TRANSPORT AND THE GUARDS. The POLICY — which
-    titles may be touched — stays in cswap-pin and is tested there; asserting
-    it again here would be a second copy to drift. The one thing this file must
-    prove about the policy is that the REAL one is wired, and that is the last
-    case.
-
-    A FIRST VERSION OF THIS CLASS WAS ALL TAUTOLOGY, worth recording because it
-    passed. `cswap_pin` is an optional extra and is not importable in this
-    environment, so `restore_bridge_titles` returned 0 from its ImportError
-    guard before reaching anything — three of four cases went green against an
-    implementation that never ran.
-    """
-
-    def _policy(self, monkeypatch, fn):
-        """Install a fake policy AT THE SEAM.
-
-        The transport is what this class owns, so the decision is injected
-        rather than imported — and injecting it is also what makes these cases
-        run at all on a machine without the extra.
-
-        INJECTED AT `claude_swap.pin`, NOT INTO sys.modules, since oauth.py
-        stopped importing the package directly. That is not a workaround: the
-        seam IS the policy boundary now, so patching it is patching exactly
-        what the class docstring says is not ours. The old sys.modules
-        injection also no longer reaches the code, deliberately — `_impl`
-        resolves through `find_spec`, and a bare `types.ModuleType` has no
-        `__spec__`, which it treats as "not installed" (`except ValueError`).
-
-        `is_available` too, because the guard and the call are separate
-        questions and a fake policy with no available seam would return
-        "no-extra" before reaching the transport under test.
-        """
-        monkeypatch.setattr("claude_swap.pin.is_available", lambda: True)
-        monkeypatch.setattr("claude_swap.pin.titles_to_restore",
-                            lambda sessions, names: list(fn(sessions, names)))
+class TestThePinAwareContextAddsTheCaAndNeverReplacesTheStore:
+    """`_pin_aware_ssl_context` hands back the DEFAULT context with our CA loaded."""
 
     def test_the_bridge_calls_trust_our_own_proxy_without_an_env_var(self):
         """A python client of the pin must ADD our CA, never REPLACE the store.
@@ -1790,153 +1745,6 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
                 "a regenerated CA at the same path kept the context built for "
                 "the old one — every call afterwards dies "
                 "CERTIFICATE_VERIFY_FAILED and the cache is the cause")
-
-    def test_every_title_the_policy_names_is_put_back(self, monkeypatch):
-        from claude_swap import oauth
-
-        calls = []
-        self._policy(monkeypatch, lambda sessions, names: [("cse_a", "slack")])
-        monkeypatch.setattr(oauth, "_list_bridge_sessions",
-                            lambda tok: [{"id": "cse_a", "title": "invented"}])
-        monkeypatch.setattr(oauth, "_put_bridge_title",
-                            lambda tok, sid, title: calls.append((sid, title)) or True)
-        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == (1, "renamed")
-        assert calls == [("cse_a", "slack")], calls
-
-    def test_the_policy_naming_nothing_puts_nothing(self, monkeypatch):
-        """THE CONTROL. Without it, "renames what the policy names" also passes
-        on a version that renames unconditionally — and that version reverts
-        every name set in the claude.ai web app, permanently."""
-        from claude_swap import oauth
-
-        calls = []
-        self._policy(monkeypatch, lambda sessions, names: [])
-        monkeypatch.setattr(oauth, "_list_bridge_sessions",
-                            lambda tok: [{"id": "cse_b", "title": "a name I typed"}])
-        monkeypatch.setattr(oauth, "_put_bridge_title",
-                            lambda tok, sid, title: calls.append((sid, title)) or True)
-        assert oauth.restore_bridge_titles("tok", {"cse_b": "local"}) == (
-            0, "nothing-to-rename")
-        assert calls == [], calls
-
-    def test_a_listing_that_failed_is_not_read_as_an_empty_one(self, monkeypatch):
-        """`None` means "could not ask", never "nothing there". The policy must
-        not even be consulted — handing it an empty listing is how a rename
-        happens on no evidence."""
-        from claude_swap import oauth
-
-        seen = []
-        self._policy(monkeypatch,
-                     lambda sessions, names: seen.append(sessions) or [])
-        monkeypatch.setattr(oauth, "_list_bridge_sessions", lambda tok: None)
-        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == (
-            0, "list-failed"), "a failed listing must be distinguishable"
-        assert seen == [], "the policy was asked to judge a listing we never got"
-
-    def test_a_rename_that_fails_is_not_counted(self, monkeypatch):
-        """The count is what a caller logs. Counting an attempt would report a
-        repair that did not happen — the shape this whole area keeps producing.
-        """
-        from claude_swap import oauth
-
-        self._policy(monkeypatch, lambda sessions, names: [("cse_a", "slack")])
-        monkeypatch.setattr(oauth, "_list_bridge_sessions",
-                            lambda tok: [{"id": "cse_a", "title": "invented"}])
-        monkeypatch.setattr(oauth, "_put_bridge_title",
-                            lambda tok, sid, title: False)
-        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == (
-            0, "all-puts-refused")
-
-    def test_it_never_raises_into_its_caller(self, monkeypatch):
-        """`AutoSwitchEngine.tick()` is documented "Never raises". A cosmetic
-        repair must not end a tick that was about to prevent a lockout."""
-        from claude_swap import oauth
-
-        def boom(tok):
-            raise RuntimeError("upstream on fire")
-
-        self._policy(monkeypatch, lambda sessions, names: [])
-        monkeypatch.setattr(oauth, "_list_bridge_sessions", boom)
-        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == (
-            0, "raised:RuntimeError")
-
-    def test_a_host_without_the_pin_extra_loses_the_repair_not_the_tick(self):
-        """cswap-pin is optional and ships on its own schedule."""
-        import sys
-
-        from claude_swap import oauth
-
-        saved = {k: sys.modules.pop(k, None)
-                 for k in ("cswap_pin", "cswap_pin.proxy")}
-        sys.modules["cswap_pin"] = None  # force ImportError on import
-        try:
-            assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == (
-                0, "no-extra")
-        finally:
-            sys.modules.pop("cswap_pin", None)
-            for k, v in saved.items():
-                if v is not None:
-                    sys.modules[k] = v
-
-    def test_the_real_policy_is_the_one_wired(self):
-        """The only claim here that the injected cases cannot make.
-
-        They prove the transport calls SOMETHING; this proves it is cswap-pin's
-        decision and not a second copy. It needs the optional extra, so it does
-        not run on a machine without it — and a skip reads exactly like a pass,
-        so the reason says so out loud rather than being silently absent.
-        """
-        import pytest
-
-        pytest.importorskip(
-            "cswap_pin.proxy",
-            reason="THIS CASE DID NOT RUN: cswap-pin is not installed here, so "
-                   "nothing in this file has checked that the real policy is "
-                   "wired. CI installs the [pin] extra and does check it.",
-        )
-        import inspect
-
-        from claude_swap import oauth, pin
-
-        # BOTH HOPS, because there are two now. oauth.py stopped importing the
-        # package directly — it asks the seam, and the seam asks the package.
-        # Checking only the first hop would pass on a seam that returned a
-        # hardcoded list, which is the exact second copy this case exists to
-        # forbid.
-        caller = inspect.getsource(oauth.restore_bridge_titles)
-        assert "titles_to_restore" in caller, "the transport calls nothing"
-        assert "_pin.titles_to_restore" in caller, (
-            "the transport must go through the seam, not around it")
-
-        # THREE HOPS NOW: oauth -> pin.titles_to_restore -> pin._ask ->
-        # the package. The passthroughs were collapsed onto one caller, so
-        # checking only the named wrapper would pass on a wrapper that
-        # decided something itself.
-        seam = inspect.getsource(pin.titles_to_restore)
-        assert '_ask("titles_to_restore"' in seam, (
-            "the seam must forward, not decide anything itself")
-        asker = inspect.getsource(pin._ask)
-        assert "getattr(impl, name)" in asker, (
-            "the shared caller must reach the package by name")
-
-        # AND THE SEAM RESOLVES THE REAL PACKAGE. `_impl` is what makes
-        # `impl.titles_to_restore` the package's function rather than any
-        # object; importorskip above already proved the package is here.
-        #
-        # NOT ON WINDOWS, and the reason is the contract rather than the
-        # runner. `_impl` RAISES there by design — the proxy holds its daemon
-        # lock with fcntl.flock and refcounts through a FIFO, so there is no
-        # real package to resolve and "resolves the real one" is not a
-        # question that has an answer. `is_available` is the seam's own way of
-        # saying so, so ask it rather than naming a platform here.
-        #
-        # This is the seam being STRICTER than the four bypasses it replaced:
-        # each of those degraded silently on a platform where the pin cannot
-        # exist, and no single site had to admit it. The two asserts above
-        # still run everywhere, so the wiring claim is not lost — only the
-        # resolution half, which Windows cannot make.
-        if pin.is_available():
-            assert pin._impl().titles_to_restore.__module__ == "cswap_pin.proxy"
 
 
 class TestInvalidGrantTaxonomy:
@@ -2159,55 +1967,6 @@ class TestEveryPinRoutedCallCarriesThePinAwareContext:
         assert seen[0].get("context") is self.SENTINEL, (
             "fetch_oauth_profile did not pass the pin-aware context")
 
-    def test_the_bridge_listing_carries_it(self, monkeypatch):
-        seen = self._capture(monkeypatch)
-        oauth._list_bridge_sessions("tok")
-        assert seen, "_list_bridge_sessions made no request"
-        assert seen[0].get("context") is self.SENTINEL
-
-    def test_the_bridge_rename_carries_it(self, monkeypatch):
-        seen = self._capture(monkeypatch)
-        oauth._put_bridge_title("tok", "cse_a", "name")
-        assert seen, "_put_bridge_title made no request"
-        assert seen[0].get("context") is self.SENTINEL
-
-    def test_a_body_that_is_not_an_object_is_a_listing_failure(
-        self, monkeypatch
-    ):
-        """`data.get(...)` sat OUTSIDE the try, in a function documented to
-        return None on failure.
-
-        A JSON array or string body — an error envelope, a captive portal page
-        that happens to parse — makes it raise AttributeError out of
-        `_list_bridge_sessions` entirely. The caller's outer handler then
-        records `raised:AttributeError` instead of `list-failed`, collapsing
-        the distinction the (renamed, outcome) return value exists to preserve
-        and routing an ordinary transport fault into the branch reserved for
-        programming errors.
-        """
-        import contextlib
-        import io
-
-        class _Resp:
-            def __init__(self, body):
-                self._body = body
-
-            def read(self):
-                return self._body
-
-        for body in (b'["not", "an", "object"]', b'"a string"', b'42'):
-            @contextlib.contextmanager
-            def _open(req, timeout=None, context=None, _b=body):
-                yield _Resp(_b)
-
-            monkeypatch.setattr(oauth.urllib.request, "urlopen", _open)
-            with contextlib.redirect_stderr(io.StringIO()):
-                got = oauth._list_bridge_sessions("tok")
-            assert got is None, (
-                f"a {body!r} body returned {got!r} instead of the None that "
-                "means 'could not list' — or raised out of a function that "
-                "documents itself as never raising")
-
     def test_the_token_refresh_needs_no_pin_ca(self):
         """THE ONE SITE THAT DOES NOT NEED IT, and the docstring used to name
         it as though it did.
@@ -2235,8 +1994,8 @@ class TestEveryPinRoutedCallCarriesThePinAwareContext:
             "call now needs `_pin_aware_ssl_context()` like the other three, "
             "and without it every refresh dies CERTIFICATE_VERIFY_FAILED and "
             "is reported as a transient network blip")
-        assert urlparse(oauth._BRIDGE_SESSIONS_URL).hostname == mitm, (
-            "the scan is broken: if the bridge endpoint is not on the MITM'd "
+        assert urlparse(oauth._POLICY_LIMITS_URL).hostname == mitm, (
+            "the scan is broken: if the policy-limits endpoint is not on the MITM'd "
             "host either, this case proves nothing about the split")
 
 

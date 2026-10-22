@@ -4448,10 +4448,6 @@ class TestSetShowAndRepinAreThePackagesToRun:
             self.calls.append(("set_pin", sw, email, org, num))
             return True, "the package's verdict"
 
-        def repin_current(self, sw):
-            self.calls.append(("repin_current", sw))
-            return True
-
         def pin_run(self, sw, account):
             self.calls.append(("pin_run", sw, account))
             return 7
@@ -4472,26 +4468,6 @@ class TestSetShowAndRepinAreThePackagesToRun:
         assert pin.set_pin(sw, "a@example.com", "org", num="2") == (
             True, "the package's verdict")
         assert pkg.calls == [("set_pin", sw, "a@example.com", "org", "2")]
-
-    def test_repin_current_is_the_packages_and_never_raises_without_it(
-            self, monkeypatch):
-        from claude_swap import pin
-
-        pkg = self._fake(monkeypatch)
-        sw = object()
-        assert pin.repin_current(sw) is True
-        assert pkg.calls == [("repin_current", sw)]
-        monkeypatch.setattr(pin, "_live_impl", lambda: None)
-        assert pin.repin_current(sw) is False
-
-    def test_repin_current_is_false_on_a_package_older_than_it(self, monkeypatch):
-        """Below the floor `repin_current` is absent: False, not AttributeError."""
-        import types
-
-        from claude_swap import pin
-
-        monkeypatch.setattr(pin, "_live_impl", lambda: types.SimpleNamespace())
-        assert pin.repin_current(object()) is False
 
     def test_run_hands_the_show_and_set_arms_to_pin_run(self, monkeypatch):
         from claude_swap import pin
@@ -4553,7 +4529,7 @@ class TestSetShowAndRepinAreThePackagesToRun:
         assert pin._pinned_email_now(s) == (SHARED_PIN_EMAIL, "")
         # `repin_current` resolves the recorded pin's slot through `_slot_for`;
         # a rename there is False here, not a raise.
-        assert pin.repin_current(s) is True
+        assert pin._impl().repin_current(s) is True
         assert seen[1]["accountUuid"] == "uuid-personal", seen
 
     def test_the_real_package_renders_a_failure_through_safe(
@@ -10180,80 +10156,6 @@ class TestTheRosterCanNameThePinWhenNoBackupCan:
             self._sw(stored="", roster_uuid="")) is None
 
 
-class TestTheSeamCanBeAskedWhichSlotIsPinned:
-    """cswap core needs the pinned SLOT, and had no public way to ask.
-
-    The autoswitch tick wants to keep the rotation off the pinned account, so
-    that the pin's own window stays for Remote Control instead of being spent
-    by ordinary inference. That is a question about the pin, so it belongs on
-    this seam — the alternative was cswap reaching into `_slot_for`, or
-    re-deriving the answer from proxy.json and drifting from it.
-
-    THE COMPOSITE, NOT THE EMAIL. Two managed slots can share one address
-    across organizations, and that is not hypothetical -- a real roster has
-    such a pair. A
-    reader keyed on the address alone picks whichever comes first and is wrong
-    half the time, silently.
-
-    NEVER RAISES. This runs on a 15-60s tick beside the switch; an exception
-    here would take the autoswitch down over a question it only asked for an
-    optimisation.
-    """
-
-    def _sw(self, rows):
-        from claude_swap import switcher as _sw
-
-        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
-        sw._get_sequence_data = lambda: {"accounts": rows}
-        sw._find_account_slot = lambda data, email, org: next(
-            (n for n, a in (data.get("accounts") or {}).items()
-             if a.get("email") == email
-             and (not org or a.get("organizationUuid") == org)), None)
-        return sw
-
-    def test_it_names_the_slot(self, monkeypatch):
-        from claude_swap import pin
-
-        monkeypatch.setattr(pin, "_pinned_email_now",
-                            lambda _s: ("pinned@example.com", "org-A"))
-        sw = self._sw({"1": {"email": "pinned@example.com",
-                             "organizationUuid": "org-A"},
-                       "5": {"email": "other@example.com"}})
-        assert pin.pinned_slot(sw) == "1"
-
-    def test_the_org_decides_when_two_slots_share_an_address(self, monkeypatch):
-        """THE CASE THE COMPOSITE EXISTS FOR. Keyed on the email alone this
-        returns slot 1 and the rotation would reserve the wrong account."""
-        from claude_swap import pin
-
-        monkeypatch.setattr(pin, "_pinned_email_now",
-                            lambda _s: ("shared@example.com", "org-B"))
-        sw = self._sw({"1": {"email": "shared@example.com",
-                             "organizationUuid": "org-A"},
-                       "2": {"email": "shared@example.com",
-                             "organizationUuid": "org-B"}})
-        assert pin.pinned_slot(sw) == "2", (
-            "the address alone chose the slot, so a fleet with two accounts "
-            "at one address reserves the wrong one")
-
-    def test_no_pin_is_None_not_an_error(self, monkeypatch):
-        from claude_swap import pin
-
-        monkeypatch.setattr(pin, "_pinned_email_now", lambda _s: None)
-        assert pin.pinned_slot(self._sw({})) is None
-
-    def test_a_switcher_that_raises_is_survived(self, monkeypatch):
-        """THE TICK PATH. An exception here stops the autoswitch over a
-        question it asked only to be tidy."""
-        from claude_swap import pin
-
-        def boom(_s):
-            raise RuntimeError("settings.json was mid-write")
-
-        monkeypatch.setattr(pin, "_pinned_email_now", boom)
-        assert pin.pinned_slot(object()) is None
-
-
 class TestAnUnreadableConfigIsNotACleanOne:
     """`env_keys_survive` must not report an un-checkable config as clean.
 
@@ -10640,100 +10542,6 @@ class TestTheCarrySurvivesAnAddressThatNamesTwoSlots:
         assert seen["identity"]["accountUuid"] == "PIN-UUID"
 
 
-class TestAnAddThatRefreshesThePinnedSlotRepairsThePin:
-    """Re-adding the pinned account is what makes its credential readable
-    again, and nothing re-asked the daemon.
-
-    Reported from a mac: logging in as the pinned account and running
-    `cswap add` brought the ACTIVE account straight back while the pin stayed
-    broken, because the daemon serving had already published `unpinnable` and
-    only a hand-run `cswap pin <n>` spawns a successor. The repair existed
-    (`repin_current`); the only automatic caller was the TUI dashboard's
-    `on_mount`, which does not re-run for a TUI that is already open.
-    """
-
-    def _switcher(self):
-        import logging
-
-        from claude_swap import switcher as _sw
-
-        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
-        sw._logger = logging.getLogger("test-repin-after-add")
-        return sw
-
-    def _patch(self, monkeypatch, *, slot, applying, calls,
-               repaired=True, available=True):
-        monkeypatch.setattr("claude_swap.pin.is_available",
-                            lambda: available)
-        monkeypatch.setattr("claude_swap.pin.pinned_slot", lambda _s: slot)
-        monkeypatch.setattr("claude_swap.pin.pin_is_applying",
-                            lambda _s: applying)
-        monkeypatch.setattr("claude_swap.pin.repin_current",
-                            lambda _s: calls.append("repin") or repaired)
-
-    def test_a_daemon_that_cannot_mint_is_replaced(self, monkeypatch):
-        calls = []
-        self._patch(monkeypatch, slot="1", applying=False, calls=calls)
-        self._switcher()._repin_if_pin_slot_refreshed("1")
-        assert calls == ["repin"], (
-            "the add refreshed the pinned slot's credential and the daemon "
-            "had published that it cannot mint -- the one state the repair "
-            "exists for, and it did not run")
-
-    def test_a_healthy_pin_is_never_recycled(self, monkeypatch):
-        """CONTROL for the test above: same call, only `applying` differs."""
-        calls = []
-        self._patch(monkeypatch, slot="1", applying=True, calls=calls)
-        self._switcher()._repin_if_pin_slot_refreshed("1")
-        assert calls == [], (
-            "a serving daemon was restarted under live sessions for nothing")
-
-    def test_a_slot_that_is_not_known_broken_is_not_repinned(self, monkeypatch):
-        """`None` is "no extra, no daemon record, an unreadable one": cannot
-        tell reads as healthy. And adding slot 3 says nothing about slot 1's
-        credential."""
-        for applying, added in ((None, "1"), (False, "3")):
-            calls = []
-            self._patch(monkeypatch, slot="1", applying=applying, calls=calls)
-            self._switcher()._repin_if_pin_slot_refreshed(added)
-            assert calls == [], (applying, added)
-
-    def test_an_int_slot_still_matches(self, monkeypatch):
-        """`account_num` is a str everywhere in `add_account`, but the guard
-        compares against `pinned_slot`, whose value comes out of the roster.
-        Coerce rather than trust, or the repair silently never fires."""
-        calls = []
-        self._patch(monkeypatch, slot="1", applying=False, calls=calls)
-        self._switcher()._repin_if_pin_slot_refreshed(1)
-        assert calls == ["repin"]
-
-    def test_a_failed_repair_does_not_fail_the_add(self, monkeypatch, capsys):
-        calls = []
-        self._patch(monkeypatch, slot="1", applying=False, calls=calls,
-                    repaired=False)
-        self._switcher()._repin_if_pin_slot_refreshed("1")   # must not raise
-        out = capsys.readouterr().out
-        assert "cswap pin 1" in out, (
-            "the pin is still broken and the user was told nothing")
-        assert "--heal" not in out, (
-            "`--heal` declines a daemon that IS serving, which is this state")
-
-    def test_a_raising_seam_does_not_fail_the_add(self, monkeypatch):
-        def _boom(_s):
-            raise RuntimeError("the daemon record is unreadable")
-
-        monkeypatch.setattr("claude_swap.pin.is_available", lambda: True)
-        monkeypatch.setattr("claude_swap.pin.pinned_slot", _boom)
-        self._switcher()._repin_if_pin_slot_refreshed("1")   # must not raise
-
-    def test_no_extra_installed_is_a_no_op(self, monkeypatch):
-        calls = []
-        self._patch(monkeypatch, slot="1", applying=False, calls=calls,
-                    available=False)
-        self._switcher()._repin_if_pin_slot_refreshed("1")
-        assert calls == []
-
-
 class TestTheSwitchSplicePicksTheSlotNotTheAddress:
     """THE TWO CALLERS REQUIREMENT 1 DEPENDS ON, and they could not pass a slot.
 
@@ -10895,13 +10703,11 @@ class TestALoginAsThePinnedAccountIsNotASplice:
     Remote Control session survives a rotation, and `_live_login_identity`
     un-splices that back to the roster's active slot. But `claude /login` as
     the pinned account writes byte-identical content there -- and that login
-    is the documented repair for a dead pin credential, the one
-    `_repin_if_pin_slot_refreshed` exists to finish.
+    is the documented repair for a dead pin credential.
 
     Un-splicing it sends `add_account` the ACTIVE slot: the pin's fresh
-    credential is stored under the wrong account, the pin's own slot keeps the
-    dead one, and the repin is skipped because the slot it was handed is not
-    the pinned one. The repair path breaks end to end and prints
+    credential is stored under the wrong account and the pin's own slot keeps
+    the dead one. The repair path breaks end to end and prints
     `Updated credentials for Account <active>` while doing it.
 
     The credential is where the two differ. After a splice the roster's active
@@ -10951,8 +10757,7 @@ class TestALoginAsThePinnedAccountIsNotASplice:
         assert s._live_login_identity() == self.PIN, (
             "the server says the credential now live is the PIN's, so this is "
             "a login and not a splice -- un-splicing it stores that credential "
-            "under the active slot and skips the repin the login was run to "
-            "trigger")
+            "under the active slot")
 
     def test_a_login_as_another_account_is_reported_as_that_account(
             self, tmp_path, monkeypatch):
@@ -11388,7 +11193,7 @@ class TestOneLoopbackProbe:
 
 class TestAskSwallowsThePackagesOwnExceptions:
     """`_ask` is the one seam every passthrough (`ca_path_for_trust`,
-    `live_bridge_names`, `titles_to_restore`) shares with the package.
+    `carry_live_pointers`) shares with the package.
     `oauth._pin_ca_fingerprint` deleted its own guard in favour of it --
     "THROUGH THE SEAM. `pin.ca_path_for_trust` already returns None for
     'cannot ask'" -- so a raise inside the package must still come back

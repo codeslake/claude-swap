@@ -1135,37 +1135,6 @@ def identity_move_is_not_a_login(switcher, before, now) -> bool:
     return switcher._live_credential_is(str(recorded), slot["email"]) is True
 
 
-def pinned_slot(switcher) -> "str | None":
-    """The roster slot the pin names, or None when it cannot be told.
-
-    THE SEAM cswap core asks so it does not have to re-derive this. Its
-    callers today are `_repin_if_pin_slot_refreshed`, and the autoswitch
-    tick's `_bridge_owner_number`, which needs the pinned account's BEARER to
-    see the bridges it is about to rename.
-
-    Keeping the ROTATION off the pinned slot is a separate use this function
-    would also serve and nothing wires yet; do not read this docstring as
-    saying that it does.
-
-    ON THE COMPOSITE, NOT THE ADDRESS: two managed slots can share one email
-    across organizations, and this roster already has such a pair. Keyed on
-    the address alone the answer is whichever comes first, silently wrong for
-    the other.
-
-    NEVER RAISES, because it runs on a 15-60 second tick beside the switch.
-    None is the honest answer to "cannot tell", and the caller then behaves
-    exactly as it does today.
-    """
-    try:
-        ident = _pinned_email_now(switcher)
-    except Exception:  # noqa: BLE001 — a tick must not die on a tidy question
-        return None
-    if not ident:
-        return None
-    email, org = ident
-    return _slot_for(switcher, email, org)
-
-
 def _slot_for(switcher, email: "str | None", org_uuid: "str | None"):
     """The roster slot for ``(email, org_uuid)``, or None when it cannot tell.
 
@@ -1351,11 +1320,6 @@ def daemon_ssl_context():
     return None
 
 
-def live_bridge_names() -> "dict[str, str] | None":
-    """Bridge id -> the name its session wants, or None when unavailable."""
-    return _ask("live_bridge_names")
-
-
 def carry_live_pointers(switcher):
     """Point every live session's bridge record at the pin's account when one
     is set, else the account signed in.
@@ -1379,15 +1343,6 @@ def carry_live_pointers(switcher):
     if not login:
         return None
     return _ask("carry_live_pointers", login)
-
-
-def titles_to_restore(sessions, names) -> "list | None":
-    """Bridges the server titles wrongly, or None when the extra is absent.
-
-    THE POLICY STAYS IN cswap-pin — this only carries the call across. What
-    to touch is the package's decision, and deliberately not repeated here.
-    """
-    return _ask("titles_to_restore", sessions, names)
 
 
 def pin_is_applying(switcher) -> bool | None:
@@ -1421,16 +1376,6 @@ def pin_is_applying(switcher) -> bool | None:
     if not state:
         return None
     return not state.get("unpinnable")
-
-
-def repin_current(switcher) -> bool:
-    """Re-apply the pin already recorded, to replace a daemon that cannot mint.
-
-    The repair is cswap-pin's; False when there is no usable package, or one
-    older than the release that carries it.
-    """
-    repin = getattr(_live_impl(), "repin_current", None)
-    return bool(repin) and repin(switcher)
 
 
 # -- launch integration ------------------------------------------------------

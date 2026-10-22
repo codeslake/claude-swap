@@ -8,7 +8,6 @@ import logging
 import os
 import ssl
 import sys
-import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -852,9 +851,6 @@ def _persist(
         )
 
 
-_BRIDGE_SESSIONS_URL = "https://api.anthropic.com/v1/code/sessions"
-
-
 _POLICY_LIMITS_URL = "https://api.anthropic.com/api/claude_code/policy_limits"
 
 
@@ -929,7 +925,7 @@ def _pin_aware_ssl_context():
     """A verifying context that ALSO trusts the pin's CA, if there is one.
 
     Named for the property, not the caller: three sites in this module have
-    the identical problem -- profile, usage and the bridge calls.
+    the identical problem -- profile, usage and policy limits.
 
     TOKEN REFRESH IS NOT ONE OF THEM. The helper is only needed where the pin
     RE-SIGNS the host: it MITMs `UPSTREAM_HOST` and blind-tunnels everything
@@ -940,7 +936,7 @@ def _pin_aware_ssl_context():
     These calls are plain urllib through whatever proxy the session was wired
     to. When that is the pin it MITMs api.anthropic.com, so a default context
     cannot verify it and every call dies CERTIFICATE_VERIFY_FAILED, which
-    `_list_bridge_sessions` swallows to debug.
+    the callers log at debug.
 
     ADD, NEVER REPLACE. `SSL_CERT_FILE` REPLACES OpenSSL's file, so it is safe
     only where the bundle subsumes the store it displaces -- measured by
@@ -988,156 +984,3 @@ def _pin_aware_ssl_context():
         return ctx
     _PIN_CTX_SLOT = (key, ctx)
     return ctx
-
-
-def _bridge_headers(access_token: str) -> dict:
-    return {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-        "anthropic-client-platform": "cli",
-    }
-
-
-def _list_bridge_sessions(access_token: str) -> list[dict] | None:
-    """The account's cloud sessions, or ``None`` when the call failed.
-
-    NONE IS NOT AN EMPTY LISTING. A caller that reads a failed request as "no
-    bridges" would go on to act on no evidence; every caller here has to be
-    able to tell the two apart.
-    """
-    req = urllib.request.Request(
-        f"{_BRIDGE_SESSIONS_URL}?limit=100", headers=_bridge_headers(access_token)
-    )
-    try:
-        with urllib.request.urlopen(
-                req, timeout=10, context=_pin_aware_ssl_context()) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception as e:  # noqa: BLE001 — cosmetic repair, never fatal
-        _logger.debug("bridge listing failed: %r", e)
-        return None
-    # SHAPED, NOT JUST PARSED, and this used to sit outside the try. A JSON
-    # array or string body — an error envelope, a captive-portal page that
-    # happens to parse — made `.get` raise AttributeError out of a function
-    # documented to return None on failure. The caller then recorded
-    # `raised:AttributeError` instead of `list-failed`, which collapses the
-    # exact distinction the (renamed, outcome) pair exists to preserve and
-    # files an ordinary transport fault under programming error.
-    if not isinstance(data, dict):
-        _logger.debug(
-            "bridge listing returned %s, not an object", type(data).__name__)
-        return None
-    items = data.get("data") or data.get("sessions") or []
-    return items if isinstance(items, list) else None
-
-
-def _put_bridge_title(access_token: str, session_id: str, title: str) -> bool:
-    """Rename one cloud session. PUT, not PATCH — measured, PATCH is 405."""
-    req = urllib.request.Request(
-        f"{_BRIDGE_SESSIONS_URL}/{session_id}",
-        data=json.dumps({"title": title}).encode("utf-8"),
-        headers=_bridge_headers(access_token),
-        method="PUT",
-    )
-    try:
-        with urllib.request.urlopen(
-                req, timeout=10, context=_pin_aware_ssl_context()):
-            return True
-    except Exception as e:  # noqa: BLE001
-        _logger.debug("bridge rename failed for %s: %r", session_id, e)
-        return False
-
-
-#: How long the bridge-title repair may spend on PUTs in ONE pass. It runs
-#: inside `AutoSwitchEngine.tick()`, the loop body that decides when to switch
-#: before a rate-limit lockout, and each PUT carries its own 10s timeout with
-#: no cap on how many there are. Smaller than one tick's usual cost on purpose:
-#: a repair that delays the switch is worse than a repair that finishes next
-#: pass, and the cadence is 300s so there always is a next pass.
-#:
-#: THE CEILING IS THIS PLUS ONE TIMEOUT, not this. The deadline is tested
-#: BEFORE each PUT, so a PUT begun just under it still gets its full 10s and
-#: the worst case is 30s. Left that way deliberately: refusing to start a PUT
-#: that might overrun would idle the last third of every pass, and shortening
-#: the timeout to the remaining budget would report a starved PUT as a refusal
-#: and turn `all-puts-refused` into a lie about the server.
-_BRIDGE_TITLE_BUDGET_S = 20.0
-
-
-def restore_bridge_titles(access_token: str, names: dict) -> "tuple[int, str]":
-    """Put each live session's own name back on its cloud bridge.
-
-    WHY HERE AND NOT IN THE PROXY. cswap-pin implements this too, but its one
-    caller runs when a `POST /v1/code/sessions` REACHES the proxy -- so the
-    repair is triggered by the very thing it exists to survive. Measured on a
-    machine where every live claude process carried an `HTTPS_PROXY` from
-    BEFORE the pin was wired: nothing reached the proxy, nothing was restored,
-    and a session sat under a server-invented title until it was renamed by
-    hand.
-
-    THE POLICY STAYS IN cswap-pin. `titles_to_restore` decides what to touch --
-    only a listed bridge whose title the server invented, never one a human
-    typed. This module contributes the transport it already has, nothing more.
-
-    Returns ``(renamed, outcome)``. The second value exists because the first
-    cannot tell the cases apart: five distinct states all produce 0, and the
-    caller only spoke when it was non-zero. Measured, this ran ~20 times over
-    107 minutes with every listing dying on CERTIFICATE_VERIFY_FAILED and
-    nothing anywhere said so.
-
-    NEVER RAISES: the caller is `AutoSwitchEngine.tick()`, documented "Never
-    raises", and a cosmetic repair must not end a tick that was about to
-    prevent a rate-limit lockout.
-    """
-    from claude_swap import pin as _pin
-
-    if not _pin.is_available():
-        return 0, "no-extra"
-    try:
-        sessions = _list_bridge_sessions(access_token)
-        if sessions is None:
-            # COULD NOT ASK. Distinct from an empty listing: this is the state
-            # that persisted for hours unnoticed, and it is the one worth
-            # waking someone for.
-            return 0, "list-failed"
-        if not sessions:
-            return 0, "no-bridges"
-        wanted = _pin.titles_to_restore(sessions, names)
-        if wanted is None:
-            # The extra went away between the check above and here, or the
-            # package raised. Same outcome as never having it: nothing to do.
-            return 0, "no-extra"
-        # THE ZERO-OUTCOME IS DECIDED BEFORE THE LOOP IT PRECEDES. This sat
-        # BELOW the loop, so the empty case walked a body that cannot execute
-        # before being detected and a reader had to prove the loop was a no-op
-        # to see the branch was reachable.
-        if not wanted:
-            return 0, "nothing-to-rename"
-        done = 0
-        # A DEADLINE, BECAUSE THIS RUNS INSIDE `tick()`. Each PUT carries a 10s
-        # timeout and `wanted` is unbounded, so 100 stale titles against a
-        # black-holing endpoint block the switch engine for ~1000s — on the
-        # very tick that was about to prevent a rate-limit lockout, which is
-        # the outcome moving this call into `finally` was meant to avoid. The
-        # cadence gate does not help: `_bridge_titles_next_at` is advanced
-        # before the work.
-        #
-        # LEFTOVERS ARE NOT LOST. This is a repair on a 300s cadence, so a pass
-        # that runs out of budget renames what it reached and the next one
-        # picks up the rest; the outcome says so rather than reporting a clean
-        # `renamed`.
-        deadline = time.monotonic() + _BRIDGE_TITLE_BUDGET_S
-        for sid, want in wanted:
-            if time.monotonic() >= deadline:
-                return done, f"partial-{done}-of-{len(wanted)}"
-            if _put_bridge_title(access_token, sid, want):
-                done += 1
-                _logger.info("restored the cloud title for %s to %r", sid, want)
-        if not done:
-            # Listed fine, had work, renamed none: every PUT was refused. A
-            # different fault from every other zero here.
-            return 0, "all-puts-refused"
-        return done, "renamed"
-    except Exception as e:  # noqa: BLE001 — see the docstring
-        _logger.debug("bridge title restore failed: %r", e)
-        return 0, f"raised:{type(e).__name__}"

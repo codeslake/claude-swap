@@ -3781,8 +3781,7 @@ class ClaudeAccountSwitcher:
         # the roster's active account is still the one authenticated, after a
         # login it is not. Without this, the repair path reaches `add_account`
         # naming the ACTIVE slot, stores the pin's fresh credential there, and
-        # leaves the pin's own slot holding the dead one -- and
-        # `_repin_if_pin_slot_refreshed` then sees the wrong slot and skips.
+        # leaves the pin's own slot holding the dead one.
         self._forget_live_login_warnings()
         if self._live_credential_is(str(recorded), slot["email"]) is False:
             # Not the recorded slot's credential, and not thereby the pin's:
@@ -4401,41 +4400,6 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
-    def _repin_if_pin_slot_refreshed(self, account_num: str) -> None:
-        """Re-apply the pin when an add refreshed the PINNED slot's credential.
-
-        Logging in again and re-adding the account is how a dead pin credential
-        gets replaced, but the daemon serving now has already published that it
-        cannot mint and nothing re-asks it. Without this the active account
-        comes back and the pin does not, until someone re-pins by hand.
-
-        Only ``is False``. ``None`` is "cannot tell", and recycling a healthy
-        daemon restarts it under live sessions for nothing.
-
-        Never raises and never returns a failure: the account IS added by the
-        time this runs, so an unrepaired pin must not report the add as failed.
-        """
-        try:
-            from claude_swap import pin as _pin
-
-            if not _pin.is_available():
-                return
-            if _pin.pinned_slot(self) != str(account_num):
-                return
-            if _pin.pin_is_applying(self) is not False:
-                return
-            if _pin.repin_current(self):
-                print(f"{accent('Re-applied')} the cloud pin.")
-            else:
-                # NOT `--heal`: it declines a daemon that IS serving, which is
-                # exactly this state. Naming the slot is the command that works.
-                warning(
-                    "The cloud pin is set but the daemon serving now cannot "
-                    f"mint it. Run `cswap pin {account_num}` to re-apply it."
-                )
-        except Exception:  # noqa: BLE001 — the add already succeeded
-            self._logger.debug("post-add re-pin skipped", exc_info=True)
-
     def _config_names_the_pin(self, email: str, org_uuid: str) -> bool:
         """Whether ``.claude.json``'s identity is a pin splice right now.
 
@@ -4677,7 +4641,6 @@ class ClaudeAccountSwitcher:
                 f"{accent('Updated credentials')} for Account {account_num} "
                 f"({current_email} {muted(f'[{tag}]')})."
             )
-            self._repin_if_pin_slot_refreshed(account_num)
             return
 
         # Determine slot number and collect confirmation decisions
@@ -4854,7 +4817,6 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
-        self._repin_if_pin_slot_refreshed(account_num)
 
     def add_account_from_token(
         self,
@@ -4971,7 +4933,6 @@ class ClaudeAccountSwitcher:
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
                 f"({email} {muted('[personal]')})."
             )
-            self._repin_if_pin_slot_refreshed(account_num)
             return
 
         displace_slot = None
@@ -5084,7 +5045,6 @@ class ClaudeAccountSwitcher:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
-        self._repin_if_pin_slot_refreshed(account_num)
 
     def _clear_pin_if_removed(self, email: str, org_uuid: str) -> None:
         """Clear the cloud pin when the account it names is the one going away.

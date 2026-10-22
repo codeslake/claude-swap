@@ -15,8 +15,6 @@ import contextlib
 import io
 import types
 
-from functools import partial
-
 import pytest
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -217,68 +215,34 @@ class TestThePinTuiSurface:
         contract.
 
         SET. `apply_pin` returning False must not read as success.
-
-        REPAIR. `repin_current` RETURNS False and never raises, so handing it
-        straight to `_start_action` lost the failure entirely: `run_action`
-        builds `ActionResult(True, ...)` for any fn that does not raise and this
-        one prints nothing, so `_action_done` found an empty first line and
-        notified nothing. Against a daemon publishing `unpinnable` the repair
-        ran on mount, failed, held `app.busy` for its duration and the cloud
-        UNPINNED badge stayed lit with no explanation anywhere.
         """
-        from claude_swap import pin
-
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
-        real = pin.repin_current
-        try:
-            async with app.run_test(size=(100, 32)) as pilot:
-                await settle(pilot)
-                screen = app.screen
-                buf = io.StringIO()
-                # ClaudeSwitchError specifically: run_action catches only that
-                # and EOFError, so a RuntimeError escaped to the worker handler
-                # and became a toast: the modal this raise exists to open never
-                # opened.
-                with contextlib.redirect_stdout(buf), pytest.raises(
-                    ClaudeSwitchError, match="no proxy is running"
-                ):
-                    screen._run_pin_op(lambda: (False, "no proxy is running"))
-                # Carried by the RAISE, not by a print: run_action renders a
-                # ClaudeSwitchError as "Error: {e}", so printing it here too put
-                # the same sentence in the modal twice.
-                assert buf.getvalue() == "", (
-                    f"the message was printed as well as raised: {buf.getvalue()!r}"
-                )
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            buf = io.StringIO()
+            # ClaudeSwitchError specifically: run_action catches only that
+            # and EOFError, so a RuntimeError escaped to the worker handler
+            # and became a toast: the modal this raise exists to open never
+            # opened.
+            with contextlib.redirect_stdout(buf), pytest.raises(
+                ClaudeSwitchError, match="no proxy is running"
+            ):
+                screen._run_pin_op(lambda: (False, "no proxy is running"))
+            # Carried by the RAISE, not by a print: run_action renders a
+            # ClaudeSwitchError as "Error: {e}", so printing it here too put
+            # the same sentence in the modal twice.
+            assert buf.getvalue() == "", (
+                f"the message was printed as well as raised: {buf.getvalue()!r}"
+            )
 
-                # And the success path stays a plain toast, no raise.
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    screen._run_pin_op(lambda: (True, "Pinned the cloud account"))
-                assert "Pinned" in buf.getvalue()
-                assert app.is_running
-
-                pin.repin_current = lambda _sw: False           # the failure, silent
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf), pytest.raises(
-                    ClaudeSwitchError, match="cloud pin"
-                ):
-                    screen._run_pin_op(partial(screen._repin, fake))
-                assert buf.getvalue() == "", (
-                    "the message was printed as well as raised, so the modal "
-                    f"carries it twice: {buf.getvalue()!r}")
-
-                # And the success path stays a plain toast, no raise: or a
-                # working repair starts opening a modal at every launch.
-                pin.repin_current = lambda _sw: True
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    screen._run_pin_op(partial(screen._repin, fake))
-                assert buf.getvalue().strip(), (
-                    "a successful repair said nothing, which is the silence "
-                    "this case exists to remove, in the other direction")
-        finally:
-            pin.repin_current = real
+            # And the success path stays a plain toast, no raise.
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                screen._run_pin_op(lambda: (True, "Pinned the cloud account"))
+            assert "Pinned" in buf.getvalue()
+            assert app.is_running
 
     async def test_the_tui_asks_pin_py_and_filters_api_keys_by_kind(self, tmp_path):
         """The TUI must not re-implement the verdict, and must filter on the
@@ -340,88 +304,6 @@ class TestThePinTuiSurface:
                 )
         finally:
             pin.set_pin, pin.is_available, pin._impl, pin.pinned_email = real
-
-    async def test_opening_the_tui_repairs_a_pin_that_stopped_applying(
-        self, tmp_path
-    ):
-        """A user who opens the TUI has already asked for the pin to work.
-
-        The badge tells them the pin is set but minting nothing. Then it asks
-        them to go and repair it by hand — with a command whose obvious
-        candidate (`--heal`) is the one that declines this state by design. The
-        product knows the pin is broken, knows how to fix it, and waits to be
-        asked.
-
-        `apply_pin` ends in `return ensure_proxy(switcher) is not None`, and
-        `ensure_proxy` reads the record WITH a fingerprint, which is exactly
-        the read an `unpinnable` daemon answers "nothing serving" to. So the
-        repair is one call the TUI already has every prerequisite for: the
-        extra is installed, an account is pinned, and the daemon has published
-        that it cannot mint.
-
-        Only that state. A healthy pin must not be recycled on every open —
-        that would restart the daemon under live sessions for nothing.
-        """
-        from claude_swap import pin
-
-        acc = make_account(1, active=True)
-        fake = FakeSwitcher([acc], tmp_path)
-        app = make_app(fake)
-        repaired = []
-
-        real = (pin.is_available, pin._impl, pin.pinned_email,
-                pin.pin_is_applying, pin.repin_current)
-        pin.is_available = lambda: True
-        pin._impl = lambda: object()
-        pin.pinned_email = lambda _sw: "cloud@example.com"
-        pin.pin_is_applying = lambda _sw: False        # set, not applying
-        pin.repin_current = lambda _sw: repaired.append("repin") or True
-        try:
-            async with app.run_test(size=(100, 32)) as pilot:
-                await settle(pilot)
-                assert repaired == ["repin"], (
-                    "the TUI opened over a pin that mints nothing and did not "
-                    "repair it — the user is told to run the command it could "
-                    "have run itself"
-                )
-        finally:
-            (pin.is_available, pin._impl, pin.pinned_email,
-             pin.pin_is_applying, pin.repin_current) = real
-
-    async def test_opening_the_tui_does_not_recycle_a_healthy_pin(self, tmp_path):
-        """The control, and the one that keeps this from being a menace.
-
-        Recycling on every open restarts the daemon under live sessions for no
-        reason. `None` — cannot tell — counts as healthy here for the same
-        reason it does at the badge: acting on "I could not look" is how a
-        repair becomes the outage.
-        """
-        from claude_swap import pin
-
-        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
-        repaired = []
-
-        real = (pin.is_available, pin._impl, pin.pinned_email,
-                pin.pin_is_applying, pin.repin_current)
-        pin.is_available = lambda: True
-        pin._impl = lambda: object()
-        pin.pinned_email = lambda _sw: "cloud@example.com"
-        pin.repin_current = lambda _sw: repaired.append("repin") or True
-        try:
-            for verdict in (True, None):
-                repaired.clear()
-                pin.pin_is_applying = lambda _sw, _v=verdict: _v
-                # A fresh app per verdict: a Textual App does not survive a
-                # second run_test, and reusing one hangs instead of failing.
-                async with make_app(fake).run_test(size=(100, 32)) as pilot:
-                    await settle(pilot)
-                    assert repaired == [], (
-                        f"pin_is_applying={verdict!r} triggered a repair — that "
-                        f"restarts the daemon under live sessions for nothing"
-                    )
-        finally:
-            (pin.is_available, pin._impl, pin.pinned_email,
-             pin.pin_is_applying, pin.repin_current) = real
 
     async def test_pin_actions_run_off_the_event_loop(self, tmp_path):
         """clear_wiring takes a 9s lock; inline it froze the dashboard.

@@ -74,57 +74,6 @@ class DashboardScreen(Screen):
         # mid-session, and the label names the pinned account, which changes
         # from the CLI too.
         self.watch(self.app, "snapshot", lambda _s: self.refresh_root_menu())
-        # A USER WHO OPENED THIS HAS ALREADY ASKED FOR THE PIN TO WORK. When the
-        # daemon has published that it cannot mint, the badge said so and then
-        # asked them to go run the repair by hand — with `--heal`, the obvious
-        # candidate, declining this exact state by design. The product knew the
-        # pin was broken, knew the fix, and waited to be asked.
-        #
-        # ONLY `is False`. `None` is "cannot tell" and a healthy pin must never
-        # be recycled on open: that restarts the daemon under live sessions for
-        # nothing, which is how a repair becomes the outage it was meant to
-        # prevent.
-        #
-        # Off the event loop, like every other pin action here: `apply_pin`
-        # spawns a daemon and can take the config lock, and doing that inline
-        # froze the dashboard for 9.31s the last time something skipped
-        # `_start_action`.
-        self._repair_pin_if_stranded()
-
-    def _repair_pin_if_stranded(self) -> None:
-        try:
-            if not pin.is_available() or not pin.pinned_email(self.app.switcher):
-                return
-            if pin.pin_is_applying(self.app.switcher) is not False:
-                return
-        except Exception:  # noqa: BLE001 — a badge-level question, never fatal
-            return
-        # THROUGH `_run_pin_op`, like every other pin action in this class.
-        # `repin_current` returns False and never raises, and handed straight
-        # to `_start_action` that False vanished: `run_action` builds
-        # `ActionResult(True, ...)` for any fn that does not raise and this one
-        # prints nothing, so `_action_done` found an empty first line and
-        # notified nothing. The repair ran on mount, failed, held `app.busy`
-        # for its duration, and the ⚠ cloud UNPINNED badge stayed lit with no
-        # explanation. `_run_pin_op` already prints on success and raises
-        # `ClaudeSwitchError` on failure so the modal opens — a second
-        # reporting path was the wrong way to say the same thing.
-        self.app._start_action(
-            "Repairing the cloud pin",
-            partial(self._run_pin_op, partial(self._repin, self.app.switcher)),
-        )
-
-    @staticmethod
-    def _repin(switcher) -> tuple[bool, str]:
-        from claude_swap import pin as _pin
-
-        if _pin.repin_current(switcher):
-            return True, "Cloud pin repaired"
-        return False, (
-            "Could not repair the cloud pin. The daemon serving now cannot "
-            "mint the pinned token; `cswap pin --heal`, or "
-            "`cswap pin <account>` to re-apply it."
-        )
 
     # -- menu plumbing --------------------------------------------------------
 
