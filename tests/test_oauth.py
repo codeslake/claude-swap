@@ -2496,6 +2496,33 @@ class TestDaemonSslContext:
         assert asked == [1], f"the impl was entered {len(asked)} times"
         assert isinstance(ctx, ssl.SSLContext)
 
+    def test_the_re_entry_guard_is_per_thread(self, monkeypatch):
+        """`_verifying_context` builds a context in milliseconds, so a second
+        `_run_usage_fetches` pool thread arriving meanwhile must not see the
+        first one's guard and fall back to a context that fails `tls-cert`."""
+        import threading
+
+        sentinel = ssl.create_default_context()
+        meet = threading.Barrier(2, timeout=5)
+
+        def verifying():
+            meet.wait()
+            return sentinel
+
+        self._as_main(monkeypatch, self.DAEMON, self._impl(verifying))
+        got = []
+        threads = [threading.Thread(
+            target=lambda: got.append(oauth._pin_aware_ssl_context()))
+            for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+
+        assert [c is sentinel for c in got] == [True, True], (
+            "a concurrent caller was refused the daemon context because "
+            "another thread was inside `_verifying_context`")
+
 
 class TestLoginExpiresAtIso:
     def test_refresh_token_expiry_is_reported_as_iso_utc(self):

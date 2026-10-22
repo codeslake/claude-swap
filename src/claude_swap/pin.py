@@ -1344,8 +1344,8 @@ def daemon_ssl_context():
         impl = _live_impl()
         if impl is not None and name in impl._DAEMON_MODULE_NAMES:
             return impl._verifying_context()
-    except Exception:  # noqa: BLE001 (an optional extra cannot break a caller)
-        pass
+    except Exception as exc:  # noqa: BLE001 (an optional extra cannot break a caller)
+        _logger.debug("daemon ssl context skipped: %r", exc)
     finally:
         _DAEMON_CTX.busy = False
     return None
