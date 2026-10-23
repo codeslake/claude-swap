@@ -1607,15 +1607,15 @@ class TestFetchOauthProfile:
 class TestThePinAwareContextAddsTheCaAndNeverReplacesTheStore:
     """`_pin_aware_ssl_context` hands back the DEFAULT context with our CA loaded."""
 
-    def test_the_bridge_calls_trust_our_own_proxy_without_an_env_var(self):
+    def test_the_pin_aware_context_trusts_our_own_proxy_without_an_env_var(self):
         """A python client of the pin must ADD our CA, never REPLACE the store.
 
-        These two calls are plain urllib through whatever proxy the session
-        was wired to. When that proxy is the pin, it MITMs api.anthropic.com,
-        so the default context cannot verify it and every call dies
-        CERTIFICATE_VERIFY_FAILED — swallowed to debug, returning None, which
-        is how the cloud session names stayed wrong for hours with nothing in
-        any log.
+        The profile fetch, the usage poll and the policy-limits fetch are
+        plain urllib through whatever proxy the session was wired to. When
+        that proxy is the pin, it MITMs api.anthropic.com, so the default
+        context cannot verify it and every call dies CERTIFICATE_VERIFY_FAILED,
+        swallowed to debug and returning None, which is how a failed fetch
+        stayed invisible for hours with nothing in any log.
 
         SSL_CERT_FILE WAS THE WRONG TOOL AND THE MEASUREMENTS SAY SO. It
         REPLACES OpenSSL's file, so it is only safe where the bundle subsumes
@@ -1625,8 +1625,8 @@ class TestThePinAwareContextAddsTheCaAndNeverReplacesTheStore:
             host-b      ambient 128  bundle 167  NOT (27 missing)
             host-c  ambient 128  bundle   2  NOT (128 missing)
 
-        so the gate that writes it correctly refuses on two of the three, and the
-        restore stays broken there. Adding the CA to a default context keeps
+        so the gate that writes it correctly refuses on two of the three, and
+        the calls stay broken there. Adding the CA to a default context keeps
         the system roots and needs no variable at all. Measured on
         host-c, same process, same proxy:
 
@@ -1716,8 +1716,8 @@ class TestThePinAwareContextAddsTheCaAndNeverReplacesTheStore:
 
         # AND IT IS BUILT ONCE PER CA STATE, not once per API call. This runs
         # on the polling path — once per account per usage poll, plus every
-        # profile fetch, listing and rename — and each build loads the whole
-        # system trust store before parsing ours on top.
+        # profile fetch and policy-limits fetch, and each build loads the
+        # whole system trust store before parsing ours on top.
         again = oauth._pin_aware_ssl_context()
         assert again is ctx, (
             "the second call rebuilt the context, so every polled request "
@@ -1917,7 +1917,7 @@ class TestEveryPinRoutedCallCarriesThePinAwareContext:
         host-c  default FAIL -> +pin CA HTTP 429
         host-a-docker      default FAIL -> +pin CA HTTP 429
 
-    So every one of these calls needs the context, not just the bridge pair
+    So every one of these calls needs the context, not just the usage poll
     that happened to be noticed first.
 
     THE SENTINEL IS THE POINT. Asserting `context is not None` would pass on a
@@ -2101,8 +2101,8 @@ class TestAFailedCaLoadIsNotCached:
 
     The cache is keyed on the CA file's path and mtime, and neither moves
     because a load failed. So caching the fallback context under that key
-    freezes it for the life of the process: every later bridge listing,
-    profile fetch and usage poll goes out on a context that does not trust the
+    freezes it for the life of the process: every later profile fetch, usage
+    poll and policy-limits fetch goes out on a context that does not trust the
     pin's CA, dies CERTIFICATE_VERIFY_FAILED, and is swallowed to debug --
     which is the silent hours this helper exists to end.
     """

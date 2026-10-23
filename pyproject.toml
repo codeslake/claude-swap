@@ -47,7 +47,7 @@ menubar = ["rumps>=0.4.0"]
 # this floor a correctness one.
 #
 # 0.1.303 is where `set_pin`, `repin_current` and `pin_run` live: `cswap pin
-# <n>` and the TUI hand off to them, and a release without them raises
+# <n>` hands off to them, and a release without them raises
 # AttributeError at that call.
 #
 # 0.1.309 is where `apply_pin` takes the keyword-only `everywhere` and the

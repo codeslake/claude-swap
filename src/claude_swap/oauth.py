@@ -980,7 +980,7 @@ def _pin_aware_ssl_context():
         # NOT CACHED: the key is the CA's path and mtime and neither moves
         # because a load failed, so caching this would freeze it for the life
         # of the process. Uncached, the next call retries.
-        _logger.debug("bridge ssl context: pin CA not added: %r", e)
+        _logger.debug("pin-aware ssl context: pin CA not added: %r", e)
         return ctx
     _PIN_CTX_SLOT = (key, ctx)
     return ctx

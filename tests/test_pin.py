@@ -11929,9 +11929,6 @@ class TestRemovingThePinnedAccountClearsThePin:
     and the TUI still draws the Cloud row. Nothing reports it, and the fix is
     the account's own removal -- the one moment cswap knows the pin's subject
     just ceased to exist.
-
-    The failure-modes doc lists this as B4 and names clearing it as work still
-    owed; this is that.
     """
 
     def _sw(self, tmp_path, pinned_email):
