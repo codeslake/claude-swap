@@ -3239,7 +3239,9 @@ class TestActiveAccountRefresh:
             switcher._collect_usage_entries(info)
 
         run_fetches.assert_not_called()  # premise: the backoff or hold blocked it
-        write_backup.assert_called_once_with("1", "test@example.com", fresh_login)
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", fresh_login, attributed=True,  # T0938 sweep
+        )
 
     @staticmethod
     def _login_blob(refresh: str, ends_at: "int | None") -> str:
@@ -4447,7 +4449,9 @@ class TestActiveAccountRefresh:
 
         assert result.sentinel is None
         assert result.usage == {"five_hour": {"pct": 3}}
-        write_backup.assert_called_once_with("1", "test@example.com", self._REFRESHED)
+        write_backup.assert_called_once_with(  # direct write
+            "1", "test@example.com", self._REFRESHED, attributed=True,
+        )
         write_live.assert_called_once_with(self._REFRESHED)
         assert switcher.list_unclaimed_credentials() == {}
 
@@ -21458,6 +21462,172 @@ class TestT1313LoginRestore:
             "N's own backup must still hold its login"
         )
 
+    def test_settle_keeps_the_config_on_the_pin_while_resolving_D_past_it(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+    ):
+        """T1313 correctness-pass items 1+2 (merged-tree only: #199's own
+        branch has no pin module). A pinned host's config names the pin,
+        not N -- so the settle's own candidate derivation must ask
+        `_live_login_identity` (the pin-aware witness), never the raw
+        `_get_current_account` read, or D never resolves to N on any
+        pinned host at all. And once restored, `oauthAccount` must stay
+        the pin's identity, or a live Remote Control bridge tears down
+        (Rule 0) -- exactly the contract `switch()`'s own splice keeps.
+        """
+        from claude_swap import pin as _pin
+
+        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login)
+        pin_oauth = {
+            "emailAddress": "pin@example.com",
+            "accountUuid": "u-pin", "organizationUuid": "org-pin",
+        }
+        # The raw config read, exactly what a rotation leaves on a pinned
+        # host -- must NOT be what the settle derives D from.
+        monkeypatch.setattr(s, "_get_current_account",
+                             lambda: ("pin@example.com", "org-pin"))
+        # The correct witness: N's own identity, as `_live_login_identity`
+        # resolves it once it sees the config names the pin. The exact
+        # signature (T1313, correctness pass item 2 [m]), not `**kw`: a
+        # `**kw`-only mock accepts an unexpected keyword silently, so a
+        # call drifting to a typo'd one (e.g. `ask_serve=False`) would
+        # still pass here while the real method raises TypeError.
+        monkeypatch.setattr(s, "_live_login_identity",
+                             lambda *, ask_server=True: ("c@example.com", "o-1"))
+        monkeypatch.setattr(_pin, "identity_for_config", lambda sw: pin_oauth)
+        with patch.object(s, "_replan_new_active"), \
+             patch.object(s._store, "_log_detected_login"):
+            outcome = s._settle_login_restore()
+        assert outcome is LoginRestoreOutcome.RESTORED, (
+            "D must resolve to N (c@example.com) through "
+            "_live_login_identity even though the config names the pin"
+        )
+        live_config = json.loads((temp_home / ".claude.json").read_text())
+        assert live_config["oauthAccount"] == pin_oauth, (
+            "the restore must keep oauthAccount on the pin's identity, "
+            "not splice in A's own stored config"
+        )
+
+    def test_settle_is_not_confused_when_the_pins_own_identity_is_a_managed_slot(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+    ):
+        """T1313 correctness-pass item 2 [m], the corrected `why`: a pin
+        is ITSELF a managed slot's own login, so the raw
+        `_get_current_account` read a rotation leaves behind resolves to
+        a REAL slot (never `None`) here -- just the wrong one. The fixed
+        path never reaches that read at all, so this must stay RESTORED
+        whether or not the pin's own address happens to alias a slot.
+        """
+        from claude_swap import pin as _pin
+
+        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login)
+        sample_sequence_data["accounts"]["3"] = {
+            "email": "pin@example.com", "uuid": "u-pin",
+            "organizationUuid": "org-pin",
+        }
+        s._write_json(s.sequence_file, sample_sequence_data)
+        assert s._find_account_slot(
+            sample_sequence_data, "pin@example.com", "org-pin",
+        ) == "3", "the setup must give the pin's raw address a real slot"
+        pin_oauth = {
+            "emailAddress": "pin@example.com",
+            "accountUuid": "u-pin", "organizationUuid": "org-pin",
+        }
+        monkeypatch.setattr(s, "_get_current_account",
+                             lambda: ("pin@example.com", "org-pin"))
+        monkeypatch.setattr(s, "_live_login_identity",
+                             lambda *, ask_server=True: ("c@example.com", "o-1"))
+        monkeypatch.setattr(_pin, "identity_for_config", lambda sw: pin_oauth)
+        with patch.object(s, "_replan_new_active"), \
+             patch.object(s._store, "_log_detected_login"):
+            outcome = s._settle_login_restore()
+        assert outcome is LoginRestoreOutcome.RESTORED
+
+    def test_settle_keeps_the_pin_in_the_fallback_write_when_the_config_is_gone(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+    ):
+        """T1313 correctness-pass item 1 [I]. `_write_oauth_account_to_
+        live_config` writes its FALLBACK argument WHOLE when the live
+        config is absent under the lock -- so that fallback must
+        already carry the pin's identity, or the write lands A's own
+        stored `oauthAccount` over the pin (Rule 0).
+        """
+        from claude_swap import pin as _pin
+
+        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login)
+        pin_oauth = {
+            "emailAddress": "pin@example.com",
+            "accountUuid": "u-pin", "organizationUuid": "org-pin",
+        }
+        monkeypatch.setattr(s, "_get_current_account",
+                             lambda: ("pin@example.com", "org-pin"))
+        monkeypatch.setattr(s, "_live_login_identity",
+                             lambda *, ask_server=True: ("c@example.com", "o-1"))
+        monkeypatch.setattr(_pin, "identity_for_config", lambda sw: pin_oauth)
+        (temp_home / ".claude.json").unlink()
+        with patch.object(s, "_replan_new_active"), \
+             patch.object(s._store, "_log_detected_login"):
+            outcome = s._settle_login_restore()
+        assert outcome is LoginRestoreOutcome.RESTORED
+        live_config = json.loads((temp_home / ".claude.json").read_text())
+        assert live_config["oauthAccount"] == pin_oauth, (
+            "the fallback write (no live config to splice into) must "
+            "still carry the pin's identity, not A's own stored config"
+        )
+
+    def test_a_settle_carries_the_pins_pointers_on_success_only(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+    ):
+        """T1467. `switch()`'s own activation calls `_pin.carry_live_
+        pointers(self)` right after its live write, under the same
+        locks (switcher.py ~12662, ~13050), so a live Remote Control
+        bridge notices the move -- the settle's own activation never
+        did. Fakes the pin function with a side_effect that records
+        its argument, the sibling switch-path test's own shape
+        (`test_ordinary_switch_carries_live_pointers_too`), and
+        asserts it fires exactly once with the switcher `s` itself --
+        a bare `MagicMock` accepts any arity and would still pass
+        against a no-argument call, which #210's real `carry_live_
+        pointers(switcher)` signature (bbabfb68) does not accept
+        (T1469, correctness pass [I]).
+        """
+        from claude_swap import pin as _pin
+
+        carried = []
+        monkeypatch.setattr(
+            _pin, "carry_live_pointers", lambda sw: carried.append(sw)
+        )
+        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login)
+        with patch.object(s, "_replan_new_active"), \
+             patch.object(s._store, "_log_detected_login"):
+            outcome = s._settle_login_restore()
+        assert outcome is LoginRestoreOutcome.RESTORED
+        assert carried == [s], (
+            "a RESTORED settle must carry the pin's live pointers "
+            "with the switcher itself, the same way switch()'s own "
+            "activation does after its live write"
+        )
+
+        carried.clear()
+        s2, login2, _active_backup2 = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s2, login2)
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(s2, "_write_json", _boom)
+        with patch.object(s2, "_replan_new_active"), \
+             patch.object(s2._store, "_log_detected_login"):
+            outcome = s2._settle_login_restore()
+        assert outcome is LoginRestoreOutcome.NONE
+        assert carried == [], (
+            "a settle whose own write never landed must not carry "
+            "pointers for a login that never went live"
+        )
+
     def test_settle_waits_under_the_settle_floor(
         self, temp_home: Path, sample_sequence_data: dict,
     ):
@@ -21667,12 +21837,12 @@ class TestT1313LoginRestore:
             # down calls `_ex` on the same pair regardless.
             real_read = s._store._read_account_credentials
 
-            def _unreadable_read(num, email, failed=None, cached=False):
+            def _unreadable_read(num, email, failed=None, cached=False, **kw):
                 if (num, email) == ("1", "c@example.com"):
                     if failed is not None:
                         failed.append(True)
                     return ""
-                return real_read(num, email, failed, cached=cached)
+                return real_read(num, email, failed, cached=cached, **kw)
 
             monkeypatch.setattr(s._store, "_read_account_credentials", _unreadable_read)
         elif condition == "write_suppressed":
