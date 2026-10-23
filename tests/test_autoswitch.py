@@ -120,7 +120,7 @@ def _blind_quarantine(h, num, email, reason="identity-conflict"):
     store = h.switcher._store
     real = store._read_account_credentials
 
-    def unreadable(account_num, e, failed=None, cached=False):
+    def unreadable(account_num, e, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (0)
         if account_num == num:
             if failed is not None:
                 failed.append(True)
@@ -4431,7 +4431,7 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None, cached=False):
+        def unreadable(account_num, email, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (1)
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
@@ -4492,7 +4492,7 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None, cached=False):
+        def unreadable(account_num, email, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (2)
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
@@ -4555,7 +4555,7 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None, cached=False):
+        def unreadable(account_num, email, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (3)
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
@@ -4653,7 +4653,7 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None, cached=False):
+        def unreadable(account_num, email, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (4)
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
@@ -4833,7 +4833,7 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None, cached=False):
+        def unreadable(account_num, email, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (5)
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)

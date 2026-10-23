@@ -380,6 +380,7 @@ def rank_switch_candidates(
     active_number: str | None,
     last_active_at: dict | None = None,
     reasons_out: dict | None = None,
+    probe_cooldown: dict[str, float] | None = None,
 ) -> tuple[list[str], str | None, str, bool]:
     """(ordered, rank_axis, trigger, unmodeled): mirrors the engine's own
     admission and order. THE shared computation -- ``ordered_accounts`` and
@@ -531,6 +532,7 @@ def rank_switch_candidates(
             reasons=reasons,
             entries=entries,
             thresholds=bars,
+            probe_cooldown=probe_cooldown,
         )
         return ordered, rank_axis
 
