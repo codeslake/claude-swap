@@ -39,7 +39,7 @@ from claude_swap.autoswitch import (
 )
 from claude_swap import pin
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
-from claude_swap.lines import binding_window
+from claude_swap.lines import BindingWindow, binding_window
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -83,6 +83,16 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 
 
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
+
+
+def _line_note(binding: BindingWindow | None, label: str, noted: bool) -> str:
+    """The "(line 97%)" note after the BINDING window's chip, once a weekly line
+    or the account's own threshold makes the lines differ: the raw pct stays,
+    and the line it is judged against is named only where it is not the one
+    number in the header."""
+    if not noted or binding is None or label != binding.label:
+        return ""
+    return f" (line {pct_label(binding.line)}%)"
 
 
 class AutoScreen(Screen):
@@ -436,6 +446,14 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
         weekly = self._settings.weekly_threshold if self._settings else None
+
+        # `bar` is bound further down, before the first call.
+        def line_of(acc) -> float:
+            return acc.policy.threshold if acc.policy.threshold is not None else bar
+
+        def noted(acc) -> bool:
+            return weekly is not None or acc.policy.threshold is not None
+
         # `dynamic` ranks on `consume_first_rank_key` below, same as
         # `consume-first` (CONSUME_FIRST_STRATEGIES) -- but that is not
         # always the engine's OWN axis for a `dynamic` tick: depending on
@@ -489,10 +507,7 @@ class AutoScreen(Screen):
                         acc.usage.last_good, models
                     )
                 )
-                own = acc.policy.threshold
-                kind, _ = classify_candidate_block(
-                    windows, bar if own is None else own, weekly
-                )
+                kind, _ = classify_candidate_block(windows, line_of(acc), weekly)
                 if kind == "open":
                     break
             else:
@@ -508,6 +523,54 @@ class AutoScreen(Screen):
         # mistake was fixed for the pin lookup itself — see the test that pins
         # its call count.
         pin_applying = pin.pin_is_applying(self.app.switcher) if pinned_identity else None
+        # Padded to the widest email among the rows THIS block renders, so
+        # every row's chips start in the same column — computed from exactly
+        # the accounts the loop below iterates (all but the active one).
+        email_width = max(
+            (len(acc.email) for acc in snap.accounts if acc.number != active_number),
+            default=0,
+        )
+        now = time.time()
+        # Chip columns are keyed by WINDOW NAME, never by position: two rows
+        # can have different-length window lists built from that account's
+        # own payload (`relevant_windows`), so "chip 1" is not the same
+        # window across rows. Computed once, before any row is drawn, over
+        # exactly the accounts that will reach the chip branch below
+        # (switchable, no sentinel, a known binding pct).
+        row_windows: dict[str, list[tuple[str, float, str | None]]] = {}
+        for acc in snap.accounts:
+            if (
+                acc.number == active_number
+                or not acc.switchable
+                or acc.usage.sentinel is not None
+                or binding_pct(acc.usage.last_good, models) is None
+            ):
+                continue
+            row_windows[acc.number] = oauth.relevant_windows(acc.usage.last_good, models)
+        # The column set is the union of window names over every chip row, in
+        # first-seen order; a row without a window gets a blank cell, so no
+        # later column moves. (label text, pct text, `(line X%)` note) widths per
+        # column; the note is part of its column so the chips after it stay put.
+        chip_width: dict[str, tuple[int, int, int]] = {}
+        for acc in snap.accounts:
+            windows = row_windows.get(acc.number)
+            if windows is None:
+                continue
+            bound = binding_window(windows, line_of(acc), weekly, scale=bar)
+            for label, wpct, resets_at in windows:
+                label_w, pct_w, note_w = chip_width.get(label, (0, 0, 0))
+                chip_width[label] = (
+                    max(label_w, len(data.chip_label(
+                        label, data.reset_text({"resets_at": resets_at}, now)
+                    ))),
+                    max(pct_w, len(f"{wpct:.0f}%")),
+                    max(note_w, len(_line_note(bound, label, noted(acc)))),
+                )
+        # 5h and 7d lead whatever row came first (sorted is stable, so the
+        # rest keep first-seen order).
+        chip_width = dict(sorted(
+            chip_width.items(), key=lambda kv: {"5h": 0, "7d": 1}.get(kv[0], 2)
+        ))
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -519,7 +582,7 @@ class AutoScreen(Screen):
             if not acc.switchable:
                 entry = Text()
                 entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
-                entry.append(acc.email, style=palette.muted)
+                entry.append(f"{acc.email:<{email_width}}", style=palette.muted)
                 # From SENTINEL_NOTES, not written here: an API-key slot has no
                 # login to restore, and the switch screen reads the same table,
                 # so both surfaces must describe a slot identically.
@@ -537,7 +600,7 @@ class AutoScreen(Screen):
                 lines[acc.number] = entry
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
-            line = acc.policy.threshold if acc.policy.threshold is not None else bar
+            line = line_of(acc)
             binding = binding_window(
                 oauth.relevant_windows(acc.usage.last_good, models),
                 line,
@@ -546,7 +609,7 @@ class AutoScreen(Screen):
             )
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
+            entry.append(f"{acc.email:<{email_width}}", style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -586,23 +649,34 @@ class AutoScreen(Screen):
                 # SAME relevant_windows call feeds the label below, so the
                 # chips and the label can never disagree on which windows
                 # exist for this account.
-                now = time.time()
-                windows = oauth.relevant_windows(acc.usage.last_good, models)
-                for i, (label, wpct, resets_at) in enumerate(windows):
-                    entry.append("  " if i == 0 else " · ", style=palette.muted)
+                windows = row_windows[acc.number]
+                have = {label: (wpct, resets_at) for label, wpct, resets_at in windows}
+                shown = False
+                for i, (label, (label_w, pct_w, note_w)) in enumerate(
+                    chip_width.items() if windows else ()
+                ):
+                    sep = "  " if i == 0 else " · " if shown else "   "
+                    if label not in have:
+                        entry.append(" " * (len(sep) + label_w + pct_w + note_w))
+                        continue
+                    wpct, resets_at = have[label]
+                    label_text = data.chip_label(
+                        label, data.reset_text({"resets_at": resets_at}, now)
+                    )
+                    pct_text = f"{wpct:.0f}%"
+                    entry.append(sep, style=palette.muted)
+                    # Label right-aligned so the `:` shares a column (owner,
+                    # 2026-09-15); pct right-aligned so the `%` does.
                     entry.append(
-                        data.chip_label(label, data.reset_text({"resets_at": resets_at}, now)),
+                        label_text.rjust(label_w) + " " * (pct_w - len(pct_text)),
                         style=palette.muted,
                     )
-                    entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
-                    # Once the lines differ, name the one the BINDING window is
-                    # judged against; the raw pct stays.
-                    if (
-                        weekly is not None or acc.policy.threshold is not None
-                    ) and label == binding.label:
-                        entry.append(
-                            f" (line {pct_label(binding.line)}%)", style=palette.muted
-                        )
+                    entry.append(pct_text, style=palette.severity(wpct))
+                    entry.append(
+                        _line_note(binding, label, noted(acc)).ljust(note_w),
+                        style=palette.muted,
+                    )
+                    shown = True
                 # A candidate whose LAST poll failed (an active backoff, a
                 # run of failures; a success clears both) must not present
                 # its cached figures as live. Not `fresh()`'s 180 s TTL: a
@@ -685,6 +759,9 @@ class AutoScreen(Screen):
                     entry.append("⚠ cloud UNPINNED", style=f"bold {palette.sev_crit}")
                 else:
                     entry.append("○ cloud", style=f"bold {palette.sev_warn}")
+            # The chip block's blank cells only exist to line up what follows
+            # them, so whatever ends up trailing the finished row is dropped.
+            entry.rstrip()
             lines[acc.number] = entry
 
         text = Text()

@@ -4570,6 +4570,8 @@ class AutoSwitchEngine:
         comes back empty and the caller's existing blackout path is
         untouched.
         """
+        if thresholds is None:
+            thresholds = ThresholdMap({}, settings.threshold)
         kw = dict(
             trigger=trigger,
             consume_first=consume_first,
@@ -4644,8 +4646,6 @@ class AutoSwitchEngine:
         window set (``models``); pure, no state writes, called at most
         twice per tick by ``_rank_candidates`` (see its docstring).
         """
-        if thresholds is None:
-            thresholds = ThresholdMap({}, settings.threshold)
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
         active_reset_ts = (
@@ -5091,7 +5091,10 @@ class AutoSwitchEngine:
                     # `active_headroom` is the axis THIS pass ranks by — the
                     # model-gated one on the primary call, `fallback_headroom
                     # [current]` on the 5h/7d retry — so a landing is always
-                    # an improvement on the axis that admitted it.
+                    # an improvement on the axis that admitted it. Measured in
+                    # policy headroom, so a 7d 93% candidate under a 97 line
+                    # beats a 5h 95% active under 85 — raw headroom (7 vs 5)
+                    # would park on the account about to hit its limit.
                     if lh - active_lh < settings.hysteresis_pct:
                         continue
             if by_recovery_axis and (not dynamic_landing or dynamic_at_limit_escape):

@@ -800,7 +800,7 @@ class TestMiniAccountText:
 
         The dashboard rendered `5h 100% (resets 2h 28m)` while the auto view
         rendered `5h(⟳2h28m):100%` for the same window in the same second.
-        Both now come from data.window_chip_label, so a change to one surface
+        Both now come from data.chip_label, so a change to one surface
         cannot silently diverge from the other.
         """
         from claude_swap.tui import data
@@ -815,7 +815,7 @@ class TestMiniAccountText:
         acc = make_account(
             1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         )
-        chip = data.window_chip_label(last_good, "five_hour", "5h", now)
+        chip = data.chip_label("5h", data.reset_text(last_good["five_hour"], now))
         assert chip == "5h(⟳2h28m):"
         assert f"{chip}100%" in mini_account_text(acc, now).plain
 
@@ -948,6 +948,44 @@ class TestMiniAccountText:
             1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         )
         assert "5h(⟳1h):42%" in mini_account_text(acc, now).plain
+
+    def test_scoped_window_below_100_shows_its_pct_alongside_5h_7d(self):
+        """PROBE: the scoped loop only fires at/over 100 (`maxed`), so once a
+        5h/7d window already rendered (`parts` nonzero) a scoped window below
+        its cap never reaches the dashboard row at all — it is not the
+        `usage unknown` fallback catching it either, since 5h/7d already
+        produced output. An account sitting at 91% on a per-model window
+        reads as if that window does not exist."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        last_good = {
+            "five_hour": {"pct": 28.0},
+            "seven_day": {"pct": 70.0},
+            "scoped": [{"name": "Fable", "pct": 91.0}],
+        }
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        out = mini_account_text(acc, now).plain
+        assert "Fable" in out and "91%" in out, (
+            f"a scoped window below 100 vanished from the dashboard row: {out!r}"
+        )
+
+    def test_scoped_window_at_100_keeps_its_marker_and_shows_pct(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        last_good = {
+            "five_hour": {"pct": 28.0},
+            "seven_day": {"pct": 70.0},
+            "scoped": [{"name": "Fable", "pct": 100.0}],
+        }
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        out = mini_account_text(acc, now).plain
+        assert "Fable" in out and "100%" in out and "(!)" in out, out
 
 
 class TestRunAction:
@@ -2297,8 +2335,8 @@ class TestAutoScreen:
             assert plain.index("user2@example.com") < plain.index(
                 "user3@example.com"
             )
-            assert re.search(r"7d\S*:93% \(line 97%\)", plain), plain
-            assert re.search(r"5h\S*:95% \(line 85%\)", plain), plain
+            assert re.search(r"7d\S*:\s*93% \(line 97%\)", plain), plain
+            assert re.search(r"5h\S*:\s*95% \(line 85%\)", plain), plain
             summary = app.screen.query_one("#auto-summary", Static).render().plain
             assert "threshold 85%" in summary and "weekly 97%" in summary
             assert app.weekly_threshold_pct == 97.0
@@ -2332,14 +2370,14 @@ class TestAutoScreen:
 
             plain = app.screen.query_one("#candidates", Static).render().plain
             assert plain.index("user3@example.com") < plain.index("user2@example.com")
-            assert re.search(r"5h\S*:83% \(line 85%\)", plain), plain
+            assert re.search(r"5h\S*:\s*83% \(line 85%\)", plain), plain
             await pilot.press("t", "right", "right", "right")
             await pilot.pause()
             assert app.screen._settings.threshold == 88.0
             plain = app.screen.query_one("#candidates", Static).render().plain
             assert plain.index("user2@example.com") < plain.index("user3@example.com")
-            assert re.search(r"5h\S*:83% \(line 88%\)", plain), plain
-            assert re.search(r"7d\S*:93% \(line 97%\)", plain), plain
+            assert re.search(r"5h\S*:\s*83% \(line 88%\)", plain), plain
+            assert re.search(r"7d\S*:\s*93% \(line 97%\)", plain), plain
 
     async def test_candidates_show_no_line_without_a_weekly_one(
         self, tmp_path, fake_engine
@@ -2358,11 +2396,44 @@ class TestAutoScreen:
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
-            assert re.search(r"5h\S*:42%", plain), plain
+            assert re.search(r"5h\S*:\s*42%", plain), plain
             assert "(line" not in plain
             summary = app.screen.query_one("#auto-summary", Static).render().plain
             assert "weekly" not in summary
             assert app.weekly_threshold_pct is None
+
+    async def test_the_line_note_keeps_the_chip_columns_and_the_block_label_on_one_line_set(
+        self, tmp_path, fake_engine
+    ):
+        """The `(line N%)` note belongs to its chip's column, so the chips after
+        it start where the other rows' do, and the block label reads the same
+        lines the chips are judged against: 7d 93% under a 97 line is no block,
+        5h 95% over an 85 line is."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 85, "weeklyThreshold": 97},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(5.0, 93.0)),
+                make_account(3, entry=make_entry(95.0, 47.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            rows = [ln for ln in plain.splitlines() if "@example.com" in ln]
+            assert len(rows) == 2
+            assert len({ln.index("7d(") for ln in rows}) == 1, plain
+            assert "5h full" in rows[1] and "7d full" not in plain, plain
 
     async def test_candidates_ranking_honors_configured_model(
         self, tmp_path, fake_engine
@@ -2968,6 +3039,7 @@ class TestUnswitchableRowsAreListed:
     def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
               sentinel=None, disabled=False):
         from unittest.mock import MagicMock
+        from claude_swap.models import AccountPolicy
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
@@ -3152,6 +3224,178 @@ class TestUnswitchableRowsAreListed:
         ), active="9")
         assert out.index("a@x.com") < out.index("empty@x.com")
 
+    def test_the_first_chip_starts_at_the_same_column_across_rows(self):
+        """Each row's content must start where the widest email in this
+        block ends, not where its own email ends — otherwise a long email
+        pushes its row's content far right while short ones sit left, and
+        the columns never line up. This must hold at BOTH sites that pad
+        the email: the switchable rows (chips) and the unswitchable row
+        (a sentinel note instead), which are two separate append sites in
+        the panel and can drift out of alignment independently.
+        """
+        import re
+
+        out = self._render(self._snap(
+            self._acct("2", "brief@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+            self._acct("3", "a-much-longer-address@example.com",
+                       switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+            self._acct("4", "new@x.com", switchable=False),
+        ), active="9")
+        rows = [line for line in out.split("\n") if re.match(r"\s+\d+\s+\S+\s+", line)]
+        assert len(rows) == 3, rows
+        columns = [re.match(r"\s+\d+\s+\S+\s+", line).end() for line in rows]
+        assert columns[0] == columns[1] == columns[2], (
+            f"content does not share a column: {columns} in {rows!r}"
+        )
+
+    def test_later_chips_align_by_window_name_not_position(self):
+        """The email pad only lines up the FIRST chip. `5h(⟳4h9m):45%` is
+        nine characters wider than `5h:0%`, so a row whose 5h window carries
+        a live countdown pushes its 7d and Fable chips right of a row whose
+        5h window does not — a positional pad over `chip_label` cannot fix
+        this because the two rows' window LISTS can differ in length and
+        membership; the column has to be keyed by window NAME. Same emails-
+        length rows to isolate this from the already-covered email pad.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=99.0)
+        now = datetime.now(timezone.utc)
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 45.0,
+                              "resets_at": (now + timedelta(hours=4, minutes=9)).isoformat()},
+                "seven_day": {"pct": 9.0,
+                              "resets_at": (now + timedelta(days=3, hours=8)).isoformat()},
+                "scoped": [{"name": "Fable", "pct": 8.0,
+                            "resets_at": (now + timedelta(days=3, hours=8)).isoformat()}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": 0.0}],
+            }),
+        ), active="9", settings=settings)
+        lines = [line for line in out.split("\n") if line.strip().startswith(("2 ", "3 "))]
+        assert len(lines) == 2, lines
+        import re
+
+        def colon(window, line):
+            return re.search(re.escape(window) + r"(?:\(⟳\w+\))?:", line).end()
+
+        seven_d = [colon("7d", line) for line in lines]
+        fable = [colon("Fable", line) for line in lines]
+        assert seven_d[0] == seven_d[1], f"7d chip not aligned: {seven_d} in {lines!r}"
+        assert fable[0] == fable[1], f"Fable chip not aligned: {fable} in {lines!r}"
+
+    def test_each_windows_percent_ends_in_one_column_across_rows(self):
+        """`7d(⟳6d20h):100%` against `7d:94%` used to push the percent out of
+        its column, and a row without a Fable window reserved nothing for it.
+        Each window is one column: its label text right-aligned to the widest
+        label (the owner's 2026-09-15 rule: the `:` sits in one column), its
+        pct right-aligned to the widest pct, so the `:` and the `%` of a given
+        window end in the same string column on every row, whatever the
+        other windows carry."""
+        import re
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=99.0)
+        now = datetime.now(timezone.utc)
+
+        def at(**kw):
+            return (now + timedelta(**kw)).isoformat()
+
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 45.0, "resets_at": at(hours=4, minutes=9)},
+                "seven_day": {"pct": 100.0, "resets_at": at(days=6, hours=20, minutes=5)},
+                "scoped": [{"name": "Fable", "pct": 8.0, "resets_at": at(days=6, minutes=5)}],
+            }),
+            # No reset text, short pcts, and no Fable window at all.
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 94.0},
+            }),
+            # No 5h window: its blank cell leads the row, with no stray separator.
+            self._acct("4", "cccc@x.com", switchable=True, last_good={
+                "seven_day": {"pct": 7.0},
+                "scoped": [{"name": "Fable", "pct": 61.0}],
+            }),
+        ), active="9", settings=settings)
+        rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom
+        assert len(rows) == 3, rows
+        assert re.search(r"cccc@x\.com\s+7d:", rows["cccc@x.com"]), rows  # no leading dot
+        assert "7d(⟳" in rows["aaaa@x.com"] and "7d:" in rows["bbbb@x.com"], rows  # widths differ
+        for window in ("5h", "7d", "Fable"):
+            hits = [
+                m
+                for line in rows.values()
+                if (m := re.search(r"(" + re.escape(window) + r"(?:\(⟳\w+\))?:)\s*\d+%", line))
+            ]
+            colons = {m.end(1) for m in hits}
+            ends = {m.end() for m in hits}
+            assert len(colons) == 1, f"{window} colon not in one column: {colons} in {rows!r}"
+            assert len(ends) == 1, f"{window} percent not in one column: {ends} in {rows!r}"
+
+    def test_5h_and_7d_columns_come_first_then_the_rest_in_first_seen_order(self):
+        """The column set is built in first-seen row order, so a first row
+        without a 5h window put 7d and its scoped windows ahead of 5h. 5h and
+        7d lead, whatever row came first; the rest keep first-seen order."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="all", threshold=99.0)
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "seven_day": {"pct": 7.0}, "scoped": [{"name": "Opus", "pct": 1.0}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 6.0},
+                "scoped": [{"name": "Fable", "pct": 2.0}, {"name": "Opus", "pct": 3.0}],
+            }),
+        ), active="9", settings=settings)
+        row = next(l for l in out.split("\n") if "bbbb@x.com" in l)
+        order = [row.index(w) for w in ("5h", "7d", "Opus", "Fable")]
+        assert order == sorted(order), f"column order: {order} in {row!r}"
+
+    def test_markers_start_in_one_column_and_a_bare_row_has_no_trailing_pad(self):
+        """The `-only` / `full` marker follows the chips, so it started
+        wherever the last chip happened to end. It must start at ONE column
+        on every row that has one, including a row that lacks the trailing
+        window (no Fable chip, so its block is shorter), and a row with no
+        marker must not carry the padding that only exists to line a marker
+        up: `cccc` lacks the trailing Fable window and has no marker, so its
+        blank cell is trailing padding and must not survive."""
+        import re
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=90.0)
+        now = datetime.now(timezone.utc)
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0,
+                              "resets_at": (now + timedelta(hours=4, minutes=9)).isoformat()},
+                "seven_day": {"pct": 5.0}, "scoped": [{"name": "Fable", "pct": 95.0}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 5.0},
+            }),
+            self._acct("4", "cccc@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 1.0}, "seven_day": {"pct": 1.0},
+            }),
+        ), active="9", settings=settings)
+        rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom
+        assert len(rows) == 3, rows
+        starts = {
+            e: m.start(1) if (m := re.search(r"\s{2}(\S+-only|\S+ full)$", line)) else None
+            for e, line in rows.items()
+        }
+        assert starts["aaaa@x.com"] is not None, rows
+        assert starts["aaaa@x.com"] == starts["bbbb@x.com"], f"{starts} in {rows!r}"
+        assert starts["cccc@x.com"] is None and rows["cccc@x.com"] == rows["cccc@x.com"].rstrip(), rows
+
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach
         the panel, not just `model` — the decision log already appends
@@ -3182,6 +3426,24 @@ class TestUnswitchableRowsAreListed:
         ), active="1", settings=settings)
         assert "Fable-walled" in out, out
         assert "  5h full" in out, out
+
+    def test_the_block_label_judges_an_account_on_its_own_line(self):
+        """Fable 50% is under the global 90 but over this account's own 40, and the engine's landing
+        gate reads it as walled: so must the label. (#323, T2713, asserted `5h full` on a 5h 50% window; #321's
+        wording prints `full` only for a window at or over 100, so the same judgement is witnessed on the
+        model window, whose marker is not reserved.)"""
+        from claude_swap.models import AccountPolicy
+        from claude_swap.settings import AutoSwitchSettings
+
+        own = self._acct("2", "own@x.com", switchable=True, last_good={
+            "five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0},
+            "scoped": [{"name": "Fable", "pct": 50.0}],
+        })
+        own.policy = AccountPolicy(threshold=40.0)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True), own,
+        ), active="1", settings=AutoSwitchSettings(model="Fable", threshold=90.0))
+        assert "Fable-walled" in out, out
 
     @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
     def test_the_full_label_is_reserved_for_actual_exhaustion(self, strategy):
