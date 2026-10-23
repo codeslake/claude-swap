@@ -46,9 +46,9 @@ menubar = ["rumps>=0.4.0"]
 # before the seam existed. Degraded, not a TypeError -- which is what keeps
 # this floor a correctness one.
 #
-# 0.1.303 is where `set_pin`, `repin_current` and `pin_run` live: `cswap pin
-# <n>` hands off to them, and a release without them raises
-# AttributeError at that call.
+# 0.1.303 is where `set_pin` and `pin_run` live: `cswap pin <n>` and the TUI's
+# pin action hand off to `pin_run` and `set_pin`, and a release without them
+# raises AttributeError at that call.
 #
 # 0.1.309 is where `apply_pin` takes the keyword-only `everywhere` and the
 # `pin-cleared` marker `cswap pin --clear` writes is honoured: its set arm
