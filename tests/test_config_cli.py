@@ -50,6 +50,7 @@ class TestConfigList:
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
+            "ui.showOrgTag",
             "updates.check",
         ):
             assert key in out
