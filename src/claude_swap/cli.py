@@ -973,7 +973,10 @@ Defaults live in settings.json in the backup root; flags override them.
         help=(
             "Switch when the active account's 5h window (or any window, "
             "without a weekly line) reaches this utilization (50-99.9; "
-            "default 90)"
+            "default 90). Under --strategy dynamic the real switch point is "
+            "fixed near 97%%; this value still decides the --model "
+            "fleet-wide blackout, poll cadence, and the exhausted-fleet "
+            "recovery hold"
         ),
     )
     parser.add_argument(
@@ -1013,12 +1016,14 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "dynamic"),
         default=None,
         help=(
-            "Target selection: 'best' (most quota left) or "
+            "Target selection: 'best' (most quota left), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest; default)"
+            "resets soonest; default), or 'dynamic' (consume-first's ranking "
+            "plus a re-picked model basis and a landing rule that never lands "
+            "on an account with no room on the window in force)"
         ),
     )
     parser.add_argument(
@@ -1033,7 +1038,12 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     args = parser.parse_args(argv)
 
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
+    from claude_swap.autoswitch import (
+        AutoSwitchEngine,
+        AutoSwitchEvent,
+        pct_label,
+        proactive_switch_bar_pct,
+    )
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
@@ -1092,6 +1102,19 @@ Defaults live in settings.json in the backup root; flags override them.
             sys.exit(engine.tick().value)
 
         if not args.json:
+            switch_bar = proactive_switch_bar_pct(
+                settings.strategy, settings.threshold
+            )
+            # The lead prints only the bar in force: `threshold <n>%` when
+            # the configured threshold IS that bar (`switch_bar ==
+            # settings.threshold`), else just `switch at <bar>%`.
+            show_threshold = switch_bar == settings.threshold
+            parts = []
+            if show_threshold:
+                parts.append(f"threshold {pct_label(settings.threshold)}%")
+            if switch_bar != settings.threshold:
+                parts.append(f"switch at {pct_label(switch_bar)}%")
+            lead = ", ".join(parts)
             weekly = (
                 f", weekly {pct_label(settings.weekly_threshold)}%"
                 if settings.weekly_threshold is not None
@@ -1099,8 +1122,8 @@ Defaults live in settings.json in the backup root; flags override them.
             )
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {pct_label(settings.threshold)}%"
-                    f"{weekly}, every {settings.interval_seconds:.0f}s"
+                    f"Auto-switch running: {lead}{weekly}, "
+                    f"every {settings.interval_seconds:.0f}s"
                     # THE ENGINE, NOT THE REQUEST. A demoted engine has
                     # `dry_run` True while `args.dry_run` is False, and this
                     # line then announces switching to somebody watching a
@@ -1889,13 +1912,17 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 json_output=args.json,
                 models=models,
                 model_source=model_source,
+                manual_source="cli",
             )
             if payload is not None and models:
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
         elif args.switch_to:
             payload = switcher.switch_to(
-                args.switch_to, json_output=args.json, force=args.force
+                args.switch_to,
+                json_output=args.json,
+                force=args.force,
+                manual_source="cli",
             )
         elif args.status:
             payload = switcher.status(json_output=args.json, read_only=args.read_only)
