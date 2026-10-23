@@ -92,12 +92,12 @@ def _blind_quarantine(h, num, email, reason="identity-conflict"):
     store = h.switcher._store
     real = store._read_account_credentials
 
-    def unreadable(account_num, e, failed=None):
+    def unreadable(account_num, e, failed=None, cached=False):
         if account_num == num:
             if failed is not None:
                 failed.append(True)
             return ""
-        return real(account_num, e, failed)
+        return real(account_num, e, failed, cached=cached)
 
     with patch.object(store, "_read_account_credentials", side_effect=unreadable):
         h.engine._quarantine(num, email, reason)
@@ -2919,12 +2919,12 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None):
+        def unreadable(account_num, email, failed=None, cached=False):
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
                 return ""
-            return real_read(account_num, email, failed)
+            return real_read(account_num, email, failed, cached=cached)
 
         # Blind at RECORD time only; the read works for every later tick.
         with patch.object(
@@ -2980,12 +2980,12 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None):
+        def unreadable(account_num, email, failed=None, cached=False):
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
                 return ""
-            return real_read(account_num, email, failed)
+            return real_read(account_num, email, failed, cached=cached)
 
         with patch.object(
             store, "_read_account_credentials", side_effect=unreadable,
@@ -3042,12 +3042,12 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None):
+        def unreadable(account_num, email, failed=None, cached=False):
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
                 return ""
-            return real_read(account_num, email, failed)
+            return real_read(account_num, email, failed, cached=cached)
 
         # The quarantine is recorded first; the user reads the notice and acts
         # later. Freeze its stamp rather than race the import inside one second.
@@ -3140,12 +3140,12 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None):
+        def unreadable(account_num, email, failed=None, cached=False):
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
                 return ""
-            return real_read(account_num, email, failed)
+            return real_read(account_num, email, failed, cached=cached)
 
         with patch.object(store, "_read_account_credentials", side_effect=unreadable):
             harness.engine._quarantine("2", "b@example.com", "identity-conflict")
@@ -3320,12 +3320,12 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None):
+        def unreadable(account_num, email, failed=None, cached=False):
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
                 return ""
-            return real_read(account_num, email, failed)
+            return real_read(account_num, email, failed, cached=cached)
 
         with patch.object(
             store, "_read_account_credentials", side_effect=unreadable,
