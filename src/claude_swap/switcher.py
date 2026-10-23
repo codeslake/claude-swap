@@ -856,8 +856,10 @@ class ClaudeAccountSwitcher:
         else:
             self._invalidate_session_credentials(account_num, email)
 
-    def _read_account_credentials(self, account_num: str, email: str) -> str:
-        return self._store._read_account_credentials(account_num, email)
+    def _read_account_credentials(
+        self, account_num: str, email: str, *, cached: bool = False
+    ) -> str:
+        return self._store._read_account_credentials(account_num, email, cached=cached)
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
@@ -984,7 +986,12 @@ class ClaudeAccountSwitcher:
         if not record:
             return False
         email = record.get("email", "")
-        return bool(self._read_account_credentials(str(account_num), email))
+        # Eligibility only (the snapshot's `switchable` flag, rotation
+        # candidates): served from the display read cache. Every activation
+        # path re-reads the backup fresh before using it.
+        return bool(
+            self._read_account_credentials(str(account_num), email, cached=True)
+        )
 
     def _write_account_config(
         self, account_num: str, email: str, config: str
@@ -2901,9 +2908,11 @@ class ClaudeAccountSwitcher:
         return self._active_verdict().degraded
 
     def _read_account_credentials_ex(
-        self, account_num: str, email: str
+        self, account_num: str, email: str, *, cached: bool = False
     ) -> tuple[str, bool]:
-        return self._store._read_account_credentials_ex(account_num, email)
+        return self._store._read_account_credentials_ex(
+            account_num, email, cached=cached
+        )
 
     def list_unclaimed_credentials(self) -> dict[str, dict]:
         """Internal safety copies preserved at switch time (diagnostics only).
@@ -4623,7 +4632,12 @@ class ClaudeAccountSwitcher:
                 creds = active.value or ""
                 self._record_active_verdict(active)
             else:
-                creds = self._read_account_credentials(str(num), email)
+                # Display read cache: this value feeds sentinels, token-status
+                # lines and the usage GET. Nothing writes or POSTs it — the
+                # consume gate re-reads under its lock and adopts a moved
+                # generation instead of consuming a stale snapshot, and
+                # strike binding re-reads before any heal (_entry_token_dead).
+                creds = self._read_account_credentials(str(num), email, cached=True)
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
@@ -5144,8 +5158,16 @@ class ClaudeAccountSwitcher:
                         # _clear_managed_key) — the config lock covers just
                         # this write. A timeout here is a live-write failure
                         # (the grant is already consumed), not a defer.
+                        # A successor built from the backup (or the
+                        # collector's read) carries that snapshot's shared
+                        # fields (mcpOAuth, ...); the live store's are current.
+                        live_write = working
+                        if refresh_input != live:
+                            live_write = self._prepare_credentials_for_activation(
+                                working, live
+                            )
                         with claude_config_lock():
-                            self._write_credentials(working)  # active store — CC reads this
+                            self._write_credentials(live_write)  # active store — CC reads this
                     except Exception:
                         live_ok = False
                         self._logger.warning(
@@ -5395,8 +5417,11 @@ class ClaudeAccountSwitcher:
                 self._active_keychain_unavailable or self._active_read_unreadable
             ):
                 return USAGE_KEYCHAIN_UNAVAILABLE
+            # Display read cache (a verdict, never bytes): a hit is the read
+            # `_build_accounts_info` just made; after a failure the cooldown
+            # makes this re-read free of spawns.
             if not is_active and self._read_account_credentials_ex(
-                str(num), email
+                str(num), email, cached=True
             )[1]:
                 # THIS slot's own read, not the process flag — which one
                 # slot's clean read erased for every other slot. Measured with
@@ -5804,7 +5829,16 @@ class ClaudeAccountSwitcher:
         # CHEAP PRE-CHECK, LOCK-FREE. This runs on every collect pass for
         # every slot; taking the lock to answer "nothing to do" would put a
         # display refresh behind every switch.
-        if not email or not self._slot_token_dead(num, email):
+        if not email:
+            return False
+        # An empty stash adopts nothing, and `_slot_token_dead` below spends a
+        # fresh backup read per pass on a struck slot (#496 paces those).
+        try:
+            if not self._store._list_unclaimed_credentials():
+                return False
+        except OSError:
+            pass                # reported by the listing below
+        if not self._slot_token_dead(num, email):
             return False
         lock = FileLock(self.lock_file)
         try:
@@ -6150,7 +6184,24 @@ class ClaudeAccountSwitcher:
         closing branch). A DEGRADED read is not "no source" -- it is a source
         nobody looked at, and answers ``None`` instead, so the closing branch
         must stay BELOW the ``active_read_degraded`` guard.
+
+        Holding needs no read beyond the caller's ``stored``; HEALING always
+        re-reads the backup fresh, for idle slots too. ``stored`` may be a
+        display-cached backup (``_build_accounts_info`` reads with
+        ``cached=True``) and the caller spends a "healed" answer on
+        ``clear_dead_token`` — a persisted write that also lifts the backoff.
+        With the cache holding generation A while another process rotated
+        the slot to B and B was struck, a cached fingerprint "heals" B's
+        strike on every pass and each pass POSTs B's dead grant again. A
+        stale fingerprint may only ever over-hold; it must never heal. With
+        no strike at threshold there is nothing to bind, so nothing is read
+        at all (the active slot's backup used to be read on every pass for
+        this). ``is_active`` still selects the LIVE-bytes rules (degraded,
+        empty, newer login): an idle slot has no live source, and the
+        process-wide degraded flag says nothing about its backup.
         """
+        if not entry.token_dead():
+            return False
         # A DEGRADED active read means `stored` may be a superseded generation
         # (CC rotates keychain-only, so a plaintext fallback can lag), so it
         # is not examined at all — it can neither confirm a dead verdict nor
@@ -6171,17 +6222,15 @@ class ClaudeAccountSwitcher:
             stored_fp=oauth.credential_fingerprint(stored)
         ):
             return True
-        if not is_active:
-            return False
         backup, unreadable = self._read_account_credentials_ex(num, email)
         if unreadable:
-            # The second source cannot be seen, so "no stored source matches
-            # the struck generation" is unproven — and the caller's `elif`
-            # spends that answer on `clear_dead_token`, which zeroes
-            # authDeadStrikes AND struckFingerprint in the PERSISTED store.
-            # One momentary lock would un-quarantine a genuinely dead account
-            # permanently and resume POSTing its dead grant. Holding the
-            # strike costs one pass of "re-login needed" on a row that
+            # The source that could still carry the struck generation cannot
+            # be seen, so "no stored source matches" is unproven — and the
+            # caller's `elif` spends that answer on `clear_dead_token`, which
+            # zeroes authDeadStrikes AND struckFingerprint in the PERSISTED
+            # store. One momentary lock would un-quarantine a genuinely dead
+            # account permanently and resume POSTing its dead grant. Holding
+            # the strike costs one pass of "re-login needed" on a row that
             # already took AUTH_DEAD_STRIKES invalid_grants; erasing it costs
             # the quarantine itself.
             #
@@ -6199,10 +6248,11 @@ class ClaudeAccountSwitcher:
         # test_a_matching_backup_still_confirms_dead.
         if backup and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
-        ) and not self._live_is_a_newer_login(stored, backup,
-                                               active_read_degraded):
+        ) and not (is_active and self._live_is_a_newer_login(
+            stored, backup, active_read_degraded
+        )):
             return True
-        if active_read_degraded:
+        if is_active and active_read_degraded:
             # Nothing CONFIRMED the strike, and the live bytes were never
             # examined (skipped above), so a non-matching backup is no evidence
             # about the generation nobody looked at.
