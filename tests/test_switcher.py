@@ -2129,7 +2129,7 @@ def _ex_reads_what_the_plain_reader_returns(monkeypatch):
     monkeypatch.setattr(
         ClaudeAccountSwitcher,
         "_read_account_credentials_ex",
-        lambda self, num, email: (self._read_account_credentials(num, email), False),
+        lambda self, num, email, **_: (self._read_account_credentials(num, email), False),
     )
 
 
@@ -4041,6 +4041,39 @@ class TestActiveAccountRefresh:
         mock_refresh.assert_not_called()
         write_live.assert_called_once_with(successor)
 
+    def test_backup_restore_keeps_the_live_shared_fields(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Restoring the backup into the live store takes the machine-shared
+        fields (mcpOAuth) from the live store, not from the backup snapshot."""
+        switcher = self._switcher(sample_sequence_data)
+        live = json.dumps({
+            **json.loads(self._EXPIRED), "mcpOAuth": {"srv": "current"},
+        })
+        successor = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-successor", "refreshToken": "rt-successor",
+                "expiresAt": 9999999999000,
+            },
+            "mcpOAuth": {"srv": "stale"},
+        })
+
+        with patch.object(switcher, "_read_credentials", return_value=live), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=successor
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            result = switcher._fetch_active_usage("1", "test@example.com", live)
+
+        assert result.sentinel is None
+        mock_refresh.assert_not_called()
+        written = json.loads(write_live.call_args[0][0])
+        assert written["claudeAiOauth"]["refreshToken"] == "rt-successor"
+        assert written["mcpOAuth"] == {"srv": "current"}
+
     def test_no_token_returns_no_credentials(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -5201,10 +5234,10 @@ class TestPerformSwitchPostDisplay:
         with "Claude wants to use the confidential information stored in your
         keychain" during the test run).
         """
-        def read_creds(num, email):
+        def read_creds(num, email, **_kw):
             return creds_store.get((str(num), email), "")
 
-        def read_creds_ex(num, email):
+        def read_creds_ex(num, email, **_kw):
             # The in-memory store IS the backup here, so it is never
             # "unreadable" — but it must answer the strict reader too, or
             # every caller that asks absent-vs-unreadable bypasses the
@@ -18753,6 +18786,63 @@ class TestActiveSlotStrikeParity:
             entry, "2", "b@example.com", replaced, False
         )
 
+    def test_idle_slot_heals_while_the_active_read_is_degraded(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        """The collector passes the process-wide degraded flag for EVERY slot,
+        but it withholds only the ACTIVE slot's live bytes: an idle slot whose
+        backup was replaced still heals."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        replaced = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-re",
+                              "refreshToken": "rt-re", "expiresAt": 2000}})
+        s._write_account_credentials("2", "b@example.com", replaced)
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant", struck_fp="sha256:deadbeef")},
+            identities,
+        )
+        entry = s._usage_store.entries(identities, [])["2"]
+        assert s._entry_token_dead(
+            entry, "2", "b@example.com", replaced, False, True
+        ) is False
+
+    def test_a_stale_stored_login_never_releases_an_idle_strike(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        """``stored`` of an idle slot is a display-cached backup, not live
+        bytes, so a later refresh stamp on it is no newer login: the fresh
+        backup still carries the struck generation and the strike holds."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        base = 9_999_999_999_000
+        struck = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-dead", "refreshToken": "rt-dead",
+            "expiresAt": 1000, "refreshTokenExpiresAt": base}})
+        cached = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-old", "refreshToken": "rt-old",
+            "expiresAt": 2000, "refreshTokenExpiresAt": base + 8_000}})
+        s._write_account_credentials("2", "b@example.com", struck)
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(struck))},
+            identities,
+        )
+        entry = s._usage_store.entries(identities, [])["2"]
+        assert s._entry_token_dead(
+            entry, "2", "b@example.com", cached, False
+        ) is True
+
     def test_active_path_refuses_consume_under_securestorage_env(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict, monkeypatch
@@ -21577,12 +21667,12 @@ class TestT1313LoginRestore:
             # down calls `_ex` on the same pair regardless.
             real_read = s._store._read_account_credentials
 
-            def _unreadable_read(num, email, failed=None):
+            def _unreadable_read(num, email, failed=None, cached=False):
                 if (num, email) == ("1", "c@example.com"):
                     if failed is not None:
                         failed.append(True)
                     return ""
-                return real_read(num, email, failed)
+                return real_read(num, email, failed, cached=cached)
 
             monkeypatch.setattr(s._store, "_read_account_credentials", _unreadable_read)
         elif condition == "write_suppressed":
