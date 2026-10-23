@@ -654,7 +654,8 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
 def _backup_prev(path: Path, data: dict) -> None:
     """Best-effort ``.prev`` copy of ``path``'s pre-write bytes.
 
-    Only ``atomic_write_json`` calls this, and only for settings.json.
+    Only ``atomic_write_json`` calls this, and only for settings.json and the
+    settings.local.json overlay a runtime write lands in.
     Skipped when the file doesn't exist yet, or the incoming write is a
     no-op (a repeated identical save must not replace the one real previous
     generation with a duplicate of itself — mirrors credentials.py's
@@ -687,13 +688,15 @@ def _backup_prev(path: Path, data: dict) -> None:
         tmp_path.unlink(missing_ok=True)
 
 
-def atomic_write_json(path: Path, data: dict) -> None:
+def atomic_write_json(path: Path, data: dict, *, base: bool = False) -> None:
     """Atomically write JSON with the backup dir's 0600/0700 modes.
 
     Shared by settings.json and the autoswitch state file (and any future
     machine-local state files beside them). A write to a settings.json is
     redirected: ``data`` is the full merged view, and only its difference from
     the file on disk lands in settings.local.json (see the module docstring).
+    ``base=True`` skips the redirect and writes the tracked file itself, for the
+    one deliberate edit of the shared record (``cswap pin --clear --everywhere``).
 
     **Writes THROUGH a symlink, never over it.** A rename swaps a directory
     ENTRY and does not follow links, so renaming onto a symlinked path
@@ -714,13 +717,13 @@ def atomic_write_json(path: Path, data: dict) -> None:
       ours to chmod. The written file still gets 0600, and ``mkstemp``
       creates it 0600 to begin with, so the secret is never exposed.
     """
-    local = _local_path(path)
+    local = None if base else _local_path(path)
     if local is not None:
         data = _diff(data, _read_file_strict(path))
         path = local
     target = publish_target(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    if path.name == SETTINGS_FILENAME:
+    if path.name in (SETTINGS_FILENAME, LOCAL_SETTINGS_FILENAME):
         _backup_prev(path, data)
     if sys.platform != "win32":
         # `path.parent`, NOT the target's: see the docstring.

@@ -3801,7 +3801,9 @@ class TestAFailedClearIsNotReportedAsSuccess:
             ("record survives", lambda: _Raises(), lambda *a: None, False),
             ("real clear", lambda: _Clears(), real_clear_record, True),
         ):
-            # A real pin record, written the way cswap writes one.
+            # A real pin record, written the way cswap writes one. The previous pass's clear left a
+            # tombstone in the overlay, which would hide it (T2876).
+            (backup / "settings.local.json").unlink(missing_ok=True)
             record.write_text(json.dumps(
                 {"remoteControl": {"pinnedEmail": "cloud@example.com"}}, indent=2))
             monkeypatch.setattr(pin, "_impl", impl)
@@ -11449,7 +11451,7 @@ class TestAClearOnASharedSettingsFileIsLocal:
             {"remoteControl": {"pinnedEmail": "a@b.c"}}, self._broken_peer)
         marker.touch()
 
-        def refuse(path, data):
+        def refuse(path, data, **kw):  # the write takes base= too (T2876)
             raise OSError("read-only")
 
         monkeypatch.setattr(_s, "atomic_write_json", refuse)
@@ -11507,6 +11509,93 @@ class TestAClearOnASharedSettingsFileIsLocal:
 
             assert shared.read_bytes() == before, f"rewrote the shared file over {record}"
             assert not marker.exists(), f"a marker over no pair: {record}"
+
+    def test_the_everywhere_fallback_drops_a_pair_the_overlay_hides(self, tmp_path, monkeypatch):
+        """An overlay tombstone hides the tracked pair from the merged view, so
+        `--everywhere` drops it from the tracked file itself (T2876)."""
+        from claude_swap import pin
+
+        sw, shared, _marker = self._shared_host(
+            tmp_path, monkeypatch,
+            {"remoteControl": {"pinnedEmail": "a@b.c", "pinnedOrganizationUuid": ""}},
+            self._broken_peer)
+        (sw.backup_dir / "settings.local.json").write_text(json.dumps(
+            {"remoteControl": {"pinnedEmail": None, "pinnedOrganizationUuid": None}}))
+
+        pin._clear_pin_record(sw, everywhere=True)
+
+        assert "pinnedEmail" not in shared.read_text()
+
+    @staticmethod
+    def _clears_like_save_pin(sw, email, org, identity=None, *, everywhere=False):
+        """cswap-pin's `save_pin(None)`: merged-view read, plain `atomic_write_json`, so a tombstone
+        in this host's overlay and the shared file untouched (T2876)."""
+        from claude_swap import settings as _s
+
+        path = _s.settings_path(sw.backup_dir)
+        raw = _s._read_raw_for_write(path)
+        raw["remoteControl"].pop("pinnedEmail", None)
+        raw["remoteControl"].pop("pinnedOrganizationUuid", None)
+        _s.atomic_write_json(path, raw)
+
+    @pytest.mark.parametrize("plain_first", [False, True], ids=["everywhere", "after-a-plain-clear"])
+    def test_everywhere_drops_the_shared_pair_a_peers_clear_left(
+            self, tmp_path, monkeypatch, plain_first):
+        """The real path: a peer clearing like `save_pin(None)` lands a tombstone in this host's
+        overlay, which hides the pair from the merged read the fallback is gated on. The shared pair
+        goes, the message is the success one, and the tombstone goes with it: it would hide a later
+        re-pin written to the shared file (T2876)."""
+        import types
+
+        from claude_swap import pin
+        from claude_swap import settings as _s
+
+        sw, shared, _marker = self._shared_host(
+            tmp_path, monkeypatch,
+            {"remoteControl": {"pinnedEmail": "a@b.c", "pinnedOrganizationUuid": "", "debugSlowMs": 5}},
+            self._clears_like_save_pin)
+        local = sw.backup_dir / "settings.local.json"
+        local.write_text(json.dumps({"theme": "dark"}))
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / "settings.json").symlink_to(shared)
+        if plain_first:
+            pin.clear_pin(sw)
+
+        ok, msg = pin.clear_pin(sw, everywhere=True)
+
+        assert (ok, msg) == (True, "Unpinned the cloud account")
+        assert json.loads(shared.read_text())["remoteControl"] == {"debugSlowMs": 5}
+        assert pin._raw_pin_record(types.SimpleNamespace(backup_dir=other)) is None
+        text = local.read_text()
+        assert "pinnedEmail" not in text and "pinnedOrganizationUuid" not in text
+        assert _s._read_raw(sw.backup_dir / "settings.json")["theme"] == "dark"
+
+    def test_everywhere_fails_when_the_shared_write_is_refused(self, tmp_path, monkeypatch):
+        """The peer's tombstone makes the merged read say unpinned, so a refused write to the tracked
+        file must still read as the pair standing: no success, the marker stays (T2876)."""
+        from claude_swap import pin
+        from claude_swap import settings as _s
+
+        sw, shared, marker = self._shared_host(
+            tmp_path, monkeypatch,
+            {"remoteControl": {"pinnedEmail": "a@b.c", "pinnedOrganizationUuid": ""}},
+            self._clears_like_save_pin)
+        marker.touch()
+        real = _s.atomic_write_json
+
+        def refuse_base(path, data, **kw):
+            if kw.get("base"):
+                raise OSError("read-only")
+            return real(path, data, **kw)
+
+        monkeypatch.setattr(_s, "atomic_write_json", refuse_base)
+
+        ok, msg = pin.clear_pin(sw, everywhere=True)
+
+        assert not ok and "Could not remove the pin" in msg
+        assert "pinnedEmail" in shared.read_text(), "premise: the shared pair stands"
+        assert marker.exists()
 
     def test_the_everywhere_fallback_keeps_the_files_key_order(self, tmp_path, monkeypatch):
         """The shared file is committed, so a rewrite that moves

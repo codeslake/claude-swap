@@ -121,8 +121,9 @@ class TestLoadSettings:
 
     def test_cache_aware_is_off_by_default_and_round_trips(self, tmp_path: Path):
         assert load_settings(tmp_path).cache_aware is False
+        # set_setting writes the overlay, never settings.json (T2876)
         set_setting(tmp_path, "autoswitch.cacheAware", "true")
-        assert json.loads(settings_path(tmp_path).read_text())["autoswitch"] == {
+        assert _local_data(tmp_path)["autoswitch"] == {
             "cacheAware": True
         }
         assert load_settings(tmp_path).cache_aware is True
@@ -164,17 +165,17 @@ class TestSaveSettings:
 
     def test_overwrite_backs_up_the_old_file_to_prev(self, tmp_path: Path):
         save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
-        old_bytes = settings_path(tmp_path).read_bytes()
+        old_bytes = _local(tmp_path).read_bytes()
 
         save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
 
-        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        prev = _local(tmp_path).with_name("settings.local.json.prev")
         assert prev.read_bytes() == old_bytes
         assert load_settings(tmp_path).threshold == 85.0
 
     def test_first_save_writes_no_backup(self, tmp_path: Path):
         save_settings(tmp_path, AutoSwitchSettings())
-        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        prev = _local(tmp_path).with_name("settings.local.json.prev")
         assert not prev.exists()
 
     def test_identical_second_save_leaves_prev_unchanged(self, tmp_path: Path):
@@ -182,7 +183,7 @@ class TestSaveSettings:
         # a duplicate of the bytes already on disk.
         save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
         save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
-        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        prev = _local(tmp_path).with_name("settings.local.json.prev")
         first_prev_bytes = prev.read_bytes()
 
         save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
@@ -203,7 +204,7 @@ class TestSaveSettings:
             save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
 
         assert "back up" in caplog.text.lower()
-        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        prev = _local(tmp_path).with_name("settings.local.json.prev")
         assert not prev.exists()
         assert load_settings(tmp_path).threshold == 85.0
 
@@ -211,7 +212,7 @@ class TestSaveSettings:
     def test_prev_mode_is_0600(self, tmp_path: Path):
         save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
         save_settings(tmp_path, AutoSwitchSettings(threshold=85.0))
-        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        prev = _local(tmp_path).with_name("settings.local.json.prev")
         assert stat.S_IMODE(prev.stat().st_mode) == 0o600
 
     def test_non_settings_file_gets_no_prev_backup(self, tmp_path: Path):
@@ -229,7 +230,8 @@ class TestSaveSettings:
         link = live / "settings.json"
         link.symlink_to(tracked)
 
-        atomic_write_json(link, {"autoswitch": {"threshold": 85.0}})
+        # settings.json is the link here, and only a base write reaches it: a runtime write lands in the overlay (T2876)
+        atomic_write_json(link, {"autoswitch": {"threshold": 85.0}}, base=True)
 
         prev = live / "settings.json.prev"
         assert prev.exists()
@@ -293,6 +295,7 @@ class TestUiSettings:
         assert load_ui_settings(tmp_path).show_org_tag is True
         assert set_setting(tmp_path, "ui.showOrgTag", "false") is False
         assert load_ui_settings(tmp_path).show_org_tag is False
+        _local(tmp_path).unlink()  # the base is hand-written below: drop the overlay set_setting wrote (T2876)
         raw = {"ui": {"showOrgTag": "no", "theme": "light"}}
         settings_path(tmp_path).write_text(json.dumps(raw))
         assert load_ui_settings(tmp_path) == UiSettings(theme="light")
@@ -415,21 +418,21 @@ class TestSetUnsetSetting:
         # set_setting is a live writer (cli.py, tui/app.py, menubar.py); it
         # must leave a `.prev` recovery copy like save_settings does.
         set_setting(tmp_path, "autoswitch.threshold", "70")
-        old_bytes = settings_path(tmp_path).read_bytes()
+        old_bytes = _local(tmp_path).read_bytes()
 
         set_setting(tmp_path, "autoswitch.threshold", "85")
 
-        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        prev = _local(tmp_path).with_name("settings.local.json.prev")
         assert prev.read_bytes() == old_bytes
 
     def test_unset_setting_backs_up_existing_file_to_prev(self, tmp_path: Path):
         set_setting(tmp_path, "autoswitch.threshold", "70")
         set_setting(tmp_path, "autoswitch.cooldownSeconds", "60")
-        old_bytes = settings_path(tmp_path).read_bytes()
+        old_bytes = _local(tmp_path).read_bytes()
 
         unset_setting(tmp_path, "autoswitch.cooldownSeconds")
 
-        prev = settings_path(tmp_path).with_name("settings.json.prev")
+        prev = _local(tmp_path).with_name("settings.local.json.prev")
         assert prev.read_bytes() == old_bytes
 
 
