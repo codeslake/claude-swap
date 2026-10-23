@@ -7770,7 +7770,10 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         if roster_active is None:
             return LoginRestoreOutcome.NONE
         a_num = str(roster_active)
-        identity = self._get_current_account()
+        # A PIN NAMES ITSELF HERE, NOT N: read the live login past it,
+        # the same ambiguity ten other call sites already resolve this
+        # way (T1313; see the pin-preserving write below).
+        identity = self._live_login_identity()
         if identity is None:
             return LoginRestoreOutcome.NONE
         d_email, d_org = identity
@@ -7928,6 +7931,15 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                         target_oauth = target_config_data.get("oauthAccount")
                         if not target_oauth:
                             return _left("no oauthAccount in the stored config")
+                        # THE IDENTITY FILE NAMES THE PIN WHILE ONE IS SET, the
+                        # same reason switch()'s own splice keeps it there: a
+                        # pinned host's Remote Control bridge is keyed on this
+                        # field, and writing A's raw identity over it here would
+                        # tear that bridge down the way a bare switch used to
+                        # before that splice existed (Rule 0).
+                        from claude_swap import pin as _pin
+
+                        pin_oauth = _pin.identity_for_config(self)
                         config_path = self._get_claude_config_path()
                         rollback_config_text = (
                             config_path.read_text(encoding="utf-8")
@@ -7959,7 +7971,9 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                             )
                             creds_written = True
                             self._write_oauth_account_to_live_config(
-                                config_path, target_oauth, target_config_data,
+                                config_path, pin_oauth or target_oauth,
+                                dict(target_config_data, oauthAccount=pin_oauth)
+                                if pin_oauth else target_config_data,
                                 emit_output=False, warnings_out=[],
                             )
                         except Exception:
@@ -7982,6 +7996,9 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                                         f"config: {e}"
                                     )
                             raise
+                        # CARRIES AFTER THE ROLLBACK BLOCK, reached only on
+                        # a successful write -- exactly as switch() does.
+                        _pin.carry_live_pointers(self)
                 finally:
                     consume_lock.release()
         except LockError:
