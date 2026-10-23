@@ -22,7 +22,12 @@ from claude_swap.autoswitch import proactive_switch_bar_pct
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.models import AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
-from claude_swap.settings import load_settings, load_ui_settings, set_setting
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    load_settings,
+    load_ui_settings,
+    set_setting,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
@@ -73,16 +78,20 @@ class CswapApp(App):
         self._applied_generation = 0
         self._last_refresh_error = ""
         # The auto-switch lines, drawn as ticks on the status strip's bars
-        # everywhere: the threshold on the 5h row, the weekly line (when
-        # set) on the 7d and per-model rows. Missing/invalid settings fall
-        # back to the default.
+        # everywhere (the threshold on the 5h row, the weekly line (when
+        # set) on the 7d and per-model rows), AND the settings object every
+        # account-listing screen ranks by (`ordered_accounts`). Missing/
+        # invalid settings fall back to the default.
         try:
-            _settings = load_settings(switcher.backup_dir)
+            self.auto_settings = load_settings(switcher.backup_dir)
             self.threshold_pct: float | None = proactive_switch_bar_pct(
-                _settings.strategy, _settings.threshold
+                self.auto_settings.strategy, self.auto_settings.threshold
             )
-            self.weekly_threshold_pct: float | None = _settings.weekly_threshold
+            self.weekly_threshold_pct: float | None = (
+                self.auto_settings.weekly_threshold
+            )
         except Exception:
+            self.auto_settings = AutoSwitchSettings()
             self.threshold_pct = None
             self.weekly_threshold_pct = None
         try:
