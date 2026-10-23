@@ -3243,6 +3243,39 @@ class TestActiveAccountRefresh:
         mock_refresh.assert_not_called()
         write_live.assert_called_once_with(successor)
 
+    def test_backup_restore_keeps_the_live_shared_fields(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Restoring the backup into the live store takes the machine-shared
+        fields (mcpOAuth) from the live store, not from the backup snapshot."""
+        switcher = self._switcher(sample_sequence_data)
+        live = json.dumps({
+            **json.loads(self._EXPIRED), "mcpOAuth": {"srv": "current"},
+        })
+        successor = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-successor", "refreshToken": "rt-successor",
+                "expiresAt": 9999999999000,
+            },
+            "mcpOAuth": {"srv": "stale"},
+        })
+
+        with patch.object(switcher, "_read_credentials", return_value=live), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=successor
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            result = switcher._fetch_active_usage("1", "test@example.com", live)
+
+        assert result.sentinel is None
+        mock_refresh.assert_not_called()
+        written = json.loads(write_live.call_args[0][0])
+        assert written["claudeAiOauth"]["refreshToken"] == "rt-successor"
+        assert written["mcpOAuth"] == {"srv": "current"}
+
     def test_no_token_returns_no_credentials(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -3551,10 +3584,10 @@ class TestPerformSwitchPostDisplay:
         with "Claude wants to use the confidential information stored in your
         keychain" during the test run).
         """
-        def read_creds(num, email):
+        def read_creds(num, email, **_kw):
             return creds_store.get((str(num), email), "")
 
-        def read_creds_ex(num, email):
+        def read_creds_ex(num, email, **_kw):
             # The in-memory store IS the backup here, so it is never
             # "unreadable" — but it must answer the strict reader too, or
             # every caller that asks absent-vs-unreadable bypasses the
@@ -8429,7 +8462,9 @@ class TestStashAndRetentionStore:
         assert second == ""
         # Only the primary direct read fires; the candidate sweep (which
         # would otherwise re-probe slot "2") is skipped by the cache.
-        direct_spy.assert_called_once_with("1", "ghost@example.com", None)
+        direct_spy.assert_called_once_with(
+            "1", "ghost@example.com", None, cached=False
+        )
 
     def test_renumber_fallback_pre_mutation_read_never_adopts_a_reassigned_slot(
         self, temp_home,
@@ -8839,8 +8874,8 @@ class TestStashAndRetentionStore:
 
         orig_direct = store._read_account_credentials_direct
 
-        def racing_direct_read(account_num, email_, failed=None):
-            result = orig_direct(account_num, email_, failed)
+        def racing_direct_read(account_num, email_, failed=None, **kw):
+            result = orig_direct(account_num, email_, failed, **kw)
             if account_num == "2":
                 # A concurrent writer lands a fresh login in slot 1 right
                 # after the sweep finds the stale copy at 2, but before the
@@ -8891,9 +8926,9 @@ class TestStashAndRetentionStore:
         orig_direct = store._read_account_credentials_direct
         calls_to_target = [0]
 
-        def racing_direct_read(account_num, email_, failed=None):
+        def racing_direct_read(account_num, email_, failed=None, **kw):
             if account_num == "2":
-                result = orig_direct(account_num, email_, failed)
+                result = orig_direct(account_num, email_, failed, **kw)
                 # A concurrent writer lands a fresh login in slot 1 while
                 # the sweep is reading slot 2.
                 store._write_backup_enc("1", email_, fresh)
@@ -8903,7 +8938,7 @@ class TestStashAndRetentionStore:
                 if calls_to_target[0] == 1:
                     # The initial direct read, before the sweep starts:
                     # genuinely absent.
-                    return orig_direct(account_num, email_, failed)
+                    return orig_direct(account_num, email_, failed, **kw)
                 # The pre-write re-read. A transient Keychain denial masks
                 # the fresh write that just landed — exactly what the
                 # `failed` list exists to report, and the buggy call site
@@ -8911,7 +8946,7 @@ class TestStashAndRetentionStore:
                 if failed is not None:
                     failed.append(True)
                 return ""
-            return orig_direct(account_num, email_, failed)
+            return orig_direct(account_num, email_, failed, **kw)
 
         with patch.object(
             store, "_read_account_credentials_direct", side_effect=racing_direct_read,
@@ -8951,8 +8986,8 @@ class TestStashAndRetentionStore:
 
         orig_direct = store._read_account_credentials_direct
 
-        def racing_direct_read(account_num, email_, failed=None):
-            result = orig_direct(account_num, email_, failed)
+        def racing_direct_read(account_num, email_, failed=None, **kw):
+            result = orig_direct(account_num, email_, failed, **kw)
             if account_num == "2":
                 # A concurrent writer lands an OLDER generation into slot 1
                 # mid-sweep — the sweep still supersedes it (newer wins)

@@ -633,6 +633,29 @@ class TestCLI:
         assert "called" not in seen
 
 
+class TestUpdateCheckSetting:
+    """The passive update hint honours `updates.check` in settings.json."""
+
+    def _run_list(self, backup_root: Path) -> MagicMock:
+        check = MagicMock(return_value=None)
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("claude_swap.paths.get_backup_root", return_value=backup_root), \
+             patch.object(sys, "argv", ["claude-swap", "--list"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", check):
+            cli.main()
+        return check
+
+    def test_checks_by_default(self, tmp_path: Path):
+        self._run_list(tmp_path).assert_called_once_with(__version__)
+
+    def test_setting_false_skips_the_check(self, tmp_path: Path):
+        from claude_swap.settings import set_setting
+
+        set_setting(tmp_path, "updates.check", "false")
+        self._run_list(tmp_path).assert_not_called()
+
+
 class TestCLICommands:
     """Test individual CLI commands."""
 
