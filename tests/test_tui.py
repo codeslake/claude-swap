@@ -1073,7 +1073,7 @@ class TestMiniAccountText:
             last_good={"five_hour": {"pct": 0.0}}, fetched_at=now, age_s=0.0,
         )
         acc = make_account(1, entry=entry)
-        assert "5h(⟳5h00m):0%" in mini_account_text(acc, now).plain
+        assert "5h(⟳5h00m):  0%" in mini_account_text(acc, now).plain  # 0%: right-aligned, width 3
 
     def test_a_live_5h_window_with_no_reported_reset_keeps_unknown_marker_on_the_dashboard(
         self,
@@ -1089,7 +1089,7 @@ class TestMiniAccountText:
             last_good={"five_hour": {"pct": 42.0}}, fetched_at=now, age_s=0.0,
         )
         acc = make_account(1, entry=entry)
-        assert "5h(⟳?):42%" in mini_account_text(acc, now).plain
+        assert "5h(⟳?): 42%" in mini_account_text(acc, now).plain  # no reset: right-aligned, width 3
 
     def test_dashboard_chip_reads_refetching_not_stale_reset_now(self):
         """Same PR #325 defect, third surface: the dashboard's inactive-row
@@ -1210,7 +1210,7 @@ class TestMiniAccountText:
             f"a scoped-only account below its cap still reads as unknown: {out!r}"
         )
         assert "Fable" in out and "99%" in out, out
-        pct_span = next(s for s in text.spans if out[s.start : s.end] == "99%")
+        pct_span = next(s for s in text.spans if out[s.start : s.end] == " 99%")  # the span carries the pad (width 3)
         assert ("dim" in str(pct_span.style)) == expect_dim, (
             f"age_s={age_s}: expected dim={expect_dim}, style={pct_span.style!r}"
         )
@@ -1235,7 +1235,8 @@ class TestMiniAccountText:
         assert "95%" in out, (
             f"a 95%-spent budget vanished behind a healthy window: {out!r}"
         )
-        assert "10% \u00b7 $$" in out, (
+        # two cells of a fixed-column row (the gap is blank), never run together
+        assert "10%  $$ 95%" in out, (
             f"the window and the spend row ran together: {out!r}"
         )
 
@@ -1249,7 +1250,7 @@ class TestMiniAccountText:
         acc = make_account(
             1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         )
-        assert "5h(⟳1h00m):42%" in mini_account_text(acc, now).plain
+        assert "5h(⟳1h00m): 42%" in mini_account_text(acc, now).plain  # below 100: right-aligned, width 3
 
     def test_scoped_window_below_100_shows_its_pct_alongside_5h_7d(self):
         """PROBE: the scoped loop only fires at/over 100 (`maxed`), so once a
@@ -1384,7 +1385,8 @@ class TestDashboard:
             tmp_path,
         )
         app = make_app(fake)
-        async with app.run_test(size=(100, 32)) as pilot:
+        # wide enough for the mini row with its right-aligned pct and `(disabled)`
+        async with app.run_test(size=(110, 32)) as pilot:
             await settle(pilot)
             from claude_swap.tui.widgets import AccountsPanel
 
@@ -1448,11 +1450,11 @@ class TestDashboard:
 
             panel = app.screen.query_one(AccountsPanel).render().plain
             mini_part = panel.split("user2@example.com", 1)[1]
-            # The window reads as one chip now — "5h(⟳1h59m):92%" — built by
+            # The window reads as one chip now — "5h(⟳1h59m): 92%" — built by
             # the same helper the auto view uses. Assert the parts that carry
             # the meaning (which window, what pct), not the spacing between
             # them, so the two surfaces can keep sharing one format.
-            assert "5h(" in mini_part and ":92%" in mini_part
+            assert "5h(" in mini_part and "92%" in mini_part
             assert "7d" not in mini_part
 
     async def test_compact_rows_share_fixed_columns(self, tmp_path, monkeypatch):
@@ -1552,9 +1554,13 @@ class TestDashboard:
             return {ln.index(token) for ln in lines if token in ln}
 
         assert "(ahead)" in panel and "⟳429" in panel
-        for token in ("login", "[", "5h(", "7d(", "Fable(", "$$ "):
+        for token in ("login", "[", "5h(", "7d(", "Fable("):
             assert len(starts(token)) == 1, (token, rows)
             assert len(starts(token, cut)) <= 1, (token, cut)  # a cut row may lose it
+        # beside windows the spend cell is a column of its own; spend alone is a note, and
+        # starts in the 5h column instead (test_a_spend_only_row_starts_at_the_first_metric_column)
+        assert len(starts("$$ ", [ln for ln in rows if "Fable(" in ln])) == 1, rows
+        assert len(starts("$$ ", [ln for ln in cut if "Fable(" in ln])) <= 1, cut  # a cut row may lose it
         # every pct of one window starts at one column, a back-off chip included:
         # the chip is padded to the widest one shown, so `7d(⟳429 30m):100%` and
         # `7d(⟳0d20h):   20%` put the `%` in the same column
@@ -1614,6 +1620,34 @@ class TestDashboard:
         marked = {str(n): f for n, f in {**fields, 12: "(disabled)"}.items()}
         assert all(out[n].endswith(f) for n, f in marked.items())
         assert len({len(out[n]) - len(f) for n, f in marked.items()}) == 1
+
+    @pytest.mark.parametrize("pct7", [10.0, None], ids=["usage-widest", "spend-widest"])
+    async def test_a_spend_only_row_starts_at_the_first_metric_column(self, pct7):
+        # Spend with no window is the row's whole usage, like `no plan`: it starts
+        # where a usage row's 5h cell does (no `$$` column pushes it right), and the
+        # marker field follows the widest metric cell, one gap on.
+        from claude_swap.tui.widgets import mini_account_text, mini_widths
+
+        now = time.time()
+        # 31 cells, one past `_MINI_NOTE_CAP`: the cap is for sentinel labels, a spend note stays whole
+        spend = {"used": 1234.56, "limit": 2000.0, "pct": 100.0, "currency": "USD"}
+        no_plan = UsageEntry(
+            last_good={}, last_error="oauth_not_allowed_for_organization",
+            fetched_at=now - 5, age_s=5.0,
+        )
+        accs = [
+            make_account(2, entry=make_entry(40.0, pct7)),
+            make_account(3, entry=make_entry(None, None, spend=spend), disabled=True),
+            make_account(4, entry=no_plan, disabled=True),
+        ]
+        widths = mini_widths(accs, now)
+        usage, only, plan = (mini_account_text(a, now, widths=widths).plain for a in accs)
+        cell = "$$ 100% · $1,234.56 / $2,000.00"
+        assert cell in only, (usage, only, plan)
+        assert only.index(cell) == plan.index("no plan") == usage.index("5h("), (usage, only, plan)
+        # the usage row carries no marker, so it ends where its last cell does
+        end = max(len(usage), only.index(cell) + len(cell))
+        assert only.index("(disabled)") == plan.index("(disabled)") == end + 2, (usage, only, plan)
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path, monkeypatch):
         # SAY WHICH WORLD THIS IS, rather than inherit it. The list below used
