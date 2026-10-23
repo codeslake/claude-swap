@@ -15360,6 +15360,63 @@ class TestActiveSlotStrikeParity:
             entry, "2", "b@example.com", replaced, False
         )
 
+    def test_idle_slot_heals_while_the_active_read_is_degraded(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        """The collector passes the process-wide degraded flag for EVERY slot,
+        but it withholds only the ACTIVE slot's live bytes: an idle slot whose
+        backup was replaced still heals."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        replaced = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-re",
+                              "refreshToken": "rt-re", "expiresAt": 2000}})
+        s._write_account_credentials("2", "b@example.com", replaced)
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant", struck_fp="sha256:deadbeef")},
+            identities,
+        )
+        entry = s._usage_store.entries(identities, [])["2"]
+        assert s._entry_token_dead(
+            entry, "2", "b@example.com", replaced, False, True
+        ) is False
+
+    def test_a_stale_stored_login_never_releases_an_idle_strike(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        """``stored`` of an idle slot is a display-cached backup, not live
+        bytes, so a later refresh stamp on it is no newer login: the fresh
+        backup still carries the struck generation and the strike holds."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        base = 9_999_999_999_000
+        struck = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-dead", "refreshToken": "rt-dead",
+            "expiresAt": 1000, "refreshTokenExpiresAt": base}})
+        cached = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-old", "refreshToken": "rt-old",
+            "expiresAt": 2000, "refreshTokenExpiresAt": base + 8_000}})
+        s._write_account_credentials("2", "b@example.com", struck)
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(struck))},
+            identities,
+        )
+        entry = s._usage_store.entries(identities, [])["2"]
+        assert s._entry_token_dead(
+            entry, "2", "b@example.com", cached, False
+        ) is True
+
     def test_active_path_refuses_consume_under_securestorage_env(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict, monkeypatch
