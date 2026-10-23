@@ -61,8 +61,10 @@ GLOBAL = AutoSwitchSettings().threshold  # 90.0
 
 
 def _fleet(temp_home, **settings_kwargs) -> EngineHarness:
-    """Three seeded OAuth accounts, account 1 live and active."""
-    # The suite reasons in `best` terms; the fork defaults to consume-first.
+    """Three seeded OAuth accounts, account 1 live and active. On `best`
+    unless a test says otherwise: these gates were written against it, and
+    consume-first (the shipped default since #325) answers a below-line active
+    with its own sooner-reset rule instead of `below-threshold`."""
     settings_kwargs.setdefault("strategy", "best")
     h = EngineHarness(temp_home, **settings_kwargs)
     h.seed(1, "a@example.com")
@@ -1150,29 +1152,42 @@ class TestHysteresisComparesRoomUnderEachAccountsOwnLine:
 
 
 class TestBestRanksByRoomUnderEachAccountsOwnLine:
-    """The `best` sort key ranks candidates on room under each one's own line.
+    """The `best` and consume-first sort keys rank candidates on room under
+    each one's own line (consume-first breaks its equal-reset tie on it).
 
     1 departs at 95% on the global line. 2 sits at 50% on a 60 line, 3 at
     55% on the global 90. Raw headroom ranks 2 first (50 vs 45); room on the
     90 scale ranks 3 first, because 2 is 10 points under a 60 line
     (`10 + 90 * 10 / 60 = 25`) while 3 is 35 points under a 90 line (`45`).
+    The weekly resets are reported, 2 and 3 alike and sooner than 1's, so
+    consume-first admits both and the tie falls to the room.
     """
 
-    def _usage_map(self) -> dict:
-        return {"1": _usage(95.0), "2": _usage(50.0), "3": _usage(55.0)}
+    STRATEGIES = pytest.mark.parametrize("strategy", ["best", "consume-first"])
 
-    def test_room_picks_the_candidate_raw_headroom_does_not(self, temp_home):
-        h = _fleet(temp_home)
+    def _usage_map(self) -> dict:
+        return {
+            "1": _usage7(95.0, 0.0, _R_LATEST),
+            "2": _usage7(50.0, 0.0, _R_SOON),
+            "3": _usage7(55.0, 0.0, _R_SOON),
+        }
+
+    @STRATEGIES
+    def test_room_picks_the_candidate_raw_headroom_does_not(
+        self, temp_home, strategy
+    ):
+        h = _fleet(temp_home, strategy=strategy)
         h.switcher.set_account_threshold("2", 60.0)
         h.engine = h._make_engine()
         outcome = h.tick_with_usage(self._usage_map())
         assert outcome is TickOutcome.SWITCHED, _reasons(h)
         assert h.active_number() == 3
 
-    def test_equal_thresholds_keep_the_raw_headroom_pick(self, temp_home):
+    @STRATEGIES
+    def test_equal_thresholds_keep_the_raw_headroom_pick(self, temp_home, strategy):
         """With every account on the global, room is `100 - pct` and the
         ranking is main's: 2 at 50 headroom beats 3 at 45."""
-        h = _fleet(temp_home)
+        h = _fleet(temp_home, strategy=strategy)
         outcome = h.tick_with_usage(self._usage_map())
         assert outcome is TickOutcome.SWITCHED, _reasons(h)
         assert h.active_number() == 2

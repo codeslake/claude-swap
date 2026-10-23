@@ -23,7 +23,7 @@ import re
 
 import pytest
 
-from claude_swap.models import AccountPolicy
+from claude_swap.models import AccountPolicy, UsageEntry
 from claude_swap.tui.widgets import account_card_text, mini_account_text
 
 from tests.test_tui import (
@@ -52,13 +52,21 @@ GOLDEN_MINI_DISABLED = " 3  user3@example.com  [personal]  (disabled)   5h:25% Â
 
 NOW = 1000.0
 
+# ``NO_RESET`` reports no reset (``âŸ³?``): #325's mini-row tests render through it, so its chip carries no wall-clock
+# countdown. Here ``mini`` strips the countdown anyway, so the goldens above are the same either way.
+NO_RESET = UsageEntry(
+    last_good={"five_hour": {"pct": 25.0}, "seven_day": {"pct": 10.0}},
+    fetched_at=NOW - 5.0,
+    age_s=5.0,
+)
 
 def with_policy(acc, **kwargs):
     """Attach an ``AccountPolicy`` to a snapshot from ``tests.test_tui``.
 
     ``make_account`` predates the policy field and takes no ``policy=``
-    argument; ``test_tui.py`` is upstream's and stays byte-unchanged, so the
-    snapshot is rebuilt here instead of the helper being widened.
+    argument; ``test_tui.py`` is upstream's and takes only the one change a
+    merge forced (the ``_acct`` fixture's real policy), so the snapshot is
+    rebuilt here instead of the helper being widened.
     """
     return dataclasses.replace(acc, policy=AccountPolicy(**kwargs))
 
@@ -139,7 +147,7 @@ class TestUnpolicedAccountsRenderExactlyAsBefore:
         assert golden_form(mini(make_account(2, active=True, alias="dev"))) == GOLDEN_MINI
 
     def test_a_disabled_account_is_byte_identical_to_the_golden(self):
-        acc = make_account(3, disabled=True)
+        acc = make_account(3, disabled=True, entry=NO_RESET)
         assert card(acc).splitlines()[0] == GOLDEN_CARD_HEADER_DISABLED
         assert golden_form(mini(acc)) == GOLDEN_MINI_DISABLED
 
@@ -280,6 +288,50 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
                 "user3@example.com"
             )
 
+
+    async def test_the_model_gate_and_label_follow_each_accounts_own_line(
+        self, tmp_path, fake_engine
+    ):
+        # Dynamic, model Fable, global 90, so an account with no line of its own is
+        # judged on dynamic's bar, 97 (#321). Account 2 sits at Fable 98% under a 99%
+        # line of its own: open, so the engine's model-gated pass ranks on Fable and
+        # account 2 beats account 3 (Fable 98% over the bar, blocked). Judged on the
+        # bar instead, both read model-blocked, the panel drops Fable and orders on
+        # 5h (account 3's 95 points beat account 2's 50), and account 2 is labelled
+        # Fable-walled.
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "threshold": 90, "model": "Fable", "strategy": "dynamic",
+            },
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                with_policy(
+                    make_account(
+                        2, entry=make_entry(50.0, 5.0, scoped=[("Fable", 98.0)])
+                    ),
+                    threshold=99.0,
+                ),
+                make_account(
+                    3, entry=make_entry(5.0, 5.0, scoped=[("Fable", 98.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+            assert "Fable-walled" not in self._row(plain, "user2@example.com")
+            assert "Fable-walled" in self._row(plain, "user3@example.com")
 
 @pytest.mark.asyncio
 class TestNextBestConsumeFirstKeyUsesTheAccountsOwnLine:
