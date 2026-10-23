@@ -597,15 +597,18 @@ def test_a_snapshot_pass_reads_the_live_item_live_and_idle_backups_from_the_memo
     active_backup = ("claude-swap", "account-1-u1@example.com")
     mac_switcher.accounts_snapshot(fetch=set())  # fills the memo
     assert idle <= set(fake_security.reads)
+    active_backup_spawns = fake_security.reads.count(active_backup)
     fake_security.reads.clear()
     mac_switcher.accounts_snapshot(fetch=set())
     assert _ACTIVE in fake_security.reads and not idle & set(fake_security.reads)
-    # The collect's resync reads the active slot's backup, which pass 1's
-    # `_account_is_switchable` memoized: it shows up here only if read fresh.
-    assert active_backup in fake_security.reads
+    # The collect's resync pre-check reads the active slot's backup through
+    # the display cache (#496), so a repaint inside the TTL never spawns for it.
+    active_backup_spawns += fake_security.reads.count(active_backup)
     fake_security.reads.clear()
     mac_switcher.usage_entries_by_account(fetch=set())
-    assert active_backup in fake_security.reads and not idle & set(fake_security.reads)
+    assert not idle & set(fake_security.reads)
+    active_backup_spawns += fake_security.reads.count(active_backup)
+    assert active_backup_spawns <= 1
     fake_security.reads.clear()
     mac_switcher.switchable_account_numbers()
     assert fake_security.reads == []
