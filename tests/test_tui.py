@@ -3485,6 +3485,72 @@ class TestAutoScreen:
             await pilot.pause()
             assert screen._settings.threshold == 50.0  # spec's lower bound
 
+    async def test_d_flips_the_files_desktop_follows_and_shows_it(
+        self, tmp_path, fake_engine
+    ):
+        """Persisted (the pin is another process), and it flips what the FILE
+        holds now, not the value read at mount or the last one this key wrote."""
+        import json as _json
+
+        from claude_swap.settings import load_pin_settings
+        from textual.widgets import RichLog, Static
+
+        path = tmp_path / "settings.json"
+        path.write_text(_json.dumps({"schemaVersion": 1, "pin": {"desktopFollows": True}}))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            summary = screen.query_one("#auto-summary", Static)
+            assert "desktop follows on" in summary.render().plain
+            await pilot.press("d")
+            await pilot.pause()
+            assert load_pin_settings(tmp_path).desktop_follows is False
+            assert "desktop follows off" in summary.render().plain
+            await pilot.press("d")
+            await pilot.pause()
+            assert load_pin_settings(tmp_path).desktop_follows is True
+            # `cswap pin --desktop off` ran meanwhile: the next press flips THAT.
+            path.write_text(_json.dumps({"schemaVersion": 1, "pin": {"desktopFollows": False}}))
+            await pilot.press("d")
+            await pilot.pause()
+            assert load_pin_settings(tmp_path).desktop_follows is True
+            log = screen.query_one("#event-log", RichLog)
+            assert any("desktop follows on" in ln.text for ln in log.lines)
+
+    async def test_d_reports_a_failed_save_and_keeps_the_old_state(
+        self, tmp_path, fake_engine, monkeypatch
+    ):
+        import json as _json
+
+        from textual.widgets import Static
+
+        def _boom(*_a, **_k):
+            raise OSError("read-only")
+
+        (tmp_path / "settings.json").write_text(
+            _json.dumps({"schemaVersion": 1, "pin": {"desktopFollows": True}})
+        )
+        monkeypatch.setattr("claude_swap.settings.set_setting", _boom)
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            notes = []
+            monkeypatch.setattr(
+                app.screen, "notify", lambda msg, **kw: notes.append(msg)
+            )
+            await pilot.press("d")
+            await pilot.pause()
+            assert len(notes) == 1 and "read-only" in notes[0]
+            summary = app.screen.query_one("#auto-summary", Static)
+            assert "desktop follows on" in summary.render().plain
+
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         import json as _json
 

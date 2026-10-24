@@ -59,6 +59,7 @@ class TestConfigList:
             "ui.theme",
             "ui.showOrgTag",
             "updates.check",
+            "pin.desktopFollows",
         ):
             assert key in out
         # From the schema, not a literal: a bare count drifts every time a
@@ -106,6 +107,7 @@ class TestConfigList:
         assert by_key["autoswitch.weeklyThreshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
         assert by_key["updates.check"]["value"] is True
+        assert by_key["pin.desktopFollows"]["value"] is False
 
 
 class TestConfigSetGet:
@@ -133,6 +135,20 @@ class TestConfigSetGet:
         assert "= false" in out
         raw = json.loads(_local_file(capsys).read_text())
         assert raw["autoswitch"]["includeApiKeyAccounts"] is False
+
+    def test_set_pin_desktop_follows_on_and_off(self, temp_home, capsys):
+        """`on`/`off` are accepted for bools: the pin's own switch speaks them."""
+        from claude_swap.settings import _read_raw
+
+        code, out, _ = _run(["set", "pin.desktopFollows", "on"], capsys)
+        assert code == 0
+        assert "pin.desktopFollows = true" in out
+        assert _read_raw(_settings_file(capsys))["pin"] == {"desktopFollows": True}
+        code, out, _ = _run(["set", "pin.desktopFollows", "off"], capsys)
+        assert code == 0
+        assert "pin.desktopFollows = false" in out
+        _, out, _ = _run(["get", "pin.desktopFollows"], capsys)
+        assert out.strip() == "false"
 
     def test_set_preserves_unknown_keys(self, temp_home, capsys):
         path = _settings_file(capsys)

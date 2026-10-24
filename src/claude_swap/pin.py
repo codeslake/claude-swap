@@ -2307,17 +2307,18 @@ def run(
     state: bool = False,
     everywhere: bool = False,
     print_shell_prefix_path: bool = False,
+    desktop: str | None = None,
 ) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
     from claude_swap.printer import accent, dimmed, warning
 
     # EVERY BRANCH ABOVE `_impl()` RUNS WITHOUT THE PACKAGE, and that ordering
-    # is the contract, not an accident: `--ensure`, `--set_port`, `--get_port`,
-    # `--get_certdir`, `--state`, `--heal` and `--clear` are the commands a
-    # user reaches for when the pin is the broken thing. Each is answered
-    # from cswap's own files. Only pinning itself needs the package, so only
-    # it resolves one.
+    # is the contract, not an accident: `--ensure`, `--set_port`, `--desktop`,
+    # `--get_port`, `--get_certdir`, `--state`, `--heal` and `--clear` are the
+    # commands a user reaches for when the pin is the broken thing. Each is
+    # answered from cswap's own files. Only pinning itself needs the package,
+    # so only it resolves one.
     if ensure:
         # The launch contract, which `--heal` deliberately does not make. An
         # rc hook calls this before EVERY `claude`, so it never fails (every
@@ -2388,6 +2389,20 @@ def run(
         except Exception as exc:  # noqa: BLE001
             error(f"Could not save the port: {_safe(exc)}")
             return 1
+        return 0
+
+    if desktop is not None:
+        # cswap's own settings.json, which the pin reads per request: no restart,
+        # and no package needed to flip it.
+        from claude_swap.printer import error
+        from claude_swap.settings import set_setting
+
+        try:
+            on = set_setting(switcher.backup_dir, "pin.desktopFollows", desktop)
+        except Exception as exc:  # noqa: BLE001: a ConfigError, or the write itself failing
+            error(f"Could not save desktop follows: {_safe(exc)}")
+            return 1
+        print(f"Desktop follows: {'on' if on else 'off'}")
         return 0
 
     if get_port:
@@ -2468,4 +2483,10 @@ def run(
 
     # Show and set are the package's: it resolves the account, pins it through the
     # one `set_pin` the TUI calls, and prints what the command prints.
-    return _impl().pin_run(switcher, account)  # raises ClaudeSwitchError with the install hint
+    rc = _impl().pin_run(switcher, account)  # raises ClaudeSwitchError with the install hint
+    if account is None:  # the bare show also names the switch, from our own file
+        from claude_swap.settings import load_pin_settings
+
+        on = load_pin_settings(switcher.backup_dir).desktop_follows
+        print(f"Desktop follows: {'on' if on else 'off'}")
+    return rc
