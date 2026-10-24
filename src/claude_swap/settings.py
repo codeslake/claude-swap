@@ -88,9 +88,9 @@ class UpdateSettings:
 
 @dataclass(frozen=True)
 class PinSettings:
-    """Cloud-pin switches (``pin`` section), read by the cswap-pin daemon from
-    this file (``pin.desktopFollows``): ``desktop_follows`` lets the Claude
-    Desktop app's inference follow the account swap."""
+    """Cloud-pin switches (``pin`` section): ``desktop_follows`` lets the Claude
+    Desktop app's inference follow the account swap. cswap-pin reads it through
+    ``load_pin_settings(backup_dir)``, not by opening the settings files."""
 
     desktop_follows: bool = False
 

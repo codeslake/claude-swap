@@ -195,8 +195,12 @@ class TestPinSettings:
         )
         assert load_pin_settings(tmp_path).desktop_follows is False
 
+    def test_non_dict_section_loads_as_off(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"pin": True}))
+        assert load_pin_settings(tmp_path) == PinSettings(desktop_follows=False)
+
     def test_set_and_unset_round_trip_the_on_disk_shape(self, tmp_path: Path):
-        """The key name and shape are the contract with the cswap-pin reader."""
+        """The key name round-trips; cswap-pin reads it through load_pin_settings."""
         from claude_swap.settings import _read_raw
 
         assert set_setting(tmp_path, "pin.desktopFollows", "on") is True

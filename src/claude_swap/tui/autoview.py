@@ -170,7 +170,7 @@ class AutoScreen(Screen):
         self._set_threshold(value)
 
     def action_toggle_desktop_follows(self) -> None:
-        # Persisted, unlike `t`: the pin is another process and reads the file.
+        # Persisted, unlike `t`: the pin is another process and reads the saved setting.
         # Flips the file's value now, not what this screen last saw.
         from claude_swap.settings import load_pin_settings, set_setting
 

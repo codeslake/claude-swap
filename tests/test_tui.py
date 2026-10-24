@@ -1531,11 +1531,16 @@ class TestAutoScreen:
     async def test_d_reports_a_failed_save_and_keeps_the_old_state(
         self, tmp_path, fake_engine, monkeypatch
     ):
+        import json as _json
+
         from textual.widgets import Static
 
         def _boom(*_a, **_k):
             raise OSError("read-only")
 
+        (tmp_path / "settings.json").write_text(
+            _json.dumps({"schemaVersion": 1, "pin": {"desktopFollows": True}})
+        )
         monkeypatch.setattr("claude_swap.settings.set_setting", _boom)
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
@@ -1551,7 +1556,7 @@ class TestAutoScreen:
             await pilot.pause()
             assert len(notes) == 1 and "read-only" in notes[0]
             summary = app.screen.query_one("#auto-summary", Static)
-            assert "desktop follows off" in summary.render().plain
+            assert "desktop follows on" in summary.render().plain
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(

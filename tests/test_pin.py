@@ -5228,17 +5228,25 @@ class TestHealADeadPin:
         from claude_swap import pin
         from claude_swap.settings import set_setting
 
-        pkg = types.SimpleNamespace(pin_run=lambda sw, account: 7)
+        def _pin_run(sw, account):
+            print("Pinned: 1 (a@b.c)")
+            return 7
+
+        pkg = types.SimpleNamespace(pin_run=_pin_run)
         monkeypatch.setattr(pin, "_impl", lambda: pkg)
         sw = types.SimpleNamespace(backup_dir=tmp_path)
 
         assert pin.run(sw, None) == 7
-        assert capsys.readouterr().out.splitlines() == ["Desktop follows: off"]
+        assert capsys.readouterr().out.splitlines() == [
+            "Pinned: 1 (a@b.c)", "Desktop follows: off"
+        ]
         set_setting(tmp_path, "pin.desktopFollows", "on")
         assert pin.run(sw, None) == 7
-        assert capsys.readouterr().out.splitlines() == ["Desktop follows: on"]
+        assert capsys.readouterr().out.splitlines() == [
+            "Pinned: 1 (a@b.c)", "Desktop follows: on"
+        ]
         assert pin.run(sw, "2") == 7
-        assert capsys.readouterr().out == ""
+        assert capsys.readouterr().out == "Pinned: 1 (a@b.c)\n"
 
     def test_the_cli_takes_desktop_on_or_off_and_nothing_else(self, monkeypatch):
         from claude_swap import cli
