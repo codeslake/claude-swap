@@ -302,6 +302,7 @@ cswap pin --heal     # restart a pin proxy that died, or unwire it
 cswap pin --get_port # the serving port, bare digits (exit 1 if none)
 cswap pin --get_certdir # the cert directory, a bare path
 cswap pin --set_port N   # serve on N from the next start (0 = dynamic)
+cswap pin --desktop on|off  # let the Claude Desktop app's inference follow the swap
 cswap pin --ensure   # repair a stale wiring before a launch, for rc hooks
 ```
 
@@ -309,6 +310,8 @@ cswap pin --ensure   # repair a stale wiring before a launch, for rc hooks
 `HTTPS_PROXY` names the pin's own dynamic port, and without a way to ask for it
 the on-disk layout becomes a compatibility surface. It prints bare digits and
 probes the port first, so a stale record cannot report a dead daemon as live.
+
+`pin.desktopFollows` (default off) lets the Claude Desktop app's inference follow the account swap. Three toggles write the same key to `settings.json` (`{"pin": {"desktopFollows": true}}`): `cswap config set pin.desktopFollows on`, `cswap pin --desktop on|off` (which works without the cswap-pin package), and `d` in the TUI's Auto view. The pin reads it live, so nothing restarts; bare `cswap pin` prints `Desktop follows: on|off`. The `CSWAP_PIN_INFERENCE_FOLLOWS` environment variable, which the pin still honors, overrides the setting for that process.
 
 `settings.json` may be a symlink into a repository shared across machines, so the pin record is one file for every host that links it. `cswap pin --clear` then unpins **this host only**: it unwires the host and writes a `pin-cleared` marker beside `settings.json`, leaving the shared record untouched for the other hosts (and for a commit of that repository). `cswap pin --clear --everywhere` drops the shared record and removes the marker; `cswap pin N` on a cleared host pins it again. The marker is per host: another host's `--clear --everywhere` followed by a re-pin leaves it standing here, and this host keeps reading as unpinned until `cswap pin N` runs on it. A `settings.json` that is not a symlink has no other hosts, so `--clear` drops its record as before.
 
@@ -336,6 +339,7 @@ cswap config set autoswitch.threshold 80  # validated: rejects out-of-range valu
 cswap config set autoswitch.weeklyThreshold 97  # own switch line for the 7-day/per-model windows
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
+cswap config set pin.desktopFollows on    # Desktop app inference follows the account swap (see "Cloud pin")
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

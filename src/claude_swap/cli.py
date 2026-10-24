@@ -128,6 +128,8 @@ Examples:
   cswap pin --get_port print the serving port (for scripts), or exit 1
   cswap pin --get_certdir  print the cert directory (for scripts)
   cswap pin --set_port N   serve on port N from the next start (0 = dynamic)
+  cswap pin --desktop on|off  let the Claude Desktop app's inference follow
+                       the account swap (cswap config: pin.desktopFollows)
   cswap pin --ensure   repair a stale wiring before a launch (rc hooks)
   cswap pin --state    print OK/NOT-OK/UNKNOWN and exit 0, for a monitor
   cswap pin --print-shell-prefix-path  write the opt-in CLAUDE_CODE_SHELL_PREFIX
@@ -181,6 +183,16 @@ Examples:
         help=(
             "Serve on port N from the next daemon start. 0 means dynamic: "
             "the kernel picks the port, which is the default."
+        ),
+    )
+    # The same setting as `cswap config set pin.desktopFollows`, in cswap's own
+    # settings.json, so it also works with the cswap-pin package absent.
+    one_of.add_argument(
+        "--desktop",
+        choices=("on", "off"),
+        help=(
+            "Let the Claude Desktop app's inference follow the account swap "
+            "(on) or not (off), and print the new state"
         ),
     )
     # The launch hook: `--heal` prints its verdict for a human, while this is
@@ -278,6 +290,7 @@ Examples:
                 ensure=args.ensure,
                 state=args.state,
                 print_shell_prefix_path=args.print_shell_prefix_path,
+                desktop=args.desktop,
             )
         )
     except ClaudeSwitchError as e:

@@ -4469,11 +4469,13 @@ class TestSetShowAndRepinAreThePackagesToRun:
             True, "the package's verdict")
         assert pkg.calls == [("set_pin", sw, "a@example.com", "org", "2")]
 
-    def test_run_hands_the_show_and_set_arms_to_pin_run(self, monkeypatch):
+    def test_run_hands_the_show_and_set_arms_to_pin_run(self, monkeypatch, tmp_path):
+        import types
+
         from claude_swap import pin
 
         pkg = self._fake(monkeypatch)
-        sw = object()
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
         assert pin.run(sw, None) == 7
         assert pin.run(sw, "2") == 7
         assert pkg.calls == [("pin_run", sw, None), ("pin_run", sw, "2")]
@@ -4810,12 +4812,14 @@ class TestHealADeadPin:
         # caught it, and the case failed as `exit 1` — a real signal, but for
         # the wrong reason and in the wrong place.)
         def _run(switcher, account, *, clear, heal_only, get_port, get_certdir,
-                 set_port, ensure, state, print_shell_prefix_path, everywhere):
+                 set_port, ensure, state, print_shell_prefix_path, everywhere,
+                 desktop):
             seen.update(
                 account=account, clear=clear, heal_only=heal_only,
                 get_port=get_port, get_certdir=get_certdir,
                 set_port=set_port, ensure=ensure, state=state,
                 print_shell_prefix_path=print_shell_prefix_path, everywhere=everywhere,
+                desktop=desktop,
             )
             return 0
 
@@ -4938,7 +4942,7 @@ class TestHealADeadPin:
             "account": None, "clear": False, "heal_only": True,
             "get_port": False, "get_certdir": False, "set_port": None,
             "ensure": False, "state": False, "print_shell_prefix_path": False,
-            "everywhere": False,
+            "everywhere": False, "desktop": None,
         }
 
     def test_get_port_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
@@ -5164,6 +5168,89 @@ class TestHealADeadPin:
             assert pin.run(sw, None, set_port=bad) != 0, (
                 f"{bad} was accepted as a port"
             )
+
+    def test_desktop_flag_writes_the_key_and_needs_no_package(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """`--desktop on|off` is cswap's own file: the pin reads
+        `{"pin": {"desktopFollows": bool}}` out of settings.json, and the
+        switch must work in exactly the case a user is fixing the pin."""
+        import types
+
+        from claude_swap import pin
+        from claude_swap.settings import _read_raw, load_pin_settings, settings_path
+
+        def _no_package():
+            raise AssertionError("--desktop resolved the cswap-pin package")
+
+        monkeypatch.setattr(pin, "_impl", _no_package)
+        monkeypatch.setattr(pin, "_live_impl", _no_package)
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
+
+        assert pin.run(sw, None, desktop="on") == 0
+        assert capsys.readouterr().out.strip() == "Desktop follows: on"
+        assert _read_raw(settings_path(tmp_path))["pin"] == {"desktopFollows": True}
+        assert load_pin_settings(tmp_path).desktop_follows is True
+
+        assert pin.run(sw, None, desktop="off") == 0
+        assert capsys.readouterr().out.strip() == "Desktop follows: off"
+        assert load_pin_settings(tmp_path).desktop_follows is False
+
+    def test_desktop_flag_reports_an_unwritable_settings_file(
+        self, tmp_path, capsys
+    ):
+        import types
+
+        from claude_swap import pin
+        from claude_swap.settings import settings_path
+
+        settings_path(tmp_path).write_text("{not json")
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
+        assert pin.run(sw, None, desktop="on") == 1
+        out, err = capsys.readouterr()
+        assert "Desktop follows" not in out
+        assert "not valid JSON" in err, err
+
+    def test_bare_pin_also_prints_whether_desktop_follows(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """One line from cswap's own settings read, after the package's status,
+        for the bare show only (a NUM|EMAIL pin does not print it)."""
+        import types
+
+        from claude_swap import pin
+        from claude_swap.settings import set_setting
+
+        pkg = types.SimpleNamespace(pin_run=lambda sw, account: 7)
+        monkeypatch.setattr(pin, "_impl", lambda: pkg)
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
+
+        assert pin.run(sw, None) == 7
+        assert capsys.readouterr().out.splitlines() == ["Desktop follows: off"]
+        set_setting(tmp_path, "pin.desktopFollows", "on")
+        assert pin.run(sw, None) == 7
+        assert capsys.readouterr().out.splitlines() == ["Desktop follows: on"]
+        assert pin.run(sw, "2") == 7
+        assert capsys.readouterr().out == ""
+
+    def test_the_cli_takes_desktop_on_or_off_and_nothing_else(self, monkeypatch):
+        from claude_swap import cli
+
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: object())
+        monkeypatch.setattr(cli, "_guard_root", lambda sw: None)
+        monkeypatch.setattr(cli, "_is_refused_root", lambda sw: False)
+        seen = []
+        monkeypatch.setattr(
+            "claude_swap.pin.run",
+            lambda sw, account, **kw: seen.append(kw["desktop"]) or 0)
+        for value in ("on", "off"):
+            with pytest.raises(SystemExit) as exc:
+                cli._pin_command(["--desktop", value])
+            assert exc.value.code == 0
+        assert seen == ["on", "off"]
+        with pytest.raises(SystemExit) as exc:
+            cli._pin_command(["--desktop", "maybe"])
+        assert exc.value.code == 2
 
     def test_the_cli_forwards_the_port_flags_and_ensure(self):
         """Both flags must be WIRED, not merely declared.
@@ -11223,7 +11310,7 @@ class TestAskSwallowsThePackagesOwnExceptions:
 class TestThePinFlagsAreMutuallyExclusive:
     """`cswap pin` takes exactly one of NUM|EMAIL / --clear / --heal /
     --get_port / --get_certdir / --set_port / --ensure / --state /
-    --print-shell-prefix-path.
+    --print-shell-prefix-path / --desktop.
 
     Every pair has to be refused, and refused with an exit code a shell can
     branch on. A query that silently discarded an action would be
@@ -11232,7 +11319,8 @@ class TestThePinFlagsAreMutuallyExclusive:
 
     ONE_OF = (["2"], ["--clear"], ["--heal"], ["--get_port"],
               ["--get_certdir"], ["--set_port", "5"], ["--ensure"],
-              ["--state"], ["--print-shell-prefix-path"])
+              ["--state"], ["--print-shell-prefix-path"],
+              ["--desktop", "on"])
 
     def test_every_pair_is_refused(self):
         import itertools
