@@ -184,7 +184,7 @@ class AutoScreen(Screen):
         self._update_summary()
         self.query_one("#event-log", RichLog).write(
             Text(
-                f"— desktop follows {'on' if value else 'off'} —",
+                f"desktop follows {'on' if value else 'off'}",
                 style=Palette.from_theme(self.app.current_theme).muted,
             )
         )

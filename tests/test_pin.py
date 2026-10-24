@@ -5197,7 +5197,7 @@ class TestHealADeadPin:
         assert load_pin_settings(tmp_path).desktop_follows is False
 
     def test_desktop_flag_reports_an_unwritable_settings_file(
-        self, tmp_path, capsys
+        self, tmp_path, monkeypatch, capsys
     ):
         import types
 
@@ -5210,6 +5210,13 @@ class TestHealADeadPin:
         out, err = capsys.readouterr()
         assert "Desktop follows" not in out
         assert "not valid JSON" in err, err
+
+        def _read_only(*_a, **_k):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr("claude_swap.settings.set_setting", _read_only)
+        assert pin.run(sw, None, desktop="off") == 1
+        assert "read-only file system" in capsys.readouterr().err
 
     def test_bare_pin_also_prints_whether_desktop_follows(
         self, tmp_path, monkeypatch, capsys

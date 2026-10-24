@@ -2358,14 +2358,13 @@ def run(
     if desktop is not None:
         # cswap's own settings.json, which the pin reads per request: no restart,
         # and no package needed to flip it.
-        from claude_swap.exceptions import ConfigError
         from claude_swap.printer import error
         from claude_swap.settings import set_setting
 
         try:
             on = set_setting(switcher.backup_dir, "pin.desktopFollows", desktop)
-        except ConfigError as exc:
-            error(f"Could not save desktop follows: {exc}")
+        except Exception as exc:  # noqa: BLE001: a ConfigError, or the write itself failing
+            error(f"Could not save desktop follows: {_safe(exc)}")
             return 1
         print(f"Desktop follows: {'on' if on else 'off'}")
         return 0
