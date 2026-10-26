@@ -50,6 +50,7 @@ class TestConfigList:
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
+            "run.shareHistory",
             "updates.check",
             "pin.desktopFollows",
         ):
