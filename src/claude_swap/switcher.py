@@ -65,6 +65,7 @@ from claude_swap.models import (
     Platform,
     SwitchTransaction,
     get_timestamp,
+    normalize_account_priority,
     normalize_account_threshold,
     normalize_alias,
 )
@@ -810,8 +811,10 @@ class ClaudeAccountSwitcher:
         else:
             self._invalidate_session_credentials(account_num, email)
 
-    def _read_account_credentials(self, account_num: str, email: str) -> str:
-        return self._store._read_account_credentials(account_num, email)
+    def _read_account_credentials(
+        self, account_num: str, email: str, *, cached: bool = False
+    ) -> str:
+        return self._store._read_account_credentials(account_num, email, cached=cached)
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
@@ -930,7 +933,10 @@ class ClaudeAccountSwitcher:
         if not record:
             return False
         email = record.get("email", "")
-        if not self._read_account_credentials(str(account_num), email):
+        # Eligibility only (the snapshot's `switchable` flag, rotation
+        # candidates): served from the display read cache. Every activation
+        # path re-reads the backup fresh before using it.
+        if not self._read_account_credentials(str(account_num), email, cached=True):
             return False
         if not self._read_account_config(str(account_num), email):
             return False
@@ -1920,7 +1926,11 @@ class ClaudeAccountSwitcher:
                 # Hand-edited garbage, out-of-range, NaN/inf: inherit the
                 # global default rather than propagate an unusable number.
                 threshold = None
-        return AccountPolicy(threshold=threshold)
+        try:
+            priority = normalize_account_priority(record.get("priority", 0))
+        except ValueError:
+            priority = 0
+        return AccountPolicy(threshold=threshold, priority=priority)
 
     def account_policies(self) -> dict[str, AccountPolicy]:
         """Every managed slot's auto-switch policy, from one sequence read.
@@ -2037,6 +2047,22 @@ class ClaudeAccountSwitcher:
             )
             print(f"{accent('Set')} Account-{account_num} ({email}) "
                   f"threshold to {normalized:g}%.")
+
+    def set_account_priority(self, identifier: str, priority: object | None) -> None:
+        """Set a priority tier, or remove it with None/0. Validate before writing."""
+        normalized = 0 if priority is None else normalize_account_priority(priority)
+        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+        if normalized:
+            changed = record.get("priority") != normalized
+            record["priority"] = normalized
+        else:
+            changed = "priority" in record
+            record.pop("priority", None)
+        if changed:
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+        print(f"Account-{account_num} ({email}) priority: {normalized} "
+              "(used by priority-consume-first).")
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         """Hold an account out of rotation (``disabled=True``) or return it.
@@ -2841,9 +2867,11 @@ class ClaudeAccountSwitcher:
         return self._active_verdict().degraded
 
     def _read_account_credentials_ex(
-        self, account_num: str, email: str
+        self, account_num: str, email: str, *, cached: bool = False
     ) -> tuple[str, bool]:
-        return self._store._read_account_credentials_ex(account_num, email)
+        return self._store._read_account_credentials_ex(
+            account_num, email, cached=cached
+        )
 
     def list_unclaimed_credentials(self) -> dict[str, dict]:
         """Internal safety copies preserved at switch time (diagnostics only).
@@ -4269,7 +4297,12 @@ class ClaudeAccountSwitcher:
                 creds = active.value or ""
                 self._record_active_verdict(active)
             else:
-                creds = self._read_account_credentials(str(num), email)
+                # Display read cache: this value feeds sentinels, token-status
+                # lines and the usage GET. Nothing writes or POSTs it — the
+                # consume gate re-reads under its lock and adopts a moved
+                # generation instead of consuming a stale snapshot, and
+                # strike binding re-reads before any heal (_entry_token_dead).
+                creds = self._read_account_credentials(str(num), email, cached=True)
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
@@ -4996,8 +5029,11 @@ class ClaudeAccountSwitcher:
                 self._active_keychain_unavailable or self._active_read_unreadable
             ):
                 return USAGE_KEYCHAIN_UNAVAILABLE
+            # Display read cache (a verdict, never bytes): a hit is the read
+            # `_build_accounts_info` just made; after a failure the cooldown
+            # makes this re-read free of spawns.
             if not is_active and self._read_account_credentials_ex(
-                str(num), email
+                str(num), email, cached=True
             )[1]:
                 # THIS slot's own read, not the process flag — which one
                 # slot's clean read erased for every other slot. Measured with
@@ -5390,31 +5426,37 @@ class ClaudeAccountSwitcher:
         every pass whenever the two lineages differ — the strike/heal/re-POST
         loop that keeps a dead backup out of quarantine forever. The strike
         holds while ANY stored source still matches the struck generation.
+
+        Holding needs no read beyond the caller's ``stored``; HEALING always
+        re-reads the backup fresh, for idle slots too. ``stored`` may be a
+        display-cached backup (``_build_accounts_info`` reads with
+        ``cached=True``) and the caller spends a "healed" answer on
+        ``clear_dead_token`` — a persisted write that also lifts the backoff.
+        With the cache holding generation A while another process rotated
+        the slot to B and B was struck, a cached fingerprint "heals" B's
+        strike on every pass and each pass POSTs B's dead grant again. A
+        stale fingerprint may only ever over-hold; it must never heal. With
+        no strike at threshold there is nothing to bind, so nothing is read
+        at all (the active slot's backup used to be read on every pass for
+        this). ``is_active`` no longer changes the procedure; it stays for
+        the callers.
         """
+        if not entry.token_dead():
+            return False
         if entry.token_dead(stored_fp=oauth.credential_fingerprint(stored)):
             return True
-        if not is_active:
-            return False
         backup, unreadable = self._read_account_credentials_ex(num, email)
         if unreadable:
-            # The second source cannot be seen, so "no stored source matches
-            # the struck generation" is unproven — and the caller's `elif`
-            # spends that answer on `clear_dead_token`, which zeroes
-            # authDeadStrikes AND struckFingerprint in the PERSISTED store.
-            # One momentary lock would un-quarantine a genuinely dead account
-            # permanently and resume POSTing its dead grant. Holding the
-            # strike costs one pass of "re-login needed" on a row that
+            # The source that could still carry the struck generation cannot
+            # be seen, so "no stored source matches" is unproven — and the
+            # caller's `elif` spends that answer on `clear_dead_token`, which
+            # zeroes authDeadStrikes AND struckFingerprint in the PERSISTED
+            # store. One momentary lock would un-quarantine a genuinely dead
+            # account permanently and resume POSTing its dead grant. Holding
+            # the strike costs one pass of "re-login needed" on a row that
             # already took AUTH_DEAD_STRIKES invalid_grants; erasing it costs
             # the quarantine itself.
-            #
-            # Gated on an actual strike existing (``entry.token_dead()``, no
-            # ``stored_fp`` — we can't verify which generation, so this only
-            # asks whether the count itself has reached threshold): the
-            # first check above already proved the LIVE credential doesn't
-            # carry the struck generation, so a row with zero strikes has
-            # nothing to hold — an unreadable backup on an otherwise-healthy
-            # account must not manufacture "re-login needed" out of nothing.
-            return entry.token_dead()
+            return True
         return bool(backup) and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
         )

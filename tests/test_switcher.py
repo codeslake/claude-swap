@@ -3583,10 +3583,10 @@ class TestPerformSwitchPostDisplay:
         with "Claude wants to use the confidential information stored in your
         keychain" during the test run).
         """
-        def read_creds(num, email):
+        def read_creds(num, email, **_kw):
             return creds_store.get((str(num), email), "")
 
-        def read_creds_ex(num, email):
+        def read_creds_ex(num, email, **_kw):
             # The in-memory store IS the backup here, so it is never
             # "unreadable" — but it must answer the strict reader too, or
             # every caller that asks absent-vs-unreadable bypasses the
