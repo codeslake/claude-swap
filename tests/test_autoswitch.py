@@ -5826,8 +5826,8 @@ class TestDynamicStrategy:
         configured threshold (`all_above`, which reads the raw threshold
         regardless of strategy), and a peer whose OWN window is already at
         the landing bar (`proactive_switch_bar_pct` — 97 under `dynamic`,
-        #321). The `all_above` escape admits that peer — measured live, the
-        very next tick read `cooldown` while still blocked. `dynamic` closes
+        #321). The `all_above` escape admits that peer (measured live: the
+        very next tick read `cooldown` while still blocked). `dynamic` closes
         it; `best`/`consume-first` keep the escape (asserted on the SAME
         inputs, both directions, as the "unchanged" evidence).
 
@@ -14972,6 +14972,29 @@ class TestTheAtLimitEscapeDoesNotLandOnASliver:
         assert list(ordered) == ["1", "2"], (
             f"got {list(ordered)} -- both slivers pass the wait, and peer 1 is "
             "back in ten minutes against peer 2's four hours"
+        )
+        assert not waiting
+
+    def test_a_spent_peer_past_a_hundred_percent_still_passes_the_wait(
+        self, harness
+    ):
+        """Under the wait the active is at its limit, so the room margin is
+        `h >= 0`; a peer the API reads at 100.5% has `h = -0.5` and must not
+        fail it. Room is noise among spent peers: the return decides, and
+        peer 2 is back in ten minutes against peer 1's fifty."""
+        now = harness.clock.now
+        args = self._args(harness, oauth_candidates=["1", "2"])
+        args["usage"] = {
+            "4": _usage(100.0, _iso_at(now + 5 * 3600)),
+            "1": _usage(100.0, _iso_at(now + 50 * 60)),
+            "2": _usage(100.5, _iso_at(now + 10 * 60)),
+        }
+        args["headroom"] = {"1": 0.0, "2": -0.5, "4": 0.0}
+        ordered, _, _, waiting = harness.engine._rank_candidates(**args)
+        assert list(ordered) == ["2", "1"], (
+            f"got {list(ordered)} -- peer 2 is half a point further over its "
+            "limit and back in ten minutes; the half point is not a reason "
+            "to drop it from the wait"
         )
         assert not waiting
 

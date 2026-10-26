@@ -4481,7 +4481,7 @@ class AutoSwitchEngine:
                 # `best`/`consume-first`'s own at-limit escape below already
                 # answers on a spent active. The `all_above` escape below
                 # exists so a proactive/at-limit trigger can still move when
-                # nothing currently qualifies — but for a trigger OTHER than
+                # nothing currently qualifies, but for a trigger OTHER than
                 # a genuinely walled at-limit, a peer's return is a future
                 # fact, and landing on it NOW moved the engine onto an
                 # account that was ITSELF still blocked (measured live: a
@@ -4506,15 +4506,16 @@ class AutoSwitchEngine:
                     # consume_first` catching first filtered on weekly ordering
                     # while the key sorted on room, two different axes, and
                     # left consume-first users with no anti-flap guard at all.)
-                    if by_recovery_axis and (
-                        recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S
-                    ):
+                    if by_recovery_axis:
                         # A sliver is worth moving to only if it comes back
                         # meaningfully sooner than the account we are on;
-                        # otherwise wait.
-                        reasons[num] = "recovers no sooner"
-                        continue
-                    if not _all_above_margin_met(h, active_headroom or 0.0):
+                        # otherwise wait. Room is noise here, so the margin
+                        # on it is not asked: it would refuse a peer past a
+                        # hundred percent (`h < 0`) the spent guard admitted.
+                        if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
+                            reasons[num] = "recovers no sooner"
+                            continue
+                    elif not _all_above_margin_met(h, active_headroom or 0.0):
                         reasons[num] = "headroom margin too small"
                         continue
                 elif (
@@ -4597,17 +4598,14 @@ class AutoSwitchEngine:
                 # sooner is plainly better than a lower slot number. It is the
                 # reset of the window the room is measured on, the fullest one
                 # (no lines passed), since its rollover is what gives the
-                # account room again. A spent candidate the guard above
-                # admitted scores 0, not below it: `pct` is copied through
-                # unclamped, so 100.5 would otherwise lose to 100.0 on half a
-                # point this module calls noise, and the reset decides.
+                # account room again. Room clamps at zero: `pct` is copied
+                # through unclamped, so a spent candidate at 100.5 would lose
+                # to one at 100.0 on half a point this module calls noise.
                 #
-                # REVERSED UNDER THE AT-LIMIT WAIT (`by_recovery_axis`): every
-                # peer it admits holds a sliver at most, where a headroom edge
-                # is noise and the only question left is who returns first.
-                # Room breaks an exact tie there. `dynamic` keeps its T1083
-                # tier in front: a FULL account (h <= 0) serves nothing until
-                # it resets, however soon, and an account at 0 < h serves now.
+                # Under the at-limit wait every peer holds a sliver at most, so
+                # who returns first leads and room breaks the tie. `dynamic`
+                # keeps its T1083 tier in front: a FULL account (h <= 0) serves
+                # nothing until it resets, one at 0 < h serves now.
                 room = -max(h, 0.0)
                 reset = _binding_recovery_ts(usage.get(num), models, now)
                 key: tuple = (
@@ -4699,8 +4697,9 @@ class AutoSwitchEngine:
                 #
                 # This does reach real dynamic fleets -- `at-limit` excludes
                 # itself from the reset-ordered `consume_first_rank_key` arm
-                # above (`trigger != "at-limit"`), so an at-limit tick
-                # always lands here, and a candidate with h in (3, 10] (91%
+                # above (`trigger != "at-limit"`), so an at-limit tick that
+                # is not `all_above` (which ranks on room) lands here, and a
+                # candidate with h in (3, 10] (91%
                 # on its own binding window, say) is demoted by THIS check.
                 # Not a "which candidate is blocked" decision either way --
                 # it only re-ranks within an already-admitted escape set --
