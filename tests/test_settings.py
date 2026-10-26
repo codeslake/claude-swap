@@ -186,8 +186,8 @@ class TestRunSettings:
 
     def test_set_share_history(self, tmp_path: Path):
         assert set_setting(tmp_path, "run.shareHistory", "true") is True
-        raw = json.loads(settings_path(tmp_path).read_text())
-        assert raw == {"schemaVersion": 1, "run": {"shareHistory": True}}
+        assert _local_data(tmp_path) == {"schemaVersion": 1, "run": {"shareHistory": True}}
+        assert not settings_path(tmp_path).exists()
 
 
 class TestUpdateSettings:
