@@ -2519,6 +2519,31 @@ class TestAutoScreen:
             await app.push_screen(AutoScreen())
             assert app.screen._settings.strategy == "consume-first"
 
+    async def test_strategy_cycle_starts_over_from_a_strategy_outside_it(
+        self, tmp_path, fake_engine
+    ):
+        """`priority-consume-first` is a valid configured strategy that the
+        session cycle does not offer; `s` used to raise on it
+        (`tuple.index`). It starts the cycle over instead."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "priority-consume-first"},
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            from claude_swap.tui.autoview import AutoScreen
+
+            await app.push_screen(AutoScreen())
+            screen = app.screen
+            assert screen._settings.strategy == "priority-consume-first"
+            screen.action_cycle_strategy()
+            assert screen._settings.strategy == "best"
+
     async def test_strategy_cycle_refreshes_a_strategy_gated_footer(
         self, tmp_path, fake_engine
     ):

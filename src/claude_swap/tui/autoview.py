@@ -249,7 +249,10 @@ class AutoScreen(Screen):
     def action_cycle_strategy(self) -> None:
         # Session-only, exactly like `t`/threshold above: never written to
         # settings.json, reverted to the file value on unmount.
-        current = _STRATEGY_CYCLE.index(self._settings.strategy)
+        # A configured strategy the cycle does not offer (priority-consume-first)
+        # starts it over.
+        strategy = self._settings.strategy
+        current = _STRATEGY_CYCLE.index(strategy) if strategy in _STRATEGY_CYCLE else -1
         value = _STRATEGY_CYCLE[(current + 1) % len(_STRATEGY_CYCLE)]
         self._settings = replace(self._settings, strategy=value)
         # A binding may be gated on strategy; the footer reads check_action
