@@ -14,6 +14,7 @@ import pytest
 from claude_swap import __version__
 from claude_swap import cli
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.settings import set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 # src layout: ensure subprocess can find claude_swap
@@ -752,7 +753,12 @@ class TestCLICommands:
 class TestRunCommand:
     """`cswap run` pre-dispatch: parsing, forwarding, and dispatch."""
 
-    def _dispatch(self, argv: list[str]):
+    @pytest.fixture(autouse=True)
+    def _backup_dir(self, tmp_path):
+        """An empty backup root, so run.shareHistory reads its default."""
+        self.backup_dir = tmp_path
+
+    def _dispatch(self, argv: list[str], **switcher_attrs):
         """Run cli.main() with a fake SessionManager; returns recorded calls."""
         calls = []
 
@@ -774,7 +780,9 @@ class TestRunCommand:
                 ))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
-             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=MagicMock(backup_dir=self.backup_dir,
+                                          **switcher_attrs)), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", *argv]):
             cli.main()
@@ -797,6 +805,33 @@ class TestRunCommand:
         assert ("run", "2", [], True, True, False) in calls
 
     def test_no_share_history_flag(self):
+        calls = self._dispatch(["run", "2", "--no-share-history"])
+        assert ("run", "2", [], True, False, False) in calls
+
+    def test_share_history_setting_is_the_default(self):
+        set_setting(self.backup_dir, "run.shareHistory", "true")
+        calls = self._dispatch(["run", "2"])
+        assert ("run", "2", [], True, True, False) in calls
+
+    def _windows_dispatch(self, argv):
+        from claude_swap.models import Platform
+
+        set_setting(self.backup_dir, "run.shareHistory", "true")
+        return self._dispatch(argv, platform=Platform.WINDOWS)
+
+    def test_share_history_setting_warns_and_falls_back_on_windows(self, capsys):
+        calls = self._windows_dispatch(["run", "2"])
+        assert ("run", "2", [], True, False, False) in calls
+        assert "run.shareHistory is not supported on Windows" in capsys.readouterr().out
+
+    def test_explicit_share_history_still_forwarded_on_windows(self, capsys):
+        # SessionManager.run raises for it; the CLI must not swallow it.
+        calls = self._windows_dispatch(["run", "2", "--share-history"])
+        assert ("run", "2", [], True, True, False) in calls
+        assert "not supported on Windows" not in capsys.readouterr().out
+
+    def test_no_share_history_flag_overrides_setting(self):
+        set_setting(self.backup_dir, "run.shareHistory", "true")
         calls = self._dispatch(["run", "2", "--no-share-history"])
         assert ("run", "2", [], True, False, False) in calls
 
@@ -864,7 +899,8 @@ class TestRunCommand:
                 raise SessionError("boom")
 
         with patch("claude_swap.session.SessionManager", FailingSessionManager), \
-             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=MagicMock(backup_dir=self.backup_dir)), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "2"]):
             with pytest.raises(SystemExit) as excinfo:
@@ -952,7 +988,7 @@ class TestSubcommandAliases:
             show_token_status=False, json_output=True, read_only=False,
         )
 
-    def test_run_subcommand_still_dispatches(self):
+    def test_run_subcommand_still_dispatches(self, tmp_path):
         """`cswap run 2` keeps reaching the session pre-dispatch (not translated)."""
         calls = []
 
@@ -971,7 +1007,8 @@ class TestSubcommandAliases:
                 calls.append((identifier, claude_args, share))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
-             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=MagicMock(backup_dir=tmp_path)), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "2"]):
             cli.main()
@@ -2074,6 +2111,58 @@ class TestRunAutoResolve:
              patch.object(sys, "argv", ["claude-swap", "run", "--share-history"]):
             cli.main()
         assert ("run", "2", [], True, True) in calls
+
+    def _mapped_run(self, tmp_path, monkeypatch, argv, platform):
+        from claude_swap.mappings import MappingStore
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        MappingStore(backup).set(repo, "work@co.com", "")
+        set_setting(backup, "run.shareHistory", "true")
+        seq = {
+            "accounts": {"2": {"email": "work@co.com", "organizationUuid": "",
+                                "organizationName": ""}},
+            "sequence": [2],
+        }
+        sw = self._fake_switcher(backup, seq)
+        sw.platform = platform
+        calls = []
+        monkeypatch.chdir(repo)
+        with patch("claude_swap.session.SessionManager", self._fake_manager(calls)), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=sw), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", *argv]):
+            cli.main()
+        return calls
+
+    def test_mapped_dir_setting_warns_and_falls_back_on_windows(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from claude_swap.models import Platform
+
+        calls = self._mapped_run(tmp_path, monkeypatch, ["run"], Platform.WINDOWS)
+        assert ("run", "2", [], True, False) in calls
+        assert "run.shareHistory is not supported on Windows" in capsys.readouterr().out
+
+    def test_unmapped_run_is_silent_on_windows(self, tmp_path, monkeypatch, capsys):
+        from claude_swap.models import Platform
+
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        set_setting(backup, "run.shareHistory", "true")
+        sw = self._fake_switcher(backup, {"accounts": {}, "sequence": []})
+        sw.platform = Platform.WINDOWS
+        calls = []
+        monkeypatch.chdir(tmp_path)
+        with patch("claude_swap.session.SessionManager", self._fake_manager(calls)), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=sw), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "run"]):
+            cli.main()
+        assert calls == [("exec_default", [])]
+        assert "Windows" not in capsys.readouterr().out
 
 
 class TestDisableEnableDispatch:

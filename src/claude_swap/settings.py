@@ -2,7 +2,8 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch``, ``ui`` and ``updates`` sections; other sections can be added additively.
+``autoswitch``, ``ui``, ``run`` and ``updates`` sections; other sections can be added
+additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
@@ -25,6 +26,7 @@ from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
+AUTOSWITCH_STRATEGIES = ("best", "consume-first", "priority-consume-first")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -57,7 +59,7 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "consume-first"  # "best" (most headroom) or "consume-first" (soonest weekly reset, default)
+    strategy: str = "consume-first"  # Default; opt-in alternatives are in AUTOSWITCH_STRATEGIES.
     include_api_key_accounts: bool = False
     decision_log: bool = False
     unhealthy_ticks: int = 3
@@ -83,6 +85,13 @@ class UiSettings:
 
 
 @dataclass(frozen=True)
+class RunSettings:
+    """Defaults for ``cswap run`` (``run`` section); its flags override them."""
+
+    share_history: bool = False
+
+
+@dataclass(frozen=True)
 class UpdateSettings:
     """Update notification (``updates`` section). ``check`` turns the daily
     PyPI lookup behind the "newer version available" hint on or off;
@@ -94,6 +103,7 @@ class UpdateSettings:
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
+    "run": RunSettings,
     "updates": UpdateSettings,
 }
 
@@ -152,7 +162,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=AUTOSWITCH_STRATEGIES,
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
@@ -178,6 +188,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "run", "shareHistory", "share_history", "bool",
+            help="cswap run shares chat history unless --no-share-history",
         ),
         SettingSpec(
             "updates", "check", "check", "bool",
@@ -300,6 +314,15 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         return default
     return UiSettings(theme=theme)
+
+
+def load_run_settings(backup_root: Path) -> RunSettings:
+    """Load the run section; missing/corrupt file or non-bool value → default."""
+    section = _read_raw(settings_path(backup_root)).get("run")
+    value = section.get("shareHistory") if isinstance(section, dict) else None
+    if not isinstance(value, bool):
+        return RunSettings()
+    return RunSettings(share_history=value)
 
 
 def load_update_settings(backup_root: Path) -> UpdateSettings:
@@ -490,6 +513,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "run": load_run_settings(backup_root),
         "updates": load_update_settings(backup_root),
     }
     rows = []
