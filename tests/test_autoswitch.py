@@ -1056,6 +1056,46 @@ class TestDecisionTable:
             "whose five-hour window is at 100% and can answer nothing"
         )
 
+    @pytest.mark.parametrize(
+        "active_pct, peer_pct, moves",
+        [
+            (97.0, 95.0, False),  # 3 vs 5 points: short of min(2*3, 3+3) = 6
+            (97.0, 94.0, True),   # 3 vs 6 points: the margin is met
+            (97.5, 95.0, True),   # 2.5 vs 5 points: min(5, 5.5) = 5 is met
+        ],
+    )
+    def test_the_capped_margin_decides_the_band_a03faa3e_used_to_bypass(
+        self, temp_home, active_pct, peer_pct, moves
+    ):
+        """DEPARTURE from a03faa3e, recorded rather than restored.
+
+        a03faa3e moved off an active at 3 points or less to ANY peer that could
+        serve (above 3 points), whatever the recovery order, so sessions are
+        not pinned on a wall. With every account over its lines the head ranks
+        by room instead (upstream 21796361), and its anti-flap margin is
+        `min(2a, a + 3)` points, which upstream measured against ping-pong:
+        active 97% (3 points) against a peer at 95% (5 points) now holds, where
+        a03faa3e moved, and the move comes once the active is down to 2.5 or
+        the peer is up to 6 points. The peer's 5-hour window resets inside the
+        recovery horizon, the shape the bypass was written for.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(active_pct, 40.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 5 * 60)
+        peer = _usage7(peer_pct, 40.0)
+        peer["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        outcome = h.tick_with_usage({"1": active, "2": peer})
+        if moves:
+            assert outcome is TickOutcome.SWITCHED
+            assert h.active_number() == 2
+        else:
+            assert outcome is not TickOutcome.SWITCHED
+            assert h.active_number() == 1
+
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 15: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold
@@ -15130,6 +15170,35 @@ class TestTheAtLimitEscapeDoesNotLandOnASliver:
             "when anything comes back, so waiting for the active is waiting "
             "for a moment nothing can name"
         )
+
+    def test_slivers_that_both_pass_the_wait_are_taken_soonest_return_first(
+        self, harness
+    ):
+        """The wait is the gate; once two slivers pass it, the one that comes
+        back first is the answer, not the one holding more.
+
+        Active at its limit for five hours; peer 1 spent but back in ten
+        minutes; peer 2 holding 2.5 points for the next four hours. Both beat
+        the active's return by more than the hysteresis, so both pass. Ranking
+        them by room lands on peer 2: about twenty-five minutes of work, then
+        every session pinned on its wall for hours. Below SPENT_HEADROOM_PCT a
+        headroom edge is under two poll intervals, so "who returns first" is
+        the only question left (the base of this branch picked peer 1).
+        """
+        now = harness.clock.now
+        args = self._args(harness, oauth_candidates=["1", "2"])
+        args["usage"] = {
+            "4": _usage(100.0, _iso_at(now + 5 * 3600)),
+            "1": _usage(100.0, _iso_at(now + 10 * 60)),
+            "2": _usage(97.5, _iso_at(now + 4 * 3600)),
+        }
+        args["headroom"] = {"1": 0.0, "2": 2.5, "4": 0.0}
+        ordered, _, _, waiting = harness.engine._rank_candidates(**args)
+        assert list(ordered) == ["1", "2"], (
+            f"got {list(ordered)} -- both slivers pass the wait, and peer 1 is "
+            "back in ten minutes against peer 2's four hours"
+        )
+        assert not waiting
 
     def test_a_healthy_peer_is_still_taken_the_ordinary_way(self, harness):
         """The second control: this must change nothing when the fleet is not
