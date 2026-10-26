@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap import autoswitch
 from claude_swap.autoswitch import (
     OVERLOAD_BACKOFF_S,
     NoSwitchEvent,
@@ -18,7 +19,9 @@ from claude_swap.settings import load_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import UsageEntry
 from tests.test_account_policy_cli import PolicyCliBase
-from tests.test_autoswitch import EngineHarness, _entry_for, _iso_at, _usage7
+from tests.test_autoswitch import (
+    EngineHarness, _entry_for, _iso_at, _trace_line, _usage7,
+)
 
 
 def fleet(temp_home, **settings):
@@ -435,3 +438,37 @@ def test_a_refused_higher_tier_is_a_stay_not_a_block(temp_home):
     assert h.active_number() == 1
     reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
     assert reasons == ["account-refused"]
+
+
+def test_an_overloaded_active_is_moved_off_even_when_it_holds_its_rank(
+    temp_home, tmp_path, monkeypatch
+):
+    """The outage escape outranks priority. A 5xx burst on the active, under
+    its lines and with no higher-ranked peer, used to keep its rank: only a
+    strictly higher-ranked target was admitted, and the tick ended as
+    `already-consuming-priority`, which misnames an outage. An overloaded
+    active has no rank to defend, so the best usable peer takes over.
+    (Upstream 80f07866 has no `overloaded` trigger; the dead escape is the
+    merge of that trigger with the priority strategy.)"""
+    trace = tmp_path / "trace.log"
+    trace.write_bytes(b"")  # armed, empty: the first tick's baseline
+    monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace)
+    h = fleet(temp_home)
+    values = usage(h)  # 1 and 2 share a tier; 1 resets sooner, so it holds
+    assert h.tick_with_usage(values) is TickOutcome.NO_ACTION
+    assert h.active_number() == 1
+    trace.write_bytes(b"".join(_trace_line(s) for s in (529, 529, 529, 200, 200)))
+    h.events.clear()
+    assert h.tick_with_usage(values) is TickOutcome.SWITCHED
+    switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+    assert switch.trigger == "overloaded"
+    assert h.active_number() == 2
+
+
+def test_a_disabled_active_holds_no_rank_to_defend(temp_home):
+    """`disabled-active` leaves as `overloaded` does: the disabled slot is
+    outside `switchable_account_numbers()`, so it is not an eligible active."""
+    h = fleet(temp_home)
+    h.switcher.set_account_disabled("1", True)
+    assert h.tick_with_usage(usage(h)) is TickOutcome.SWITCHED
+    assert h.active_number() == 2

@@ -2244,6 +2244,9 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
+        # Under priority an overloaded active has no rank to defend (a disabled
+        # one is already outside `switchable`).
+        active_in_rotation = current in switchable and trigger != "overloaded"
 
         def _rank(*, overload_backoff=overload_backoff, **kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -2306,7 +2309,7 @@ class AutoSwitchEngine:
                     return self._rank_priority_candidates(
                         oauth_candidates=kw["oauth_candidates"],
                         usage=kw["usage"], headroom=kw["headroom"],
-                        current=current, active_enabled=current in switchable,
+                        current=current, active_enabled=active_in_rotation,
                         settings=settings, now=kw["now"], thresholds=thresholds,
                         policies=policies, overload_backoff=backoff,
                     )
@@ -2410,7 +2413,7 @@ class AutoSwitchEngine:
                 thresholds=thresholds,
             )
 
-        priority_active_ready = priority_mode and current in switchable and self._priority_ready(
+        priority_active_ready = priority_mode and active_in_rotation and self._priority_ready(
             usage.get(current), headroom.get(current), settings, thresholds[current]
         )
         if (
@@ -3560,10 +3563,14 @@ class AutoSwitchEngine:
                 # admitted scores 0, not below it: `pct` is copied through
                 # unclamped, so 100.5 would otherwise lose to 100.0 on half a
                 # point this module calls noise, and the reset decides.
-                key: tuple = (
-                    -max(h, 0.0),
-                    _binding_recovery_ts(usage.get(num), self._models, now),
-                )
+                #
+                # REVERSED UNDER THE AT-LIMIT WAIT (`by_recovery_axis`): every
+                # peer it admits holds a sliver at most, where a headroom edge
+                # is noise and the only question left is who returns first.
+                # Room breaks an exact tie there.
+                room = -max(h, 0.0)
+                reset = _binding_recovery_ts(usage.get(num), self._models, now)
+                key: tuple = (reset, room) if by_recovery_axis else (room, reset)
             elif consume_first and trigger != "at-limit":
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
