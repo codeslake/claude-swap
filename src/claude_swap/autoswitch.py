@@ -4603,32 +4603,32 @@ class AutoSwitchEngine:
                 # sooner is plainly better than a lower slot number. It is the
                 # reset of the window the room is measured on, the fullest one
                 # (no lines passed), since its rollover is what gives the
-                # account room again.
+                # account room again. A spent candidate the guard above
+                # admitted scores 0, not below it: `pct` is copied through
+                # unclamped, so 100.5 would otherwise lose to 100.0 on half a
+                # point this module calls noise, and the reset decides.
+                #
+                # REVERSED UNDER THE AT-LIMIT WAIT (`by_recovery_axis`): every
+                # peer it admits holds a sliver at most, where a headroom edge
+                # is noise and the only question left is who returns first.
+                # Room breaks an exact tie there. `dynamic` keeps its T1083
+                # tier in front: a FULL account (h <= 0) serves nothing until
+                # it resets, however soon, and an account at 0 < h serves now.
+                room = -max(h, 0.0)
+                reset = _binding_recovery_ts(usage.get(num), models, now)
                 key: tuple = (
-                    -h,
-                    _binding_recovery_ts(usage.get(num), models, now),
+                    (dynamic_landing and h <= 0, reset, room)
+                    if by_recovery_axis
+                    else (room, reset)
                 )
                 key_axis[num] = "soonest to recover" if by_recovery_axis else "most headroom"
-            elif consume_first and trigger != "at-limit" and not all_above:
+            elif consume_first and trigger != "at-limit":
                 # Soonest weekly reset first (unknown resets sort last), most
                 # policy headroom breaks ties, then sequence order.
                 #
-                # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so neither
-                # escape belongs: `at-limit` is a stopped session, and under
-                # `all_above` the spent guard has admitted candidates on a
-                # RECOVERY argument that this key would re-order by a weekly
-                # reset. `not all_above` covers only the second — one
-                # below-threshold peer clears it, and `failover` never
-                # satisfies it at all. `dynamic` (#321) never satisfies it
-                # either: whenever `all_above` holds, `dynamic_landing`
-                # keeps the `by_recovery_axis and (not dynamic_landing or
-                # dynamic_at_limit_escape)` key a few lines above out of
-                # reach too (its own comment) — this `elif`'s own guard,
-                # `trigger != "at-limit"`, is what keeps `dynamic_at_limit_
-                # escape` False here too (T0938: it requires `trigger ==
-                # "at-limit"`), so every dynamic candidate reaching this key
-                # selection with `all_above` true still falls to the escape
-                # key below instead.
+                # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so an escape
+                # does not belong: `at-limit` is a stopped session. The
+                # all-above states never reach this arm; they rank on room.
                 #
                 # TIERED, because `disabled-active` and `failover` reach this
                 # arm with NO admission axis (both skip the landing gate), and
@@ -4663,21 +4663,12 @@ class AutoSwitchEngine:
                 # window says nothing about the rest, so the servability tier
                 # goes first -- without it a peer with fifty points here and
                 # one overall wins, walls on the next request, and the tick
-                # after pays a second swap. A spent candidate does reach this
-                # arm under `failover`/`disabled-active`, but never on the
-                # escape AXIS: `escape_label` is set for at-limit alone, and
-                # under at-limit the spent guard's conjuncts are a SUPERSET of
-                # `by_recovery_axis`'s, so such a candidate takes the tiered
-                # key above instead. WIDENING `escape_label` PAST AT-LIMIT
-                # REMOVES THAT ARGUMENT.
+                # after pays a second swap. A spent candidate never reaches
+                # this arm: the spent guard admits one only under `all_above`,
+                # which ranks on room above.
                 #
-                # Clamped so equally-spent candidates tie and the reset
-                # decides: `pct` is copied through unclamped, so 100.5 would
-                # outrank 100.0 on half a point this module calls noise. Only
-                # they are touched -- a negative score needs a window past 100.
-                # `recovery_ts` is the 0.0 sentinel outside `all_above`, so
-                # nothing outside it moves; inside it the reset breaks ties
-                # that fell to slot order.
+                # Clamped so a window past 100 does not outrank 100.0 on half a
+                # point this module calls noise.
                 escape_h = (
                     oauth.headroom_on_window(
                         usage.get(num), escape_label, models
@@ -4743,7 +4734,6 @@ class AutoSwitchEngine:
                         else 0
                     ),
                     -max(escape_h if escape_h is not None else lh, 0.0),
-                    recovery_ts,
                 )
                 key_axis[num] = "at-limit escape" if escape_h is not None else "most headroom"
             qualifying.append((key, num))
