@@ -4268,7 +4268,7 @@ class AutoSwitchEngine:
         # not whether to move at all. Scoped to exactly the case
         # `by_recovery_axis` already carved out for every other strategy
         # (at-limit, all_above, a knowable return, nothing healthy to land
-        # on): there `dynamic` takes the same recovery gate and sort key as
+        # on): there `dynamic` takes the same wait gate and sort key as
         # `best`/`consume-first` do, below. Every other dynamic landing
         # decision (the bar itself, the proactive/all_above case) is
         # unchanged.
@@ -4287,12 +4287,7 @@ class AutoSwitchEngine:
         # bar_for_a_healthy_active`, active headroom 8, candidate headroom
         # 2). "Choosing WHERE to be stuck" presupposes the active IS
         # stuck.
-        dynamic_at_limit_escape = (
-            dynamic_landing
-            and trigger == "at-limit"
-            and about_to_wall
-            and by_recovery_axis
-        )
+        dynamic_at_limit_escape = dynamic_landing and about_to_wall and by_recovery_axis
 
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
@@ -4400,11 +4395,10 @@ class AutoSwitchEngine:
                 # T0938): there "recovers soonest" is not a future
                 # optimisation, it is the only question left, the same one
                 # `best`/`consume-first`'s own at-limit escape below already
-                # answers on a spent active. The `all_above` recovery-axis
-                # escape below exists so a proactive/at-limit trigger can
-                # wait on whichever account recovers soonest when nothing
-                # currently qualifies — but for a trigger OTHER than a
-                # genuinely walled at-limit, "recovers soonest" is a future
+                # answers on a spent active. The `all_above` escape below
+                # exists so a proactive/at-limit trigger can still move when
+                # nothing currently qualifies — but for a trigger OTHER than
+                # a genuinely walled at-limit, a peer's return is a future
                 # fact, and landing on it NOW moved the engine onto an
                 # account that was ITSELF still blocked (measured live: a
                 # proactive move onto an account whose own 5h was already at
