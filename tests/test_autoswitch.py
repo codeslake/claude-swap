@@ -12337,6 +12337,58 @@ class TestTheAtLimitEscapeDoesNotLandOnASliver:
             "for a moment nothing can name"
         )
 
+    def test_slivers_that_both_pass_the_wait_are_taken_soonest_return_first(
+        self, harness
+    ):
+        """The wait is the gate; once two slivers pass it, the one that comes
+        back first is the answer, not the one holding more.
+
+        Active at its limit for five hours; peer 1 spent but back in ten
+        minutes; peer 2 holding 2.5 points for the next four hours. Both beat
+        the active's return by more than the hysteresis, so both pass. Ranking
+        them by room lands on peer 2: about twenty-five minutes of work, then
+        every session pinned on its wall for hours. Below SPENT_HEADROOM_PCT a
+        headroom edge is under two poll intervals, so "who returns first" is
+        the only question left.
+        """
+        now = harness.clock.now
+        args = self._args(harness, oauth_candidates=["1", "2"])
+        args["usage"] = {
+            "4": _usage(100.0, _iso_at(now + 5 * 3600)),
+            "1": _usage(100.0, _iso_at(now + 10 * 60)),
+            "2": _usage(97.5, _iso_at(now + 4 * 3600)),
+        }
+        args["headroom"] = {"1": 0.0, "2": 2.5, "4": 0.0}
+        ordered, _, _, waiting = harness.engine._rank_candidates(**args)
+        assert list(ordered) == ["1", "2"], (
+            f"got {list(ordered)} -- both slivers pass the wait, and peer 1 is "
+            "back in ten minutes against peer 2's four hours"
+        )
+        assert not waiting
+
+    def test_a_spent_peer_past_a_hundred_percent_still_passes_the_wait(
+        self, harness
+    ):
+        """Under the wait the active is at its limit, so the room margin is
+        `h >= 0`; a peer the API reads at 100.5% has `h = -0.5` and must not
+        fail it. Room is noise among spent peers: the return decides, and
+        peer 2 is back in ten minutes against peer 1's fifty."""
+        now = harness.clock.now
+        args = self._args(harness, oauth_candidates=["1", "2"])
+        args["usage"] = {
+            "4": _usage(100.0, _iso_at(now + 5 * 3600)),
+            "1": _usage(100.0, _iso_at(now + 50 * 60)),
+            "2": _usage(100.5, _iso_at(now + 10 * 60)),
+        }
+        args["headroom"] = {"1": 0.0, "2": -0.5, "4": 0.0}
+        ordered, _, _, waiting = harness.engine._rank_candidates(**args)
+        assert list(ordered) == ["2", "1"], (
+            f"got {list(ordered)} -- peer 2 is half a point further over its "
+            "limit and back in ten minutes; the half point is not a reason "
+            "to drop it from the wait"
+        )
+        assert not waiting
+
     def test_a_healthy_peer_is_still_taken_the_ordinary_way(self, harness):
         """The second control: this must change nothing when the fleet is not
         all above the threshold. A peer with real headroom wins on headroom,
