@@ -2136,6 +2136,9 @@ class AutoSwitchEngine:
                 # legacy escape/no-return heuristics unnecessary. A recovered
                 # higher tier must be able to reclaim work immediately after
                 # the configured cooldown, even when it is the account we left.
+                # Priority never probes: clear the pick a consume-first tick
+                # left, or it would name this switch "probe".
+                self._last_probe_num = None
                 return self._rank_priority_candidates(
                     oauth_candidates=kw["oauth_candidates"],
                     usage=kw["usage"], headroom=kw["headroom"],
@@ -2962,7 +2965,6 @@ class AutoSwitchEngine:
         waiting on a recovery time. It never probes: an unknown reset sorts
         last in its tier rather than being excluded.
         """
-        self._last_probe_num = None  # else a pick left by a consume-first tick names this switch
         def key(num: str) -> tuple[int, float]:
             reset = _seven_day_reset_ts(usage.get(num), now)
             return (-policies.get(num, AccountPolicy()).priority,
