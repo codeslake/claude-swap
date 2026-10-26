@@ -1101,8 +1101,11 @@ class TestDecisionTable:
         # better than the active 90%, but it already sits over the threshold
         # and would re-trigger on the very next tick — blocked. The 79% peer
         # keeps this out of the every-account-above escape, which drops the
-        # landing rule, and misses the 15-point margin itself.
-        h = EngineHarness(temp_home, threshold=80.0, hysteresis_pct=15.0)
+        # landing rule, and misses the 15-point margin itself. `best` is named:
+        # consume-first, this branch's default, has no margin and would move.
+        h = EngineHarness(
+            temp_home, threshold=80.0, hysteresis_pct=15.0, strategy="best",
+        )
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
@@ -6060,17 +6063,21 @@ class TestDynamicStrategy:
         configured threshold (`all_above`, which reads the raw threshold
         regardless of strategy), and a peer whose OWN window is already at
         the landing bar (`proactive_switch_bar_pct` — 97 under `dynamic`,
-        #321) but whose binding window happens to reset soonest. The
-        pre-existing `all_above` recovery-axis escape admits that peer on
-        recovery timing alone — measured live, the very next tick read
-        `cooldown` while still blocked. `dynamic` closes it; `best`/
-        `consume-first` keep the escape (asserted on the SAME inputs, both
-        directions, as the "unchanged" evidence)."""
+        #321). The `all_above` escape admits that peer — measured live, the
+        very next tick read `cooldown` while still blocked. `dynamic` closes
+        it; `best`/`consume-first` keep the escape (asserted on the SAME
+        inputs, both directions, as the "unchanged" evidence).
+
+        The active holds ONE point and the peer three, so upstream's capped
+        margin (`min(2a, a + 3)` = 2, 21796361) is met and the landing rule
+        is the only thing that differs. The live trace's 8 against 3 no
+        longer moves `best`/`consume-first` at all: the escape ranks by room
+        now, not by which window returns first."""
         h = EngineHarness(temp_home, strategy="dynamic")
         now = h.clock.now
         usage = {
-            "6": {  # active: headroom 8, recovers in ~5.5h
-                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
+            "6": {  # active: headroom 1, recovers in ~5.5h
+                "five_hour": {"pct": 99.0, "resets_at": _iso_at(now + 20000)},
                 "seven_day": {"pct": 0.0},
             },
             "2": {  # candidate: headroom 3 (at the dynamic bar), recovers in 2min
@@ -6078,7 +6085,7 @@ class TestDynamicStrategy:
                 "seven_day": {"pct": 0.0},
             },
         }
-        headroom = {"6": 8.0, "2": 3.0}
+        headroom = {"6": 1.0, "2": 3.0}
         for strategy, expected in (
             ("dynamic", []),
             ("consume-first", ["2"]),
@@ -6086,7 +6093,7 @@ class TestDynamicStrategy:
         ):
             args = self._args(
                 h, usage=usage, current="6", oauth_candidates=["2"],
-                headroom=headroom, active_headroom=8.0,
+                headroom=headroom, active_headroom=1.0,
                 trigger="proactive", strategy=strategy,
             )
             ordered, _, _, _ = h.engine._rank_candidates(**args)
@@ -6234,12 +6241,17 @@ class TestDynamicStrategy:
         "at-limit" and not about_to_wall)` disjunct this test actually
         names -- moving to headroom 3 crosses that OTHER boundary too and
         the row starts passing on `by_recovery_axis` alone, whether or not
-        the code this test names is even present."""
+        the code this test names is even present.
+
+        The active holds six points, not eight: upstream's capped margin
+        (`min(2a, a + 3)`, 21796361) is 9 here, which the peer's ten clears,
+        where against eight points (margin 11) a peer still over its line
+        (at most ten) could never clear it."""
         h = EngineHarness(temp_home, strategy="dynamic")
         now = h.clock.now
         usage = {
             "6": {
-                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
+                "five_hour": {"pct": 94.0, "resets_at": _iso_at(now + 20000)},
                 "seven_day": {"pct": 0.0},
             },
             "2": {
@@ -6247,14 +6259,14 @@ class TestDynamicStrategy:
                 "seven_day": {"pct": 0.0},
             },
         }
-        headroom = {"6": 8.0, "2": 10.0}
+        headroom = {"6": 6.0, "2": 10.0}
         for strategy, expected in (
             ("dynamic", []),
             ("consume-first", ["2"]),
         ):
             args = self._args(
                 h, usage=usage, current="6", oauth_candidates=["2"],
-                headroom=headroom, active_headroom=8.0,
+                headroom=headroom, active_headroom=6.0,
                 trigger="at-limit", strategy=strategy,
             )
             ordered, _, _, _ = h.engine._rank_candidates(**args)
@@ -16708,14 +16720,18 @@ class TestPerAccountSwitchThreshold:
         }
 
     @pytest.mark.parametrize("strategy", ["consume-first", "best"])
-    def test_control_a_fleet_all_past_the_threshold_takes_the_recovery_axis(
+    def test_control_a_fleet_all_past_the_threshold_takes_the_room_axis(
         self, temp_home, strategy
     ):
+        """Every account is past the 90 line, so the move ranks by room, not by
+        which window returns first (upstream 21796361): account 3 returns
+        sooner, account 2 holds a point more, and the margin (`min(2a, a + 3)`
+        = 6 points against the active's 3) is met by both."""
         h = self._harness(temp_home, strategy, threshold=90.0)
         outcome = h.tick_with_usage({
-            "1": self._five(h, 92, 4 * 3600),
-            "2": self._five(h, 95, 600),
-            "3": self._five(h, 95, 900),
+            "1": self._five(h, 97, 4 * 3600),
+            "2": self._five(h, 92, 900),
+            "3": self._five(h, 93, 600),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
@@ -16725,14 +16741,14 @@ class TestPerAccountSwitchThreshold:
         self, temp_home, strategy
     ):
         """The control's fleet, but the active's own line (98) sits above the
-        strategy's 90: at 92 it is not past its line, so peers returning
-        sooner must not pull it onto less room."""
+        strategy's 90: at 97 it is not past its line, so peers with more room
+        must not pull it off an account that is still under its own line."""
         h = self._harness(temp_home, strategy, threshold=90.0)
         self._set(h, 1, 98.0)
         outcome = h.tick_with_usage({
-            "1": self._five(h, 92, 4 * 3600),
-            "2": self._five(h, 95, 600),
-            "3": self._five(h, 95, 900),
+            "1": self._five(h, 97, 4 * 3600),
+            "2": self._five(h, 92, 900),
+            "3": self._five(h, 93, 600),
         })
         assert outcome is not TickOutcome.SWITCHED
         assert h.active_number() == 1
