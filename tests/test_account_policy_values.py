@@ -177,10 +177,9 @@ class TestAccountPolicy:
 
     def test_field_types_are_declared_as_specified(self):
         fields = {f.name: f for f in dataclasses.fields(AccountPolicy)}
-        assert set(fields) == {"threshold"}, (
-            "the policy carries exactly one field, the threshold"
-        )
+        assert set(fields) == {"threshold", "priority"}
         assert fields["threshold"].default is None
+        assert fields["priority"].default == 0
 
 
 class TestAccountSnapshotPolicyField:
