@@ -400,7 +400,6 @@ def test_priority_strategy_uses_existing_configurable_cutoffs(tmp_path):
     assert settings.weekly_threshold == 99.9
 
 
-
 def test_a_disabled_active_holds_no_rank_to_defend(temp_home):
     """`disabled-active` leaves under priority too: the disabled slot is
     outside `switchable_account_numbers()`, so it is not an eligible active."""

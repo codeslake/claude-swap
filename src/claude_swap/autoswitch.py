@@ -2960,8 +2960,7 @@ class AutoSwitchEngine:
         Returns the same four-tuple as ``_rank_candidates``; the last element
         is always False, since this ranking holds and polls rather than
         waiting on a recovery time. It never probes: an unknown reset sorts
-        last in its tier rather than being excluded, so no pick is left for
-        ``_tick_inner`` to name a switch after.
+        last in its tier rather than being excluded.
         """
         self._last_probe_num = None  # else a pick left by a consume-first tick names this switch
         def key(num: str) -> tuple[int, float]:
