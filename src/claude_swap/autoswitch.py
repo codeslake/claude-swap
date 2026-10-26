@@ -2747,7 +2747,7 @@ class AutoSwitchEngine:
         current: str, active_enabled: bool, settings: AutoSwitchSettings,
         now: float, thresholds: Mapping[str, float],
         policies: Mapping[str, AccountPolicy],
-    ) -> tuple[list[str], bool, float | None]:
+    ) -> tuple[list[str], bool, float | None, bool]:
         """Highest usable tier, then earliest weekly reset, with stable ties.
 
         Pure snapshot ranking, also used after the pre-switch refresh. Unknown
@@ -2755,6 +2755,10 @@ class AutoSwitchEngine:
         equal keys, so changing usage alone cannot cause ping-pong. Unlike the
         existing strategies, even at-limit/failover never selects an account
         at its switch line. Priorities do not bypass eligibility checks.
+
+        Returns the same four-tuple as ``_rank_candidates``; the last element
+        is always False, since this ranking holds and polls rather than
+        waiting on a recovery time.
         """
         def key(num: str) -> tuple[int, float]:
             reset = _seven_day_reset_ts(usage.get(num), now)
@@ -2777,6 +2781,7 @@ class AutoSwitchEngine:
             ordered,
             any(headroom.get(num) is not None for num in oauth_candidates),
             _seven_day_reset_ts(usage.get(current), now),
+            False,
         )
 
     def _rank_candidates(
