@@ -3315,9 +3315,8 @@ class AutoSwitchEngine:
                 # loop runs over every candidate.
                 raise _EngineStopped()
             email = self.switcher.account_email(num)
-            if trigger in _FRESHEN_GATED_TRIGGERS or (
-                priority_mode and num in oauth_candidates
-            ):
+            is_priority = priority_mode and num in oauth_candidates
+            if trigger in _FRESHEN_GATED_TRIGGERS or is_priority:
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. No trigger
@@ -3336,7 +3335,14 @@ class AutoSwitchEngine:
                 # None entry must call it zero times, matching every other
                 # clock read on this path (call-order-sensitive tests script
                 # the clock as a fixed sequence).
-                if trigger == "failover":
+                if is_priority:
+                    # Priority rotation lands only on fresh data, escapes and
+                    # failover included: the strict-landing contract has no
+                    # looser bar for a backed-off peer.
+                    unusable = entry is None or candidate_usage_is_stale(
+                        entry, self.clock()
+                    )
+                elif trigger == "failover":
                     # Failover is the ACTIVE credential failing, and a peer
                     # in a 429 backoff is exactly what `trust_extended` keeps
                     # serving past `fresh()`'s TTL so it stays a usable
@@ -3365,12 +3371,13 @@ class AutoSwitchEngine:
                         entry, self.clock()
                     )
                 if unusable:
-                    if trigger in CONSUME_FIRST_STRATEGIES or priority_active_ready:
+                    if trigger in CONSUME_FIRST_STRATEGIES or is_priority:
                         # Sliding to a worse-ranked, later-reset candidate
                         # defeats consume-first's whole point (burn the
                         # soonest-resetting quota first) — hold instead and
                         # retry next tick. A priority rotation off a usable
-                        # active holds for the same reason.
+                        # active holds for the same reason, but is skipped
+                        # past when the active cannot be kept.
                         self._emit(
                             NoSwitchEvent(
                                 reason="stale-usage",
@@ -3381,6 +3388,8 @@ class AutoSwitchEngine:
                                 ),
                             )
                         )
+                        if is_priority and not priority_active_ready:
+                            continue
                         return TickOutcome.NO_ACTION
                     # `proactive`/`failover`: a stale top candidate must not
                     # park the engine at the wall while a healthy, lower-
@@ -3935,7 +3944,7 @@ class AutoSwitchEngine:
         current: str, active_enabled: bool, settings: AutoSwitchSettings,
         now: float, thresholds: Mapping[str, float],
         policies: Mapping[str, AccountPolicy],
-    ) -> tuple[list[str], bool, float | None]:
+    ) -> tuple[list[str], bool, float | None, bool]:
         """Highest usable tier, then earliest weekly reset, with stable ties.
 
         Pure snapshot ranking, also used after the pre-switch refresh. Unknown
@@ -3943,6 +3952,10 @@ class AutoSwitchEngine:
         equal keys, so changing usage alone cannot cause ping-pong. Unlike the
         existing strategies, even at-limit/failover never selects an account
         at its switch line. Priorities do not bypass eligibility checks.
+
+        Returns the same four-tuple as ``_rank_candidates``; the last element
+        is always False, since this ranking holds and polls rather than
+        waiting on a recovery time.
         """
         def key(num: str) -> tuple[int, float]:
             reset = _seven_day_reset_ts(usage.get(num), now)
@@ -3965,6 +3978,7 @@ class AutoSwitchEngine:
             ordered,
             any(headroom.get(num) is not None for num in oauth_candidates),
             _seven_day_reset_ts(usage.get(current), now),
+            False,
         )
 
     def _rank_candidates(
