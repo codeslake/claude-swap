@@ -3150,15 +3150,15 @@ class AutoSwitchEngine:
                 # with no room on the axis this pass ranks by, even when
                 # every account is above the threshold. The `all_above`
                 # escape below exists so a proactive/at-limit trigger can
-                # still move when nothing currently qualifies — but a peer
+                # still move when nothing currently qualifies, but a peer
                 # with no room is a future fact, and landing on it NOW moved
                 # the engine onto an account that was ITSELF still blocked
                 # (measured live: a proactive move onto an account whose own
                 # 5h was already at the switch threshold, which the very next
                 # tick read as `cooldown` while still blocked, and the tick
                 # after that had burned worse). `best`/`consume-first` keep
-                # the escape unchanged — this is additive, gated on the
-                # strategy alone.
+                # the escape unchanged (this is additive, gated on the
+                # strategy alone).
                 dynamic_landing = settings.strategy == "dynamic"
                 if over and not (all_above and not dynamic_landing):
                     continue
