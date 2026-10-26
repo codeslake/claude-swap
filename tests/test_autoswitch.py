@@ -1042,13 +1042,56 @@ class TestDecisionTable:
             "whose five-hour window is at 100% and can answer nothing"
         )
 
+    @pytest.mark.parametrize(
+        "active_pct, peer_pct, moves",
+        [
+            (97.0, 95.0, False),  # 3 vs 5 points: short of min(2*3, 3+3) = 6
+            (97.0, 94.0, True),   # 3 vs 6 points: the margin is met
+            (97.5, 95.0, True),   # 2.5 vs 5 points: min(5, 5.5) = 5 is met
+        ],
+    )
+    def test_the_capped_margin_decides_the_band_a03faa3e_used_to_bypass(
+        self, temp_home, active_pct, peer_pct, moves
+    ):
+        """DEPARTURE from a03faa3e, recorded rather than restored.
+
+        a03faa3e moved off an active at 3 points or less to ANY peer that could
+        serve (above 3 points), whatever the recovery order, so sessions are
+        not pinned on a wall. With every account over its lines the head ranks
+        by room instead (upstream 21796361), and its anti-flap margin is
+        `min(2a, a + 3)` points, which upstream measured against ping-pong:
+        active 97% (3 points) against a peer at 95% (5 points) now holds, where
+        a03faa3e moved, and the move comes once the active is down to 2.5 or
+        the peer is up to 6 points. The peer's 5-hour window resets inside the
+        recovery horizon, the shape the bypass was written for.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(active_pct, 40.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 5 * 60)
+        peer = _usage7(peer_pct, 40.0)
+        peer["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        outcome = h.tick_with_usage({"1": active, "2": peer})
+        if moves:
+            assert outcome is TickOutcome.SWITCHED
+            assert h.active_number() == 2
+        else:
+            assert outcome is not TickOutcome.SWITCHED
+            assert h.active_number() == 1
+
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 15: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold
         # and would re-trigger on the very next tick — blocked. The 79% peer
         # keeps this out of the every-account-above escape, which drops the
-        # landing rule, and misses the 15-point margin itself.
-        h = EngineHarness(temp_home, threshold=80.0, hysteresis_pct=15.0)
+        # landing rule, and misses the 15-point margin itself. `best` is named:
+        # consume-first, this branch's default, has no margin and would move.
+        h = EngineHarness(
+            temp_home, threshold=80.0, hysteresis_pct=15.0, strategy="best",
+        )
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
@@ -4773,17 +4816,22 @@ class TestDynamicStrategy:
         """Reproduces the live trace: active over threshold with real
         headroom (`proactive`, not `at-limit`), every account above the
         threshold (`all_above`), and a peer whose OWN window is already at
-        the switch threshold but whose binding window happens to reset
-        soonest. The pre-existing `all_above` recovery-axis escape admits
-        that peer on recovery timing alone — measured live, the very next
-        tick read `cooldown` while still blocked. `dynamic` closes it;
-        `best`/`consume-first` keep the escape (asserted on the SAME
-        inputs, both directions, as the "unchanged" evidence)."""
+        the switch threshold. The `all_above` escape admits that peer
+        (measured live: the very next tick read `cooldown` while still
+        blocked). `dynamic` closes it; `best`/`consume-first` keep the
+        escape (asserted on the SAME inputs, both directions, as the
+        "unchanged" evidence).
+
+        The active holds six points and the peer ten, so upstream's capped
+        margin (`min(2a, a + 3)` = 9, 21796361) is met and the landing rule
+        is the only thing that differs. The live trace's 8 against 10 no
+        longer moves `best`/`consume-first` at all: the escape ranks by room
+        now, not by which window returns first."""
         h = EngineHarness(temp_home, strategy="dynamic")
         now = h.clock.now
         usage = {
-            "6": {  # active: headroom 8, recovers in ~5.5h
-                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
+            "6": {  # active: headroom 6, recovers in ~5.5h
+                "five_hour": {"pct": 94.0, "resets_at": _iso_at(now + 20000)},
                 "seven_day": {"pct": 0.0},
             },
             "2": {  # candidate: headroom 10 (at the wall), recovers in 2min
@@ -4791,7 +4839,7 @@ class TestDynamicStrategy:
                 "seven_day": {"pct": 0.0},
             },
         }
-        headroom = {"6": 8.0, "2": 10.0}
+        headroom = {"6": 6.0, "2": 10.0}
         for strategy, expected in (
             ("dynamic", []),
             ("consume-first", ["2"]),
@@ -4799,7 +4847,7 @@ class TestDynamicStrategy:
         ):
             args = self._args(
                 h, usage=usage, current="6", oauth_candidates=["2"],
-                headroom=headroom, active_headroom=8.0,
+                headroom=headroom, active_headroom=6.0,
                 trigger="proactive", strategy=strategy,
             )
             ordered, _, _, _ = h.engine._rank_candidates(**args)
@@ -4856,12 +4904,17 @@ class TestDynamicStrategy:
         active NOT `about_to_wall` on this axis (the 5h/7d retry pass,
         where the active can hold real headroom even though the model gate
         that set the trigger spent it) — the other trigger the `all_above`
-        recovery axis reaches."""
+        escape reaches.
+
+        The active holds six points, not eight: upstream's capped margin
+        (`min(2a, a + 3)`, 21796361) is 9 here, which the peer's ten clears,
+        where against eight points (margin 11) a peer still over its line
+        (at most ten) could never clear it."""
         h = EngineHarness(temp_home, strategy="dynamic")
         now = h.clock.now
         usage = {
             "6": {
-                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
+                "five_hour": {"pct": 94.0, "resets_at": _iso_at(now + 20000)},
                 "seven_day": {"pct": 0.0},
             },
             "2": {
@@ -4869,14 +4922,14 @@ class TestDynamicStrategy:
                 "seven_day": {"pct": 0.0},
             },
         }
-        headroom = {"6": 8.0, "2": 10.0}
+        headroom = {"6": 6.0, "2": 10.0}
         for strategy, expected in (
             ("dynamic", []),
             ("consume-first", ["2"]),
         ):
             args = self._args(
                 h, usage=usage, current="6", oauth_candidates=["2"],
-                headroom=headroom, active_headroom=8.0,
+                headroom=headroom, active_headroom=6.0,
                 trigger="at-limit", strategy=strategy,
             )
             ordered, _, _, _ = h.engine._rank_candidates(**args)
