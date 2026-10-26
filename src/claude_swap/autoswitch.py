@@ -331,8 +331,9 @@ def _overload_bar_releases(trigger: str) -> bool:
     """May a barred-empty ranking fall back to the unfiltered candidate
     list, dropping the overload bar to retry rather than staying BLOCKED?
 
-    Only on an escape. ``proactive`` and ``consume-first`` already read an
-    empty ranking as the correct outcome, not a stall to retry out of; and
+    Only on an escape. ``proactive``, ``consume-first`` and ``priority``
+    already read an empty ranking as the correct outcome, not a stall to
+    retry out of; and
     releasing on a SECOND ``overloaded`` fire walks the whole fleet one
     switch every two ticks (each fire bars the account it lands on next, so
     the next fire finds everyone barred and would release right back).
@@ -350,7 +351,7 @@ def _overload_bar_releases(trigger: str) -> bool:
     shipped unscoped for two rounds running: the invariant lived at the call
     site, so the second site never inherited the fix made to the first.
     """
-    return trigger not in ("proactive", "consume-first", "overloaded")
+    return trigger not in ("proactive", "consume-first", "priority", "overloaded")
 
 
 # Ceiling on `stop()`'s wait for an in-flight TICK before it frees the LIVE
@@ -2298,13 +2299,24 @@ class AutoSwitchEngine:
                 # legacy escape/no-return heuristics unnecessary. A recovered
                 # higher tier must be able to reclaim work immediately after
                 # the configured cooldown, even when it is the account we left.
-                return self._rank_priority_candidates(
-                    oauth_candidates=kw["oauth_candidates"],
-                    usage=kw["usage"], headroom=kw["headroom"],
-                    current=current, active_enabled=current in switchable,
-                    settings=settings, now=kw["now"], thresholds=thresholds,
-                    policies=policies,
-                )
+                # The overload and refusal bars are not anti-flap: the API is
+                # failing on that account, so they bind here too, and release
+                # on the same escapes as above.
+                def rank_priority(backoff):
+                    return self._rank_priority_candidates(
+                        oauth_candidates=kw["oauth_candidates"],
+                        usage=kw["usage"], headroom=kw["headroom"],
+                        current=current, active_enabled=current in switchable,
+                        settings=settings, now=kw["now"], thresholds=thresholds,
+                        policies=policies, overload_backoff=backoff,
+                    )
+
+                ranked = rank_priority(overload_backoff)
+                if not ranked[0] and overload_backoff and _overload_bar_releases(trigger):
+                    unbarred = rank_priority({})
+                    if unbarred[0]:
+                        return unbarred
+                return ranked
             # Recomputed per snapshot, never once per tick: the consume-first
             # two-phase commit replaces `headroom` and `active_headroom` and
             # re-ranks, and the ratio release consumes exactly those two
@@ -2458,7 +2470,7 @@ class AutoSwitchEngine:
                 )
                 return (
                     TickOutcome.NO_ACTION
-                    if trigger == "consume-first"
+                    if trigger in ("consume-first", "priority")
                     else TickOutcome.BLOCKED
                 )
             if priority_active_ready:
@@ -3203,14 +3215,20 @@ class AutoSwitchEngine:
         current: str, active_enabled: bool, settings: AutoSwitchSettings,
         now: float, thresholds: Mapping[str, float],
         policies: Mapping[str, AccountPolicy],
-    ) -> tuple[list[str], bool, float | None]:
+        overload_backoff: Mapping[str, float] | None = None,
+    ) -> tuple[list[str], bool, float | None, bool]:
         """Highest usable tier, then earliest weekly reset, with stable ties.
 
         Pure snapshot ranking, also used after the pre-switch refresh. Unknown
         reset times sort last within a tier; an eligible active account wins
         equal keys, so changing usage alone cannot cause ping-pong. Unlike the
         existing strategies, even at-limit/failover never selects an account
-        at its switch line. Priorities do not bypass eligibility checks.
+        at its switch line. Priorities do not bypass eligibility checks, nor
+        the overload and refusal bars (``overload_backoff``).
+
+        Returns the same four-tuple as ``_rank_candidates``; the last element
+        is always False, since this ranking holds and polls rather than
+        waiting on a recovery time.
         """
         def key(num: str) -> tuple[int, float]:
             reset = _seven_day_reset_ts(usage.get(num), now)
@@ -3226,6 +3244,7 @@ class AutoSwitchEngine:
         ordered = [
             num for num in oauth_candidates
             if self._priority_ready(usage.get(num), headroom.get(num), settings, thresholds[num])
+            and now >= ((overload_backoff or {}).get(num) or 0)
             and (active_key is None or key(num) < active_key)
         ]
         ordered.sort(key=key)  # Sequence order breaks candidate ties.
@@ -3233,6 +3252,7 @@ class AutoSwitchEngine:
             ordered,
             any(headroom.get(num) is not None for num in oauth_candidates),
             _seven_day_reset_ts(usage.get(current), now),
+            False,
         )
 
     def _rank_candidates(
@@ -3443,11 +3463,11 @@ class AutoSwitchEngine:
                 # facts: an active whose reset has passed can return at any
                 # moment and must not lose to a peer hours out.
                 #
-                # `all_above` FIRST, and it is what makes the rest safe to
-                # read: it is False whenever the active is unmeasured, which is
-                # the state `(active_headroom or 0.0)` cannot tell from a spent
-                # one. This branch IS reached on failover -- the exhausted-fleet
-                # exit is downstream of the ranking, not before it.
+                # `all_above` FIRST. For the escapes it ignores the active, so
+                # an unmeasured one reads `(active_headroom or 0.0)` as spent;
+                # `active_recovery_ts != inf` is what refuses that state (no
+                # window means `inf`). This branch IS reached on failover --
+                # the exhausted-fleet exit is downstream of the ranking.
                 #
                 # NO TEST CAN KILL `all_above` ALONE, and that is measured
                 # rather than missing: both recovery values are read as
@@ -3483,9 +3503,10 @@ class AutoSwitchEngine:
             if by_recovery_axis and (
                 recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S
             ):
-                # Hysteresis on the axis we rank by: the target must come back
-                # meaningfully sooner than the account we are on. It bounds
-                # the flap RATE rather than making a reverse move impossible.
+                # A sliver is worth moving to only if it comes back
+                # meaningfully sooner than the account we are on; otherwise
+                # wait. This gates admission and the room key below orders
+                # whoever passes, so the two never disagree about the winner.
                 continue
             if trigger in ("proactive", "consume-first"):
                 # Landing must be healthy: an account at/over any of its own
@@ -3526,13 +3547,7 @@ class AutoSwitchEngine:
                     # would park on the account about to hit its limit.
                     if lh - active_lh < settings.hysteresis_pct:
                         continue
-            if by_recovery_axis:
-                # Ranked on the axis its own gate decided: nothing here can
-                # serve, so who returns first goes first and room only breaks
-                # a tie. Same predicate for the gate and the key, so the
-                # filter and the sort stay on one axis.
-                key: tuple = (0, recovery_ts, -h)
-            elif all_above:
+            if all_above:
                 # Every trigger, escapes included: at-limit and failover skip
                 # the gate above, but an escape sorting by consume-first's
                 # weekly key here lands on whichever spent account resets
@@ -3541,22 +3556,21 @@ class AutoSwitchEngine:
                 # sooner is plainly better than a lower slot number. It is the
                 # reset of the window the room is measured on, the fullest one
                 # (no lines passed), since its rollover is what gives the
-                # account room again.
+                # account room again. A spent candidate the guard above
+                # admitted scores 0, not below it: `pct` is copied through
+                # unclamped, so 100.5 would otherwise lose to 100.0 on half a
+                # point this module calls noise, and the reset decides.
                 key: tuple = (
-                    -h,
+                    -max(h, 0.0),
                     _binding_recovery_ts(usage.get(num), self._models, now),
                 )
-            elif consume_first and trigger != "at-limit" and not all_above:
+            elif consume_first and trigger != "at-limit":
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 #
-                # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so neither
-                # escape belongs: `at-limit` is a stopped session, and under
-                # `all_above` the spent guard has admitted candidates on a
-                # RECOVERY argument that this key would re-order by a weekly
-                # reset. `not all_above` covers only the second — one
-                # below-threshold peer clears it, and `failover` never
-                # satisfies it at all.
+                # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so an escape
+                # does not belong: `at-limit` is a stopped session. The
+                # all-above states never reach this arm; they rank on room.
                 #
                 # TIERED, because `disabled-active` and `failover` reach this
                 # arm with NO admission axis (both skip the landing gate), and
@@ -3591,21 +3605,12 @@ class AutoSwitchEngine:
                 # window says nothing about the rest, so the servability tier
                 # goes first -- without it a peer with fifty points here and
                 # one overall wins, walls on the next request, and the tick
-                # after pays a second swap. A spent candidate does reach this
-                # arm under `failover`/`disabled-active`, but never on the
-                # escape AXIS: `escape_label` is set for at-limit alone, and
-                # under at-limit the spent guard's conjuncts are a SUPERSET of
-                # `by_recovery_axis`'s, so such a candidate takes the tiered
-                # key above instead. WIDENING `escape_label` PAST AT-LIMIT
-                # REMOVES THAT ARGUMENT.
+                # after pays a second swap. A spent candidate never reaches
+                # this arm: the spent guard admits one only under `all_above`,
+                # which ranks above.
                 #
-                # Clamped so equally-spent candidates tie and the reset
-                # decides: `pct` is copied through unclamped, so 100.5 would
-                # outrank 100.0 on half a point this module calls noise. Only
-                # they are touched -- a negative score needs a window past 100.
-                # `recovery_ts` is the 0.0 sentinel outside `all_above`, so
-                # nothing outside it moves; inside it the reset breaks ties
-                # that fell to slot order.
+                # Clamped so a window past 100 does not outrank 100.0 on half a
+                # point this module calls noise.
                 escape_h = (
                     oauth.headroom_on_window(
                         usage.get(num), escape_label, self._models
@@ -3622,7 +3627,6 @@ class AutoSwitchEngine:
                 key = (
                     0 if h > SPENT_HEADROOM_PCT else 1,
                     -max(escape_h if escape_h is not None else lh, 0.0),
-                    recovery_ts,
                 )
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.

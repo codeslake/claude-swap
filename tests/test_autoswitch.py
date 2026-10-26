@@ -1088,7 +1088,9 @@ class TestDecisionTable:
         # and would re-trigger on the very next tick — blocked. The 79% peer
         # keeps this out of the every-account-above escape, which drops the
         # landing rule, and misses the 15-point margin itself.
-        h = EngineHarness(temp_home, threshold=80.0, hysteresis_pct=15.0)
+        h = EngineHarness(
+            temp_home, threshold=80.0, hysteresis_pct=15.0, strategy="best"
+        )
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")

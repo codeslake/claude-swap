@@ -1,11 +1,13 @@
 """Optional priority tiers, strict landing, and a complete multi-tick rotation."""
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 
 from claude_swap.autoswitch import (
+    OVERLOAD_BACKOFF_S,
     NoSwitchEvent,
     SwitchEvent,
     TickOutcome,
@@ -353,7 +355,7 @@ class TestPriorityCli(PolicyCliBase):
         self._main(["priority"])
         out = capsys.readouterr().out
         assert "account-2@example.test" in out and "100" in out
-        assert load_settings(s.backup_dir).strategy == "best"
+        assert load_settings(s.backup_dir).strategy == "consume-first"  # this branch's default
         self._main(["priority", "2", "--unset"])
         assert "priority" not in self._record(s, "2")
         before = s.sequence_file.read_bytes()
@@ -399,3 +401,37 @@ def test_priority_strategy_uses_existing_configurable_cutoffs(tmp_path):
     assert settings.threshold == 85
     assert settings.weekly_threshold == 99.9
 
+
+@pytest.mark.parametrize("active_pct,expected,landed", [
+    # A priority nudge reads an empty ranking as a correct stay.
+    (10, TickOutcome.NO_ACTION, 1),
+    # Over a line but not at the limit: not an escape, so the bar holds.
+    (95, TickOutcome.BLOCKED, 1),
+    # At the limit with nowhere else to go: the bar releases.
+    (100, TickOutcome.SWITCHED, 2),
+])
+def test_an_account_barred_after_an_api_failure_is_not_a_priority_target(
+    temp_home, active_pct, expected, landed
+):
+    """The overload bar is not anti-flap: the API is failing on that account,
+    so the higher tier waits out the bar, and only an escape releases it."""
+    h = fleet(temp_home)
+    h.switcher.set_account_priority("2", 200)
+    h.engine._overload_backoff["2"] = h.clock.now + OVERLOAD_BACKOFF_S
+    values = usage(h, pcts=(active_pct, 10, 90, 90))
+    assert h.tick_with_usage(values) is expected
+    assert h.active_number() == landed
+
+
+def test_a_refused_higher_tier_is_a_stay_not_a_block(temp_home):
+    """The refusal mark bars the account like an overload escape does; a
+    priority nudge that stays because of it is a correct stay, as for
+    consume-first, so cron wrappers keying on BLOCKED do not see a false one."""
+    h = fleet(temp_home)
+    h.switcher.set_account_priority("2", 200)
+    entries = {n: _entry_for(v, h.clock.now) for n, v in usage(h).items()}
+    entries["2"] = replace(entries["2"], refused_until=h.clock.now + 600)
+    assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+    assert h.active_number() == 1
+    reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+    assert reasons == ["account-refused"]
