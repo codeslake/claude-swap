@@ -3119,7 +3119,7 @@ class AutoSwitchEngine:
                     usage=kw["usage"], headroom=kw["headroom"],
                     current=current, active_enabled=current in switchable,
                     settings=settings, now=kw["now"], thresholds=thresholds,
-                    policies=policies,
+                    policies=policies, models=self._models,
                 )
             # Recomputed per snapshot, never once per tick: the consume-first
             # two-phase commit replaces `headroom` and `active_headroom` and
@@ -3217,7 +3217,8 @@ class AutoSwitchEngine:
             priority_mode
             and current in switchable
             and self._priority_ready(
-                usage.get(current), headroom.get(current), settings, thresholds[current]
+                usage.get(current), headroom.get(current), settings,
+                thresholds[current], self._models,
             )
         )
         if (
@@ -3992,23 +3993,26 @@ class AutoSwitchEngine:
             < was - RECOVERY_HYSTERESIS_S
         )
 
+    @staticmethod
     def _priority_ready(
-        self, value: dict | str | None, headroom: float | None,
+        value: dict | str | None, headroom: float | None,
         settings: AutoSwitchSettings, threshold: float,
+        models: Sequence[str],
     ) -> bool:
         """Priority rotation never lands at or above any configured line."""
-        binding = self._binding(value, settings, threshold)
+        binding = _binding_at(value, settings, models, threshold)
         return (
             headroom is not None and headroom > 0
             and binding is not None and not binding.over
         )
 
+    @staticmethod
     def _rank_priority_candidates(
-        self, *, oauth_candidates: list[str],
+        *, oauth_candidates: list[str],
         usage: dict[str, dict | str | None], headroom: dict[str, float | None],
         current: str, active_enabled: bool, settings: AutoSwitchSettings,
         now: float, thresholds: Mapping[str, float],
-        policies: Mapping[str, AccountPolicy],
+        policies: Mapping[str, AccountPolicy], models: Sequence[str],
     ) -> tuple[list[str], bool, float | None, bool]:
         """Highest usable tier, then earliest weekly reset, with stable ties.
 
@@ -4020,8 +4024,11 @@ class AutoSwitchEngine:
 
         Returns the same four-tuple as ``_rank_candidates``; the last element
         is always False, since this ranking holds and polls rather than
-        waiting on a recovery time.
+        waiting on a recovery time. Static, with a module-level alias below,
+        so the "Next best" panel ranks through it without an engine instance.
         """
+        ready = AutoSwitchEngine._priority_ready
+
         def key(num: str) -> tuple[int, float]:
             reset = _seven_day_reset_ts(usage.get(num), now)
             return (-policies.get(num, AccountPolicy()).priority,
@@ -4029,13 +4036,14 @@ class AutoSwitchEngine:
 
         active_key = (
             key(current)
-            if active_enabled and self._priority_ready(
-                usage.get(current), headroom.get(current), settings, thresholds[current]
+            if active_enabled and ready(
+                usage.get(current), headroom.get(current), settings,
+                thresholds[current], models,
             ) else None
         )
         ordered = [
             num for num in oauth_candidates
-            if self._priority_ready(usage.get(num), headroom.get(num), settings, thresholds[num])
+            if ready(usage.get(num), headroom.get(num), settings, thresholds[num], models)
             and (active_key is None or key(num) < active_key)
         ]
         ordered.sort(key=key)  # Sequence order breaks candidate ties.
@@ -5504,7 +5512,8 @@ class AutoSwitchEngine:
             self._wake.wait(delay)
 
 
-# A direct module-level name, not `AutoSwitchEngine._rank_candidates_pass`:
-# a caller that only wants the (pure, static) ranking -- the "Next best"
-# panel -- needs no engine instance to reach it.
+# Direct module-level names, not `AutoSwitchEngine._rank_candidates_pass` and
+# `._rank_priority_candidates`: a caller that only wants the (pure, static)
+# ranking -- the "Next best" panel -- needs no engine instance to reach it.
 rank_candidates_pass = AutoSwitchEngine._rank_candidates_pass
+rank_priority_candidates = AutoSwitchEngine._rank_priority_candidates

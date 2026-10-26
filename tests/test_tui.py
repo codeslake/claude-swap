@@ -2073,6 +2073,110 @@ class TestRankSwitchOwnBars:
         assert ordered == ["2"], ordered
 
 
+class TestPanelOrderIsTheEnginesOrder:
+    """The panel asks the engine who can be picked (#371), so where the engine
+    has its own order the panel's list is the order a real tick acts on: its
+    top row is the account the tick switches to. Pinned for the two regimes
+    upstream added that order unlike the strategies the panel once imitated:
+    `priority-consume-first` (tier, then soonest weekly reset) and a fleet
+    entirely over its lines (most room, whatever returns first)."""
+
+    @staticmethod
+    def _tick_and_panel(temp_home, fleet, *, tiers=None, **kw):
+        """Tick the real engine on ``fleet`` (account 1 active); return the
+        account it switched to, the panel's ordered list and its rendered text
+        for the same fleet."""
+        from claude_swap.autoswitch import TickOutcome
+        from tests.test_autoswitch import EngineHarness
+
+        tiers = tiers or {}
+        h = EngineHarness(temp_home, **kw)
+        for num in fleet:
+            h.seed(int(num), f"user{num}@example.com")
+        h.make_live("user1@example.com", 1)
+        for num, tier in tiers.items():
+            h.switcher.set_account_priority(num, tier)
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(
+                    num,
+                    active=num == "1",
+                    entry=UsageEntry(
+                        last_good=value, fetched_at=time.time(), age_s=0.0
+                    ),
+                    policy=AccountPolicy(priority=tiers.get(num, 0)),
+                )
+                for num, value in fleet.items()
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(**kw)
+        ordered = tui_data.rank_switch_candidates(snap, settings, time.time(), "1")[0]
+        return str(h.active_number()), ordered, _autoview_text(snap, "1", settings)
+
+    @pytest.mark.parametrize("active_pct", [50.0, 96.0])
+    def test_priority_consume_first_lists_tier_first_then_the_soonest_reset(
+        self, temp_home, active_pct
+    ):
+        """The active is below its line (a priority move off a healthy
+        account) or over it (a proactive one); either way the order is tier,
+        then weekly reset, and an account over its own line is never listed
+        however high its tier."""
+        def w(pct, days):
+            return {
+                "five_hour": {"pct": pct},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_in(days * 86400)},
+            }
+
+        fleet = {
+            "1": w(active_pct, 9),   # tier 0
+            "2": w(95.0, 1),         # tier 100, but over its line
+            "3": w(20.0, 2),         # tier 100
+            "4": w(10.0, 1 / 24),    # tier 50, the soonest reset of all
+            "5": w(20.0, 1),         # tier 100, ahead of 3 on reset
+        }
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, fleet, tiers={"2": 100, "3": 100, "4": 50, "5": 100},
+            strategy="priority-consume-first", threshold=90.0,
+            cooldown_seconds=0.0,
+        )
+        assert engine_pick == "5"
+        assert ordered == ["5", "3", "4"], ordered
+        assert "Next best (highest tier, then soonest reset)" in rendered, rendered
+        positions = [rendered.index(f"user{n}@example.com") for n in ordered]
+        assert positions == sorted(positions), rendered
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_a_fleet_entirely_over_its_lines_lists_the_most_room_first(
+        self, temp_home, strategy
+    ):
+        """Every account is past the 90 line, so the engine ranks by room and
+        holds the move to a capped margin (6 points against the active's 3):
+        #2 holds 8, #3 holds 7 and returns sooner, #4 holds 4 and misses the
+        margin. By which window returns first (the order before upstream's
+        21796361) #4 would head the list."""
+        def w(pct, secs):
+            return {
+                "five_hour": {"pct": pct, "resets_at": _iso_in(secs)},
+                "seven_day": {"pct": 10.0},
+            }
+
+        fleet = {
+            "1": w(97.0, 4 * 3600),
+            "2": w(92.0, 900),
+            "3": w(93.0, 600),
+            "4": w(96.0, 300),
+        }
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, fleet, strategy=strategy, threshold=90.0,
+        )
+        assert engine_pick == "2"
+        assert ordered == ["2", "3"], ordered
+        assert "Next best (most headroom)" in rendered, rendered
+
+
 @pytest.mark.asyncio
 class TestSharedAccountOrder:
     """Dashboard/Switch/Watch render `ordered_accounts`; Remove/Disable keep slot order."""
@@ -3981,6 +4085,31 @@ class TestUnswitchableRowsAreListed:
         ), active="1", settings=settings)
         assert "not previewed (active below threshold)" in out, out
 
+    def test_CONTROL_the_api_key_last_resort_waits_for_the_priority_active_to_hit_its_line(
+        self,
+    ):
+        """`priority-consume-first` below its line is a `priority` tick, which
+        is outside the engine's last-resort set (autoswitch.py: `trigger not in
+        (*CONSUME_FIRST_STRATEGIES, "priority")`): it holds rather than move
+        onto a metered account. Over its line the last resort stands."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(
+            strategy="priority-consume-first", threshold=90.0,
+            include_api_key_accounts=True,
+        )
+
+        def render(active_pct):
+            active = {"five_hour": {"pct": active_pct}, "seven_day": {"pct": 20.0}}
+            return self._render(self._snap(
+                self._acct("1", "active@x.com", switchable=True, last_good=active),
+                self._acct("2", "apikey@x.com", switchable=True, kind="api_key",
+                           last_good={}),
+            ), active="1", settings=settings)
+
+        assert "no candidate qualifies" in render(20.0)
+        assert "no candidate qualifies" not in render(95.0)
+
     def test_the_api_key_last_resort_sorts_above_a_refused_oauth_row(self):
         """The fallback (:539) can set `ordered` to an API-key row while a
         refused OAuth peer is also listed -- that peer is not the engine's
@@ -4057,21 +4186,33 @@ class TestUnswitchableRowsAreListed:
 
     def test_the_legend_prints_the_engines_own_axis(self):
         """The legend names `_rank_candidates_pass`'s own 5th return value,
-        not a re-derived key: the one-way `fallback` list (autoswitch.py
-        :3654) admits both peers by soonest recovery, not headroom."""
+        not a re-derived key. With every account over its line the engine
+        ranks by room, so the peer that returns LATER but holds more heads the
+        list under "most headroom"; at the active's limit it waits on the
+        soonest return instead, and the legend says so."""
         from claude_swap.settings import AutoSwitchSettings
 
-        active = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 97.0, "resets_at": _iso_in(20 * 3600)}}
-        sooner = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 96.5, "resets_at": _iso_in(5 * 3600)}}
-        later = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 96.0, "resets_at": _iso_in(6 * 3600)}}
-        out = self._render(self._snap(
-            self._acct("1", "active@x.com", switchable=True, last_good=active),
-            self._acct("2", "sooner@x.com", switchable=True, last_good=sooner),
-            self._acct("3", "later@x.com", switchable=True, last_good=later),
-        ), active="1", settings=AutoSwitchSettings(strategy="best", threshold=90.0))
+        def week(pct, hours):
+            return {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": pct, "resets_at": _iso_in(hours * 3600)},
+            }
+
+        def render(active, sooner, later):
+            return self._render(self._snap(
+                self._acct("1", "active@x.com", switchable=True, last_good=active),
+                self._acct("2", "sooner@x.com", switchable=True, last_good=sooner),
+                self._acct("3", "later@x.com", switchable=True, last_good=later),
+            ), active="1", settings=AutoSwitchSettings(strategy="best", threshold=90.0))
+
+        out = render(week(97.0, 20), week(93.0, 5), week(92.0, 6))
+        assert out.index("later@x.com") < out.index("sooner@x.com"), out
+        assert "Next best (most headroom)" in out, out
+        assert "Next best (soonest to recover)" not in out, out
+
+        out = render(week(100.0, 20), week(99.0, 5), week(98.5, 6))
         assert out.index("sooner@x.com") < out.index("later@x.com"), out
         assert "Next best (soonest to recover)" in out, out
-        assert "Next best (most headroom)" not in out, out
 
     def test_unswitchable_rows_sort_last(self):
         out = self._render(self._snap(

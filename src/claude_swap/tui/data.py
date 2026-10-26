@@ -38,6 +38,7 @@ from claude_swap.autoswitch import (
     _ruler,
     _wall_headroom,
     rank_candidates_pass,
+    rank_priority_candidates,
 )
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.models import AccountsSnapshot
@@ -317,6 +318,8 @@ def rank_switch_candidates(
             if active_binding is not None
             else (100.0 - active_headroom) < departure_pct
         ):
+            if settings.strategy == "priority-consume-first":
+                return "priority"  # ranks below the line too, by tier
             return (
                 settings.strategy
                 if settings.strategy in CONSUME_FIRST_STRATEGIES
@@ -397,6 +400,25 @@ def rank_switch_candidates(
         if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
             return _rank_dynamic_on(axis, trigger)
         headroom = _headroom_by_account(usage, axis)
+        if settings.strategy == "priority-consume-first":
+            # The engine ranks every trigger through its priority pass alone.
+            ordered, *_ = rank_priority_candidates(
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=active_number,
+                active_enabled=any(
+                    acc.number == active_number and acc.switchable and not acc.disabled
+                    for acc in snap.accounts
+                ),
+                settings=settings,
+                now=now,
+                thresholds=bars,
+                policies={acc.number: acc.policy for acc in snap.accounts},
+                models=axis,
+            )
+            # The legend names `_rank_priority_candidates`'s own sort key.
+            return ordered, ("highest tier, then soonest reset" if ordered else None)
         ordered, _any_known, _reset_ts, _waiting, rank_axis = rank_candidates_pass(
             models=axis,
             trigger=trigger,
@@ -439,7 +461,7 @@ def rank_switch_candidates(
         not ordered
         and api_key_candidates
         and not unmodeled
-        and trigger not in CONSUME_FIRST_STRATEGIES
+        and trigger not in (*CONSUME_FIRST_STRATEGIES, "priority")
     ):
         ordered, rank_axis = api_key_candidates, None
     return ordered, rank_axis, trigger, unmodeled
