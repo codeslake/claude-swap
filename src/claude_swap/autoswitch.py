@@ -3509,22 +3509,22 @@ class AutoSwitchEngine:
                 # sooner is plainly better than a lower slot number. It is the
                 # reset of the window the room is measured on, the fullest one
                 # (no lines passed), since its rollover is what gives the
-                # account room again.
-                key: tuple = (
-                    -h,
-                    _binding_recovery_ts(usage.get(num), models, now),
-                )
-            elif consume_first and trigger != "at-limit" and not all_above:
+                # account room again. Room clamps at zero: `pct` is copied
+                # through unclamped, so a spent candidate at 100.5 would lose
+                # to one at 100.0 on half a point this module calls noise.
+                #
+                # Under the at-limit wait every peer holds a sliver at most, so
+                # who returns first leads and room breaks the tie.
+                room = -max(h, 0.0)
+                reset = _binding_recovery_ts(usage.get(num), models, now)
+                key: tuple = (reset, room) if by_recovery_axis else (room, reset)
+            elif consume_first and trigger != "at-limit":
                 # Soonest weekly reset first (unknown resets sort last), most
                 # policy headroom breaks ties, then sequence order.
                 #
-                # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so neither
-                # escape belongs: `at-limit` is a stopped session, and under
-                # `all_above` the spent guard has admitted candidates on a
-                # RECOVERY argument that this key would re-order by a weekly
-                # reset. `not all_above` covers only the second — one
-                # below-threshold peer clears it, and `failover` never
-                # satisfies it at all.
+                # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so an escape
+                # does not belong: `at-limit` is a stopped session. The
+                # all-above states never reach this arm; they rank on room.
                 #
                 # TIERED, because `disabled-active` and `failover` reach this
                 # arm with NO admission axis (both skip the landing gate), and
@@ -3559,21 +3559,12 @@ class AutoSwitchEngine:
                 # window says nothing about the rest, so the servability tier
                 # goes first -- without it a peer with fifty points here and
                 # one overall wins, walls on the next request, and the tick
-                # after pays a second swap. A spent candidate does reach this
-                # arm under `failover`/`disabled-active`, but never on the
-                # escape AXIS: `escape_label` is set for at-limit alone, and
-                # under at-limit the spent guard's conjuncts are a SUPERSET of
-                # `by_recovery_axis`'s, so such a candidate takes the tiered
-                # key above instead. WIDENING `escape_label` PAST AT-LIMIT
-                # REMOVES THAT ARGUMENT.
+                # after pays a second swap. A spent candidate never reaches
+                # this arm: the spent guard admits one only under `all_above`,
+                # which ranks on room above.
                 #
-                # Clamped so equally-spent candidates tie and the reset
-                # decides: `pct` is copied through unclamped, so 100.5 would
-                # outrank 100.0 on half a point this module calls noise. Only
-                # they are touched -- a negative score needs a window past 100.
-                # `recovery_ts` is the 0.0 sentinel outside `all_above`, so
-                # nothing outside it moves; inside it the reset breaks ties
-                # that fell to slot order.
+                # Clamped so a window past 100 does not outrank 100.0 on half a
+                # point this module calls noise.
                 escape_h = (
                     oauth.headroom_on_window(
                         usage.get(num), escape_label, models
@@ -3590,7 +3581,6 @@ class AutoSwitchEngine:
                 key = (
                     0 if h > SPENT_HEADROOM_PCT else 1,
                     -max(escape_h if escape_h is not None else lh, 0.0),
-                    recovery_ts,
                 )
             qualifying.append((key, num))
         # AT MOST ONE PROBE PER DECISION. `select_probe_target` picks the
