@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+import gc
 import json
 import os
 import shutil
@@ -885,3 +887,11 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if item.get_closest_marker("no_keychain_fake"):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
+
+
+def pytest_configure():
+    # A disposable xdist worker skips the exit-time collection of the heap the
+    # session built. atexit runs after pytest's whole cleanup stack, the final
+    # unraisable-exception sweep included; the controller and -n 0 never freeze.
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        atexit.register(gc.freeze)

@@ -16,9 +16,11 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    RunSettings,
     UiSettings,
     UpdateSettings,
     effective_settings,
+    load_run_settings,
     load_settings,
     load_ui_settings,
     load_update_settings,
@@ -169,6 +171,24 @@ class TestUiSettings:
         assert load_ui_settings(tmp_path) == UiSettings(show_org_tag=False)
 
 
+class TestRunSettings:
+    def test_missing_file_defaults_to_per_account_history(self, tmp_path: Path):
+        assert load_run_settings(tmp_path) == RunSettings(share_history=False)
+
+    def test_reads_share_history(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": True}}))
+        assert load_run_settings(tmp_path).share_history is True
+
+    def test_non_bool_falls_back_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": "yes"}}))
+        assert load_run_settings(tmp_path).share_history is False
+
+    def test_set_share_history(self, tmp_path: Path):
+        assert set_setting(tmp_path, "run.shareHistory", "true") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "run": {"shareHistory": True}}
+
+
 class TestUpdateSettings:
     def test_missing_file_checks(self, tmp_path: Path):
         assert load_update_settings(tmp_path) == UpdateSettings(check=True)
@@ -201,6 +221,9 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["run"] == {
+            f.name for f in RunSettings.__dataclass_fields__.values()
+        }
         assert by_section["updates"] == {
             f.name for f in UpdateSettings.__dataclass_fields__.values()
         }
@@ -209,6 +232,7 @@ class TestSettingSpecs:
         sources = {
             "autoswitch": AutoSwitchSettings(),
             "ui": UiSettings(),
+            "run": RunSettings(),
             "updates": UpdateSettings(),
         }
         for spec in SETTING_SPECS.values():

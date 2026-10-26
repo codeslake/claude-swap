@@ -51,10 +51,11 @@ class TestConfigList:
             "autoswitch.model",
             "ui.theme",
             "ui.showOrgTag",
+            "run.shareHistory",
             "updates.check",
         ):
             assert key in out
-        assert out.count("(default)") == 12
+        assert out.count("(default)") == 13
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
