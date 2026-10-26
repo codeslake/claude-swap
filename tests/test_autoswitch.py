@@ -6030,6 +6030,44 @@ class TestConsumeFirstProbesAnUnknownReset:
             "source"
         )
 
+    @pytest.mark.parametrize(
+        "unknown_pct,known_pct,picks",
+        [
+            (91.0, 92.0, 2),  # the unknown-reset peer holds more room: it wins on room
+            (92.0, 91.0, 3),  # the known one holds more: the probe's -inf does not leapfrog
+            (92.0, 92.0, 3),  # equal room: the known reset breaks the tie
+        ],
+    )
+    def test_every_account_over_its_lines_ranks_an_unknown_reset_on_room_not_as_a_probe(
+        self, temp_home, unknown_pct, known_pct, picks
+    ):
+        """The probe is the below-the-lines case. With the active and every
+        peer over their lines the room ranking owns the pick (upstream
+        21796361): an unknown reset is an ordinary candidate that sorts last on
+        a room tie, the switch is the plain `proactive` one, and no probe
+        cooldown is armed on the account it lands on."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": {  # active: 5 points of room, over its 90 line
+                "five_hour": {"pct": 95.0, "resets_at": _R_LATER},
+                "seven_day": {"pct": 20.0, "resets_at": _R_LATER},
+            },
+            "2": {  # UNKNOWN reset on every window
+                "five_hour": {"pct": unknown_pct},
+                "seven_day": {"pct": 20.0},
+            },
+            "3": {
+                "five_hour": {"pct": known_pct, "resets_at": _R_SOON},
+                "seven_day": {"pct": 20.0, "resets_at": _R_SOON},
+            },
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == picks
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+        assert h.engine._last_probe_num is None
+        assert not h.state().get("probeCooldown")
+
     def test_a_probe_switch_records_the_cooldown(self, temp_home):
         h = self._harness(temp_home)
         h.tick_with_usage({
@@ -13065,6 +13103,34 @@ class TestTheAtLimitEscapeDoesNotLandOnASliver:
             "when anything comes back, so waiting for the active is waiting "
             "for a moment nothing can name"
         )
+
+    def test_a_sliver_with_no_reported_return_is_never_the_waits_target(
+        self, harness
+    ):
+        """An unknown return cannot be shown to come back meaningfully sooner
+        than the active (`inf >= active - RECOVERY_HYSTERESIS_S`), so the wait
+        refuses it. Beside a sliver with a known earlier return it is dropped;
+        alone it leaves the pass waiting. The unknown-reset probe is
+        consume-first's below-the-lines case and is never admitted here."""
+        now = harness.clock.now
+        args = self._args(harness, oauth_candidates=["2", "3"])
+        args["usage"] = {
+            "4": args["usage"]["4"],
+            "2": _usage7(1.0, 98.0, _iso_at(now + 5 * 60)),
+            "3": _usage7(1.0, 98.0),  # no reset reported on any window
+        }
+        args["headroom"] = {"2": 2.0, "3": 2.0, "4": 0.0}
+        ordered, _, _, waiting = harness.engine._rank_candidates(**args)
+        assert list(ordered) == ["2"], f"got {list(ordered)}"
+        assert not waiting
+
+        args["oauth_candidates"] = ["3"]
+        ordered, _, _, waiting = harness.engine._rank_candidates(**args)
+        assert list(ordered) == [] and waiting, (
+            f"got {list(ordered)}, waiting={waiting} -- the only peer cannot "
+            "name when it returns, so the pass waits on the active's own reset"
+        )
+        assert harness.engine._last_probe_num is None
 
     def test_slivers_that_both_pass_the_wait_are_taken_soonest_return_first(
         self, harness

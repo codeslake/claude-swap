@@ -681,7 +681,7 @@ def select_probe_target(
 
     ONE FUNCTION, TWO READERS — ``_rank_candidates_pass`` calls it (already
     narrowed to candidates that cleared its own servability/no-return/
-    recovery-axis gates) to decide the switch; the "Next best" panel calls
+    landing-health gates) to decide the switch; the "Next best" panel calls
     it on the full candidate list to decide what to DISPLAY. Before this
     function existed the panel had no notion of probing at all and ranked
     every candidate with ``probe=False``, so an unknown-reset account read
@@ -3393,15 +3393,15 @@ class AutoSwitchEngine:
                 # with no room on the axis this pass ranks by, even when
                 # every account is above the threshold. The `all_above`
                 # escape below exists so a proactive/at-limit trigger can
-                # still move when nothing currently qualifies — but a peer
+                # still move when nothing currently qualifies, but a peer
                 # with no room is a future fact, and landing on it NOW moved
                 # the engine onto an account that was ITSELF still blocked
                 # (measured live: a proactive move onto an account whose own
                 # 5h was already at the switch threshold, which the very next
                 # tick read as `cooldown` while still blocked, and the tick
                 # after that had burned worse). `best`/`consume-first` keep
-                # the escape unchanged — this is additive, gated on the
-                # strategy alone.
+                # the escape unchanged (this is additive, gated on the
+                # strategy alone).
                 dynamic_landing = settings.strategy == "dynamic"
                 if over and not (all_above and not dynamic_landing):
                     continue
@@ -3460,28 +3460,19 @@ class AutoSwitchEngine:
                             # loop may still turn out healthier, and probing
                             # is capped at one admission per decision.
                             #
-                            # NOT under `by_recovery_axis`: that tick-level
-                            # state (only reachable here via `dynamic`'s
-                            # landing rule with `all_above`) gives every OTHER
-                            # candidate a differently-shaped key below (`(tier,
-                            # recovery_ts, -h)`, 3 fields) instead of
-                            # `consume_first_rank_key`'s 4 — mixing the two
-                            # shapes in one sort compares fields that mean
-                            # different things at the same index. Probing is
-                            # this branch's own base case; the escape axis
-                            # keeps its existing behaviour untouched.
+                            # The probe is consume-first's BELOW-the-lines case
+                            # only. Every account over its lines ranks on room
+                            # above (an unknown reset sorts last on a room tie)
+                            # and the at-limit wait refuses a return it cannot
+                            # name, so neither reaches this arm.
                             #
                             # `select_probe_target` re-applies
                             # `_seven_day_reset_unmeasured` and the cooldown
                             # (the shared function both this pass and the
-                            # panel now call) -- membership here only needs
-                            # the two conditions that ARE this loop's own:
-                            # not on the recovery axis, and fresh enough to
-                            # admit without risking the stale-usage abort
-                            # below.
-                            if not by_recovery_axis and _probe_source_fresh(
-                                entries, num, now
-                            ):
+                            # panel call) -- membership here only needs to be
+                            # fresh enough to admit without risking the
+                            # stale-usage abort below.
+                            if _probe_source_fresh(entries, num, now):
                                 probe_candidates.append(num)
                             continue
                         if reset_ts >= active_reset_ts:
