@@ -207,10 +207,10 @@ def _corroborating_daemon_port(_switcher, timeout: float = 1.0):
 
     Returns ``None`` when there is nothing to protect a wiring with (no
     record at all, or a pid dead here that /health does not answer as) --
-    freely condemn. Returns `_SPARE_ALL` when a record exists but cannot be narrowed to one port
-    (unreadable, no usable pid, or an alive pid with no valid port) -- the
-    old, conservative machine-wide spare. Otherwise the port a confirmed-
-    alive daemon actually serves.
+    freely condemn. Returns `_SPARE_ALL` when a record exists but cannot be
+    narrowed to one port (unreadable, no usable pid, or an alive pid with no
+    valid port) -- the old, conservative machine-wide spare. Otherwise the
+    port a confirmed-alive daemon actually serves.
 
     PID REUSE AFTER A REBOOT (a surviving record naming a pid the OS later
     hands to an unrelated process) is a known, carried gap: three passes at
@@ -2021,7 +2021,11 @@ def heal(
 
     ``connect_timeout`` is every loopback probe below, and the LAUNCH path must
     pass it -- one call arms three probes, so a port that black-holes rather
-    than refuses costs the launch 4.2s on the ``--heal`` default.
+    than refuses costs the launch 4.2s on the ``--heal`` default. One more
+    GET can follow: when the recorded pid reads dead here,
+    `_corroborating_daemon_port` asks the recorded port's ``/health`` who
+    answers, bounded by the same budget (up to 2s on ``--heal``, 0.2s on the
+    launch path).
     """
     # A serving pin is never TORN DOWN -- that is what the guard protects, and
     # the destructive operation is `clear_wiring` at the bottom, not the
@@ -2188,13 +2192,19 @@ def _health_bytes(port: int, timeout: float) -> bytes:
 
 
 def _health_pid(port: int, timeout: float) -> int | None:
-    """The pid `/health` on ``port`` says answered, or None if it did not say."""
+    """The pid the PIN's own `/health` on ``port`` says answered, or None.
+
+    Only a body marked ``"pin_proxy": True`` counts: any other listener that
+    happens to answer ``{"pid": N}`` on that port is no witness for the pin.
+    """
     try:
         data = json.loads(_health_bytes(port, timeout).decode())
     except Exception:  # noqa: BLE001 (unreachable or malformed: no witness)
         return None
-    pid = data.get("pid") if isinstance(data, dict) else None
-    return pid if isinstance(pid, int) else None
+    if not isinstance(data, dict) or data.get("pin_proxy") is not True:
+        return None
+    pid = data.get("pid")
+    return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
 
 
 def _daemon_can_pin(port: int, *, timeout: float) -> tuple[bool | None, str]:

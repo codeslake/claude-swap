@@ -6630,10 +6630,11 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
 
     @contextlib.contextmanager
     def _across_a_pid_namespace(self, tmp_path, monkeypatch, health):
-        """The lmd42 shape: the daemon's pid is invisible here (`os.kill`
-        says ESRCH) while its port serves `/health` as `health`
-        (None: nothing serves). One missed connect is simulated with
-        `_port_answers`. Yields (switcher, config path, recorded port)."""
+        """The lmd42 shape: the daemon's pid is invisible here
+        (`_pid_is_alive` says dead, on every OS) while its port serves
+        `/health` as `health` (None: nothing serves). One missed connect is
+        simulated with `_port_answers`. Yields (switcher, config path,
+        recorded port)."""
         import http.server
         import threading
 
@@ -6663,14 +6664,7 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
         self._record(sw, port=port, pid=os.getpid(), fingerprint="fp")
-        real_kill = os.kill
-
-        def _kill(pid, sig):
-            if pid == os.getpid():
-                raise ProcessLookupError(pid)
-            return real_kill(pid, sig)
-
-        monkeypatch.setattr(os, "kill", _kill)
+        monkeypatch.setattr(pin, "_pid_is_alive", lambda pid: False)
         monkeypatch.setattr(pin, "_port_answers", lambda *a, **k: False)
         try:
             yield sw, cfg, port
@@ -6687,7 +6681,7 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
         from claude_swap import pin
 
         with self._across_a_pid_namespace(
-            tmp_path, monkeypatch, {"pid": os.getpid()}
+            tmp_path, monkeypatch, {"pin_proxy": True, "pid": os.getpid()}
         ) as (sw, _cfg_path, port):
             assert pin._corroborating_daemon_port(sw) == port
             assert pin._dead_wired_configs(sw) == []
@@ -6700,7 +6694,7 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
         from claude_swap import pin
 
         with self._across_a_pid_namespace(
-            tmp_path, monkeypatch, {"pid": os.getpid()}
+            tmp_path, monkeypatch, {"pin_proxy": True, "pid": os.getpid()}
         ) as (sw, cfg, port):
             monkeypatch.setattr(pin, "heal", lambda s, **_k: (False, "Nothing to heal"))
             assert pin.run(sw, None, ensure=True) == 0
@@ -6713,8 +6707,12 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
         "health",
         [
             pytest.param(None, id="nothing-serves"),
-            pytest.param({"pid": os.getpid() + 1}, id="answers-as-another-pid"),
+            pytest.param(
+                {"pin_proxy": True, "pid": os.getpid() + 1},
+                id="answers-as-another-pid",
+            ),
             pytest.param({"pin_proxy": True}, id="names-no-pid"),
+            pytest.param({"pid": os.getpid()}, id="not-the-pins-health"),
         ],
     )
     def test_an_unseen_pid_is_dead_when_health_does_not_name_it(
@@ -6729,6 +6727,7 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
         ):
             assert pin._corroborating_daemon_port(sw) is None
             assert pin._dead_wired_configs(sw) == [cfg]
+
 
 class TestPidIsAliveIsPortableAcrossOS:
     """`os.kill(pid, 0)` is a pure liveness probe on POSIX. On Windows the
