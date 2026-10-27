@@ -135,6 +135,7 @@ class AutoScreen(Screen):
         self.app.weekly_threshold_pct = self._settings.weekly_threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
+        self.watch(self.app, "refresh_status", self._on_refresh_status)
         self.watch(self.app, "theme", self._on_theme_change)
         # ONLY `cswap tui --auto` starts LIVE. Entering the view from the
         # menu always starts dry-run, because opening a view must never
@@ -264,6 +265,8 @@ class AutoScreen(Screen):
                 f" · weekly {pct_label(self._settings.weekly_threshold)}%"
             )
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
+        if self.app.refresh_status:
+            text.append(f" · {self.app.refresh_status}")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
@@ -357,6 +360,9 @@ class AutoScreen(Screen):
             badge.set_classes("dry")
 
     # -- candidates -----------------------------------------------------------
+
+    def _on_refresh_status(self, _status: str) -> None:
+        self._update_summary()
 
     def _on_snapshot(self, snap: AccountsSnapshot | None) -> None:
         if snap is None:
