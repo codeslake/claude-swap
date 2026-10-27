@@ -238,6 +238,21 @@ def test_format_account_label_disabled_marker():
     assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
 
 
+def test_auto_switch_item_shows_a_demoted_engine_as_dry_run():
+    class Engine:
+        demoted_from_live = False
+
+    engine = Engine()
+    assert menubar.auto_switch_item(False, engine) == ("Auto-switch accounts", 0)
+    assert menubar.auto_switch_item(True, None) == ("Auto-switch accounts", 1)
+    assert menubar.auto_switch_item(True, engine) == ("Auto-switch accounts", 1)
+    # The flag clears on a later promotion, so the item follows it live.
+    engine.demoted_from_live = True
+    assert menubar.auto_switch_item(True, engine) == ("Auto-switch accounts (dry run)", -1)
+    engine.demoted_from_live = False
+    assert menubar.auto_switch_item(True, engine) == ("Auto-switch accounts", 1)
+
+
 # --- usage logging -------------------------------------------------------------
 
 def test_format_usage_log_full():

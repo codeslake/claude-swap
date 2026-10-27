@@ -292,6 +292,16 @@ def format_account_label(
     return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
 
 
+def auto_switch_item(enabled: bool, engine) -> tuple[str, int]:
+    """Title and rumps state for the auto-switch item; -1 is the mixed state.
+
+    An engine that lost the live lock only dry-runs, so it is not shown as on.
+    """
+    if enabled and getattr(engine, "demoted_from_live", False):
+        return "Auto-switch accounts (dry run)", -1
+    return "Auto-switch accounts", int(enabled)
+
+
 def _local_part(email: str, limit: int = 12) -> str:
     """Email text before '@', truncated with a trailing '*' marker."""
     local = email.split("@", 1)[0]
@@ -913,8 +923,9 @@ def run(switcher) -> int:
                 interval.add(choice)
             menu.add(interval)
 
-            auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
-            auto_item.state = 1 if self.settings.auto_switch_enabled else 0
+            auto_title, auto_state = auto_switch_item(self.settings.auto_switch_enabled, self._engine)
+            auto_item = rumps.MenuItem(auto_title, callback=self.on_toggle_autoswitch)
+            auto_item.state = auto_state
             menu.add(auto_item)
 
             threshold_menu = rumps.MenuItem("Auto-switch threshold")
