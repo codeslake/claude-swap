@@ -6628,6 +6628,108 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
             "narrow to nothing and condemn a wiring the record cannot rule out"
         )
 
+    @contextlib.contextmanager
+    def _across_a_pid_namespace(self, tmp_path, monkeypatch, health):
+        """The lmd42 shape: the daemon's pid is invisible here (`os.kill`
+        says ESRCH) while its port serves `/health` as `health`
+        (None: nothing serves). One missed connect is simulated with
+        `_port_answers`. Yields (switcher, config path, recorded port)."""
+        import http.server
+        import threading
+
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        class _H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                data = json.dumps(health).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        srv = None
+        if health is None:
+            port = _dead_port()
+        else:
+            srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            port = srv.server_address[1]
+        sw = self._sw(tmp_path)
+        cfg = _cfg(tmp_path, "cfgdir", port)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        self._record(sw, port=port, pid=os.getpid(), fingerprint="fp")
+        real_kill = os.kill
+
+        def _kill(pid, sig):
+            if pid == os.getpid():
+                raise ProcessLookupError(pid)
+            return real_kill(pid, sig)
+
+        monkeypatch.setattr(os, "kill", _kill)
+        monkeypatch.setattr(pin, "_port_answers", lambda *a, **k: False)
+        try:
+            yield sw, cfg, port
+        finally:
+            if srv is not None:
+                srv.shutdown()
+                srv.server_close()
+
+    def test_a_pid_this_namespace_cannot_see_is_alive_when_health_names_it(
+        self, tmp_path, monkeypatch
+    ):
+        """T2938, the defect: ESRCH on the recorded pid is not proof of death
+        while the recorded port's /health answers as that pid."""
+        from claude_swap import pin
+
+        with self._across_a_pid_namespace(
+            tmp_path, monkeypatch, {"pid": os.getpid()}
+        ) as (sw, _cfg_path, port):
+            assert pin._corroborating_daemon_port(sw) == port
+            assert pin._dead_wired_configs(sw) == []
+
+    def test_ensure_leaves_the_env_wired_when_health_names_the_recorded_pid(
+        self, tmp_path, monkeypatch
+    ):
+        """T2938, end to end: `--ensure` must not strip the wiring of a
+        daemon in another pid namespace that answers as its recorded pid."""
+        from claude_swap import pin
+
+        with self._across_a_pid_namespace(
+            tmp_path, monkeypatch, {"pid": os.getpid()}
+        ) as (sw, cfg, port):
+            monkeypatch.setattr(pin, "heal", lambda s, **_k: (False, "Nothing to heal"))
+            assert pin.run(sw, None, ensure=True) == 0
+            after = json.loads(cfg.read_text(encoding="utf-8"))
+            assert (after.get("env") or {}).get("HTTPS_PROXY") == f"http://127.0.0.1:{port}", (
+                f"--ensure stripped a wiring /health vouches for: {after!r}"
+            )
+
+    @pytest.mark.parametrize(
+        "health",
+        [
+            pytest.param(None, id="nothing-serves"),
+            pytest.param({"pid": os.getpid() + 1}, id="answers-as-another-pid"),
+            pytest.param({"pin_proxy": True}, id="names-no-pid"),
+        ],
+    )
+    def test_an_unseen_pid_is_dead_when_health_does_not_name_it(
+        self, tmp_path, monkeypatch, health
+    ):
+        """T2938, the old verdict stands: no /health answer as the recorded
+        pid means the ESRCH is read as death and the wiring is condemned."""
+        from claude_swap import pin
+
+        with self._across_a_pid_namespace(tmp_path, monkeypatch, health) as (
+            sw, cfg, _port,
+        ):
+            assert pin._corroborating_daemon_port(sw) is None
+            assert pin._dead_wired_configs(sw) == [cfg]
+
 class TestPidIsAliveIsPortableAcrossOS:
     """`os.kill(pid, 0)` is a pure liveness probe on POSIX. On Windows the
     same call is NOT a probe -- signal 0 there IS `CTRL_C_EVENT`, so

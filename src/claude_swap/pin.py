@@ -189,7 +189,7 @@ def _pid_is_alive(pid: int) -> bool:
 _SPARE_ALL = object()
 
 
-def _corroborating_daemon_port(_switcher):
+def _corroborating_daemon_port(_switcher, timeout: float = 1.0):
     """A currently-alive recorded daemon's port, when its record says so.
 
     Corroborates a dead loopback PROBE against the daemon's own state file
@@ -206,8 +206,8 @@ def _corroborating_daemon_port(_switcher):
     the package installed.
 
     Returns ``None`` when there is nothing to protect a wiring with (no
-    record at all, or a confirmed-dead pid) -- freely condemn. Returns
-    `_SPARE_ALL` when a record exists but cannot be narrowed to one port
+    record at all, or a pid dead here that /health does not answer as) --
+    freely condemn. Returns `_SPARE_ALL` when a record exists but cannot be narrowed to one port
     (unreadable, no usable pid, or an alive pid with no valid port) -- the
     old, conservative machine-wide spare. Otherwise the port a confirmed-
     alive daemon actually serves.
@@ -256,15 +256,16 @@ def _corroborating_daemon_port(_switcher):
         pid = int(state["pid"])
     except (KeyError, TypeError, ValueError):
         return _SPARE_ALL
-    if not _pid_is_alive(pid):
-        return None
     try:
         port = int(state["port"])
     except (KeyError, TypeError, ValueError):
-        return _SPARE_ALL
-    if not (0 < port <= 65535):
-        return _SPARE_ALL
-    return port
+        port = 0
+    in_range = 0 < port <= 65535
+    # ESRCH is also what a live daemon in ANOTHER pid namespace reads as (lmd42:
+    # pin on the host, sessions in a container): its own /health is the witness.
+    if not _pid_is_alive(pid) and not (in_range and _health_pid(port, timeout) == pid):
+        return None
+    return port if in_range else _SPARE_ALL
 
 
 def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
@@ -309,7 +310,7 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
         # says nothing about a config wired to a DIFFERENT port. Narrowed to
         # the port the record actually names; an unreadable/portless record
         # keeps the old, more conservative machine-wide spare (`_SPARE_ALL`).
-        rec_port = _corroborating_daemon_port(_switcher)
+        rec_port = _corroborating_daemon_port(_switcher, connect_timeout)
         if rec_port is _SPARE_ALL:
             return []
         if rec_port is not None:
@@ -2172,6 +2173,30 @@ def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
 _MINT_STALL_WEDGE_S = 60.0  # matches cswap-pin's own bound, proxy.py _serving_can_pin
 
 
+def _health_bytes(port: int, timeout: float) -> bytes:
+    """One loopback GET /health body. Raises whatever the round trip raises."""
+    import urllib.request
+
+    # A LOOPBACK CALL, ROUTED DIRECT. `urlopen`'s default opener reads
+    # `http_proxy`/`no_proxy` from the environment on every call, and a host
+    # wired through a corporate/cache proxy has no reason to exempt
+    # 127.0.0.1 -- probing our OWN daemon must not be redirected through it.
+    # `_port_answers` avoids the same trap by using a raw socket instead.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(f"http://127.0.0.1:{port}/health", timeout=timeout) as resp:
+        return resp.read()
+
+
+def _health_pid(port: int, timeout: float) -> int | None:
+    """The pid `/health` on ``port`` says answered, or None if it did not say."""
+    try:
+        data = json.loads(_health_bytes(port, timeout).decode())
+    except Exception:  # noqa: BLE001 (unreachable or malformed: no witness)
+        return None
+    pid = data.get("pid") if isinstance(data, dict) else None
+    return pid if isinstance(pid, int) else None
+
+
 def _daemon_can_pin(port: int, *, timeout: float) -> tuple[bool | None, str]:
     """`/health`'s serving verdict and the reason for it. None with no
     verdict at all — unreachable or non-JSON — collapses two causes into one
@@ -2197,19 +2222,9 @@ def _daemon_can_pin(port: int, *, timeout: float) -> tuple[bool | None, str]:
     reader treats as not-serving, not "no verdict".
     """
     import http.client
-    import urllib.request
 
-    # A LOOPBACK CALL, ROUTED DIRECT. `urlopen`'s default opener reads
-    # `http_proxy`/`no_proxy` from the environment on every call, and a host
-    # wired through a corporate/cache proxy has no reason to exempt
-    # 127.0.0.1 -- probing our OWN daemon must not be redirected through it.
-    # `_port_answers` avoids the same trap by using a raw socket instead.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(
-            f"http://127.0.0.1:{port}/health", timeout=timeout
-        ) as resp:
-            body = resp.read()
+        body = _health_bytes(port, timeout)
     except (TimeoutError, http.client.RemoteDisconnected):
         return False, "accepted a connection but never answered /health"
     except Exception:  # noqa: BLE001 — unreachable: no verdict
