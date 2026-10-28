@@ -67,7 +67,6 @@ class CswapApp(App):
         self._normal_refreshing = False
         self._store_refreshing = False
         self._normal_started_at: float | None = None
-        self._store_started_at: float | None = None
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
@@ -146,7 +145,6 @@ class CswapApp(App):
         if self._store_refreshing:
             return
         self._store_refreshing = True
-        self._store_started_at = time.time()
         generation = self._next_refresh_generation()
         self._update_refresh_status()
         self.run_worker(
@@ -175,7 +173,6 @@ class CswapApp(App):
             self._normal_started_at = None
         else:
             self._store_refreshing = False
-            self._store_started_at = None
         self._last_refresh_error = ""
         if generation >= self._applied_generation:
             self._applied_generation = generation
@@ -210,10 +207,8 @@ class CswapApp(App):
             age = max(0.0, now - self.snapshot.taken_at)
             if age >= self.SNAPSHOT_AGE_NOTE_S:
                 parts.append(f"snapshot {format_duration(age)} ago")
-        # Both lanes can be in flight; report the oldest once.
-        started = [t for t in (self._normal_started_at, self._store_started_at) if t]
-        if started:
-            elapsed = now - min(started)
+        if self._normal_refreshing and self._normal_started_at is not None:
+            elapsed = now - self._normal_started_at
             if elapsed >= self.POLL_INTERVAL_S:
                 parts.append(f"refreshing {format_duration(elapsed)}")
         self.refresh_status = " · ".join(parts)
@@ -238,7 +233,6 @@ class CswapApp(App):
                 self._normal_started_at = None
             else:
                 self._store_refreshing = False
-                self._store_started_at = None
             self._update_refresh_status()
             msg = str(event.worker.error)
             if msg != self._last_refresh_error:

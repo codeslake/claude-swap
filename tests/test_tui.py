@@ -1701,9 +1701,7 @@ class TestAutoScreen:
 
             assert len(app.screen.query_one("#event-log", RichLog).lines) > 0
 
-    async def test_summary_shows_snapshot_age_and_long_store_refresh(
-        self, tmp_path, fake_engine
-    ):
+    async def test_summary_shows_snapshot_age(self, tmp_path, fake_engine):
         """The auto screen only runs the store lane: a hung store worker froze
         the panel with nothing on screen saying how old it was."""
         from textual.widgets import Static
@@ -1714,6 +1712,7 @@ class TestAutoScreen:
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
+            await settle(pilot)  # on_mount starts a store worker
             summary = app.screen.query_one("#auto-summary", Static)
             assert "snapshot" not in summary.render().plain
             app.snapshot = dataclasses.replace(
@@ -1722,11 +1721,6 @@ class TestAutoScreen:
             app._update_refresh_status()
             await pilot.pause()
             assert "snapshot 1m ago" in summary.render().plain
-            app._store_refreshing = True
-            app._store_started_at = time.time() - app.POLL_INTERVAL_S - 1.0
-            app._update_refresh_status()
-            await pilot.pause()
-            assert "refreshing" in summary.render().plain
 
     async def test_a_promoted_engine_updates_the_badge(
         self, tmp_path, contended_fake_engine
