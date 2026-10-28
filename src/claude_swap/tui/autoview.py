@@ -251,6 +251,9 @@ class AutoScreen(Screen):
     def _update_summary(self) -> None:
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
+        # Leading: #auto-title-row is one line and clips the end of the text.
+        if self.app.refresh_status:
+            text.append(f"{self.app.refresh_status} · ", style=palette.sev_warn)
         text.append("auto-switch · ")
         text.append(
             f"threshold {pct_label(self._settings.threshold)}%",
@@ -265,8 +268,6 @@ class AutoScreen(Screen):
                 f" · weekly {pct_label(self._settings.weekly_threshold)}%"
             )
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
-        if self.app.refresh_status:
-            text.append(f" · {self.app.refresh_status}")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)

@@ -1720,7 +1720,8 @@ class TestAutoScreen:
             )
             app._update_refresh_status()
             await pilot.pause()
-            assert "snapshot 1m ago" in summary.render().plain
+            # leading: the title row is one line and clips the end of the text
+            assert summary.render().plain.startswith("snapshot 1m ago · auto-switch")
 
     async def test_a_promoted_engine_updates_the_badge(
         self, tmp_path, contended_fake_engine
