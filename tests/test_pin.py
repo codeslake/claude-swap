@@ -6657,7 +6657,9 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
             port = _dead_port()
         else:
             srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
-            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            threading.Thread(
+                target=srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+            ).start()
             port = srv.server_address[1]
         sw = self._sw(tmp_path)
         cfg = _cfg(tmp_path, "cfgdir", port)
