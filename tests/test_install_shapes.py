@@ -3,9 +3,12 @@
 cswap alone, cswap + menubar, cswap + pin, cswap + menubar + pin. The menubar
 and pin extras are optional, so a switch, a usage fetch, a refresh, an
 auto-switch tick and a settings write must neither need nor trigger either
-one: an unguarded ``import cswap_pin`` / ``import rumps`` on any of them
-breaks the install that lacks the extra, and a path that wires the pin breaks
-the install that has it but never asked for it.
+one: an unguarded call-time ``import cswap_pin`` / ``import rumps`` on any of
+them breaks the install that lacks the extra (a guarded or module-level import
+is covered by TestImportSafeWithoutTheExtra and
+test_only_pin_py_names_cswap_pin_at_all in tests/test_pin.py), and a path that
+wires the pin breaks the install that has it but never asked for it. The
+menubar stubs are asserted never called, not never imported.
 """
 
 from __future__ import annotations
@@ -108,7 +111,7 @@ def test_shared_paths_work_in_every_install_shape(
         got = h.switcher.consume_backup_grant("1", "a@example.com", old)
     assert got.credentials == rotated
 
-    # the extras the install lacks were never needed, the ones it has never touched
+    # the extras the install lacks were never needed, the ones it has never called
     config = json.loads((temp_home / ".claude.json").read_text())
     assert "_cswapPinWiredKeys" not in config
     assert "CSWAP_PIN_PORT" not in config.get("env", {})
@@ -116,7 +119,8 @@ def test_shared_paths_work_in_every_install_shape(
         assert sys.modules[mod] is stub
         assert stub is None or stub.mock_calls == []
     if with_pin:
-        assert pin._live_impl() is not None
+        # _impl() refuses on win32 before it looks for the package
+        assert (pin._live_impl() is None) is (sys.platform == "win32")
         assert wire_calls == []
     else:
         assert pin._live_impl() is None
