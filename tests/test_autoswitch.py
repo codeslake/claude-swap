@@ -4084,6 +4084,7 @@ class TestQuarantineLifecycle:
             json.dumps({
                 "claudeAiOauth": {"accessToken": "sk-2b", "refreshToken": "rt-2b"},
             }),
+            attributed=True,
         )
         harness.events.clear()
         outcome = harness.tick_with_usage({
@@ -4158,6 +4159,7 @@ class TestDryRunAndNoOp:
         h.switcher._write_account_credentials(
             "2", "b@example.com",
             json.dumps({"claudeAiOauth": {"accessToken": "n", "refreshToken": "n"}}),
+            attributed=True,
         )
         h.events.clear()
         h.engine = h._make_engine(dry_run=True)
@@ -4872,6 +4874,7 @@ class TestTokenIdentity:
                 "accessToken": "sk-2-dead", "refreshToken": "rt-2-dead",
                 "expiresAt": 0,
             }}),
+            attributed=True,
         )
 
         def refresh(creds, **kw):
@@ -4890,7 +4893,14 @@ class TestTokenIdentity:
         q = harness.state().get("quarantine", {})
         assert q.get("2", {}).get("reason") == "invalid_grant"
         # The safety copy was not consumed, and the switch landed elsewhere.
-        assert len(harness.switcher.list_unclaimed_credentials()) == 1
+        # (The switch itself also stashes its own outgoing slot 1, whose
+        # divergence the oracle can't resolve in this harness -- no longer
+        # a fail-open backup, so it adds its own unclaimed entry rather
+        # than reusing or displacing the pre-seeded one.)
+        entries = harness.switcher.list_unclaimed_credentials()
+        assert len(entries) == 2
+        reasons = {e.get("reason") for e in entries.values()}
+        assert reasons == {None, "unresolved"}, reasons
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
 
@@ -7454,7 +7464,7 @@ class TestAllAboveHeadroomDoesNotFlap:
         WALKED PAST THE OLD BOUNDARY: the pre-fix dominance leg was a bare
         `h > active x RATIO`, which held only up to and including ratio
         exactly 2.00 (`active=2.0` pts) and opened on the very next cell
-        (`active=1.8`) — measured, on this fleet. The fixed leg adds a flat
+        (`active=1.8`) — measured on three machines. The fixed leg adds a flat
         `+SPENT_HEADROOM_PCT` on top of the ratio, so the boundary against
         this same 4.0-pt frozen
         peer moves from `active=2.0` to `active=0.5` — the walk below covers
@@ -7965,7 +7975,7 @@ class TestAllAboveHeadroomDoesNotFlap:
         account frozen at 4 pts, the new active burning from 4 pts down past
         the exact boundary (98.2%) a bare dominance leg opens at —
         `4.0 > 1.8 x 2` — walked further still, to a bare sliver (99.9%,
-        0.1 pts). Measured on this exact fleet, the bare leg switched back
+        0.1 pts). Measured on a live rotation, the bare leg switched back
         to the frozen peer at 98.2%. This leaves the ORDINARY-path shape
         (`test_the_release_needs_the_barred_account_to_have_improved`) as
         the sibling proving the general
@@ -8292,6 +8302,14 @@ class TestAllAboveHeadroomDoesNotFlap:
             h = EngineHarness(temp_home)
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
+            # Each case shares `temp_home`'s sequence.json with the ones
+            # before it in this loop, so a prior case's switch can leave
+            # `activeAccountNumber` at 2 -- reset it to match `make_live`
+            # below, or this case starts from a roster/identity mismatch
+            # none of its own fixtures intended.
+            data = h.switcher._get_sequence_data()
+            data["activeAccountNumber"] = 1
+            h.switcher._write_json(h.switcher.sequence_file, data)
             h.make_live("a@example.com", 1)
 
             outcome = None
@@ -8374,6 +8392,14 @@ class TestAllAboveHeadroomDoesNotFlap:
             h = EngineHarness(temp_home)
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
+            # Each case shares `temp_home`'s sequence.json with the ones
+            # before it in this loop, so a prior case's switch can leave
+            # `activeAccountNumber` at 2 -- reset it to match `make_live`
+            # below, or this case starts from a roster/identity mismatch
+            # none of its own fixtures intended.
+            data = h.switcher._get_sequence_data()
+            data["activeAccountNumber"] = 1
+            h.switcher._write_json(h.switcher.sequence_file, data)
             h.make_live("a@example.com", 1)
 
             outcome = None
@@ -14321,7 +14347,6 @@ class TestCacheAwareRules:
     ):
         settings = AutoSwitchSettings(strategy=strategy, cache_aware=cache_aware)
         assert autoswitch.cache_aware_active(settings) is want
-
 
 class TestWeeklyThreshold:
     """`autoswitch.weeklyThreshold`: a separate switch line for the 7d and
