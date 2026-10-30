@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import oauth
+from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     HORIZON_HEADROOM_RATIO,
     SPENT_HEADROOM_PCT,
@@ -39,7 +39,7 @@ from claude_swap.autoswitch import (
     _parse_reset_ts,
     pct_label,
 )
-from claude_swap.lines import binding_window
+from claude_swap.lines import binding_window, weekly_capped
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.usage_store import FetchRecord, UsageEntry
 
@@ -1595,19 +1595,26 @@ class TestWeeklyCap:
         assert h.switcher._poll_inputs_override[1] == expected
 
     @pytest.mark.parametrize(
-        ("pct7", "recent_429", "lo", "hi"),
-        [(88.0, False, 120.0, 120.0), (80.0, False, 121.0, 300.0), (88.0, True, 360.0, 1800.0)],
+        ("pct7", "prev7", "recent_429", "lo", "hi"),
+        [
+            # Moved since the last poll: the band clamps (a 0.5 rise is under the
+            # movement rule, so urgent mode is not what sets 120 s).
+            (88.0, 87.5, False, 120.0, 120.0),
+            # In the band but flat: the band lets go, the normal cadence resumes.
+            (88.0, 88.0, False, 121.0, 300.0),
+            (80.0, 79.5, False, 121.0, 300.0),
+            (88.0, 87.5, True, 360.0, 1800.0),
+        ],
     )
-    def test_the_active_polls_every_two_minutes_within_the_band_below_its_cap(
-        self, temp_home, pct7, recent_429, lo, hi
+    def test_the_active_polls_every_two_minutes_only_while_moving_in_the_band_below_its_cap(
+        self, temp_home, pct7, prev7, recent_429, lo, hi
     ):
-        """The engine pins the cap; the planner reads it. A 0.5 point rise is
-        under the movement rule, so only the band clamps the interval."""
+        """The engine pins the cap; the planner reads it."""
         h = _fleet(temp_home)
         h.switcher.set_account_weekly_cap("1", 90)
         h.tick_with_usage({n: _usage7(10, pct7) for n in ("1", "2", "3")})
         before = UsageEntry(
-            last_good=_usage7(10, pct7 - 0.5), poll_interval_s=300.0,
+            last_good=_usage7(10, prev7), poll_interval_s=300.0,
             last_429_at=h.switcher._usage_store.clock() if recent_429 else None,
         )
         plans = h.switcher._plans_after_fetch(
@@ -1615,3 +1622,34 @@ class TestWeeklyCap:
             {"1": (None, None, None, None, True)},
         )
         assert lo <= plans["1"][1] <= hi, plans
+
+    @pytest.mark.parametrize(
+        ("start", "idle_polls", "bound"), [(70.0, 0, 1.0), (86.0, 0, 1.0), (89.0, 5, 1.7)]
+    )
+    def test_a_slow_burn_stepped_through_the_planned_intervals_trips_the_cap_inside_the_stated_overshoot(
+        self, temp_home, start, idle_polls, bound
+    ):
+        """0.3 points a minute, whole-number readings, the engine's pinned
+        inputs, every wait at its +10% jitter. Measured: 0.85 points burning, 1.45
+        after `idle_polls` flat polls in the band (one normal interval of burn,
+        300 s + 10% is 1.65 at most)."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_weekly_cap("1", 90)
+        h.tick_with_usage({n: _usage7(10, 10) for n in ("1", "2", "3")})
+        threshold, weekly, models = h.switcher._poll_inputs_override
+        worst = 0.0
+        for phase in range(20):
+            true, t, polls, interval, prev = start + phase / 20, 0.0, 0, None, None
+            while not weekly_capped(90.0, usage := _usage7(10, float(int(true)))):
+                next_poll, interval = poll_policy.plan_after_fetch(
+                    prev_interval_s=interval, prev_usage=prev, new_usage=usage,
+                    is_active=True, threshold=threshold, weekly_threshold=weekly,
+                    models=models, recent_429=False, now=t,
+                    weekly_cap=h.switcher._poll_weekly_cap, rng=lambda: 1.0,
+                )
+                polls += 1
+                if polls > idle_polls:
+                    true += 0.3 * (next_poll - t) / 60
+                t, prev = next_poll, usage
+            worst = max(worst, true - 90.0)
+        assert 0.0 <= worst < bound

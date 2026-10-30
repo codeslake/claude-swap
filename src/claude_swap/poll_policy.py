@@ -92,9 +92,11 @@ MIN_INTERVAL_S = 180.0
 URGENT_INTERVAL_S = 60.0
 
 # The active account this close below its weekly cap polls at CAP_BAND_INTERVAL_S
-# even when it barely moved: a slow burn never trips urgent mode, a cap is a stop.
+# while that reading keeps moving, even when a step is under urgent mode's bar: a
+# slow burn never trips urgent mode, a cap is a stop. A flat reading ends it (the
+# normal decay takes over), so an idle active cannot sit on the shared budget.
 CAP_BAND_PCT = 3.0
-# 120 s, not 60: an idle active can sit in the band, and 60 s is twice the budget above.
+# 120 s, not 60: 60 s is twice the budget above.
 CAP_BAND_INTERVAL_S = 120.0
 
 # Decay ceilings for an account whose usage is not moving: the active account
@@ -228,7 +230,8 @@ def plan_after_fetch(
     movement backs off ×1.5 toward the account's ceiling;
     unknown utilization uses the default. The active account within
     ``CAP_BAND_PCT`` below its ``weekly_cap`` (under 100) drops to
-    ``CAP_BAND_INTERVAL_S``. A recent 429 on this token floors
+    ``CAP_BAND_INTERVAL_S`` while its weekly reading moved since the previous
+    poll. A recent 429 on this token floors
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
     until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
     ``JITTER_FRAC`` noise, is never later than the account's next window
@@ -268,7 +271,9 @@ def plan_after_fetch(
     near_cap = (
         weekly_cap is not None
         and weekly_cap < 100.0
-        and weekly_capped(weekly_cap - CAP_BAND_PCT, new_usage) is not None
+        # Moved since the last poll: a flat reading decays like any other.
+        and (in_band := weekly_capped(weekly_cap - CAP_BAND_PCT, new_usage)) is not None
+        and in_band != weekly_capped(weekly_cap - CAP_BAND_PCT, prev_usage)
         and weekly_capped(weekly_cap, new_usage) is None  # past it, the engine leaves
     )
     if is_active and (rising_in_band or near_cap) and not recent_429:

@@ -7303,7 +7303,7 @@ class ClaudeAccountSwitcher:
 
         next_account: str | None = None
         skipped_exhausted: list[str] = []
-        skipped_capped = False
+        skipped_capped: list[str] = []
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
             if self._disabled_from_data(data, candidate):
@@ -7330,7 +7330,7 @@ class ClaudeAccountSwitcher:
                     usage.get(candidate),
                 ):
                     skipped_exhausted.append(candidate)
-                    skipped_capped = True
+                    skipped_capped.append(candidate)
                     if json_output:
                         warnings.append(f"Skipped Account-{candidate} (at weekly cap)")
                     else:
@@ -7368,11 +7368,14 @@ class ClaudeAccountSwitcher:
             # With model limits in play the binding window may be a scoped
             # one (the per-skip lines name it), so don't claim "5h/7d".
             limits_label = "usage limits" if models else "5h/7d limit"
+            # Only caps in the way is its own reason, as `best` reports it.
+            only_caps = len(skipped_capped) == len(skipped_exhausted)
             if skipped_capped:
-                limits_label += " or weekly cap"
+                limits_label = "weekly cap" if only_caps else limits_label + " or weekly cap"
             if json_output:
                 return self._switch_noop(
-                    strategy=strategy_label, reason="candidates-exhausted",
+                    strategy=strategy_label,
+                    reason="candidates-capped" if only_caps else "candidates-exhausted",
                     to_ref=current_ref, warnings=warnings,
                     message=(
                         f"All other accounts are at their {limits_label} — staying on "
