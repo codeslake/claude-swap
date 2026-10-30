@@ -1520,12 +1520,30 @@ def _config_still_names(email: str, instead_of: "dict | None") -> bool:
     return False
 
 
+def _base_holds_pin(switcher) -> bool:
+    """Does the TRACKED settings.json carry a pin, whatever this host's overlay says?
+
+    ``_raw_pin_record`` reads the merged view, where this host's tombstone hides a pair the shared file
+    still holds. An unreadable file counts as holding it: a clear is never reported over a file it
+    could not look at (T2876).
+    """
+    from claude_swap import settings as _s
+
+    try:
+        section = _s._read_file_strict(_s.settings_path(switcher.backup_dir)).get("remoteControl")
+    except Exception:  # noqa: BLE001 - unreadable is not cleared
+        return True
+    return isinstance(section, dict) and bool(section.get("pinnedEmail"))
+
+
 def _clear_pin_record(switcher, everywhere: bool = False) -> None:
     """Drop the pin record from settings.json. Never raises.
 
     Only for the path where the package cannot do it — normally ``apply_pin``
     owns this file's pin section, and going around it would race the daemon's
-    own writes. Here there IS no package, so nothing else can.
+    own writes. Here there IS no package, so nothing else can. The ``everywhere`` drop of the
+    tracked file is the exception: it runs on every ``--everywhere`` clear, package or not,
+    because the package's own clear lands in this host's overlay and leaves the shared pair.
 
     A settings.json that is a symlink is ONE record for every host linking it,
     and the write goes through the link, so dropping the pair there unpins them
@@ -1543,18 +1561,30 @@ def _clear_pin_record(switcher, everywhere: bool = False) -> None:
             if _raw_pin_record(switcher) is not None:
                 _s.pin_cleared_path(switcher.backup_dir).touch()
             return
+        def drop_pair(raw: dict) -> bool:
+            section = raw.get("remoteControl")
+            if isinstance(section, dict):
+                n = len(section)
+                section.pop("pinnedEmail", None)
+                section.pop("pinnedOrganizationUuid", None)
+                changed = len(section) != n
+                if not section:
+                    del raw["remoteControl"]
+                return changed
+            return raw.pop("remoteControl", None) is not None
+
+        base_changed = False
+        if everywhere:
+            # The shared record is the TRACKED file, and this clear is the deliberate act: the merged
+            # write below lands in this host's overlay, which leaves every other host pinned.
+            base_raw = _s._read_file_strict(path)
+            base_changed = drop_pair(base_raw)
+            if base_changed:
+                _s.atomic_write_json(path, base_raw, base=True)
         raw = _s._read_raw_for_write(path)
-        section = raw.get("remoteControl")
-        if isinstance(section, dict):
-            n = len(section)
-            section.pop("pinnedEmail", None)
-            section.pop("pinnedOrganizationUuid", None)
-            changed = len(section) != n
-            if not section:
-                del raw["remoteControl"]
-        else:
-            changed = raw.pop("remoteControl", None) is not None
-        if changed:
+        # A dropped base pair leaves this host's tombstone for it in the overlay, which would hide a later
+        # re-pin written to the shared file: writing the merged view back lets the diff shed it.
+        if drop_pair(raw) or base_changed:
             _s.atomic_write_json(path, raw)
     except Exception:  # noqa: BLE001 — the caller re-reads and reports
         pass
@@ -1713,7 +1743,8 @@ def clear_pin(switcher, everywhere: bool = False) -> tuple[bool, str]:
     """
     _record = _raw_pin_record if everywhere else _pinned_email_now
     _pinned = _record(switcher)
-    had_pin = _pinned is not None
+    # `--everywhere` also counts the shared file's pair: this host's overlay tombstone hides it from the merged read.
+    had_pin = _pinned is not None or (everywhere and _base_holds_pin(switcher))
     # Captured before the first thing that unwires, which is `apply_pin`, not
     # `clear_wiring`. Below both, the survivor check ran against a config the
     # package had already rewritten, and reported `(True, 'Unpinned the cloud
@@ -1782,7 +1813,10 @@ def clear_pin(switcher, everywhere: bool = False) -> tuple[bool, str]:
     # measured 2026-09-19, that stood for 21 hours. `env_keys_survive`
     # re-reads each config fresh, so `not survivors` is a sound "the wiring is
     # actually gone" measurement, not an inference from a return value.
-    if _unsplice and not survivors:
+    # `--everywhere` drops the shared record whether or not the peer cleared: cswap-pin's own clear
+    # (`save_pin(None)`) lands a tombstone in this host's overlay, which hides the pair from the merged
+    # read `_unsplice` came from while the shared file keeps it (T2876). The wiring check still gates it.
+    if (_unsplice or everywhere) and not survivors:
         # The keyword is passed only when set: test_clear_pin_converges_against_
         # a_peer_that_silently_does_nothing patches `_clear_pin_record` as a
         # one-argument lambda and drives the local clear through it.
@@ -1790,7 +1824,9 @@ def clear_pin(switcher, everywhere: bool = False) -> tuple[bool, str]:
             _clear_pin_record(switcher, everywhere=True)
         else:
             _clear_pin_record(switcher)
-    still_pinned = _record(switcher) is not None
+    # `--everywhere` also reads the shared file: a refused `base=True` write leaves its pair there while the
+    # peer's tombstone makes the merged read say cleared, and the marker would go over a record that stands.
+    still_pinned = _record(switcher) is not None or (everywhere and _base_holds_pin(switcher))
     # THE MARKER GOES WITH THE WIRING AND THE RECORD, WHOEVER DROPPED THE RECORD.
     # A peer that drops it and returns never reaches the fallback above, and a
     # marker left standing keeps this host reading as cleared once the record is
