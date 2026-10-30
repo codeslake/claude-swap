@@ -28,6 +28,7 @@ from claude_swap.json_output import (
     USAGE_TOKEN_EXPIRED,
 )
 from claude_swap.models import AccountPolicy, AccountSnapshot, AccountsSnapshot
+from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import STALE_OK_S, UsageEntry
@@ -2024,6 +2025,746 @@ class TestWatchScreen:
             assert "refreshing" in title.render().plain
 
 
+def _order_fixture_accounts():
+    """Active "3", usable "5" (ranks first only by admission, never by
+    sorting numbers), unusable "2"/"4"/"12" (disabled/expired/full). "12"
+    is a genuine candidate the pass refused -- still in the waiting tier,
+    ordered by its own reset -- while "2" (disabled) and "4" (expired) are
+    non-targets the engine will never pick automatically, however soon
+    either resets."""
+    return [
+        make_account(3, active=True, entry=make_entry(95.0, 95.0)),
+        make_account(5, entry=make_entry(5.0, 5.0)),
+        make_account(2, entry=make_entry(20.0, 20.0), disabled=True),
+        make_account(4, entry=make_entry(sentinel=USAGE_TOKEN_EXPIRED)),
+        make_account(12, entry=UsageEntry(
+            last_good={
+                "five_hour": {"pct": 50.0, "resets_at": _iso_in(7200)},
+                "seven_day": {"pct": 100.0, "resets_at": _iso_in(86400 * 6)},
+            },
+            fetched_at=time.time() - 5.0, age_s=5.0,
+        )),
+    ]
+
+
+_ORDER_SETTINGS = AutoSwitchSettings(strategy="best", threshold=90.0)
+
+_WARM_ORDER_SETTINGS = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+
+
+def _warm_fixture_accounts():
+    """Active "1" healthy (50/50, `dynamic-healthy`); "2" a warm partner
+    (last active 20m ago, cached org context inside the default 1h
+    `cache_ttl_seconds`) with a 5-day weekly reset; "3" cold (never
+    active) with the SOONER 1-day reset. `_rank_dynamic_candidates` ranks
+    a warm candidate ahead of every cold one regardless of reset time, so
+    every screen must list "2" before "3" -- same fixture the auto view's
+    own `test_a_warm_partner_outranks_a_sooner_cold_reset` uses, reused
+    here to prove the OTHER surfaces agree with it, not just re-derive it."""
+    return [
+        make_account(1, active=True, entry=make_entry(50.0, 50.0)),
+        make_account(2, entry=UsageEntry(
+            last_good={
+                "five_hour": {"pct": 40.0},
+                "seven_day": {"pct": 40.0, "resets_at": _iso_in(5 * 86400)},
+            },
+            fetched_at=time.time(), age_s=0.0,
+        )),
+        make_account(3, entry=UsageEntry(
+            last_good={
+                "five_hour": {"pct": 10.0},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_in(1 * 86400)},
+            },
+            fetched_at=time.time(), age_s=0.0,
+        )),
+    ]
+
+
+def _autoview_text(snap, active, settings, last_active_at=None):
+    """The "Next best" panel's rendered text."""
+    from unittest.mock import MagicMock, patch
+
+    from claude_swap.tui.autoview import AutoScreen
+    from claude_swap.tui.theme import CSWAP_DARK
+
+    v = AutoScreen.__new__(AutoScreen)
+    v._settings = settings
+    v._last_active_at = last_active_at or {}
+    app = MagicMock(current_theme=CSWAP_DARK)
+    with patch.object(AutoScreen, "app", property(lambda s: app)):
+        return str(v._candidates_text(snap, active_number=active))
+
+
+def _autoview_order(snap, active, settings, last_active_at=None):
+    """The account numbers "Next best" renders, in its own displayed order."""
+    rendered = _autoview_text(snap, active, settings, last_active_at)
+    others = [acc.number for acc in snap.accounts if acc.number != active]
+    return sorted(others, key=lambda n: rendered.index(f"user{n}@example.com"))
+
+
+class TestReadLastActiveAt:
+    """Mirrors `AutoSwitchEngine._read_state`'s own safety contract: a
+    missing or garbled state file reads as no cached warm context, never
+    raises -- the file being unreadable is no different from the engine's
+    own read of it."""
+
+    def test_no_file_returns_empty(self, tmp_path):
+        assert tui_data.read_last_active_at(tmp_path) == {}
+
+    def test_non_json_file_returns_empty(self, tmp_path):
+        (tmp_path / "autoswitch_state.json").write_text("not json{")
+        assert tui_data.read_last_active_at(tmp_path) == {}
+
+
+class TestOrderedAccounts:
+    """One order every listing screen renders -- never a re-derived key."""
+
+    def test_matches_the_auto_switch_view_and_sorts_unusable_last(self):
+        """Non-targets sort dead last, on BOTH screens: "12" is a real
+        candidate the engine's own pass refused (still waiting on its own
+        reset) and must outrank "2", a disabled slot -- the engine will
+        never pick a disabled account automatically, however soon its
+        window resets, so it belongs with the other non-targets (token-
+        expired "4"), not mixed into the waiting tier by reset time."""
+        snap = AccountsSnapshot(
+            accounts=_order_fixture_accounts(), active_number="3", taken_at=0.0
+        )
+        order = tui_data.ordered_accounts(snap, _ORDER_SETTINGS, time.time())
+        assert order[0] == "3"  # active pinned first
+        assert order[1:] == _autoview_order(snap, "3", _ORDER_SETTINGS)
+        for unusable in ("2", "4", "12"):  # disabled / token-expired / 7d-full
+            assert order.index("5") < order.index(unusable)
+        assert order.index("12") < order.index("2")
+
+    def test_unmodeled_trigger_keys_stay_in_sync_with_the_auto_view_text(self):
+        """Two files key the same trigger names; a name added to one alone
+        is a silent mis-render, not an import error."""
+        from claude_swap.tui import autoview
+
+        assert set(autoview._UNMODELED_TEXT) == tui_data._UNMODELED_TRIGGERS
+
+    def test_waiting_tier_orders_by_binding_recovery_not_the_weekly_reset(self):
+        """Two never-ranked candidates: "2"'s BINDING window is its 5-hour
+        one (99%, back in 1h) with a distant, irrelevant 7-day reset (5d);
+        "3"'s binding window is its 7-day one (99%, back in 2d) with a
+        near, irrelevant 5-hour reset. The engine would fail over to
+        whichever recovers first -- "2" -- so the waiting tier must use
+        `_binding_recovery_ts` (the window that actually blocks each
+        account), not a flat 7-day-reset key that reads "3" as sooner
+        because it never looks at which window binds."""
+        active = {"five_hour": {"pct": 95.0, "resets_at": _iso_in(600)},
+                  "seven_day": {"pct": 20.0, "resets_at": _iso_in(86400)}}
+        soonest_via_5h = {
+            "five_hour": {"pct": 99.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 50.0, "resets_at": _iso_in(86400 * 5)},
+        }
+        later_via_7d = {
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(1800)},
+            "seven_day": {"pct": 99.0, "resets_at": _iso_in(86400 * 2)},
+        }
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=UsageEntry(
+                    last_good=active, fetched_at=time.time(), age_s=0.0)),
+                make_account(2, entry=UsageEntry(
+                    last_good=soonest_via_5h, fetched_at=time.time(), age_s=0.0)),
+                make_account(3, entry=UsageEntry(
+                    last_good=later_via_7d, fetched_at=time.time(), age_s=0.0)),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "2", "3"], order
+        assert order[1:] == _autoview_order(snap, "1", settings)
+
+    def test_full_accounts_never_outrank_a_waiting_candidate_with_headroom(self):
+        """The owner's report: with no candidate qualifying, "Next best"
+        read a FULL account (every relevant window at or over 100%) ABOVE
+        an account that still has headroom in every window, because the
+        waiting tier's only key was soonest `_binding_recovery_ts` -- so a
+        full "6" (7d 100%, back in 20m) outranked a merely-refused "2" (5h
+        97%, back in 30m), though "2" is usable right now and "6" is not
+        usable until it resets. Headroom-everywhere accounts ("2","4","3")
+        must sort before every full one ("6","7","5"); only inside each
+        half does soonest recovery break the tie. "8" (no stored login)
+        stays last, in its own unswitchable tier. "9" is the CONTROL: a
+        genuinely admitted candidate still ranks first, ahead of both
+        halves of the waiting tier."""
+        active = {"five_hour": {"pct": 95.0, "resets_at": _iso_in(600)},
+                  "seven_day": {"pct": 20.0, "resets_at": _iso_in(86400)}}
+        best_candidate = {"five_hour": {"pct": 5.0, "resets_at": _iso_in(7200)},
+                           "seven_day": {"pct": 5.0, "resets_at": _iso_in(86400)}}
+        headroom_soonest = {  # "2": binds at 97% on 5h, back in 30m
+            "five_hour": {"pct": 97.0, "resets_at": _iso_in(30 * 60)},
+            "seven_day": {"pct": 72.0, "resets_at": _iso_in(86400 * 3)},
+        }
+        headroom_mid = {  # "4": binds at 97% on 7d, back in 5h
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
+            "seven_day": {"pct": 97.0, "resets_at": _iso_in(5 * 3600)},
+        }
+        headroom_last = {  # "3": binds at 97% on 7d, back in 10h
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
+            "seven_day": {"pct": 97.0, "resets_at": _iso_in(10 * 3600)},
+        }
+        full_soonest = {  # "6": 7d full, back in 20m
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(20 * 60)},
+        }
+        full_mid = {  # "7": 7d full, back in 1h
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(3600)},
+        }
+        full_last = {  # "5": 7d full, back in 2h
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(7200)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(2 * 3600)},
+        }
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=UsageEntry(
+                    last_good=active, fetched_at=time.time(), age_s=0.0)),
+                make_account(9, entry=UsageEntry(
+                    last_good=best_candidate, fetched_at=time.time(), age_s=0.0)),
+                make_account(2, entry=UsageEntry(
+                    last_good=headroom_soonest, fetched_at=time.time(), age_s=0.0)),
+                make_account(4, entry=UsageEntry(
+                    last_good=headroom_mid, fetched_at=time.time(), age_s=0.0)),
+                make_account(3, entry=UsageEntry(
+                    last_good=headroom_last, fetched_at=time.time(), age_s=0.0)),
+                make_account(6, entry=UsageEntry(
+                    last_good=full_soonest, fetched_at=time.time(), age_s=0.0)),
+                make_account(7, entry=UsageEntry(
+                    last_good=full_mid, fetched_at=time.time(), age_s=0.0)),
+                make_account(5, entry=UsageEntry(
+                    last_good=full_last, fetched_at=time.time(), age_s=0.0)),
+                make_account(8, switchable=False),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "9", "2", "4", "3", "6", "7", "5", "8"], order
+        assert order[1:] == _autoview_order(snap, "1", settings)
+
+    def test_a_disabled_slot_never_outranks_a_waiting_candidate(self):
+        """CONTROL, isolated from the fixture above: a disabled slot with
+        the SOONEST reset of the fleet must still sort after a genuine
+        waiting candidate -- proving the non-target tier is a separate
+        tier, not just a reset-based tie-break "2" happens to lose."""
+        active = {"five_hour": {"pct": 95.0, "resets_at": _iso_in(600)},
+                  "seven_day": {"pct": 20.0, "resets_at": _iso_in(86400)}}
+        waiting = {
+            "five_hour": {"pct": 99.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 99.0, "resets_at": _iso_in(86400 * 2)},
+        }
+        disabled_soon = {
+            "five_hour": {"pct": 10.0, "resets_at": _iso_in(300)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(600)},
+        }
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=UsageEntry(
+                    last_good=active, fetched_at=time.time(), age_s=0.0)),
+                make_account(3, entry=UsageEntry(
+                    last_good=waiting, fetched_at=time.time(), age_s=0.0)),
+                make_account(2, entry=UsageEntry(
+                    last_good=disabled_soon, fetched_at=time.time(), age_s=0.0),
+                    disabled=True),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "3", "2"], order
+        assert order[1:] == _autoview_order(snap, "1", settings)
+
+    def test_a_disabled_spend_only_row_sorts_with_the_uniform_spend_tier(self):
+        """`acc.disabled or acc.usage.sentinel is not None` used to fold a
+        disabled SPEND-ONLY row into the same tier as a disabled WINDOW-
+        based one -- but the auto view's own key (autoview.py:485-488)
+        keys every spend-only row at its own, later tier, disabled or not:
+        a spend axis carries no window pct to gate `disabled` against. "3"
+        (disabled, window-based) and "2" (disabled, no window/spend-only)
+        used to tie-break on account NUMBER inside the one shared bucket,
+        printing "2" before "3" -- the reverse of the auto view's own
+        order, which puts the window-based row ("3") first."""
+        active = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0}}
+        window_based_disabled = {
+            "five_hour": {"pct": 20.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_in(86400)},
+        }
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=UsageEntry(
+                    last_good=active, fetched_at=time.time(), age_s=0.0)),
+                make_account(3, entry=UsageEntry(
+                    last_good=window_based_disabled, fetched_at=time.time(),
+                    age_s=0.0), disabled=True),
+                make_account(2, entry=make_entry(None, None), disabled=True),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "3", "2"], order
+        assert order[1:] == _autoview_order(snap, "1", settings)
+
+    def test_matches_next_best_on_a_warm_partner_fixture(self, tmp_path):
+        """`ordered_accounts` called `rank_switch_candidates` with no
+        `last_active_at`, so the account list (Switch/Watch) and the
+        AccountsPanel minis never saw a warm partner -- only AutoScreen
+        read the state file. On this fixture "Next best" lists "2" (warm)
+        before "3" (cold, sooner reset); `ordered_accounts` must agree."""
+        snap = AccountsSnapshot(
+            accounts=_warm_fixture_accounts(), active_number="1", taken_at=0.0
+        )
+        (tmp_path / "autoswitch_state.json").write_text(json.dumps({
+            "lastActiveAt": {"2": time.time() - 20 * 60},
+        }))
+        last_active_at = tui_data.read_last_active_at(tmp_path)
+        order = tui_data.ordered_accounts(
+            snap, _WARM_ORDER_SETTINGS, time.time(), last_active_at
+        )
+        assert order[1:] == ["2", "3"], order
+        assert order[1:] == _autoview_order(
+            snap, "1", _WARM_ORDER_SETTINGS, last_active_at
+        )
+
+    def test_an_unranked_no_plan_slot_sorts_after_an_unswitchable_one(self):
+        """A no-plan slot (`oauth_not_allowed_for_organization`) the pass did
+        not rank sinks below even an unswitchable slot, on BOTH screens: the
+        panel keys it (1001.0,), so the bucket here must put it after the
+        unswitchable (4,) one too, not in the waiting tier by its chips. Its
+        poll is stale (past `STALE_OK_S`), so `decision_value()` is None and
+        the pass drops it; "3" sorts before "4" by number, so only the tier
+        puts it last."""
+        no_plan = dataclasses.replace(
+            make_entry(10.0, 5.0, age_s=STALE_OK_S + 60),
+            last_error="oauth_not_allowed_for_organization",
+        )
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(95.0, 20.0)),
+                make_account(2, entry=make_entry(5.0, 5.0)),
+                make_account(3, entry=no_plan),
+                make_account(4, switchable=False),
+            ],
+            active_number="1", taken_at=0.0,
+        )
+        order = tui_data.ordered_accounts(snap, _ORDER_SETTINGS, time.time())
+        assert order == ["1", "2", "4", "3"], order
+        assert order[1:] == _autoview_order(snap, "1", _ORDER_SETTINGS)
+
+
+class TestRankSwitchReasons:
+    """`reasons_out` names why the engine's own pass dropped a candidate."""
+
+    @staticmethod
+    def _weekly(reset_in_s, pct=10.0):
+        window = {"pct": pct}
+        if reset_in_s is not None:
+            window["resets_at"] = _iso_in(reset_in_s)
+        return UsageEntry(
+            last_good={"five_hour": {"pct": pct}, "seven_day": window},
+            fetched_at=time.time(), age_s=0.0,
+        )
+
+    def _reasons(self, settings, *accounts):
+        snap = AccountsSnapshot(
+            accounts=list(accounts), active_number="1", taken_at=0.0
+        )
+        reasons: dict = {}
+        tui_data.rank_switch_candidates(snap, settings, time.time(), "1", None, reasons)
+        return reasons
+
+    def test_consume_first_names_a_later_or_an_unknown_weekly_reset(self):
+        """"weekly reset not sooner" claims the candidate's reset is KNOWN and
+        no sooner than the active's; an unknown reset (on either side, or
+        already past) is "weekly reset unknown", never the first wording."""
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0)
+        reasons = self._reasons(
+            settings,
+            make_account(1, active=True, entry=self._weekly(3 * 86400)),
+            make_account(2, entry=self._weekly(6 * 86400)),
+            make_account(3, entry=self._weekly(None)),
+        )
+        assert reasons == {
+            "2": "weekly reset not sooner", "3": "weekly reset unknown",
+        }, reasons
+        reasons = self._reasons(
+            settings,
+            make_account(1, active=True, entry=self._weekly(None)),
+            make_account(2, entry=self._weekly(6 * 86400)),
+        )
+        assert reasons == {"2": "weekly reset unknown"}, reasons
+
+    def test_dynamic_names_an_unreadable_and_a_spent_candidate(self):
+        reasons = self._reasons(
+            _WARM_ORDER_SETTINGS,
+            make_account(1, active=True, entry=make_entry(50.0, 50.0)),
+            make_account(2, entry=make_entry(sentinel=USAGE_TOKEN_EXPIRED)),
+            make_account(3, entry=make_entry(100.0, 5.0)),
+            make_account(4, entry=make_entry(5.0, 5.0)),
+        )
+        assert reasons == {
+            "2": "usage unreadable", "3": "no headroom left",
+        }, reasons
+
+    def test_an_overdue_reading_is_not_called_unreadable(self):
+        """A row whose last good reading aged past `STALE_OK_S` with no failure
+        says it is overdue, whatever its poll plan (its chips still show the
+        reading); a failure count alone, or a backoff alone, keeps "usage
+        unreadable", on both passes."""
+        now = time.time()
+        stale = make_entry(61.0, 96.0, age_s=STALE_OK_S + 60)
+        planned = dataclasses.replace(stale, next_poll_at=now - 5)
+        failing = dataclasses.replace(stale, consecutive_failures=2)
+        backed_off = dataclasses.replace(stale, backoff_until=now + 600)
+        for settings in (
+            _WARM_ORDER_SETTINGS,
+            AutoSwitchSettings(strategy="consume-first", threshold=90.0),
+        ):
+            reasons = self._reasons(
+                settings,
+                make_account(1, active=True, entry=make_entry(50.0, 50.0)),
+                make_account(2, entry=planned),
+                make_account(3, entry=stale),
+                make_account(4, entry=failing),
+                make_account(5, entry=backed_off),
+            )
+            assert reasons == {
+                "2": "usage overdue for refresh",
+                "3": "usage overdue for refresh",
+                "4": "usage unreadable",
+                "5": "usage unreadable",
+            }, (settings.strategy, reasons)
+
+
+class TestRankSwitchOwnBars:
+    """An account's own switch threshold (#321's per-account bars) reaches the
+    panel's pass as it reaches the engine's tick (`self._bars`): the row
+    carries it as `policy.threshold`, and every bar the engine reads per
+    account is that number, never the strategy's."""
+
+    @staticmethod
+    def _rank(settings, *accounts):
+        snap = AccountsSnapshot(
+            accounts=list(accounts), active_number="1", taken_at=0.0
+        )
+        return snap, tui_data.rank_switch_candidates(snap, settings, time.time(), "1")
+
+    def test_best_refuses_a_candidate_past_its_own_bar(self):
+        """Active at 95%, #2 at 70% under its own bar of 60, #3 at 75% under
+        the strategy's 90: the engine refuses #2 (it would leave again next
+        tick) and lands on #3, so #2 must not head the list."""
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
+            settings,
+            make_account(1, active=True, entry=make_entry(95.0, 10.0)),
+            make_account(2, entry=make_entry(70.0, 10.0), policy=AccountPolicy(threshold=60.0)),
+            make_account(3, entry=make_entry(75.0, 10.0)),
+        )
+        assert trigger == "proactive", trigger
+        assert ordered == ["3"], ordered
+        assert _autoview_order(snap, "1", settings) == ["3", "2"]
+
+    def test_best_leaves_an_active_at_its_own_bar(self):
+        """Active at 85% with its own bar of 80 under `best` (90): the engine
+        departs it (`departure_pct`), so the panel must not read it as
+        below the threshold and show nothing."""
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        _snap, (ordered, _axis, trigger, unmodeled) = self._rank(
+            settings,
+            make_account(
+                1, active=True, entry=make_entry(85.0, 10.0), policy=AccountPolicy(threshold=80.0)
+            ),
+            make_account(2, entry=make_entry(10.0, 10.0)),
+        )
+        assert (trigger, unmodeled) == ("proactive", False)
+        assert ordered == ["2"], ordered
+
+    def test_a_row_reads_its_own_bar_in_its_line_chip_and_its_block(self):
+        """The row text is the engine's reading too: #2 (5h 70%, own bar 60)
+        under best/90 beside a 97 weekly line is refused at 60, so its chip
+        names line 60 (not the strategy's 90) and the block is the window's,
+        not an unexplained "not a candidate"."""
+        settings = AutoSwitchSettings(
+            strategy="best", threshold=90.0, weekly_threshold=97.0
+        )
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(95.0, 10.0)),
+                make_account(2, entry=make_entry(70.0, 10.0), policy=AccountPolicy(threshold=60.0)),
+                make_account(3, entry=make_entry(75.0, 10.0)),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        rows = _autoview_text(snap, "1", settings).split("\n")
+        row2 = next(r for r in rows if "user2@example.com" in r)
+        row3 = next(r for r in rows if "user3@example.com" in r)
+        assert re.search(r"5h\S*:70% \(line 60%\)", row2), row2
+        assert "not a candidate" not in row2, row2
+        assert re.search(r"5h\S*:75% \(line 90%\)", row3), row3
+
+    def test_dynamic_walls_the_active_at_its_own_bar_and_refuses_peers_past_theirs(
+        self,
+    ):
+        """Under `dynamic` an active with its own bar of 80 walls at headroom
+        20 (`_active_wall`), not 3: "proactive" there, and #2 (85%, past its
+        own bar of 80) is as unlandable as a spent peer."""
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        _snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
+            settings,
+            make_account(
+                1, active=True, entry=make_entry(80.0, 10.0), policy=AccountPolicy(threshold=80.0)
+            ),
+            make_account(2, entry=make_entry(85.0, 10.0), policy=AccountPolicy(threshold=80.0)),
+            make_account(3, entry=make_entry(50.0, 10.0)),
+        )
+        assert trigger == "proactive", trigger
+        assert ordered == ["3"], ordered
+
+    def test_dynamic_active_at_the_real_wall_lifts_the_peers_own_bars(self):
+        """Every peer past its own line, but the active at the REAL wall
+        (headroom 2 <= 3): the engine re-ranks without the bars rather than
+        ride to the limit (`_dynamic_rank`), and so does the panel."""
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        _snap, (ordered, _axis, trigger, _unmodeled) = self._rank(
+            settings,
+            make_account(
+                1, active=True, entry=make_entry(98.0, 10.0), policy=AccountPolicy(threshold=80.0)
+            ),
+            make_account(2, entry=make_entry(85.0, 10.0), policy=AccountPolicy(threshold=80.0)),
+        )
+        assert trigger == "proactive", trigger
+        assert ordered == ["2"], ordered
+
+
+class TestPanelOrderIsTheEnginesOrder:
+    """The panel asks the engine who can be picked (#371), so where the engine
+    has its own order the panel's list is the order a real tick acts on: its
+    top row is the account the tick switches to. Pinned for the two regimes
+    upstream added that order unlike the strategies the panel once imitated:
+    `priority-consume-first` (tier, then soonest weekly reset) and a fleet
+    entirely over its lines (most room, whatever returns first)."""
+
+    @staticmethod
+    def _tick_and_panel(temp_home, fleet, *, tiers=None, **kw):
+        """Tick the real engine on ``fleet`` (account 1 active); return the
+        account it switched to, the panel's ordered list and its rendered text
+        for the same fleet."""
+        from claude_swap.autoswitch import TickOutcome
+        from tests.test_autoswitch import EngineHarness
+
+        tiers = tiers or {}
+        h = EngineHarness(temp_home, **kw)
+        for num in fleet:
+            h.seed(int(num), f"user{num}@example.com")
+        h.make_live("user1@example.com", 1)
+        for num, tier in tiers.items():
+            h.switcher.set_account_priority(num, tier)
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(
+                    num,
+                    active=num == "1",
+                    entry=UsageEntry(
+                        last_good=value, fetched_at=time.time(), age_s=0.0
+                    ),
+                    policy=AccountPolicy(priority=tiers.get(num, 0)),
+                )
+                for num, value in fleet.items()
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(**kw)
+        ordered = tui_data.rank_switch_candidates(snap, settings, time.time(), "1")[0]
+        return str(h.active_number()), ordered, _autoview_text(snap, "1", settings)
+
+    @pytest.mark.parametrize("active_pct", [50.0, 96.0])
+    def test_priority_consume_first_lists_tier_first_then_the_soonest_reset(
+        self, temp_home, active_pct
+    ):
+        """The active is below its line (a priority move off a healthy
+        account) or over it (a proactive one); either way the order is tier,
+        then weekly reset, and an account over its own line is never listed
+        however high its tier."""
+        def w(pct, days):
+            return {
+                "five_hour": {"pct": pct},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_in(days * 86400)},
+            }
+
+        fleet = {
+            "1": w(active_pct, 9),   # tier 0
+            "2": w(95.0, 1),         # tier 100, but over its line
+            "3": w(20.0, 2),         # tier 100
+            "4": w(10.0, 1 / 24),    # tier 50, the soonest reset of all
+            "5": w(20.0, 1),         # tier 100, ahead of 3 on reset
+        }
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, fleet, tiers={"2": 100, "3": 100, "4": 50, "5": 100},
+            strategy="priority-consume-first", threshold=90.0,
+            cooldown_seconds=0.0,
+        )
+        assert engine_pick == "5"
+        assert ordered == ["5", "3", "4"], ordered
+        assert "Next best (highest tier, then soonest reset)" in rendered, rendered
+        positions = [rendered.index(f"user{n}@example.com") for n in ordered]
+        assert positions == sorted(positions), rendered
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_a_fleet_entirely_over_its_lines_lists_the_most_room_first(
+        self, temp_home, strategy
+    ):
+        """Every account is past the 90 line, so the engine ranks by room and
+        holds the move to a capped margin (6 points against the active's 3):
+        #2 holds 8, #3 holds 7 and returns sooner, #4 holds 4 and misses the
+        margin. By which window returns first (the order before upstream's
+        21796361) #4 would head the list."""
+        def w(pct, secs):
+            return {
+                "five_hour": {"pct": pct, "resets_at": _iso_in(secs)},
+                "seven_day": {"pct": 10.0},
+            }
+
+        fleet = {
+            "1": w(97.0, 4 * 3600),
+            "2": w(92.0, 900),
+            "3": w(93.0, 600),
+            "4": w(96.0, 300),
+        }
+        engine_pick, ordered, rendered = self._tick_and_panel(
+            temp_home, fleet, strategy=strategy, threshold=90.0,
+        )
+        assert engine_pick == "2"
+        assert ordered == ["2", "3"], ordered
+        assert "Next best (most headroom)" in rendered, rendered
+
+
+@pytest.mark.asyncio
+class TestSharedAccountOrder:
+    """Dashboard/Switch/Watch render `ordered_accounts`; Remove/Disable keep slot order."""
+
+    async def test_opening_the_auto_view_resyncs_auto_settings(self, tmp_path, fake_engine):
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"schemaVersion": 1, "autoswitch": {"strategy": "best"}})
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            assert app.auto_settings.strategy == "consume-first"  # stale copy
+            await pilot.press("g")
+            await pilot.pause()
+            assert app.auto_settings.strategy == "best"
+
+    async def test_every_listing_screen_follows_the_shared_order(self, tmp_path):
+        """A state file on disk, so the reference order below actually
+        depends on `last_active_at` (`dynamic`, the warm-partner fixture)
+        -- a fixture with no state file passes even when a surface skips
+        the read entirely, since `last_active_at={}` and `{}` agree."""
+        from textual.widgets import ListView
+
+        from claude_swap.tui.dashboard import SwitchScreen, WatchScreen
+        from claude_swap.tui.widgets import AccountItem, AccountsPanel
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"schemaVersion": 1, "autoswitch": {"strategy": "dynamic"}})
+        )
+        (tmp_path / "autoswitch_state.json").write_text(json.dumps({
+            "lastActiveAt": {"2": time.time() - 20 * 60},
+        }))
+        fake = FakeSwitcher(_warm_fixture_accounts(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            last_active_at = tui_data.read_last_active_at(tmp_path)
+            order = tui_data.ordered_accounts(
+                fake.accounts_snapshot(), app.auto_settings, time.time(),
+                last_active_at,
+            )
+            assert order[1:] == ["2", "3"], order  # warm outranks sooner cold
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            positions = [panel.index(f"user{n}@example.com") for n in order]
+            assert positions == sorted(positions)
+            for screen in (SwitchScreen(), WatchScreen()):  # one mount, pushed in turn
+                await app.push_screen(screen)
+                await pilot.pause()
+                listview = screen.query_one("#accounts", ListView)
+                numbers = [item.number for item in listview.query(AccountItem)]
+                assert numbers == order
+
+    async def test_remove_and_disable_menus_keep_slot_order_and_say_so(
+        self, tmp_path
+    ):
+        from textual.widgets import ListView, Static
+
+        from claude_swap.tui.widgets import MenuItem
+
+        fake = FakeSwitcher(_order_fixture_accounts(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            for menu_id, prefix in (("remove-menu", "remove:"), ("disable-menu", "disable:")):
+                await menu_select(pilot, menu_id)
+                await settle(pilot)
+                title = app.screen.query_one("#menu-title", Static).render().plain
+                assert "slot order" in title
+                assert "numbers stay put" in title  # states the reason, not just the label
+                menu = app.screen.query_one("#menu", ListView)
+                ids = [
+                    item.action_id for item in menu.query(MenuItem)
+                    if item.action_id.startswith(prefix)
+                ]
+                assert ids == [f"{prefix}{n}" for n in ("3", "5", "2", "4", "12")]
+                await menu_select(pilot, "back")
+
+    async def test_switch_cursor_follows_the_account_when_order_changes(
+        self, tmp_path
+    ):
+        from textual.widgets import ListView
+
+        from claude_swap.tui.widgets import AccountItem
+
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(95.0, 95.0)),
+                make_account(2, entry=make_entry(30.0, 30.0)),
+                make_account(3, entry=make_entry(5.0, 5.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "switch")
+            await settle(pilot)
+            listview = app.screen.query_one("#accounts", ListView)
+            before = [item.number for item in listview.query(AccountItem)]
+            assert before == ["1", "3", "2"]  # "3" (5%) ranks ahead of "2" (30%)
+            listview.index = before.index("2")  # cursor on the worse one
+
+            swapped = [  # invert the ranking: "2" becomes the better candidate
+                dataclasses.replace(a, usage=make_entry(5.0, 5.0))
+                if a.number == "2"
+                else dataclasses.replace(a, usage=make_entry(30.0, 30.0))
+                if a.number == "3"
+                else a
+                for a in fake._accounts
+            ]
+            app.snapshot = AccountsSnapshot(
+                active_number="1", accounts=tuple(swapped), taken_at=time.time()
+            )
+            await pilot.pause()
+
+            after = [item.number for item in listview.query(AccountItem)]
+            assert after == ["1", "2", "3"]  # the row order really flipped
+            assert listview.index == after.index("2")  # cursor followed "2"
+
+
 def fake_calls(app) -> list[tuple]:
     return app.switcher.calls
 
@@ -2997,15 +3738,19 @@ class TestAutoScreen:
     async def test_candidates_keep_the_model_gate_under_best_even_when_every_row_is_model_only(
         self, tmp_path, fake_engine
     ):
-        """The regression this gate exists to stop: same shape as the test
-        above (both candidates blocked ONLY by the pinned model, here at
-        95%/90% rather than the dynamic test's 99%/98% -- `best` reads the
-        raw `settings.threshold` unchanged, so 90% already blocks), but
-        `strategy: "best"` — the engine's own retry never drops the model
-        set for `best`/`consume-first` (autoswitch.py:2400), so the panel
-        must not either. Ranking stays on the model-gated axis: #3 (90%
-        Fable) ranks first, the OPPOSITE order from the `dynamic` test
-        above."""
+        """The regression this gate exists to stop: both candidates blocked
+        ONLY by the pinned model (their 5h/7d are open; only the Fable
+        window is over the bar), but `strategy: "best"` — the engine's own
+        retry never drops the model set for `best`/`consume-first`
+        (autoswitch.py:2400), so the panel must not either: both rows stay
+        labelled "Fable-walled", the model-gated block reason, never a
+        5h-based ranking (which `dynamic`, not exercised by this fleet,
+        would take instead).
+
+        With the active also above the threshold (91% 5h) every account here
+        is at/over the bar, so `_rank_candidates_pass`'s `all_above` recovery
+        axis applies and admits neither candidate — "next best" must say so
+        rather than picking a top row the engine would never reach for."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -3031,18 +3776,102 @@ class TestAutoScreen:
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
-            assert plain.index("user3@example.com") < plain.index(
-                "user2@example.com"
+            assert "no candidate qualifies" in plain, plain
+            assert plain.count("Fable-walled") == 2, (
+                f"both rows must stay model-gated, never re-ranked on the "
+                f"5h axis `best` never uses: {plain!r}"
             )
+
+    async def test_candidates_rank_unconditionally_under_a_disabled_active(
+        self, tmp_path, fake_engine
+    ):
+        """The engine checks `is_account_disabled(current)` FIRST and
+        unconditionally, before any headroom reading, and its trigger --
+        "disabled-active" -- is in neither gated tuple, so a disabled
+        active's own healthy headroom (50%) must never derive "proactive"
+        here and gate out a low-headroom candidate the way it would for a
+        merely-healthy active. #2's own utilization (96% 5h) is itself over
+        the threshold (90) -- excluded by the landing-health gate under
+        "proactive" before `best`'s hysteresis margin is ever reached -- but
+        a disabled active must still rank it rather than report no
+        candidate at all."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "best", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, disabled=True, entry=make_entry(50.0, 50.0)),
+                make_account(2, entry=make_entry(96.0, 5.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "no candidate qualifies" not in plain, plain
+
+    async def test_candidates_dynamic_retry_ranks_once_the_model_gate_drops(
+        self, tmp_path, fake_engine
+    ):
+        """A single trigger, carried into both the model-gated pass and the
+        5h/7d retry, must still let the retry itself land a real ranking --
+        this is the case the retry exists for, not merely a case that
+        returns empty either way. The active is genuinely spent on BOTH 5h
+        and 7d (100%/100%), so widening is a no-op and the trigger
+        classifies "at-limit" on either axis; #2 is maxed ONLY on the pinned
+        Fable window (100%) with 5h/7d wide open (10%/5%). On the
+        model-gated axis #2 reads spent too (headroom 0), which sends the
+        pass onto `dynamic`'s own recovery axis; there `dynamic`'s landing
+        rule refuses to admit ANY zero-headroom account unconditionally --
+        unlike `best`/`consume-first`, which would still take the recovery
+        escape -- so the primary pass comes back empty and
+        `_model_window_binds_everywhere` sends it to the retry; there, with
+        the model dropped, #2's real 5h/7d headroom (90) has nothing to
+        exclude it and the retry ranks it.
+        """
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(100.0, 100.0)),
+                make_account(
+                    2, entry=make_entry(10.0, 5.0, scoped=[("Fable", 100.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "no candidate qualifies" not in plain, plain
 
     async def test_candidates_drain_soonest_seven_day_reset_first(
         self, tmp_path, fake_engine
     ):
-        """Under the default (consume-first) strategy, 'Next best' lists
-        switchable accounts in the order the engine would actually switch to
-        them: soonest 7-day reset first, so quota is spent before it resets
-        and goes to waste. The active's 5-hour window stays a gate, never a
-        key -- it plays no part in this order."""
+        """Under the default (consume-first) strategy, `_rank_candidates_pass`
+        only ever admits an account whose 7-day reset comes SOONER than the
+        active's own -- moving to one that resets LATER would waste nothing
+        yet and is not something a consume-first tick would do (it revisits
+        the rest on later ticks, once the active's own reset moves). Of six
+        peers only "5" resets sooner than the active's 1.75 days out; the
+        other four must be named "not a candidate", and -- unranked as they
+        are -- still keep the fallback's own soonest-reset order, never the
+        account number."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -3093,9 +3922,11 @@ class TestAutoScreen:
 
             plain = app.screen.query_one("#candidates", Static).render().plain
             positions = [
-                plain.index(f"user{n}@example.com") for n in ("5", "3", "2", "1", "6", "7")
+                plain.index(f"user{n}@example.com")
+                for n in ("5", "3", "2", "1", "6", "7")
             ]
             assert positions == sorted(positions), plain
+            assert plain.count("not a candidate") == 4, plain
 
 
 class TestEventText:
@@ -3493,7 +4324,7 @@ class TestUnswitchableRowsAreListed:
             )
         return a
 
-    def _render(self, snap, active, *, settings=None, engine=None):
+    def _render(self, snap, active, *, settings=None, engine=None, backup_dir=None):
         from unittest.mock import MagicMock, patch
         from claude_swap.tui.autoview import AutoScreen
         from claude_swap.settings import AutoSwitchSettings
@@ -3501,6 +4332,11 @@ class TestUnswitchableRowsAreListed:
         v = AutoScreen.__new__(AutoScreen)
         v._settings = settings or AutoSwitchSettings()
         v._engine = engine
+        # Real read off `backup_dir`'s state file when a test supplies one
+        # (`data.read_last_active_at`'s own safety contract otherwise applies
+        # to `getattr`'s `{}` default -- no `backup_dir` here is not the
+        # panel's "no access", just this call not exercising it).
+        v._last_active_at = tui_data.read_last_active_at(backup_dir) if backup_dir else {}
         from claude_swap.tui.theme import CSWAP_DARK
         app = MagicMock()
         app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
@@ -3705,6 +4541,514 @@ class TestUnswitchableRowsAreListed:
         assert "usage unknown" in out, (
             f"CONTROL BROKEN: an account with no usage stopped saying so: {out!r}"
         )
+
+    def test_a_7d_exhausted_account_never_outranks_a_5h_exhausted_one(self):
+        """The panel used to re-derive its own order from the raw window
+        pcts and could rank an account the engine would never pick above
+        one it could actually reach. The engine only admits an at-limit
+        escape through a conjunction that needs the ACTIVE account at its
+        own limit too -- so the active here is 5h-exhausted with no 7d
+        window at all (an annual-plan style reading).
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0)
+        active = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(4 * 3600)}}
+        seven_day_full = {
+            "five_hour": {"pct": 20.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        five_hour_full = {
+            "five_hour": {"pct": 100.0, "resets_at": _iso_in(300)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(5 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "sevenday@x.com", switchable=True,
+                       last_good=seven_day_full),
+            self._acct("3", "fivehour@x.com", switchable=True,
+                       last_good=five_hour_full),
+        ), active="1", settings=settings)
+        assert out.index("fivehour@x.com") < out.index("sevenday@x.com"), (
+            f"the 7d-exhausted account outranked the 5h-exhausted one the "
+            f"engine could still reach: {out!r}"
+        )
+        assert "7d full" in out, (
+            f"the excluded 7d-exhausted row gave no reason: {out!r}"
+        )
+
+    def test_CONTROL_a_7d_exhausted_account_alone_is_excluded_not_ranked(self):
+        """CONTROL for the row above: with no 5h-exhausted peer to land on,
+        the 7d-exhausted account is still excluded (the engine's own
+        conjunction never admits it), and the panel must say so rather than
+        naming it "Next best" — the empty-competitive-list case, distinct
+        from "no other accounts" (there IS another account, just none the
+        engine would pick).
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0)
+        active = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(4 * 3600)}}
+        seven_day_full = {
+            "five_hour": {"pct": 20.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "sevenday@x.com", switchable=True,
+                       last_good=seven_day_full),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" in out, (
+            f"an unusable account was ranked as next best instead: {out!r}"
+        )
+        assert "7d full" in out, (
+            f"the excluded 7d-exhausted row gave no reason: {out!r}"
+        )
+
+    def test_dynamic_healthy_ranks_through_the_engines_own_warm_cold_mechanism(self):
+        """`dynamic`'s own steady state (the active neither at-limit nor
+        about to wall) never reaches `rank_candidates_pass` on a real tick
+        -- `_tick_inner` ranks it with the separate warm/cold-tiered
+        `_rank_dynamic_candidates` instead (the `dynamic-healthy` arm's own
+        `_dynamic_rank`/`_rank_dynamic_candidates` call). The panel must
+        call that SAME pure function, not stay silent about it: a healthy
+        candidate clearing both `SPENT_HEADROOM_PCT` and `settings.
+        cold_switch_cost_pct` IS knowable here, and "not previewed" is now
+        the false claim (owner decision: all three surfaces follow the
+        dynamic engine's own ranking)."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        active = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_in(5 * 86400)},
+        }
+        candidate = {
+            "five_hour": {"pct": 5.0},
+            "seven_day": {"pct": 5.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "candidate@x.com", switchable=True,
+                       last_good=candidate),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" not in out, (
+            f"a real, healthy candidate was ranked: {out!r}"
+        )
+        assert "not previewed" not in out, (
+            f"the engine's own warm/cold ranking is knowable here -- "
+            f"staying silent is now the false claim: {out!r}"
+        )
+        row2 = out[out.index("candidate@x.com"):]
+        assert "not a candidate" not in row2, (
+            f"the engine's own next pick was labelled never a candidate: {out!r}"
+        )
+
+    def test_dynamic_ranks_two_cold_candidates_by_soonest_weekly_reset(self):
+        """The engine's own `_rank_dynamic_candidates` ranks a `dynamic`
+        proactive/healthy tick's candidates by SOONEST WEEKLY (7-day)
+        reset, never by `_binding_recovery_ts` (whichever window actually
+        blocks THIS account -- the waiting tier's own key, for a candidate
+        the pass never ranked at all). "2" is 5h 60% (its OWN binding
+        window, back in 1h) and 7d 20% (back in 6d); "3" is 5h 5% and 7d
+        30% (its OWN binding window, back in 1d). Both are cold (no cached
+        org context) and both clear `SPENT_HEADROOM_PCT` -- the engine
+        ranks [3, 2] (soonest 7-day reset first); `_binding_recovery_ts`
+        reads [2, 3] instead (1h < 1d on each account's own binding
+        window) -- the wrong key for this state.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        active = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        acc2 = {
+            "five_hour": {"pct": 60.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_in(6 * 86400)},
+        }
+        acc3 = {
+            "five_hour": {"pct": 5.0, "resets_at": _iso_in(4 * 3600)},
+            "seven_day": {"pct": 30.0, "resets_at": _iso_in(1 * 86400)},
+        }
+        snap = self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "b@x.com", switchable=True, last_good=acc2),
+            self._acct("3", "c@x.com", switchable=True, last_good=acc3),
+        )
+        ordered, *_ = tui_data.rank_switch_candidates(
+            snap, settings, time.time(), "1"
+        )
+        assert ordered == ["3", "2"], ordered
+
+    def test_the_panel_admits_a_headroom_candidate_with_hours_to_reset_under_dynamic(
+        self,
+    ):
+        """The owner's live case, 2026-09-19 (#321): account 4 at 7d 95%
+        (headroom 5) with its reset hours away must read as open on the
+        panel too, and rank ahead of a peer with more headroom but a
+        reset days out -- the panel's label and its "Next best" order
+        must never disagree with the engine (`proactive_switch_bar_pct`,
+        97 under dynamic). `_rank_dynamic_on` used to apply the proactive
+        arm's cold-floor partition (floor-clearing cold first) on the
+        HEALTHY trigger too; the engine only ever applies that partition
+        on the `proactive` arm (`_tick_inner`'s own `dynamic_ordered =
+        warm_ordered + cold_clears_floor`, reached only when `trigger ==
+        "proactive"`) -- on `dynamic-healthy` the order is `_rank_dynamic_
+        candidates`' own (soonest 7-day reset, warm before cold), which
+        ranks #4 (reset ~6.5h out) ahead of #2 (reset ~5.8d out) even
+        though #2 clears the cold floor and #4, cold at only 5 headroom,
+        does not.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+        from tests.test_autoswitch import _iso_at
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("7", "active@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 18.0},
+            }),
+            self._acct("4", "close@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {
+                    "pct": 95.0, "resets_at": _iso_at(time.time() + 23340),
+                },
+            }),
+            self._acct("2", "far@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {
+                    "pct": 40.0, "resets_at": _iso_at(time.time() + 500000),
+                },
+            }),
+        ), active="7", settings=settings)
+
+        rows = {
+            email: next(line for line in out.split("\n") if email in line)
+            for email in ("close@x.com", "far@x.com")
+        }
+        assert "full" not in rows["close@x.com"], rows["close@x.com"]
+        assert ">=" not in rows["close@x.com"], rows["close@x.com"]
+        assert out.index("close@x.com") < out.index("far@x.com"), (
+            f"the panel's 'Next best' order disagrees with the engine: {out!r}"
+        )
+
+    def test_the_proactive_arms_cold_floor_partition_ranks_the_floor_clearer_first(
+        self,
+    ):
+        """The owner's fixture above, widened at the active only: account 7
+        at 7d 98% (headroom 2) is inside `SPENT_HEADROOM_PCT` (3.0), so
+        `_classify_dynamic_trigger` reads `proactive`, not `dynamic-
+        healthy` — the ONE trigger `_rank_dynamic_on` applies the
+        cold-floor partition on (`_tick_inner`'s own `dynamic_ordered =
+        warm_ordered + cold_clears_floor`, reached only when `trigger ==
+        "proactive"`). Both #4 and #2 stay cold (no `last_active_at`); #4
+        (`close@x.com`, headroom 5) is below `cold_switch_cost_pct` (the
+        20.0 default) and #2 (`far@x.com`, headroom 60) clears it, so the
+        floor-clearer must rank first even though its reset is the later
+        one. A mutant collapsing the partition to `ordered = warm + cold`
+        for `trigger == "proactive"` too falls back to `_rank_dynamic_
+        candidates`' own soonest-reset order (close's reset is hours out,
+        far's is days out) and reads close before far instead.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+        from tests.test_autoswitch import _iso_at
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("7", "active@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 98.0},
+            }),
+            self._acct("4", "close@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {
+                    "pct": 95.0, "resets_at": _iso_at(time.time() + 23340),
+                },
+            }),
+            self._acct("2", "far@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0}, "seven_day": {
+                    "pct": 40.0, "resets_at": _iso_at(time.time() + 500000),
+                },
+            }),
+        ), active="7", settings=settings)
+
+        assert out.index("far@x.com") < out.index("close@x.com"), (
+            f"the proactive arm's cold-floor partition must rank the "
+            f"floor-clearer first: {out!r}"
+        )
+
+    def test_a_warm_partner_outranks_a_sooner_cold_reset(self, tmp_path):
+        """`_rank_dynamic_on` used to pass a hardcoded `{}` for
+        `last_active_at`, so `_is_warm` was False for every candidate and
+        the warm tier was always empty (#375's own warm/cold pass never ran
+        here). The engine writes `lastActiveAt` to `<backup_dir>/
+        autoswitch_state.json` on every switch (autoswitch.py's
+        `_mutate_state` call in the switch path) -- this panel must read
+        THAT file, read-only, and rank through it: "2" was active 20m ago
+        (warm, inside the default 1h `cache_ttl_seconds`) with a 5-day
+        weekly reset; "3" has never been active (cold) with the SOONER
+        1-day reset. On reset alone "3" would rank first, but a warm
+        candidate ranks ahead of every cold one regardless of reset time
+        (`_rank_dynamic_candidates`) -- "2" must be first. Also covers the
+        axis legend: the engine's own name for this ranking is "soonest
+        reset", never the recovery axis' "soonest to recover" (that name
+        belongs to the at-limit escape order alone).
+        """
+        active = {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 50.0}}
+        warm_partner = {
+            "five_hour": {"pct": 40.0},
+            "seven_day": {"pct": 40.0, "resets_at": _iso_in(5 * 86400)},
+        }
+        cold_sooner = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(1 * 86400)},
+        }
+        (tmp_path / "autoswitch_state.json").write_text(json.dumps({
+            "lastActiveAt": {"2": time.time() - 20 * 60},
+        }))
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "warm@x.com", switchable=True, last_good=warm_partner),
+            self._acct("3", "cold@x.com", switchable=True, last_good=cold_sooner),
+        ), active="1", settings=settings, backup_dir=tmp_path)
+        assert out.index("warm@x.com") < out.index("cold@x.com"), (
+            f"the sooner-reset cold candidate outranked the warm one -- "
+            f"lastActiveAt never reached this panel: {out!r}"
+        )
+        assert "Next best (soonest reset)" in out, out
+
+    def test_a_disabled_account_with_the_most_headroom_is_not_offered(self):
+        """Every OTHER unswitchable/blocked row already says why; `disabled`
+        was the one silent exception in the real-usage (chip) branch --
+        `acc.disabled` used to be read only in the spend-only branch. The
+        disabled slot here has the SOONEST weekly reset of the three (1 day,
+        against the active's 10 and the enabled peer's 3) -- under
+        consume-first that is exactly what wins the competitive ranking, so
+        without the `and not acc.disabled` filter on `oauth_candidates` this
+        account would be admitted AND rank first, not merely tie on
+        headroom. It must not be offered at all.
+        """
+        active = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(10 * 86400)},
+        }
+        enabled = {
+            "five_hour": {"pct": 5.0},
+            "seven_day": {"pct": 5.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        disabled = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": 0.0, "resets_at": _iso_in(1 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("9", "enabled@x.com", switchable=True, last_good=enabled),
+            self._acct("8", "disabled@x.com", switchable=True,
+                       last_good=disabled, disabled=True),
+        ), active="1")
+        assert "auto-swap disabled" in out, (
+            f"the disabled account gave no reason it is never chosen: {out!r}"
+        )
+        assert out.index("enabled@x.com") < out.index("disabled@x.com"), (
+            f"the disabled account, with more headroom, outranked the "
+            f"enabled one: {out!r}"
+        )
+
+    def test_below_threshold_under_best_reads_not_previewed(self):
+        """Below threshold under `best`: real NO_ACTION, reads "not
+        previewed", never "no candidate qualifies"/`dynamic`'s reason."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        active = {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 20.0}}
+        candidate = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0}}
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "candidate@x.com", switchable=True, last_good=candidate),
+        ), active="1", settings=settings)
+        assert "not previewed (active below threshold)" in out, out
+        assert "no candidate qualifies" not in out and "not a candidate" not in out, out
+
+    def test_an_api_key_last_resort_is_not_asserted_as_no_candidate(self):
+        """`_tick_inner` takes `api_key_candidates` as a last resort whenever
+        `not ordered and trigger not in CONSUME_FIRST_STRATEGIES`
+        (autoswitch.py :2600) -- which covers `proactive`/`at-limit`/
+        `disabled-active` under the default (consume-first) strategy too,
+        not just `best`: those trigger literals are never the strategy's own
+        name. With no OAuth peer and `include_api_key_accounts` on, the next
+        tick switches to the API-key slot, so the panel must not claim "no
+        candidate qualifies" -- the false-claim class `_UNMODELED_TEXT` stops.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(include_api_key_accounts=True)
+        active = {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 20.0}}
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "apikey@x.com", switchable=True, kind="api_key",
+                       last_good={}),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" not in out, (
+            f"the API-key slot is the engine's own last-resort pick, not "
+            f"'no candidate qualifies': {out!r}"
+        )
+
+    def test_CONTROL_the_api_key_last_resort_needs_the_flag(self):
+        """CONTROL for the row above: same fleet, `include_api_key_accounts`
+        off -- the engine never falls back to the API-key slot either, so
+        "no candidate qualifies" is the honest claim here."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(include_api_key_accounts=False)
+        active = {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 20.0}}
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "apikey@x.com", switchable=True, kind="api_key",
+                       last_good={}),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" in out, out
+
+    def test_CONTROL_the_api_key_last_resort_is_withheld_when_unmodeled(self):
+        """CONTROL: a real below-threshold tick returns NO_ACTION at
+        autoswitch.py :1945, before :2600's last resort is ever reached --
+        so an API-key candidate present under `include_api_key_accounts`
+        must not make the fallback fire and swallow the "not previewed"
+        text the way "no candidate qualifies" was swallowed above."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0,
+                                       include_api_key_accounts=True)
+        active = {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 20.0}}
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "apikey@x.com", switchable=True, kind="api_key",
+                       last_good={}),
+        ), active="1", settings=settings)
+        assert "not previewed (active below threshold)" in out, out
+
+    def test_CONTROL_the_api_key_last_resort_waits_for_the_priority_active_to_hit_its_line(
+        self,
+    ):
+        """`priority-consume-first` below its line is a `priority` tick, which
+        is outside the engine's last-resort set (autoswitch.py: `trigger not in
+        (*CONSUME_FIRST_STRATEGIES, "priority")`): it holds rather than move
+        onto a metered account. Over its line the last resort stands."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(
+            strategy="priority-consume-first", threshold=90.0,
+            include_api_key_accounts=True,
+        )
+
+        def render(active_pct):
+            active = {"five_hour": {"pct": active_pct}, "seven_day": {"pct": 20.0}}
+            return self._render(self._snap(
+                self._acct("1", "active@x.com", switchable=True, last_good=active),
+                self._acct("2", "apikey@x.com", switchable=True, kind="api_key",
+                           last_good={}),
+            ), active="1", settings=settings)
+
+        assert "no candidate qualifies" in render(20.0)
+        assert "no candidate qualifies" not in render(95.0)
+
+    def test_the_api_key_last_resort_sorts_above_a_refused_oauth_row(self):
+        """The fallback (:539) can set `ordered` to an API-key row while a
+        refused OAuth peer is also listed -- that peer is not the engine's
+        pick, so it must not sort ABOVE the one that is. The spend/sentinel
+        branches used their own hard-coded (998.0,)/(999.0,) keys, never
+        `ordered_rank`, so a row the engine refused always outranked the
+        engine's own last-resort pick.
+
+        `sentinel=USAGE_API_KEY`, not `last_good={}`: a real switchable
+        API-key account always carries that sentinel (switcher.py:5184's
+        `_static_usage_sentinel`), so this is the branch (:577) a live TUI
+        actually reaches, not the spend one (:590) an empty `last_good`
+        would exercise instead.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0,
+                                       include_api_key_accounts=True)
+        active = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(4 * 3600)}}
+        seven_day_full = {
+            "five_hour": {"pct": 20.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "sevenday@x.com", switchable=True,
+                       last_good=seven_day_full),
+            self._acct("3", "apikey@x.com", switchable=True, kind="api_key",
+                       sentinel=USAGE_API_KEY),
+        ), active="1", settings=settings)
+        assert out.index("apikey@x.com") < out.index("sevenday@x.com"), (
+            f"the engine's own pick sorted behind a row it refused: {out!r}"
+        )
+
+    def test_CONTROL_a_sentinel_blocked_candidate_does_not_enter_the_ranking(self):
+        """CONTROL for the `ordered_rank` arm added to the sentinel branch:
+        a sentinel-blocked account is never in `ordered_rank` (its
+        `decision_value()` is the sentinel string, so headroom reads None
+        and `_rank_candidates_pass` drops it) -- an unconditional top key
+        there would put an unusable row above a real peer, the same
+        false-claim class this task closes. The active must itself be
+        readable and over threshold (else the pass never runs at all and
+        neither row reaches this arm, `not previewed` instead) and the
+        sentinel row must carry the LOWER account number: a mutated
+        unconditional `(0, 0)` ties the peer's own `(0, 0)`, and the tie
+        breaks on `acc.number` as a string -- a higher-numbered sentinel
+        row would let that tie-break mask the mutation.
+        """
+        active = {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 20.0}}
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good=active),
+            self._acct("2", "expired@x.com", switchable=True,
+                       sentinel=USAGE_TOKEN_EXPIRED),
+            self._acct("3", "healthy@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0},
+            }),
+        ), active="1")
+        assert "not previewed" not in out, (
+            f"the ranking pass never ran, so this control tested nothing: {out!r}"
+        )
+        assert out.index("healthy@x.com") < out.index("expired@x.com"), (
+            f"a sentinel-blocked row outranked a real peer: {out!r}"
+        )
+
+    def test_an_unreadable_active_is_not_asserted_as_failover(self):
+        """Real `failover` needs consecutive unreadable ticks; one is not
+        enough to tell apart from still-counting/idle-held/no-active."""
+        candidate = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0}}
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, sentinel=USAGE_TOKEN_EXPIRED),
+            self._acct("2", "candidate@x.com", switchable=True, last_good=candidate),
+        ), active="1")
+        assert "not previewed (active status unknown)" in out and "not a candidate" not in out, out
+
+    def test_the_legend_prints_the_engines_own_axis(self):
+        """The legend names `_rank_candidates_pass`'s own 5th return value,
+        not a re-derived key. With every account over its line the engine
+        ranks by room, so the peer that returns LATER but holds more heads the
+        list under "most headroom"; at the active's limit it waits on the
+        soonest return instead, and the legend says so."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        def week(pct, hours):
+            return {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": pct, "resets_at": _iso_in(hours * 3600)},
+            }
+
+        def render(active, sooner, later):
+            return self._render(self._snap(
+                self._acct("1", "active@x.com", switchable=True, last_good=active),
+                self._acct("2", "sooner@x.com", switchable=True, last_good=sooner),
+                self._acct("3", "later@x.com", switchable=True, last_good=later),
+            ), active="1", settings=AutoSwitchSettings(strategy="best", threshold=90.0))
+
+        out = render(week(97.0, 20), week(93.0, 5), week(92.0, 6))
+        assert out.index("later@x.com") < out.index("sooner@x.com"), out
+        assert "Next best (most headroom)" in out, out
+        assert "Next best (soonest to recover)" not in out, out
+
+        out = render(week(100.0, 20), week(99.0, 5), week(98.5, 6))
+        assert out.index("sooner@x.com") < out.index("later@x.com"), out
+        assert "Next best (soonest to recover)" in out, out
 
     def test_unswitchable_rows_sort_last(self):
         out = self._render(self._snap(
@@ -3946,7 +5290,10 @@ class TestUnswitchableRowsAreListed:
         alone does not say which window blocked: it is driven by the fixed
         WARN/CRIT constants in `theme.py`, not by `settings.threshold`, so
         at an off-default threshold the colour and the block classification
-        can disagree."""
+        can disagree. `full` is reserved for actual exhaustion (100%,
+        `test_the_full_tag_reads_the_dynamic_switch_bar_not_the_threshold`)
+        so the full-block fixture here must genuinely exhaust its window,
+        not merely sit at/over the bar."""
         from claude_swap.settings import AutoSwitchSettings
 
         settings = AutoSwitchSettings(model="Fable", threshold=90.0)
@@ -3969,6 +5316,116 @@ class TestUnswitchableRowsAreListed:
         ), active="1", settings=settings)
         assert "Fable-walled" in out, out
         assert "  5h full" in out, out
+
+    def test_the_full_tag_reads_the_dynamic_switch_bar_not_the_threshold(self):
+        """`full` is reserved for actual exhaustion (a window's own pct at
+        or over 100) -- never merely at or over the landing bar
+        (`proactive_switch_bar_pct`, 97% at the default threshold under
+        `dynamic`, #321's `SPENT_HEADROOM_PCT`). A window at or over that
+        bar but still under 100 carries NO marker: the owner (2026-10-04)
+        found the ">= <bar>%" form noise ("97% >= 97%"), the chips already
+        show the figure and the "not a candidate" reason speaks for the
+        refusal. A candidate under the bar
+        (over the raw `settings.threshold` of 90, still open on the
+        engine's actual bar) reads plain "open", neither tag. CONTROL:
+        a genuinely exhausted row (100%) must still read `full`, proving
+        the fix does not just delete the tag.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(threshold=90.0, strategy="dynamic")
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+            }),
+            # 95%: over the raw threshold (90) but under the dynamic switch
+            # bar (97) -- open, no block label at all.
+            self._acct("2", "open@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 95.0},
+            }),
+            # 98%: at/over the dynamic switch bar, still under 100 -- no
+            # marker, never "full".
+            self._acct("3", "between@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 98.0},
+            }),
+            # CONTROL: 100%, genuinely exhausted.
+            self._acct("4", "full@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 100.0},
+            }),
+        ), active="1", settings=settings)
+        row2 = out[out.index("open@x.com"):out.index("between@x.com")]
+        assert "full" not in row2 and ">=" not in row2, out
+        row3 = out[out.index("between@x.com"):out.index("full@x.com")]
+        assert ">=" not in row3 and "full" not in row3, out
+        row4 = out[out.index("full@x.com"):]
+        assert "7d full" in row4, out
+        assert ">=" not in row4, out
+
+    def test_a_refused_row_names_the_reason_the_pass_dropped_it(self):
+        """`not a candidate` carries the engine's own reason (the pass's
+        `reasons` side channel), never a plain refusal the owner has to
+        guess at (2026-10-04). `best`, threshold 90, hysteresis 10: the
+        active (92%) is over the bar, the 20% peer is admitted, and the 85%
+        peer (under the bar, so still "open") has 7 points more headroom
+        than the active, short of the 10-point margin."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        def windows(pct):
+            return {"five_hour": {"pct": pct}, "seven_day": {"pct": 5.0}}
+
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good=windows(92.0)),
+            self._acct("2", "open@x.com", switchable=True, last_good=windows(20.0)),
+            self._acct("3", "close@x.com", switchable=True, last_good=windows(85.0)),
+        ), active="1", settings=AutoSwitchSettings(threshold=90.0, strategy="best"))
+        assert "not a candidate" not in out[:out.index("close@x.com")], out
+        assert "not a candidate (headroom margin too small)" in out, out
+
+    def test_a_no_plan_row_names_why_and_sorts_after_every_other_row(self):
+        """A slot whose usage poll answered `oauth_not_allowed_for_
+        organization` (subscription inactive) renders that reason INSTEAD
+        of chips and `stale`, and goes behind even an unswitchable slot."""
+        no_plan = UsageEntry(
+            last_good={"five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0}},
+            fetched_at=time.time(), age_s=0.0, consecutive_failures=3,
+            last_error="oauth_not_allowed_for_organization",
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("5", "noplan@x.com", switchable=True, usage=no_plan),
+            self._acct("4", "empty@x.com", switchable=False),
+        ), active="1")
+        row = out.rstrip().splitlines()[-1]
+        assert "noplan@x.com" in row, out
+        assert row.endswith("no plan (subscription inactive)"), out
+        assert "5h" not in row and "%" not in row and "stale" not in row, out
+
+    def test_a_no_plan_row_the_pass_ranked_keeps_its_ranked_place(self):
+        """`decision_value()` keeps serving `last_good` for a while after
+        polls fail, so the pass can still RANK a no-plan slot: drawing it last
+        would put the engine's actual pick below a refused row while the
+        header names its axis. It renders as a normal row, the reason a
+        marker after the chips."""
+        no_plan = UsageEntry(
+            last_good={"five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0}},
+            fetched_at=time.time(), age_s=0.0, consecutive_failures=3,
+            last_error="oauth_not_allowed_for_organization",
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 20.0},
+            }),
+            self._acct("2", "full@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 100.0},
+            }),
+            self._acct("3", "noplan@x.com", switchable=True, usage=no_plan),
+        ), active="1")
+        assert "no candidate qualifies" not in out, (
+            f"the pass ranked nothing, so this tested nothing: {out!r}"
+        )
+        assert out.index("noplan@x.com") < out.index("full@x.com"), out
+        row = next(r for r in out.splitlines() if "noplan@x.com" in r)
+        assert "5h" in row and row.endswith("no plan (subscription inactive)"), out
 
     @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
     def test_the_full_label_is_reserved_for_actual_exhaustion(self, strategy):
@@ -4281,6 +5738,14 @@ class TestUnswitchableRowsAreListed:
             self._acct("3", "c@x.invalid", switchable=True, last_good=fleet["3"]),
             self._acct("4", "d@x.invalid", switchable=True, last_good=fleet["4"]),
         ), active="1", settings=settings)
+        # A row's POSITION falls back to unranked/sequence order when the
+        # panel refuses to rank at all ("no candidate qualifies") -- so
+        # `panel_top` alone cannot tell a real top pick from that fallback
+        # naming the same account by coincidence.
+        assert "no candidate qualifies" not in rendered, (
+            f"the panel refused to rank at all instead of naming a top "
+            f"pick: {rendered!r}"
+        )
         emails = {"2": "b@x.invalid", "3": "c@x.invalid", "4": "d@x.invalid"}
         positions = {n: rendered.index(e) for n, e in emails.items()}
         panel_top = min(positions, key=positions.get)
@@ -4582,6 +6047,162 @@ class TestUnswitchableRowsAreListed:
             f"panel put the unknown-reset account on top ({panel_top!r}) "
             f"while the active account's own reset is stale and unknown to "
             f"the engine -- panel out:\n{rendered}"
+        )
+
+    def test_panel_names_a_held_import_the_top_pick_when_the_engine_switches_to_it(
+        self, temp_home, monkeypatch
+    ):
+        """A candidate's freshness gate (`candidate_usage_is_stale`,
+        autoswitch.py) accepts a HELD reading (`cswap import-usage`) too,
+        so a consume-first tick can switch to a target that is stale by
+        `SERVE_TTL_S` on its own but still held. The panel's ranking
+        never gated on that freshness bar at all -- `rank_switch_
+        candidates` reads `decision_value()`, which already trusts a
+        held row through `trust_extended` -- so it must show the held
+        row as the top pick whenever the engine actually switches to it.
+        Resets are real-clock future timestamps, not the engine suite's
+        own FakeClock literals: the panel's own ranking runs on
+        `time.time()`, and a reset already past THAT clock reads as
+        unknown (`_seven_day_reset_ts`), which would refuse every
+        candidate for a reason that has nothing to do with this test."""
+        from unittest.mock import patch
+
+        from claude_swap import oauth
+        from claude_swap.autoswitch import TickOutcome
+        from claude_swap.settings import AutoSwitchSettings
+        from tests.test_autoswitch import EngineHarness, _iso_at
+
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = EngineHarness(temp_home, strategy="consume-first", threshold=90.0)
+        for num, email in (
+            (1, "a@x.invalid"), (2, "b@x.invalid"), (3, "c@x.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a@x.invalid", 1)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+
+        real_now = time.time()
+
+        def w(five_h, seven_d, hours_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(real_now + hours_out * 3600),
+                },
+            }
+
+        # Populate the store while the active account resets soonest --
+        # consume-first has nothing to switch to yet.
+        view_a = {"1": w(50, 20, 24), "2": w(10, 10, 240), "3": w(10, 10, 480)}
+        # The active's own refetch now reports the LATEST reset, so stored
+        # #2 (adopted, held, stale by TTL) becomes the provisional pick.
+        view_b = {"1": w(50, 20, 600), "2": w(10, 10, 240), "3": w(10, 10, 480)}
+
+        def fetch_from(view):
+            def fake_fetch(num, email, creds, is_active=False,
+                            persist_credentials=None, **kwargs):
+                value = view.get(str(num))
+                return oauth.UsageOutcome(dict(value) if value else None)
+            return fake_fetch
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=fetch_from(view_a),
+        ):
+            h.engine.tick()          # t0: fetches 1, 2
+            h.clock.advance(60)
+            h.engine.tick()          # t60: fetches 3
+
+        # #2's reading is adopted from another machine, held for 480s more.
+        h.switcher._usage_store.adopt(
+            {"2": (w(10, 10, 240), 30.0)},
+            {"2": ("b@x.invalid", "")}, hold_s=480.0,
+        )
+        # 320s past adoption (age 350s): stale by SERVE_TTL_S (180s) *and*
+        # past STALE_OK_S (300s) -- trusted only through the still-live
+        # hold (lifts at 480s), never through age alone.
+        h.clock.advance(320)
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=fetch_from(view_b),
+        ):
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.SWITCHED
+        engine_pick = str(h.active_number())
+        assert engine_pick == "2"  # premise: the engine picked the held row
+
+        # The store's per-account rows the collect phase just wrote (the
+        # active's own refetch to `view_b`, #2's untouched held row) --
+        # what a panel polling right after that phase, still showing #1
+        # active, would render.
+        ident = {
+            "1": ("a@x.invalid", ""), "2": ("b@x.invalid", ""),
+            "3": ("c@x.invalid", ""),
+        }
+        entries = h.switcher._usage_store.entries(ident)
+
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0)
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True, usage=entries["1"]),
+            self._acct("2", "b@x.invalid", switchable=True, usage=entries["2"]),
+            self._acct("3", "c@x.invalid", switchable=True, usage=entries["3"]),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" not in rendered, (
+            f"the panel refused to rank at all instead of naming a top "
+            f"pick: {rendered!r}"
+        )
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == engine_pick, (
+            f"panel top={panel_top!r}, engine picked {engine_pick!r} — "
+            f"panel out:\n{rendered}"
+        )
+
+    def test_an_unranked_row_still_orders_a_known_reset_before_an_unknown_one(self):
+        """When the active's own usage reading is stale (`age_s` past
+        `STALE_OK_S`, `decision_value()` -> None) the ranking pass never
+        runs (`trigger == "unreadable-active"`, `ordered` empty) and every
+        candidate falls to the panel's fallback key -- which must still
+        order a known 7-day reset before an unknown one
+        (`_seven_day_reset_ts`, `+inf` for unknown), never the account
+        NUMBER STRING: an unknown-reset account ("2") must not sort above
+        a known, soon-reset one ("3").
+        """
+        stale_active = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 20.0},
+                "seven_day": {"pct": 20.0, "resets_at": _iso_in(8 * 86400)},
+            },
+            fetched_at=time.time() - STALE_OK_S - 100.0,
+            age_s=STALE_OK_S + 100.0,
+        )
+        unknown = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        known_soon = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(5 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, usage=stale_active),
+            self._acct("2", "b@x.com", switchable=True, last_good=unknown),
+            self._acct("3", "c@x.com", switchable=True, last_good=known_soon),
+        ), active="1")
+        # CONTROL that the ranking pass really never ran -- else `ordered_
+        # rank` could supply this same order for an unrelated reason and
+        # the assertion below would cover nothing.
+        assert "not previewed (active status unknown)" in out, (
+            f"the ranking pass ran after all, so this test proves nothing "
+            f"about the fallback key: {out!r}"
+        )
+        positions = {n: out.index(e) for n, e in
+                     {"2": "b@x.com", "3": "c@x.com"}.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == "3", (
+            f"panel put the unknown-reset account on top ({panel_top!r}) "
+            f"while the active account's own reset is stale and unknown to "
+            f"the engine -- panel out:\n{out}"
         )
 
 
