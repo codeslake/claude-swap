@@ -1596,9 +1596,9 @@ class TestWeeklyCap:
 
     @pytest.mark.parametrize(
         ("pct7", "recent_429", "lo", "hi"),
-        [(88.0, False, 0, 60.0), (80.0, False, 61.0, 300.0), (88.0, True, 360.0, 1800.0)],
+        [(88.0, False, 120.0, 120.0), (80.0, False, 121.0, 300.0), (88.0, True, 360.0, 1800.0)],
     )
-    def test_the_active_polls_every_minute_within_the_band_below_its_cap(
+    def test_the_active_polls_every_two_minutes_within_the_band_below_its_cap(
         self, temp_home, pct7, recent_429, lo, hi
     ):
         """The engine pins the cap; the planner reads it. A 0.5 point rise is

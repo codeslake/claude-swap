@@ -91,9 +91,12 @@ MIN_INTERVAL_S = 180.0
 # steady traffic is absorbed by the post-429 floor below.
 URGENT_INTERVAL_S = 60.0
 
-# The active account this close below its weekly cap polls at URGENT_INTERVAL_S
+# The active account this close below its weekly cap polls at CAP_BAND_INTERVAL_S
 # even when it barely moved: a slow burn never trips urgent mode, a cap is a stop.
 CAP_BAND_PCT = 3.0
+# 120 s, not URGENT_INTERVAL_S: an idle active can sit in the band for hours, and
+# 60 s there is ~60 requests/hour, twice the budget above (a 429 floors it at 360 s).
+CAP_BAND_INTERVAL_S = 120.0
 
 # Decay ceilings for an account whose usage is not moving: the active account
 # stays reasonably fresh, an idle alternate drifts out to ten minutes.
@@ -226,7 +229,7 @@ def plan_after_fetch(
     movement backs off ×1.5 toward the account's ceiling;
     unknown utilization uses the default. The active account within
     ``CAP_BAND_PCT`` below its ``weekly_cap`` (under 100) drops to
-    ``URGENT_INTERVAL_S`` too. A recent 429 on this token floors
+    ``CAP_BAND_INTERVAL_S``. A recent 429 on this token floors
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
     until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
     ``JITTER_FRAC`` noise, is never later than the account's next window
@@ -270,7 +273,7 @@ def plan_after_fetch(
         and weekly_capped(weekly_cap, new_usage) is None  # past it, the engine leaves
     )
     if is_active and (rising_in_band or near_cap) and not recent_429:
-        interval = URGENT_INTERVAL_S
+        interval = URGENT_INTERVAL_S if rising_in_band else CAP_BAND_INTERVAL_S
     if recent_429:
         # AIMD additive-increase: grow the interval multiplicatively from the
         # last one toward the wider 429 ceiling, so machines sharing a
