@@ -252,6 +252,22 @@ class TestWeeklyCapVerb(PolicyCliBase):
         record = self._record(ClaudeAccountSwitcher(), "2")
         assert "weeklyCap" not in record and record["threshold"] == 85.0
 
+    def test_an_existing_threshold_moves_to_a_cap_in_two_commands(
+        self, temp_home: Path, capsys
+    ):
+        """The deploy step for an account that carries only `threshold`."""
+        self._fleet(temp_home)
+        self._threshold(["2", "90"])
+        self._threshold(["2", "90", "--weekly-cap"])
+        self._threshold(["2", "--unset"])
+        record = self._record(ClaudeAccountSwitcher(), "2")
+        assert (record.get("threshold"), record["weeklyCap"]) == (None, 90.0)
+        capsys.readouterr()
+        self._threshold([])
+        out = capsys.readouterr().out
+        assert out.endswith("Weekly caps:\n  Account-2  90%\n")
+        assert "No per-account overrides" not in out
+
     def test_an_out_of_range_cap_exits_nonzero_and_names_the_range(
         self, temp_home: Path, capsys
     ):

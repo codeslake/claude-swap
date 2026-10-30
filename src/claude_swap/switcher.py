@@ -387,6 +387,7 @@ class ClaudeAccountSwitcher:
             float | None, tuple[float, float | None, tuple[str, ...]]
         ] | None = None
         self._poll_inputs_override: tuple[float, float | None, tuple[str, ...]] | None = None
+        self._poll_weekly_cap: float | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -1895,12 +1896,18 @@ class ClaudeAccountSwitcher:
         instead of the settings file)."""
         self._poll_inputs_override = (threshold, weekly_threshold, models)
 
+    def set_poll_weekly_cap(self, cap: float | None) -> None:
+        """Pin the active account's weekly cap for poll planning (the hosted
+        engine re-pins it every tick; without one the cap is not read)."""
+        self._poll_weekly_cap = cap
+
     def clear_poll_policy_inputs(self) -> None:
         """Drop the hosted engine's pin so poll planning falls back to the
         settings file — called when the engine's screen closes, or a TUI
         session threshold override would keep steering cadence after the
         engine it belonged to is gone."""
         self._poll_inputs_override = None
+        self._poll_weekly_cap = None
 
     def _poll_policy_inputs(self) -> tuple[float, float | None, tuple[str, ...]]:
         """Switch lines (threshold, weekly threshold or None) + configured
@@ -6354,6 +6361,7 @@ class ClaudeAccountSwitcher:
                 is_active=bool(info_by_num[num][4]),
                 threshold=threshold,
                 weekly_threshold=weekly_threshold,
+                weekly_cap=self._poll_weekly_cap,
                 models=models,
                 recent_429=recent_429,
                 now=now,
@@ -7016,7 +7024,7 @@ class ClaudeAccountSwitcher:
             strategy: Usage-aware target selection. ``"best"`` jumps to the
                   switchable account with the most remaining 5h/7d quota instead
                   of advancing the rotation; ``"next-available"`` rotates to the
-                  next account, skipping any currently at its 5h/7d limit. ``None``
+                  next account, skipping any at its 5h/7d limit or weekly cap. ``None``
                   (the default) performs a plain rotation.
             models: Per-model weekly windows folded into every usage
                   comparison of the usage-aware strategies (parsed display
@@ -7295,6 +7303,7 @@ class ClaudeAccountSwitcher:
 
         next_account: str | None = None
         skipped_exhausted: list[str] = []
+        skipped_capped = False
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
             if self._disabled_from_data(data, candidate):
@@ -7316,6 +7325,17 @@ class ClaudeAccountSwitcher:
                     )
                 continue
             if strategy == "next-available":
+                if weekly_capped(
+                    self._policy_from_data(data, candidate).weekly_cap,
+                    usage.get(candidate),
+                ):
+                    skipped_exhausted.append(candidate)
+                    skipped_capped = True
+                    if json_output:
+                        warnings.append(f"Skipped Account-{candidate} (at weekly cap)")
+                    else:
+                        print(f"{accent('Skipping')} Account-{candidate} (at weekly cap)")
+                    continue
                 headroom = oauth.account_headroom(usage.get(candidate), models)
                 if headroom is not None and headroom <= 0:
                     skipped_exhausted.append(candidate)
@@ -7348,6 +7368,8 @@ class ClaudeAccountSwitcher:
             # With model limits in play the binding window may be a scoped
             # one (the per-skip lines name it), so don't claim "5h/7d".
             limits_label = "usage limits" if models else "5h/7d limit"
+            if skipped_capped:
+                limits_label += " or weekly cap"
             if json_output:
                 return self._switch_noop(
                     strategy=strategy_label, reason="candidates-exhausted",
@@ -7407,6 +7429,13 @@ class ClaudeAccountSwitcher:
             next_account, emit_output=not json_output, provenance=provenance
         )
         self._record_manual_switch(manual_source, op["from"], op["to"])
+        # Rotation can land on a capped account; the engine moves off it next tick.
+        cap_note = self._weekly_cap_note(next_account) if manual_source else None
+        if cap_note:
+            if json_output:
+                warnings.append(cap_note)
+            else:
+                warning(cap_note, file=sys.stderr)
         return (
             self._switch_result_from_op(op, strategy_label, warnings)
             if json_output else None

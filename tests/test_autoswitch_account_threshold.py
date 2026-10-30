@@ -41,6 +41,7 @@ from claude_swap.autoswitch import (
 )
 from claude_swap.lines import binding_window
 from claude_swap.settings import AutoSwitchSettings
+from claude_swap.usage_store import FetchRecord, UsageEntry
 
 # The module, not its Test class: a class imported by name is collected here too.
 import tests.test_autoswitch as test_autoswitch
@@ -1537,30 +1538,39 @@ class TestWeeklyCap:
         )
         assert h.active_number() == lands
 
-    @pytest.mark.parametrize("pct5", [90.0, 95.0])
-    def test_the_five_hour_window_never_triggers_the_cap(self, temp_home, pct5):
-        h = _fleet(temp_home, threshold=99.0)
+    @pytest.mark.parametrize(
+        ("threshold", "pct5", "trigger"),
+        [(99.0, 90.0, None), (99.0, 95.0, None), (GLOBAL, 95.0, "proactive")],
+    )
+    def test_the_five_hour_window_follows_the_global_line_never_the_cap(
+        self, temp_home, threshold, pct5, trigger
+    ):
+        h = _fleet(temp_home, threshold=threshold)
         h.switcher.set_account_weekly_cap("1", 50)
-        assert h.tick_with_usage({
+        h.tick_with_usage({
             "1": _usage7(pct5, 10), "2": _usage7(10, 10), "3": _usage7(10, 10),
-        }) is TickOutcome.NO_ACTION
-        assert _switch_trigger(h) is None
+        })
+        assert _switch_trigger(h) == trigger
 
     @pytest.mark.parametrize(
-        ("weekly_line", "pct7", "leaves"),
-        [(60.0, 91.0, True), (99.0, 91.0, True), (99.0, 89.0, False)],
+        ("weekly_line", "pct7", "trigger"),
+        [
+            (60.0, 91.0, "weekly-capped"),
+            (99.0, 91.0, "weekly-capped"),
+            (99.0, 89.0, None),
+            # A lower weekly line still leaves earlier, on the soft line.
+            (60.0, 75.0, "proactive"),
+        ],
     )
     def test_the_weekly_line_does_not_move_the_cap(
-        self, temp_home, weekly_line, pct7, leaves
+        self, temp_home, weekly_line, pct7, trigger
     ):
         h = _fleet(temp_home, weekly_threshold=weekly_line)
         h.switcher.set_account_weekly_cap("1", 90)
-        outcome = h.tick_with_usage({
+        h.tick_with_usage({
             "1": _usage7(10, pct7), "2": _usage7(10, 10), "3": _usage7(10, 10),
         })
-        assert (outcome is TickOutcome.SWITCHED) is leaves
-        if leaves:
-            assert _switch_trigger(h) == "weekly-capped"
+        assert _switch_trigger(h) == trigger
 
     @pytest.mark.parametrize("cap", [None, 100])
     def test_no_cap_and_a_cap_of_100_are_never_capped(self, temp_home, cap):
@@ -1584,26 +1594,24 @@ class TestWeeklyCap:
         h.tick_with_usage({n: _usage7(10, 10) for n in ("1", "2", "3")})
         assert h.switcher._poll_inputs_override[1] == expected
 
-    def test_overshoot_past_the_cap_is_bounded_by_the_poll_plan(self):
-        """Simulated ticks on the planner: the first poll reading the cap is the
-        tick that leaves, so overshoot is the burn over one planned interval."""
-        from claude_swap import poll_policy as pp
-
-        def overshoot(rate_per_min: float, cap: float) -> float:
-            now, pct, interval, prev = 0.0, 60.0, None, None
-            while True:
-                usage = _usage7(10, pct)
-                if pct >= cap:
-                    return pct - cap
-                nxt, interval = pp.plan_after_fetch(
-                    prev_interval_s=interval, prev_usage=prev, new_usage=usage,
-                    is_active=True, threshold=95.0, weekly_threshold=cap,
-                    models=(), recent_429=False, now=now, rng=lambda: 1.0,
-                )
-                pct += rate_per_min * (nxt - now) / 60.0
-                prev, now = usage, nxt
-
-        rate = 0.3
-        bound = rate * pp.ACTIVE_MAX_INTERVAL_S * (1 + pp.JITTER_FRAC) / 60.0
-        measured = max(overshoot(rate, 90.0 + i * 0.1) for i in range(100))
-        assert 0 < measured <= bound
+    @pytest.mark.parametrize(
+        ("pct7", "recent_429", "lo", "hi"),
+        [(88.0, False, 0, 60.0), (80.0, False, 61.0, 300.0), (88.0, True, 360.0, 1800.0)],
+    )
+    def test_the_active_polls_every_minute_within_the_band_below_its_cap(
+        self, temp_home, pct7, recent_429, lo, hi
+    ):
+        """The engine pins the cap; the planner reads it. A 0.5 point rise is
+        under the movement rule, so only the band clamps the interval."""
+        h = _fleet(temp_home)
+        h.switcher.set_account_weekly_cap("1", 90)
+        h.tick_with_usage({n: _usage7(10, pct7) for n in ("1", "2", "3")})
+        before = UsageEntry(
+            last_good=_usage7(10, pct7 - 0.5), poll_interval_s=300.0,
+            last_429_at=h.switcher._usage_store.clock() if recent_429 else None,
+        )
+        plans = h.switcher._plans_after_fetch(
+            {"1": FetchRecord(usage=_usage7(10, pct7))}, {"1": before},
+            {"1": (None, None, None, None, True)},
+        )
+        assert lo <= plans["1"][1] <= hi, plans

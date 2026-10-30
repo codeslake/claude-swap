@@ -204,6 +204,9 @@ class FakeSwitcher:
         ]
         print(f"Set Account-{identifier} weekly cap")
 
+    def set_account_threshold(self, identifier: str, pct: float | None) -> None:
+        self.calls.append(("set_threshold", str(identifier), pct))
+
     def add_account(self, slot: int | None = None, assume_yes: bool = False) -> None:
         self.calls.append(("add", slot, assume_yes))
         print("Added Account 9: fresh@example.com")
@@ -1258,6 +1261,8 @@ class TestDashboard:
             await menu_select(pilot, "set-cap:1:80")
             await settle(pilot)
             assert ("set_cap", "1", 80.0) in fake.calls
+            # A cap hands the 5h window to the global line: the old own line goes.
+            assert ("set_threshold", "1", None) in fake.calls
             # back at the root, not stranded in the submenu
             menu = app.screen.query_one("#menu", ListView)
             assert [i.action_id for i in menu.query(MenuItem)][0] == "switch"
@@ -1267,6 +1272,7 @@ class TestDashboard:
             await menu_select(pilot, "set-cap:2:default")
             await settle(pilot)
             assert ("set_cap", "2", None) in fake.calls
+            assert ("set_threshold", "2", None) in fake.calls
 
     async def test_a_rejected_cap_is_reported_not_raised(self, tmp_path):
         """`set_account_weekly_cap` rejects a value out of range with

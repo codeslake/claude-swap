@@ -7738,6 +7738,28 @@ class TestUsageAwareSwitch:
         assert "Skipping Account-2 (at 5h/7d limit)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
+    @pytest.mark.parametrize(("strategy", "lands"), [(None, 2), ("next-available", 3)])
+    def test_a_weekly_capped_account_is_skipped_by_next_available_and_warned_on_by_rotation(
+        self, temp_home: Path, capsys, strategy, lands
+    ):
+        s = self._setup(temp_home)
+        for num, email in ((1, "a"), (2, "b"), (3, "c")):
+            self._seed(s, num, f"{email}@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        s.set_account_weekly_cap("2", 90)
+        capped = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 92.0}}
+        usage = {"1": self._usage(0), "2": capped, "3": self._usage(20)}
+        stored = {"2": UsageEntry(last_good=capped, fetched_at=0.0, age_s=0.0)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "usage_entries_by_account", return_value=stored), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy=strategy, manual_source="cli")
+
+        out, err = capsys.readouterr()
+        assert s._get_sequence_data()["activeAccountNumber"] == lands
+        assert ("past its weekly cap (7d 92% >= 90%)" in err) is (strategy is None)
+        assert ("Skipping Account-2 (at weekly cap)" in out) is (strategy is not None)
+
     @staticmethod
     def _model_usage(five_h: float, fable: float) -> dict:
         return {

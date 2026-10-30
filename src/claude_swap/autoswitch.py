@@ -2082,6 +2082,7 @@ class AutoSwitchEngine:
             _capped_weekly_line(weekly_cap, self.settings.weekly_threshold, lowest),
             self._models,
         )
+        self.switcher.set_poll_weekly_cap(weekly_cap)
 
     def _load_health_counters(self, state: dict, current: str) -> None:
         """Seed the unreadable-active counters from the state file.

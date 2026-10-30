@@ -344,13 +344,15 @@ class CswapApp(App):
         )
 
     def do_set_account_weekly_cap(self, number: str, pct: float | None) -> None:
-        """Cap the account's weekly windows at ``pct`` (``None``: no cap)."""
+        """Cap the account's weekly windows at ``pct`` (``None``: no cap) and
+        clear its own switch line, so its 5h window follows the global one."""
 
         def set_cap() -> None:
             # The setter rejects an out-of-range value with ValueError;
             # `run_action` reports only `ClaudeSwitchError`.
             try:
                 self.switcher.set_account_weekly_cap(number, pct)
+                self.switcher.set_account_threshold(number, None)
             except ValueError as e:
                 raise ClaudeSwitchError(str(e)) from e
 
