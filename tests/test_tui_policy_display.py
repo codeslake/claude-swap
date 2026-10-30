@@ -28,6 +28,7 @@ from claude_swap.tui.widgets import account_card_text, mini_account_text
 
 from tests.test_tui import (
     FakeSwitcher,
+    _iso_in,
     fake_engine,  # noqa: F401 - the auto screen's engine fixture, used by name
     make_account,
     make_app,
@@ -41,7 +42,9 @@ from tests.test_tui import (
 # through the same ``make_account`` fixture used below.  Only the header row and
 # the whole mini row are pinned as literals: the card's bar rows carry a wall
 # clock date and would rot daily.  Their invariance is asserted structurally
-# instead (see ``test_the_card_bar_rows_are_untouched``).
+# instead (see ``test_the_card_bar_rows_are_untouched``).  The two mini rows were
+# re-captured on this branch, whose chips read ``5h:25%`` where the unmodified
+# engine printed ``5h 25%`` (see ``golden_form``).
 GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
 GOLDEN_MINI = " 2  dev (user2@example.com)  [personal]   5h:25% · 7d:10%"
 GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
@@ -69,6 +72,13 @@ def mini(acc) -> str:
     # measured against ``NOW`` and so against the wall clock: drop the countdown
     # so the goldens stay a statement about the policy token alone.
     return re.sub(r"\(⟳[^)]*\)", "", mini_account_text(acc, NOW).plain)
+
+
+def golden_form(plain: str) -> str:
+    """Drop the chips' reset countdown, `5h(⟳1h59m):25%` -> `5h:25%`: this
+    branch's mini row carries one, and ``make_entry`` derives it from the wall
+    clock, so a literal golden would rot daily."""
+    return re.sub(r"\(⟳[^)]*\)", "", plain)
 
 
 class TestThresholdBadge:
@@ -154,12 +164,12 @@ class TestUnpolicedAccountsRenderExactlyAsBefore:
         )
 
     def test_the_mini_row_is_byte_identical_to_the_golden(self):
-        assert mini(make_account(2, active=True, alias="dev")) == GOLDEN_MINI
+        assert golden_form(mini(make_account(2, active=True, alias="dev"))) == GOLDEN_MINI
 
     def test_a_disabled_account_is_byte_identical_to_the_golden(self):
         acc = make_account(3, disabled=True)
         assert card(acc).splitlines()[0] == GOLDEN_CARD_HEADER_DISABLED
-        assert mini(acc) == GOLDEN_MINI_DISABLED
+        assert golden_form(mini(acc)) == GOLDEN_MINI_DISABLED
 
     def test_an_explicit_empty_policy_renders_the_same_as_no_policy(self):
         # ``AccountPolicy()`` is the field default, but a store that wrote an
@@ -229,7 +239,9 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "50% (line 60%)" in self._row(plain, "user2@example.com")
+            assert "5h:50% (line 60%)" in golden_form(
+                self._row(plain, "user2@example.com")
+            )
             assert "(line" not in self._row(plain, "user3@example.com")
 
     async def test_a_capped_candidate_is_marked_and_ranked_last(
@@ -270,7 +282,9 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
-            assert "50% (line 60%)" in self._row(plain, "user2@example.com")
+            assert "5h:50% (line 60%)" in golden_form(
+                self._row(plain, "user2@example.com")
+            )
 
     async def test_a_candidate_blocked_on_its_own_line_counts_in_the_model_wall_check(
         self, tmp_path, fake_engine
@@ -314,3 +328,41 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
                 "user3@example.com"
             )
 
+
+@pytest.mark.asyncio
+class TestNextBestConsumeFirstKeyUsesTheAccountsOwnLine:
+    """Under consume-first the panel's key reads each account against its own
+    line, as the engine's ranking does. Account 2 sits at 5h 92% under a 95%
+    line of its own with the sooner weekly reset; on the global 90 it read as
+    over and fell behind account 3."""
+
+    async def test_an_account_under_its_own_line_keeps_the_soonest_reset(
+        self, tmp_path, fake_engine
+    ):
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 90, "strategy": "consume-first"},
+        }))
+        later = make_entry(50.0, 10.0)
+        later.last_good["seven_day"]["resets_at"] = _iso_in(86400 * 5)
+        app = make_app(FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(99.0, 20.0)),
+                with_policy(
+                    make_account(2, entry=make_entry(92.0, 10.0)), threshold=95.0
+                ),
+                make_account(3, entry=later),
+            ],
+            tmp_path,
+        ))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("g")
+            await pilot.pause()
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )

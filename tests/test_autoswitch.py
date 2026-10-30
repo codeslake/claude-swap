@@ -2845,6 +2845,7 @@ class TestAdaptiveScheduler:
         outcome = self._tick(h, counts, view_b)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+        assert counts["2"] == 1  # the hold kept phase 2 from refetching #2
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert "stale-usage" not in reasons
 
@@ -6813,6 +6814,39 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
             "only on the axis that blocked the active) must beat #2 "
             "(headroom 1, genuinely near-dead)"
         )
+
+    def test_classify_reads_each_window_against_its_own_line(self):
+        """Under a weekly line the block label and the engine's `over` verdict
+        read ONE set of lines: 7d 93 under a 97 line is open (the engine would
+        land there), 5h 90 over an 85 line still blocks, and a scoped window
+        takes the weekly line."""
+        windows = [("5h", 5.0), ("7d", 93.0)]
+        assert classify_candidate_block(windows, 85.0) == ("full", "7d")
+        assert classify_candidate_block(windows, 85.0, 97.0) == ("open", None)
+        assert classify_candidate_block(
+            [("5h", 90.0), ("7d", 50.0)], 85.0, 97.0
+        ) == ("full", "5h")
+        assert classify_candidate_block(
+            [("5h", 5.0), ("7d", 5.0), ("Fable", 96.0)], 85.0, 97.0
+        ) == ("open", None)
+        assert classify_candidate_block(
+            [("5h", 5.0), ("7d", 5.0), ("Fable", 96.0)], 85.0, 95.0
+        ) == ("model", "Fable")
+
+    def test_the_decision_log_does_not_call_a_window_under_its_line_full(self):
+        def line(weekly):
+            return PollEvent(
+                active={"number": 1, "email": "a@example.com"},
+                headroom={"1": 5.0, "2": 7.0},
+                threshold=85.0,
+                windows={"1": {"5h": 95.0, "7d": 1.0}, "2": {"5h": 5.0, "7d": 93.0}},
+                weekly_threshold=weekly,
+            ).human()
+
+        assert "#2: 5h 5% · 7d 93% (7d full)" in line(None)
+        under_line = line(97.0)
+        assert "#2: 5h 5% · 7d 93%" in under_line
+        assert "(7d full)" not in under_line, under_line
 
 
 class TestTheRetryAdmitsOnlyAnImprovement:
@@ -14255,9 +14289,9 @@ class TestLiveLock:
             reasons=['PollEvent', 'stale-usage']
 
         against `['PollEvent', 'engine-stopped']` unmutated. "usage could not
-        be refreshed this tick (backoff or a concurrent poller); retrying"
-        sends an operator after a fetch problem that does not exist, for an
-        engine that simply stopped.
+        be refreshed this tick (backoff, a hold, or a concurrent poller);
+        retrying" sends an operator after a fetch problem that does not
+        exist, for an engine that simply stopped.
 
         Asserts the REASON, which is what the gate decides now, rather than
         the freshen count, which something else already bounds.
@@ -20095,6 +20129,29 @@ class TestWeeklyThreshold:
         assert h.tick_with_usage({"1": active, "2": _usage7(5, 5)}) is expected
         if detail is not None:
             assert self._details(h) == [detail]
+
+    @pytest.mark.parametrize(
+        "strategy,fable,stays_on",
+        [
+            # Headroom is 15 on the model-gated and the 5h/7d bases alike, so
+            # dynamic's widening does not fire at 82 (it does at 86, where
+            # the model window is read as no wall); the trigger must read the
+            # same 5h/7d windows at both. `best` keeps the model wall.
+            ("dynamic", 82.0, 1),
+            ("dynamic", 86.0, 1),
+            ("best", 82.0, 2),
+        ],
+    )
+    def test_dynamic_does_not_depart_for_a_model_window_over_its_weekly_line(
+        self, temp_home, strategy, fable, stays_on
+    ):
+        h = self._harness(
+            temp_home, threshold=90.0, weekly_threshold=80.0,
+            model="Fable", strategy=strategy,
+        )
+        active = {**_usage7(85, 10), "scoped": [{"name": "Fable", "pct": fable}]}
+        h.tick_with_usage({"1": active, "2": _usage7(5, 5)})
+        assert h.active_number() == stays_on
 
     @pytest.mark.parametrize(
         "fable,weekly,expected,detail",
