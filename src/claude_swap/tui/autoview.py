@@ -72,6 +72,7 @@ class AutoScreen(Screen):
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
         Binding("d", "toggle_desktop_follows", "Desktop follows"),
+        Binding("o", "toggle_connectors_follow_pin", "Connectors follow pin"),
         Binding("escape,q", "back", "Back"),
     ]
 
@@ -170,21 +171,29 @@ class AutoScreen(Screen):
         self._set_threshold(value)
 
     def action_toggle_desktop_follows(self) -> None:
+        self._toggle_pin_switch("desktop_follows", "pin.desktopFollows", "desktop follows")
+
+    def action_toggle_connectors_follow_pin(self) -> None:
+        self._toggle_pin_switch(
+            "connectors_follow_pin", "pin.connectorsFollowPin", "connectors follow pin"
+        )
+
+    def _toggle_pin_switch(self, field: str, key: str, label: str) -> None:
         # Persisted, unlike `t`: the pin is another process and reads the saved setting.
         # Flips the file's value now, not what this screen last saw.
         from claude_swap.settings import load_pin_settings, set_setting
 
         backup_dir = self.app.switcher.backup_dir
-        value = not load_pin_settings(backup_dir).desktop_follows
+        value = not getattr(load_pin_settings(backup_dir), field)
         try:
-            set_setting(backup_dir, "pin.desktopFollows", "true" if value else "false")
+            set_setting(backup_dir, key, "true" if value else "false")
         except Exception as exc:  # best-effort, like the theme; never crash the UI
-            self.notify(f"Could not save desktop follows: {exc}", severity="warning")
+            self.notify(f"Could not save {label}: {exc}", severity="warning")
             return
         self._update_summary()
         self.query_one("#event-log", RichLog).write(
             Text(
-                f"desktop follows {'on' if value else 'off'}",
+                f"{label} {'on' if value else 'off'}",
                 style=Palette.from_theme(self.app.current_theme).muted,
             )
         )
@@ -236,8 +245,9 @@ class AutoScreen(Screen):
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         from claude_swap.settings import load_pin_settings
 
-        desktop = load_pin_settings(self.app.switcher.backup_dir).desktop_follows
-        text.append(f" · desktop follows {'on' if desktop else 'off'}")
+        follows = load_pin_settings(self.app.switcher.backup_dir)
+        text.append(f" · desktop follows {'on' if follows.desktop_follows else 'off'}")
+        text.append(f" · connectors follow pin {'on' if follows.connectors_follow_pin else 'off'}")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)

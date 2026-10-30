@@ -2297,6 +2297,7 @@ def run(
     everywhere: bool = False,
     print_shell_prefix_path: bool = False,
     desktop: str | None = None,
+    connectors: str | None = None,
 ) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
@@ -2304,10 +2305,10 @@ def run(
 
     # EVERY BRANCH ABOVE `_impl()` RUNS WITHOUT THE PACKAGE, and that ordering
     # is the contract, not an accident: `--ensure`, `--set_port`, `--desktop`,
-    # `--get_port`, `--get_certdir`, `--state`, `--heal` and `--clear` are the
-    # commands a user reaches for when the pin is the broken thing. Each is
-    # answered from cswap's own files. Only pinning itself needs the package,
-    # so only it resolves one.
+    # `--connectors`, `--get_port`, `--get_certdir`, `--state`, `--heal` and
+    # `--clear` are the commands a user reaches for when the pin is the broken
+    # thing. Each is answered from cswap's own files. Only pinning itself needs
+    # the package, so only it resolves one.
     if ensure:
         # The launch contract, which `--heal` deliberately does not make. An
         # rc hook calls this before EVERY `claude`, so it never fails (every
@@ -2380,18 +2381,23 @@ def run(
             return 1
         return 0
 
-    if desktop is not None:
+    if desktop is not None or connectors is not None:
         # cswap's own settings.json, which the pin reads per request: no restart,
         # and no package needed to flip it.
         from claude_swap.printer import error
         from claude_swap.settings import set_setting
 
+        key, label, value = (
+            ("pin.desktopFollows", "Desktop follows", desktop)
+            if desktop is not None
+            else ("pin.connectorsFollowPin", "Connectors follow pin", connectors)
+        )
         try:
-            on = set_setting(switcher.backup_dir, "pin.desktopFollows", desktop)
+            on = set_setting(switcher.backup_dir, key, value)
         except Exception as exc:  # noqa: BLE001: a ConfigError, or the write itself failing
-            error(f"Could not save desktop follows: {_safe(exc)}")
+            error(f"Could not save {label.lower()}: {_safe(exc)}")
             return 1
-        print(f"Desktop follows: {'on' if on else 'off'}")
+        print(f"{label}: {'on' if on else 'off'}")
         return 0
 
     if get_port:
@@ -2476,6 +2482,7 @@ def run(
     if account is None:  # the bare show also names the switch, from our own file
         from claude_swap.settings import load_pin_settings
 
-        on = load_pin_settings(switcher.backup_dir).desktop_follows
-        print(f"Desktop follows: {'on' if on else 'off'}")
+        loaded = load_pin_settings(switcher.backup_dir)
+        print(f"Desktop follows: {'on' if loaded.desktop_follows else 'off'}")
+        print(f"Connectors follow pin: {'on' if loaded.connectors_follow_pin else 'off'}")
     return rc
