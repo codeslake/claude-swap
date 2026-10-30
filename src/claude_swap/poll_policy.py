@@ -94,8 +94,7 @@ URGENT_INTERVAL_S = 60.0
 # The active account this close below its weekly cap polls at CAP_BAND_INTERVAL_S
 # even when it barely moved: a slow burn never trips urgent mode, a cap is a stop.
 CAP_BAND_PCT = 3.0
-# 120 s, not URGENT_INTERVAL_S: an idle active can sit in the band for hours, and
-# 60 s there is ~60 requests/hour, twice the budget above (a 429 floors it at 360 s).
+# 120 s, not 60: an idle active can sit in the band, and 60 s is twice the budget above.
 CAP_BAND_INTERVAL_S = 120.0
 
 # Decay ceilings for an account whose usage is not moving: the active account
