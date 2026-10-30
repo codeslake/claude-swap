@@ -268,6 +268,14 @@ _DEMOTING_STASH_REASONS = (
     "consume-gate-store-unreadable",
 )
 
+ERROR_NOTES.update({
+    "oauth_not_allowed_for_organization": (
+        "this account's organization does not allow OAuth sign-in (a lapsed "
+        "plan or an org policy), so its usage cannot be read — renewing the "
+        "plan restores it"
+    ),
+})
+
 
 SENTINEL_NOTES = {
     # Not always the ≤1m the wording used to promise: this also covers an
