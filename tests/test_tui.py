@@ -3089,6 +3089,7 @@ class TestUnswitchableRowsAreListed:
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
+        a.login_expires_at = None
         a.policy = AccountPolicy()
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
