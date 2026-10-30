@@ -238,6 +238,21 @@ def test_format_account_label_disabled_marker():
     assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
 
 
+def test_auto_switch_item_shows_a_demoted_engine_as_dry_run():
+    class Engine:
+        demoted_from_live = False
+
+    engine = Engine()
+    assert menubar.auto_switch_item(False, engine) == ("Auto-switch accounts", 0)
+    assert menubar.auto_switch_item(True, None) == ("Auto-switch accounts", 1)
+    assert menubar.auto_switch_item(True, engine) == ("Auto-switch accounts", 1)
+    # The flag clears on a later promotion, so the item follows it live.
+    engine.demoted_from_live = True
+    assert menubar.auto_switch_item(True, engine) == ("Auto-switch accounts (dry run)", -1)
+    engine.demoted_from_live = False
+    assert menubar.auto_switch_item(True, engine) == ("Auto-switch accounts", 1)
+
+
 # --- usage logging -------------------------------------------------------------
 
 def test_format_usage_log_full():
@@ -556,6 +571,58 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "rumps", None)
     with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
         menubar.run(switcher=None)
+
+
+# --- switch notification -------------------------------------------------------
+
+def test_a_plain_switch_reports_the_propagation_delay():
+    title, body = menubar.switch_notification({"switched": True})
+    assert title == "Account switched"
+    assert "30s" in body
+
+
+def test_a_logged_out_landing_is_not_reported_as_a_working_switch():
+    """An empty slot is a valid destination and leaves the machine LOGGED OUT.
+
+    "Account switched / takes effect within ~30s" tells the user to wait for
+    an account that will never arrive; the recovery step is `/login`.
+    """
+    title, body = menubar.switch_notification({
+        "switched": True,
+        "needsLogin": True,
+        "message": "Switched to Account-2 (b@example.com) — no stored login; "
+                   "run /login",
+    })
+    assert "30s" not in body, (
+        f"a logged-out landing was reported as a switch that propagates: "
+        f"{title!r} {body!r}"
+    )
+    assert "/login" in body, f"the recovery step was dropped: {body!r}"
+
+
+def test_a_deliberate_wait_is_not_titled_an_exhausted_fleet():
+    """The notification is the fourth surface, and it was not counted.
+
+    `AllExhaustedEvent`'s own comment enumerates "the panel, the JSON and the
+    log". This says the same sentence to the same user, and said "All accounts
+    exhausted" for a wait entered BECAUSE every candidate was READ and one
+    still holds quota.
+    """
+    from claude_swap.autoswitch import AllExhaustedEvent
+
+    wait = AllExhaustedEvent(
+        earliest_reset_at="2026-07-05T20:00:00Z", deliberate_wait=True
+    )
+    title, body = menubar.exhausted_notification(wait)
+    assert "exhausted" not in title.lower(), (
+        f"a deliberate wait was announced as an exhausted fleet: {title!r}"
+    )
+    assert body == wait.human(), "the body drifted from the shared renderer"
+
+    real = AllExhaustedEvent(earliest_reset_at=None, deliberate_wait=False)
+    assert menubar.exhausted_notification(real)[0] == "All accounts exhausted", (
+        "a genuinely exhausted fleet lost its own title"
+    )
 
 
 class TestFrameworkBuildWarning:
