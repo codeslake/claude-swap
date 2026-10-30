@@ -69,6 +69,7 @@ from claude_swap.models import (
     get_timestamp,
     normalize_account_priority,
     normalize_account_threshold,
+    normalize_account_weekly_cap,
     normalize_alias,
 )
 from claude_swap.printer import (
@@ -94,6 +95,7 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances, scan_sessions
 from claude_swap import poll_policy
+from claude_swap.lines import weekly_capped
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
     FetchRecord,
@@ -1986,7 +1988,17 @@ class ClaudeAccountSwitcher:
             priority = normalize_account_priority(record.get("priority", 0))
         except ValueError:
             priority = 0
-        return AccountPolicy(threshold=threshold, priority=priority)
+        weekly_cap: float | None
+        try:
+            weekly_cap = (
+                None if record.get("weeklyCap") is None
+                else normalize_account_weekly_cap(record["weeklyCap"])
+            )
+        except ValueError:
+            weekly_cap = None  # unusable cap: no cap, like an unusable threshold
+        return AccountPolicy(
+            threshold=threshold, priority=priority, weekly_cap=weekly_cap
+        )
 
     def account_policies(self) -> dict[str, AccountPolicy]:
         """Every managed slot's auto-switch policy, from one sequence read.
@@ -2103,6 +2115,28 @@ class ClaudeAccountSwitcher:
             )
             print(f"{accent('Set')} Account-{account_num} ({email}) "
                   f"threshold to {normalized:g}%.")
+
+    def set_account_weekly_cap(self, identifier: str, cap: object | None) -> None:
+        """Set or clear one account's weekly cap (see :class:`AccountPolicy`).
+
+        ``cap=None`` removes the key, so a fleet that never sets one keeps a
+        byte-identical ``sequence.json``. A value is validated before any write.
+        """
+        normalized = None if cap is None else normalize_account_weekly_cap(cap)
+        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+        if normalized is None:
+            changed = record.pop("weeklyCap", None) is not None
+        else:
+            changed = record.get("weeklyCap") != normalized
+            record["weeklyCap"] = normalized
+        if changed:
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+        print(
+            f"Account-{account_num} ({email}) weekly cap: "
+            + ("none" if normalized is None else f"{normalized:g}%")
+            + " (auto-switch never stays on or lands on it past that on a weekly window)."
+        )
 
     def set_account_priority(self, identifier: str, priority: object | None) -> None:
         """Set a priority tier, or remove it with None/0. Validate before writing."""
@@ -6425,6 +6459,8 @@ class ClaudeAccountSwitcher:
         - ``(None, "exhausted")`` — current is the best and every account is at
           its limit (switching would not help) → stay
         - ``(None, "none")`` — no other switchable account exists
+        - ``(None, "capped")``: every other switchable account is at its
+          weekly cap, so stay
 
         Ties (including current-vs-other) resolve in favour of staying put.
         Never raises on network failure.
@@ -6441,6 +6477,16 @@ class ClaudeAccountSwitcher:
 
         if usage is None:
             usage = self._usage_by_account()
+        # A weekly-capped account is never a target, whatever it offers.
+        uncapped = [
+            n for n in others
+            if not weekly_capped(
+                self._policy_from_data(data, n).weekly_cap, usage.get(n)
+            )
+        ]
+        if not uncapped:
+            return None, "capped"
+        others = uncapped
         current_headroom = oauth.account_headroom(usage.get(str(current_num)), models)
         if current_at_limit:
             # The caller measured the limit somewhere the poll cannot see (the
@@ -7192,6 +7238,18 @@ class ClaudeAccountSwitcher:
                     f"(Account-{current_num})."
                 )
                 return None
+            if note == "capped":
+                msg = (
+                    f"Every other account is at its weekly cap; staying on "
+                    f"Account-{current_num}."
+                )
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="candidates-capped",
+                        to_ref=current_ref, warnings=warnings, message=msg,
+                    )
+                warning(msg)
+                return None
             if note == "exhausted":
                 # With model limits in play the binding window may be scoped.
                 limits_label = "usage limits" if models else "5h/7d limit"
@@ -7472,7 +7530,14 @@ class ClaudeAccountSwitcher:
         )
         if not (force and op["from"] == op["to"]):  # a forced rewrite is no "already-active"
             self._record_manual_switch(manual_source, op["from"], op["to"])
-        result = self._switch_result_from_op(op, "direct") if json_output else None
+        # Warn, never refuse: the engine moves off a capped account next tick.
+        cap_note = self._weekly_cap_note(target_account) if manual_source else None
+        if cap_note and not json_output:
+            warning(cap_note, file=sys.stderr)
+        result = (
+            self._switch_result_from_op(op, "direct", [cap_note] if cap_note else None)
+            if json_output else None
+        )
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
         # A cross-slot force stays "switched": reason reports the outcome, not
@@ -7484,6 +7549,21 @@ class ClaudeAccountSwitcher:
                 f"Activated Account-{to['number']} ({to['email']}) from stored backup"
             )
         return result
+
+    def _weekly_cap_note(self, account_num: str) -> str | None:
+        """One line naming the cap and window when ``account_num`` is past its
+        weekly cap, from stored usage only (no fetch); ``None`` otherwise."""
+        cap = self._policy_from_data(self._get_sequence_data() or {}, account_num).weekly_cap
+        if cap is None:
+            return None
+        entry = self.usage_entries_by_account(fetch=set()).get(account_num)
+        hit = weekly_capped(cap, entry.decision_value() if entry else None)
+        if hit is None:
+            return None
+        return (
+            f"Account-{account_num} is past its weekly cap ({hit[0]} {hit[1]:g}% "
+            f">= {cap:g}%); auto-switch will move off it on its next tick."
+        )
 
     def _live_matches_slot_backup(self, slot: str, email: str) -> bool:
         """Whether the live credential is provably the slot's stored lineage.

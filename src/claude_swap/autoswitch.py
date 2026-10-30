@@ -52,7 +52,7 @@ from typing import ClassVar
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
-from claude_swap.lines import BindingWindow, binding_window, window_line
+from claude_swap.lines import BindingWindow, binding_window, weekly_capped, window_line
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import decision_logger
 from claude_swap.models import AccountPolicy
@@ -210,6 +210,17 @@ _COOLDOWN_GATED_TRIGGERS = (
     "proactive", "alternation", "priority", *CONSUME_FIRST_STRATEGIES,
 )
 _FRESHEN_GATED_TRIGGERS = ("proactive", "alternation", "failover", *CONSUME_FIRST_STRATEGIES)
+
+
+def _capped_weekly_line(
+    cap: float | None, weekly: float | None, threshold: float
+) -> float | None:
+    """The weekly input cadence and escalation read: the active's weekly cap
+    folded into the weekly line (the 5h line stands in while none is set), so
+    the urgent band and the escalation fetch open before the cap, not after."""
+    if cap is None or cap >= 100.0:
+        return weekly
+    return min(cap, threshold if weekly is None else weekly)
 
 
 def _wall_headroom(own_bar: float | None) -> float:
@@ -729,7 +740,7 @@ class PollEvent(AutoSwitchEvent):
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
     # proactive | at-limit | failover | consume-first | priority | alternation
-    # | disabled-active
+    # | disabled-active | weekly-capped
     trigger: str
     from_ref: dict | None
     to_ref: dict | None
@@ -2039,7 +2050,9 @@ class AutoSwitchEngine:
         ]
         return min(values) if values else self.settings.threshold
 
-    def _refresh_poll_policy_inputs(self, thresholds: ThresholdMap) -> None:
+    def _refresh_poll_policy_inputs(
+        self, thresholds: ThresholdMap, weekly_cap: float | None = None
+    ) -> None:
         """Re-pin poll cadence from this tick's threshold map.
 
         ``set_poll_policy_inputs`` used to be called in exactly two places,
@@ -2063,9 +2076,10 @@ class AutoSwitchEngine:
         per-tick cost is one ``switchable_account_numbers()`` read, which
         ``_tick_inner`` already performs for candidate construction.
         """
+        lowest = self._min_effective_threshold(thresholds)
         self.switcher.set_poll_policy_inputs(
-            self._min_effective_threshold(thresholds),
-            self.settings.weekly_threshold,
+            lowest,
+            _capped_weekly_line(weekly_cap, self.settings.weekly_threshold, lowest),
             self._models,
         )
 
@@ -2209,9 +2223,10 @@ class AutoSwitchEngine:
         # global rather than raising mid-tick.
         policies = self.switcher.account_policies()
         thresholds = self._resolve_thresholds(settings, policies=policies)
+        active_cap = policies.get(current, AccountPolicy()).weekly_cap
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
-        self._refresh_poll_policy_inputs(thresholds)
+        self._refresh_poll_policy_inputs(thresholds, active_cap)
         # AN ACCOUNT'S OWN THRESHOLD (the `threshold` key, a used-%) REPLACES
         # THE STRATEGY'S BAR FOR THAT ACCOUNT ONLY, and only where a bar is
         # applied: leaving it while it is active (`departure_pct`,
@@ -2237,8 +2252,10 @@ class AutoSwitchEngine:
             # `dynamic` leaves on raw headroom against the own bar, every
             # window alike (`_classify_dynamic_trigger`): a weekly line would
             # put the escalation band above a switch the trigger already makes.
-            weekly_threshold=(
-                None if settings.strategy == "dynamic" else settings.weekly_threshold
+            weekly_threshold=_capped_weekly_line(
+                active_cap,
+                None if settings.strategy == "dynamic" else settings.weekly_threshold,
+                thresholds[current],
             ),
         )
         bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
@@ -2292,6 +2309,15 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
+        def _capped(num: str) -> tuple[str, float] | None:
+            """(window, pct) past the account's weekly cap in the CURRENT
+            `usage`, else None. A veto, applied to the active (must leave) and
+            to the candidate set before any ranking or escape reads it."""
+            return weekly_capped(
+                policies.get(num, AccountPolicy()).weekly_cap, usage.get(num)
+            )
+
+        active_capped = _capped(current)
         active_headroom = headroom.get(current)
         active_binding: BindingWindow | None = None
         # THE ACTUAL (never-widened) MODEL-GATED READING, kept alongside the
@@ -2357,6 +2383,15 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             trigger = "disabled-active"
+        elif active_capped is not None:
+            # A CAP IS NOT A LINE: no strategy, cooldown, hysteresis or
+            # no-return bar relaxes it, and "every peer is walled" is no
+            # reason to stay. Its own trigger name for the same reason as
+            # `disabled-active` (`leftTrigger` must not lie); outside the
+            # cooldown and freshness sets, so it leaves now.
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            trigger = "weekly-capped"
         elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
@@ -2452,12 +2487,15 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
+        # Priority's strict landing would hold a capped active in place.
+        priority_mode = priority_mode and trigger != "weekly-capped"
+
         # -- candidate selection ------------------------------------------
         switchable = self.switcher.switchable_account_numbers()
         candidates = [
             num
             for num in switchable
-            if num != current and num not in quarantined
+            if num != current and num not in quarantined and _capped(num) is None
         ]
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
@@ -2997,7 +3035,15 @@ class AutoSwitchEngine:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
-            self._emit(NoSwitchEvent(reason="no-candidates"))
+            self._emit(NoSwitchEvent(
+                reason="no-candidates",
+                detail=(
+                    f"Account-{current} is past its weekly cap "
+                    f"({active_capped[0]} {pct_label(active_capped[1])}%) "
+                    "and no other account is eligible"
+                    if active_capped else ""
+                ),
+            ))
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
@@ -3135,6 +3181,8 @@ class AutoSwitchEngine:
                 thresholds,
             )
             decided_now = self.clock()
+            # The fresh rows may have carried a candidate past its cap.
+            oauth_candidates = [n for n in oauth_candidates if _capped(n) is None]
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
@@ -4181,7 +4229,7 @@ class AutoSwitchEngine:
             num: self._over(usage.get(num), settings, models, thresholds[num])
             for num in oauth_candidates
         }
-        if trigger in ("at-limit", "failover"):
+        if trigger in ("at-limit", "failover", "weekly-capped"):
             all_above = _every_candidate_above_threshold(
                 oauth_candidates, over_by_account
             )
@@ -4342,12 +4390,20 @@ class AutoSwitchEngine:
                 # compares 0.0 to 0.0 and refuses anyway. Do not read a green
                 # suite as permission to delete it -- a precondition belongs in
                 # its guard, not in a sentinel two variables away.
+                #
+                # A CAPPED ACTIVE ASKS NO RECOVERY MARGIN: staying is the one
+                # thing the cap forbids, so with every peer over its lines a
+                # spent one is admitted whenever it returns (the all-above
+                # key below orders them soonest return first).
                 if not (
-                    all_above
-                    and (active_headroom or 0.0) <= 0
-                    and best_candidate_headroom <= SPENT_HEADROOM_PCT
-                    and active_recovery_ts != float("inf")
-                    and recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
+                    (all_above and trigger == "weekly-capped")
+                    or (
+                        all_above
+                        and (active_headroom or 0.0) <= 0
+                        and best_candidate_headroom <= SPENT_HEADROOM_PCT
+                        and active_recovery_ts != float("inf")
+                        and recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
+                    )
                 ):
                     continue  # itself at its limit — never a target
             if num == no_return:

@@ -1486,3 +1486,124 @@ class TestADepartureOnTheAccountsOwnLineKeepsTheTargetLoopExits:
             outcome, _ = _tick(h, [self._snapshot(active=60.0)])
         assert outcome is TickOutcome.ERROR
         assert any(isinstance(e, ErrorEvent) for e in h.events)
+
+
+_usage57 = test_autoswitch._usage57
+
+
+def _switch_trigger(h: EngineHarness) -> str | None:
+    return next((e.trigger for e in h.events if isinstance(e, SwitchEvent)), None)
+
+
+class TestWeeklyCap:
+    """`weeklyCap` is an eligibility veto on the weekly-resetting windows."""
+
+    @pytest.mark.parametrize(
+        "strategy", ["best", "consume-first", "dynamic", "priority-consume-first"]
+    )
+    def test_a_capped_active_leaves_for_the_walled_peer_that_returns_soonest(
+        self, temp_home, strategy
+    ):
+        h = _fleet(temp_home, strategy=strategy)
+        h.switcher.set_account_weekly_cap("1", 90)
+        outcome = h.tick_with_usage({
+            "1": _usage57(10, None, 92, _R_LATEST),
+            "2": _usage57(100, _R_LATEST, 0),
+            "3": _usage57(100, _R_SOON, 0),
+        })
+        assert outcome is TickOutcome.SWITCHED, _reasons(h)
+        assert h.active_number() == 3
+        assert _switch_trigger(h) == "weekly-capped"
+
+    def test_a_capped_active_with_no_eligible_peer_stays_and_reports_blocked(
+        self, temp_home
+    ):
+        h = _fleet(temp_home)
+        h.switcher.set_account_disabled("3", True)
+        for n in ("1", "2"):
+            h.switcher.set_account_weekly_cap(n, 80)
+        outcome = h.tick_with_usage({"1": _usage7(10, 85), "2": _usage7(10, 85)})
+        assert outcome is TickOutcome.BLOCKED and h.active_number() == 1
+        assert "no-candidates" in _reasons(h)
+        assert "weekly cap (7d 85%)" in _details(h)[-1]
+
+    @pytest.mark.parametrize(("cap", "lands"), [(None, 2), (75, 3)])
+    def test_a_capped_candidate_is_never_landed_on(self, temp_home, cap, lands):
+        h = _fleet(temp_home)
+        if cap is not None:
+            h.switcher.set_account_weekly_cap("2", cap)
+        h.tick_with_usage(
+            {"1": _usage7(95, 0), "2": _usage7(0, 80), "3": _usage7(85, 0)}
+        )
+        assert h.active_number() == lands
+
+    @pytest.mark.parametrize("pct5", [90.0, 95.0])
+    def test_the_five_hour_window_never_triggers_the_cap(self, temp_home, pct5):
+        h = _fleet(temp_home, threshold=99.0)
+        h.switcher.set_account_weekly_cap("1", 50)
+        assert h.tick_with_usage({
+            "1": _usage7(pct5, 10), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        }) is TickOutcome.NO_ACTION
+        assert _switch_trigger(h) is None
+
+    @pytest.mark.parametrize(
+        ("weekly_line", "pct7", "leaves"),
+        [(60.0, 91.0, True), (99.0, 91.0, True), (99.0, 89.0, False)],
+    )
+    def test_the_weekly_line_does_not_move_the_cap(
+        self, temp_home, weekly_line, pct7, leaves
+    ):
+        h = _fleet(temp_home, weekly_threshold=weekly_line)
+        h.switcher.set_account_weekly_cap("1", 90)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, pct7), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        })
+        assert (outcome is TickOutcome.SWITCHED) is leaves
+        if leaves:
+            assert _switch_trigger(h) == "weekly-capped"
+
+    @pytest.mark.parametrize("cap", [None, 100])
+    def test_no_cap_and_a_cap_of_100_are_never_capped(self, temp_home, cap):
+        h = _fleet(temp_home, threshold=99.9)
+        if cap is not None:
+            h.switcher.set_account_weekly_cap("1", cap)
+        assert h.tick_with_usage({
+            "1": _usage7(10, 99), "2": _usage7(10, 10), "3": _usage7(10, 10),
+        }) is TickOutcome.NO_ACTION
+
+    @pytest.mark.parametrize(
+        ("cap", "weekly", "expected"),
+        [(85.0, None, 85.0), (95.0, None, GLOBAL), (85.0, 97.0, 85.0), (None, 97.0, 97.0)],
+    )
+    def test_cadence_reads_the_cap_as_its_weekly_line(
+        self, temp_home, cap, weekly, expected
+    ):
+        h = _fleet(temp_home, weekly_threshold=weekly)
+        if cap is not None:
+            h.switcher.set_account_weekly_cap("1", cap)
+        h.tick_with_usage({n: _usage7(10, 10) for n in ("1", "2", "3")})
+        assert h.switcher._poll_inputs_override[1] == expected
+
+    def test_overshoot_past_the_cap_is_bounded_by_the_poll_plan(self):
+        """Simulated ticks on the planner: the first poll reading the cap is the
+        tick that leaves, so overshoot is the burn over one planned interval."""
+        from claude_swap import poll_policy as pp
+
+        def overshoot(rate_per_min: float, cap: float) -> float:
+            now, pct, interval, prev = 0.0, 60.0, None, None
+            while True:
+                usage = _usage7(10, pct)
+                if pct >= cap:
+                    return pct - cap
+                nxt, interval = pp.plan_after_fetch(
+                    prev_interval_s=interval, prev_usage=prev, new_usage=usage,
+                    is_active=True, threshold=95.0, weekly_threshold=cap,
+                    models=(), recent_429=False, now=now, rng=lambda: 1.0,
+                )
+                pct += rate_per_min * (nxt - now) / 60.0
+                prev, now = usage, nxt
+
+        rate = 0.3
+        bound = rate * pp.ACTIVE_MAX_INTERVAL_S * (1 + pp.JITTER_FRAC) / 60.0
+        measured = max(overshoot(rate, 90.0 + i * 0.1) for i in range(100))
+        assert 0 < measured <= bound
