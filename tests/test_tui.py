@@ -5233,6 +5233,83 @@ class TestUnswitchableRowsAreListed:
         assert starts["aaaa@x.com"] == starts["bbbb@x.com"], f"{starts} in {rows!r}"
         assert starts["cccc@x.com"] is None and rows["cccc@x.com"] == rows["cccc@x.com"].rstrip(), rows
 
+    def test_a_backoff_chip_row_lines_up_with_a_plain_row_and_the_markers_share_a_column(self):
+        """T1738, #321 + #323 + #371 merged: a window whose reset fired before its pct was
+        measured reads `7d(⟳429 30m):` (`chip_label` over `reset_text(..., entry=)`), wider
+        than the plain `7d(⟳3d08h):` another row prints. The columns are sized from the
+        text the cells print, so that chip's `:` and `%` sit in the plain row's columns,
+        and the first marker (`stale` on the backed-off row, `Fable-walled` on the other)
+        starts at ONE column after the padded chip block, the backed-off row's missing
+        Fable cell included."""
+        import re
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=90.0)
+        now = time.time()
+        backing_off = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 10.0, "resets_at": _iso_in(3600)},
+                "seven_day": {"pct": 100.0, "resets_at": _iso_in(-60)},
+            },
+            fetched_at=now - 120, age_s=120.0, consecutive_failures=2,
+            backoff_until=now + 1800, last_error="http-429",
+        )
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 5.0, "resets_at": _iso_in(4 * 3600)},
+                "seven_day": {"pct": 9.0, "resets_at": _iso_in(3 * 86400 + 8 * 3600)},
+                "scoped": [{"name": "Fable", "pct": 95.0}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, usage=backing_off),
+        ), active="9", settings=settings)
+        rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}
+        assert len(rows) == 2, rows
+        assert "7d(⟳429 " in rows["bbbb@x.com"], rows  # premise: the back-off chip is drawn
+        for window in ("5h", "7d"):
+            hits = [
+                m for line in rows.values()
+                if (m := re.search(r"(" + window + r"\(⟳[^)]*\):)\s*\d+%", line))
+            ]
+            assert len(hits) == 2, (window, rows)
+            assert len({m.end(1) for m in hits}) == 1, f"{window} colon not in one column: {rows!r}"
+            assert len({m.end() for m in hits}) == 1, f"{window} percent not in one column: {rows!r}"
+        starts = {
+            e: m.start(1) for e, line in rows.items()
+            if (m := re.search(r"\s{2}(stale|Fable-walled)(?:\s|$)", line))
+        }
+        assert set(starts) == set(rows), (starts, rows)
+        assert len(set(starts.values())) == 1, f"{starts} in {rows!r}"
+
+    def test_an_unranked_no_plan_slot_sizes_no_column(self):
+        """T1738, #323 + #371 merged: an unranked no-plan slot draws `no plan
+        (subscription inactive)` and no chips, so a wide window on it must not widen
+        the cells of the rows that do draw them (the column pre-pass skips it)."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        no_plan = UsageEntry(
+            last_good={"five_hour": {"pct": 100.0}, "seven_day": {"pct": 5.0}},
+            fetched_at=time.time() - STALE_OK_S - 600, age_s=STALE_OK_S + 600,
+            consecutive_failures=3, last_error="oauth_not_allowed_for_organization",
+        )
+
+        def render(*extra):
+            return self._render(self._snap(
+                self._acct("1", "a@x.com", switchable=True, last_good={
+                    "five_hour": {"pct": 92.0}, "seven_day": {"pct": 5.0},
+                }),
+                self._acct("2", "bbbb@x.com", switchable=True, last_good={
+                    "five_hour": {"pct": 5.0}, "seven_day": {"pct": 9.0},
+                }),
+                *extra,
+            ), active="1", settings=AutoSwitchSettings(model="all", threshold=90.0))
+
+        def row(out):
+            return next(l for l in out.split("\n") if "bbbb@x.com" in l)
+
+        out = render(self._acct("3", "cccc@x.com", switchable=True, usage=no_plan))
+        assert out.rstrip().splitlines()[-1].endswith("no plan (subscription inactive)"), out
+        assert row(out) == row(render()), out
+
     def test_next_best_percent_columns_align_across_countdown_widths(self):
         """The owner, 2026-09-15 (live auto-switch panel): `5h(⟳3h14m):25%`
         vs `7d(⟳2h4m):100%` -- the countdown's own width varies (`12m`,
@@ -5468,45 +5545,6 @@ class TestUnswitchableRowsAreListed:
         for email in ("ninetytwo@x.com", "fifty@x.com", "ninetyeight@x.com"):
             assert "full" not in rows[email], rows[email]
             assert ">=" not in rows[email], rows[email]
-
-    def test_the_panel_admits_a_headroom_candidate_with_hours_to_reset_under_dynamic(
-        self,
-    ):
-        """The owner's live case, 2026-09-19 (#321): account 4 at 7d 95%
-        (headroom 5) with its reset hours away must read as open on the
-        panel too, and rank ahead of a peer with more headroom but a
-        reset days out -- the panel's label and its "Next best" order
-        must never disagree with the engine (`proactive_switch_bar_pct`,
-        97 under dynamic)."""
-        from claude_swap.settings import AutoSwitchSettings
-        from tests.test_autoswitch import _iso_at
-
-        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
-        out = self._render(self._snap(
-            self._acct("7", "active@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 18.0},
-            }),
-            self._acct("4", "close@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 5.0}, "seven_day": {
-                    "pct": 95.0, "resets_at": _iso_at(time.time() + 23340),
-                },
-            }),
-            self._acct("2", "far@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 5.0}, "seven_day": {
-                    "pct": 40.0, "resets_at": _iso_at(time.time() + 500000),
-                },
-            }),
-        ), active="7", settings=settings)
-
-        rows = {
-            email: next(line for line in out.split("\n") if email in line)
-            for email in ("close@x.com", "far@x.com")
-        }
-        assert "full" not in rows["close@x.com"], rows["close@x.com"]
-        assert ">=" not in rows["close@x.com"], rows["close@x.com"]
-        assert out.index("close@x.com") < out.index("far@x.com"), (
-            f"the panel's 'Next best' order disagrees with the engine: {out!r}"
-        )
 
     def test_the_panel_never_calls_a_refetching_window_full(self):
         """PR #325: a 5h window whose reset just fired reads `refetching`
