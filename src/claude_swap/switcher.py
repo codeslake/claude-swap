@@ -6361,7 +6361,7 @@ class ClaudeAccountSwitcher:
                 is_active=bool(info_by_num[num][4]),
                 threshold=threshold,
                 weekly_threshold=weekly_threshold,
-                weekly_cap=self._poll_weekly_cap,
+                weekly_cap=getattr(self, "_poll_weekly_cap", None),
                 models=models,
                 recent_429=recent_429,
                 now=now,

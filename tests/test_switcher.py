@@ -18312,6 +18312,21 @@ class TestPollPolicyInputsCarryTheWeeklyLine:
         assert kwargs["models"] == ("Fable",)
         assert kwargs["is_active"] is True
 
+    def test_plans_after_fetch_runs_on_a_stub_without_a_weekly_cap(self):
+        from types import SimpleNamespace
+
+        from claude_swap.usage_store import FetchRecord
+
+        stub = SimpleNamespace(
+            _usage_store=SimpleNamespace(clock=lambda: 1000.0),
+            _poll_policy_inputs=lambda: (90.0, None, ()),
+        )
+        record = FetchRecord(usage={"five_hour": {"pct": 5.0}, "seven_day": {"pct": 10.0}})
+        plans = ClaudeAccountSwitcher._plans_after_fetch(
+            stub, {"1": record}, {}, {"1": (None, None, None, None, False)}
+        )
+        assert set(plans) == {"1"}
+
 
 class TestSwitchTransactionRollback:
     """``SwitchTransaction.rollback`` restores ``~/.claude.json`` by rename,
