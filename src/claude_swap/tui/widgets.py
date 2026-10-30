@@ -21,6 +21,7 @@ from claude_swap.json_output import (
     USAGE_NO_CREDENTIALS,
     USAGE_RELOGIN_REQUIRED,
 )
+from claude_swap.lines import weekly_capped
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
 from claude_swap.switcher import ERROR_NOTES
@@ -205,6 +206,10 @@ def _policy_badges(acc: AccountSnapshot, gap: str) -> list[str]:
         # ``:g`` so 75.0 reads as "75%" and 82.5 keeps its fraction — the store
         # accepts one decimal place and the row shows back exactly what was set.
         badges.append(f"{gap}th {acc.policy.threshold:g}%")
+    cap = acc.policy.weekly_cap
+    if cap is not None:
+        capped = " CAPPED" if weekly_capped(cap, acc.usage.last_good) else ""
+        badges.append(f"{gap}cap {cap:g}%{capped}")
     return badges
 
 

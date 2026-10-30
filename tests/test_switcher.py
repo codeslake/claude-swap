@@ -9882,6 +9882,35 @@ class TestUsageAwareSwitch:
         assert "Skipping Account-2 (at 5h/7d limit)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
+    @pytest.mark.parametrize(
+        ("strategy", "lands", "three_capped"),
+        [(None, 2, False), ("next-available", 3, False), ("next-available", 1, True)],
+    )
+    def test_a_weekly_capped_account_is_skipped_by_next_available_and_warned_on_by_rotation(
+        self, temp_home: Path, capsys, strategy, lands, three_capped
+    ):
+        s = self._setup(temp_home)
+        for num, email in ((1, "a"), (2, "b"), (3, "c")):
+            self._seed(s, num, f"{email}@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        s.set_account_weekly_cap("2", 90)
+        s.set_account_weekly_cap("3", 90)
+        capped = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 92.0}}
+        usage = {"1": self._usage(0), "2": capped, "3": capped if three_capped else self._usage(20)}
+        stored = {"2": UsageEntry(last_good=capped, fetched_at=0.0, age_s=0.0)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "usage_entries_by_account", return_value=stored), \
+             patch.object(s, "list_accounts"):
+            result = s.switch(strategy=strategy, manual_source="cli", json_output=three_capped)
+
+        out, err = capsys.readouterr()
+        assert s._get_sequence_data()["activeAccountNumber"] == lands
+        if three_capped:
+            assert result["reason"] == "candidates-capped"
+        else:
+            assert ("past its weekly cap (7d 92% >= 90%)" in err) is (strategy is None)
+            assert ("Skipping Account-2 (at weekly cap)" in out) is (strategy is not None)
+
     @staticmethod
     def _model_usage(five_h: float, fable: float) -> dict:
         return {
@@ -22745,7 +22774,7 @@ class TestALoginLandsInItsOwnSlot:
     gets the answer, compares it to ONE slot, and when it does not match it
     logs "foreign credential under a stale config" and DISCARDS the answer.
 
-    Measured on the personal mac: the owner ran `/login` and signed in as
+    Measured on a live machine: the owner ran `/login` and signed in as
     slot 5 while slot 1 was active. A switch to slot 5 then stashed that
     credential as foreign and installed slot 5's stored one — which was dead
     — one log line later. The stash was proven to be slot 5's own credential
@@ -23724,7 +23753,7 @@ class TestALoginLandsInItsOwnSlot:
         """A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE, the rule the
         switch-time heal (`_adopt_into_dead_slot`) already applies.
 
-        Measured 2026-09-02 06:15Z on the work Mac: the /login's first pass
+        Measured 2026-09-02 06:15Z on a live machine: the /login's first pass
         cleared slot 2's strike because the live credential was fresh, which
         made the slot look healthy, which made this refuse, which let the old
         stored token strike again two minutes later."""
@@ -27075,6 +27104,21 @@ class TestPollPolicyInputsCarryTheWeeklyLine:
         assert kwargs["weekly_threshold"] == 97.0
         assert kwargs["models"] == ("Fable",)
         assert kwargs["is_active"] is True
+
+    def test_plans_after_fetch_runs_on_a_stub_without_a_weekly_cap(self):
+        from types import SimpleNamespace
+
+        from claude_swap.usage_store import FetchRecord
+
+        stub = SimpleNamespace(
+            _usage_store=SimpleNamespace(clock=lambda: 1000.0),
+            _poll_policy_inputs=lambda: (90.0, None, ()),
+        )
+        record = FetchRecord(usage={"five_hour": {"pct": 5.0}, "seven_day": {"pct": 10.0}})
+        plans = ClaudeAccountSwitcher._plans_after_fetch(
+            stub, {"1": record}, {}, {"1": (None, None, None, None, False)}
+        )
+        assert set(plans) == {"1"}
 
 
 class TestSwitchTransactionRollback:

@@ -44,7 +44,7 @@ import math
 import random
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -58,7 +58,7 @@ from claude_swap.json_output import (
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
 )
-from claude_swap.lines import BindingWindow, binding_window, window_line
+from claude_swap.lines import BindingWindow, binding_window, weekly_capped, window_line
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import decision_logger
 from claude_swap.models import AccountPolicy
@@ -67,20 +67,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
-from claude_swap.switcher import (
-    LOGIN_RESTORE_RECHECK_MARGIN_S,
-    LOGIN_RESTORE_SETTLE_FLOOR_S,
-    ClaudeAccountSwitcher,
-    LoginRestoreOutcome,
-)
-from claude_swap.usage_store import (
-    WALL_FALLBACK_S,
-    due_candidates,
-    plan_oversleeps_interval,
-)
+from claude_swap.settings import AutoSwitchSettings, atomic_write_json, load_settings, parse_model_names
+from claude_swap.switcher import ClaudeAccountSwitcher, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome
+from claude_swap.usage_store import UsageEntry, WALL_FALLBACK_S, due_candidates, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
+STATE_LOCK_FILENAME = ".autoswitch_state.lock"
 STATE_SCHEMA_VERSION = 1
 # Held for the lifetime of a LIVE engine; a second one starts dry-run.
 LIVE_LOCK_FILENAME = ".auto-live.lock"
@@ -286,6 +278,331 @@ def _message_error_burst(
             server_errors += 1
     return (server_errors, calls, since + len(chunk))
 
+# The engine's own wake floor while the active is within two margins of that
+# bar (adr/0010 R2). The fleet runs `intervalSeconds` 360, so the engine can
+# read 96% at one tick and a wall at the next, never seeing the 3-point band
+# it is supposed to act in. Set to `poll_policy.URGENT_INTERVAL_S`, the
+# tightest cadence the planner will fetch a burning active at, because a wake
+# inside `poll_policy.SERVE_TTL_S` (180s) of the last read is served from the
+# store with no API call: looking this often is nearly free, and it lets the
+# engine act on each urgent fetch the tick it lands instead of up to
+# `interval_seconds` later. This and SPENT_HEADROOM_PCT are the calibration
+# knobs if the fleet is ever measured walling from inside the band.
+DANGER_INTERVAL_S = poll_policy.URGENT_INTERVAL_S
+
+
+def proactive_switch_bar_pct(strategy: str, threshold: float) -> float:
+    """The used-% a candidate is blocked at.
+
+    Originally a panel-only display helper ("where the proactive arm
+    fires"); since #321 also the value every landing-gate, ranking-key and
+    label comparison in ``_rank_candidates_pass`` (and its TUI/decision-log
+    mirrors) reads, except `dynamic_self_walled`, deliberately kept on the
+    raw threshold (see its own comment).
+
+    Under ``dynamic`` this is NOT ``settings.threshold`` — the proactive arm
+    is gated on ``_about_to_wall`` (headroom <= SPENT_HEADROOM_PCT), measured
+    against the dynamic-widened headroom (``_dynamic_active_headroom``), so
+    the true bar is ``100 - SPENT_HEADROOM_PCT`` regardless of the configured
+    threshold. `best`/`consume-first` still gate on the raw threshold, so
+    they get it back unchanged (#321 follow-up: a panel printing
+    ``settings.threshold`` under dynamic misreports the engine's real bar).
+    """
+    if strategy == "dynamic":
+        return 100.0 - SPENT_HEADROOM_PCT
+    return threshold
+
+
+def _ruler(settings: AutoSwitchSettings) -> float:
+    """The one threshold every account's windows are scored on
+    (``lines.line_headroom``'s ``T``): the strategy's bar, so accounts on
+    different own lines compare directly and ranking, hysteresis and recovery
+    all pick the same window for one account."""
+    return proactive_switch_bar_pct(settings.strategy, settings.threshold)
+
+
+# Strategies that rank by soonest weekly reset rather than most headroom.
+# `dynamic` shares consume-first's ranking key (and every gate keyed on the
+# below-threshold "consume-first" trigger, which this literal also drives —
+# `trigger = settings.strategy` when the strategy is one of these) and adds
+# its own behaviour on top, gated separately on `settings.strategy ==
+# "dynamic"` so `consume-first` itself is untouched by that addition.
+CONSUME_FIRST_STRATEGIES = ("consume-first", "dynamic")
+
+# Triggers a switch is still subject to the ordinary cooldown/freshness gates
+# under, alongside the existing proactive/consume-first set (#375's
+# `alternation` — a discretionary, healthy-active move, gated exactly like
+# `proactive` so it cannot bypass either check by being new).
+_COOLDOWN_GATED_TRIGGERS = (
+    "proactive", "alternation", "priority", *CONSUME_FIRST_STRATEGIES,
+)
+_FRESHEN_GATED_TRIGGERS = ("proactive", "alternation", "failover", *CONSUME_FIRST_STRATEGIES)
+
+
+def _capped_weekly_line(
+    cap: float | None, weekly: float | None, threshold: float
+) -> float | None:
+    """The weekly input cadence and escalation read: the active's weekly cap
+    folded into the weekly line (the 5h line stands in while none is set), so
+    the urgent band and the escalation fetch open before the cap, not after."""
+    if cap is None or cap >= 100.0:
+        return weekly
+    return min(cap, threshold if weekly is None else weekly)
+
+
+def _wall_headroom(own_bar: float | None) -> float:
+    """The headroom `dynamic` calls walled for one account: its own switch
+    threshold (the ``threshold`` key, a used-%) when it has one, else the fixed
+    ``SPENT_HEADROOM_PCT``. The one place a per-account bar becomes a wall, so
+    the land bar and the hold bar of an account stay the same number."""
+    return SPENT_HEADROOM_PCT if own_bar is None else 100.0 - own_bar
+
+
+def _about_to_wall(
+    active_headroom: float | None, wall: float = SPENT_HEADROOM_PCT
+) -> bool:
+    """Whether the active account's binding headroom is at the wall.
+
+    THE ONE predicate `dynamic`'s proactive-arm trigger classification and
+    its ranking pass both read (#375) — a second, independently-written copy
+    is exactly the kind of two-call-site drift this file has already paid
+    for once (see ``_dynamic_active_headroom``'s docstring).
+    """
+    return (active_headroom or 0.0) <= wall
+
+
+def _cooldown_yields_to_the_wall(
+    strategy: str,
+    active_headroom: float | None,
+    wall: float = SPENT_HEADROOM_PCT,
+) -> bool:
+    """Whether the anti-flap cooldown must stand aside (adr/0010 R1).
+
+    The land bar and the hold bar are the same number. `_rank_dynamic_
+    candidates` drops every candidate at `h <= SPENT_HEADROOM_PCT` and the
+    landing-healthy gate needs `h > SPENT_HEADROOM_PCT`, so the engine
+    REFUSES to land on an account down here — while
+    `_classify_dynamic_trigger` still calls the whole band `proactive`,
+    which is in `_COOLDOWN_GATED_TRIGGERS`, so a `dynamic` active sits
+    unservable for the full `cooldown_seconds`. An account the engine
+    would refuse to land on is one it must be free to leave.
+
+    IT CANNOT FLAP, BY CONSTRUCTION, and that is the check the tests make
+    rather than a scenario: outside the at-limit escape
+    (`dynamic_at_limit_escape`, T0938), landing requires `h >
+    SPENT_HEADROOM_PCT` and this departure requires `h <=
+    SPENT_HEADROOM_PCT` — the two conditions are disjoint, so the ordinary
+    landing path can never pick the account just left. The escape itself
+    CAN land on an `h <= SPENT_HEADROOM_PCT` candidate (that is its whole
+    purpose — choosing WHERE a walled fleet is stuck), but it fires only
+    when the active is ALSO walled (`about_to_wall`, the same condition
+    this function gates cooldown on), and the account just left is
+    excluded by its own number (`no_return`), not by headroom, so the
+    escape's bypass cannot re-pick it either. Either path, the bypass can
+    only produce a chain of departures onto accounts with room or a
+    genuinely sooner recovery, bounded by the roster.
+
+    NOT the exemption `_in_cooldown`'s docstring records as reverted: that
+    one lived inside `_in_cooldown` on its own fresh, unwidened `h <= 0`
+    store read, at a trigger (`at-limit`) no cooldown-gated caller reaches.
+    This reads the tick's own already-widened `active_headroom` at the call
+    site, and `dynamic` only — `best` and `consume-first` keep the cooldown
+    they have (adr/0009's fence).
+    """
+    return (
+        strategy == "dynamic"
+        and active_headroom is not None
+        and _about_to_wall(active_headroom, wall)
+    )
+
+
+def _walled_may_take_any_room(about_to_wall: bool, candidate_headroom: float) -> bool:
+    """Whether a WALLED active must yield to THIS candidate regardless of
+    reset order — the mirror of 7d5b5d33 (#375), read in the opposite
+    direction. That commit stops a HEALTHY active leaving for a candidate
+    whose reset is merely sooner; this stops a WALLED one staying for a
+    candidate whose reset is merely later. One function for both readings
+    of the same ``about_to_wall``/``peer_can_serve`` pair, not a second,
+    independently-written copy of it (see ``_about_to_wall``'s docstring).
+    """
+    return about_to_wall and candidate_headroom > SPENT_HEADROOM_PCT
+
+
+def _classify_dynamic_trigger(
+    active_headroom: float, wall: float = SPENT_HEADROOM_PCT
+) -> str:
+    """`dynamic`'s own trigger classification (#375 item 1): drop the bare
+    threshold, `_about_to_wall` (``wall``, SPENT_HEADROOM_PCT unless the active
+    has its own switch threshold) is the only bar left for the proactive arm;
+    a mutant restoring the pre-#375 bare-threshold shape is the digest control
+    (`TestOutcomeDigest375`).
+    """
+    if active_headroom <= 0:
+        return "at-limit"
+    if _about_to_wall(active_headroom, wall):
+        return "proactive"
+    # Resolved by the caller, once `oauth_candidates` exists — either
+    # `alternation` or a `below-threshold` NO_ACTION.
+    return "dynamic-healthy"
+
+
+def _is_warm(number: str, last_active_at: dict, now: float, cache_ttl_seconds: float) -> bool:
+    """Whether ``number``'s cached org context is still inside the TTL.
+
+    Absent from ``last_active_at`` (never departed, or a fleet from before
+    this field existed) reads as cold, never warm — an unmeasured candidate
+    is not evidence its context is loaded (#375).
+    """
+    ts = last_active_at.get(number)
+    return ts is not None and (now - ts) < cache_ttl_seconds
+
+
+def _rank_dynamic_candidates(
+    oauth_candidates: Sequence[str],
+    headroom: dict[str, float | None],
+    usage: dict[str, dict | str | None],
+    now: float,
+    last_active_at: dict,
+    cache_ttl_seconds: float,
+    bars: dict[str, float] | None = None,
+) -> tuple[list[str], list[str]]:
+    """WARM-tiered candidates for a `dynamic` proactive/alternation switch
+    (#375 item 3), each tier soonest-weekly-reset first (`dynamic`'s own
+    ranking key elsewhere in this file) then most headroom — never the
+    hysteresis-margin key `best` uses, since a wall is coming either way and
+    the question is only which account serves it, same reasoning
+    `_rank_candidates_pass`'s at-limit escape already applies. EVERY
+    candidate, warm or cold, is filtered here at ``SPENT_HEADROOM_PCT``
+    (the `peer_can_serve` idiom `_rank_candidates_pass` already uses for the
+    same question) — item 3b's floor (`cold_switch_cost_pct`) is a
+    separate, HIGHER bar the caller applies on top for an ORDINARY cold
+    admission (a walled candidate against a still-healthy active, or an
+    alternation partner). NOT true once `model_window_dropped` fires
+    (#321): there the caller's bar is `_blackout_retry_admission_bar`'s
+    relative margin over what the active already reads on this axis (a
+    cold candidate ALSO still floored at `cold_switch_cost_pct`, never
+    lower — see that function's own docstring), because the question is a
+    genuine rescue against a dead active, not an ordinary departure — a bare
+    ``headroom > 0`` let the no-return bar's own
+    "barred list is empty and the account recovered [on the RESET axis, not
+    headroom] — retry unbarred" fallback re-admit a candidate sitting at the
+    wall right back, because that fallback trusts `recovered` alone and
+    never re-checks headroom (found live: A at h=3 -> B, B burns to h=3, A's
+    reset alone "recovers" while its headroom never moves -> back to A ->
+    repeat every cooldown).
+    """
+    warm: list[tuple[tuple, str]] = []
+    cold: list[tuple[tuple, str]] = []
+    for num in oauth_candidates:
+        h = headroom.get(num)
+        # A candidate past its OWN switch threshold (`bars`) is as unlandable
+        # as a spent one: it would leave again on the next tick.
+        if h is None or h <= _wall_headroom((bars or {}).get(num)):
+            continue
+        reset_ts = _seven_day_reset_ts(usage.get(num), now)
+        key = (reset_ts if reset_ts is not None else float("inf"), -h)
+        bucket = warm if _is_warm(num, last_active_at, now, cache_ttl_seconds) else cold
+        bucket.append((key, num))
+    warm.sort(key=lambda t: t[0])
+    cold.sort(key=lambda t: t[0])
+    return [num for _, num in warm], [num for _, num in cold]
+
+
+def _blackout_retry_admission_bar(
+    floor_headroom: dict[str, float | None],
+    current: str,
+    cold_floor: float | None = None,
+) -> float:
+    """The candidate admission bar once ``dynamic``'s unmodeled-retry has
+    legitimately dropped the model set for ranking (#321), shared by the
+    `proactive` arm's `cold_floor` and the `dynamic-healthy` arm's
+    walled-escape admission -- the SAME retry, the same question, in both
+    places it is asked.
+
+    An ABSOLUTE bar cannot answer it on its own: 12% unmodeled headroom is
+    a real rescue against an active genuinely pinned at 5%, and worthless
+    noise against one already holding 60% (both routed through this
+    retry, only one is a genuine improvement). So the bar is, first, a
+    margin over what the active ALREADY reads on this same axis --
+    ``SPENT_HEADROOM_PCT``, the same churn margin `_rank_dynamic_
+    candidates` already applies to drop a candidate with nothing worth
+    taking.
+
+    ``cold_floor``, passed only for a COLD candidate (never a warm one --
+    a warm switch has no re-write cost to price), also floors the bar at
+    ``settings.cold_switch_cost_pct``: that constant prices the real cost
+    of a cold landing (~19 5h-points, settings.py), which does not shrink
+    just because the active's own reading is low. Without it, a chain of
+    cold rewrites each barely clearing the PREVIOUS active's margin nets
+    a real loss every time it fires, however small the active's own
+    reading gets.
+    """
+    relative = floor_headroom.get(current, 0.0) + SPENT_HEADROOM_PCT
+    return max(relative, cold_floor) if cold_floor is not None else relative
+
+
+def candidate_usage_is_stale(entry: UsageEntry | None, now: float) -> bool:
+    """Whether a candidate's cached usage cannot be trusted for admission.
+
+    Unreadable, past ``UsageEntry.fresh``'s TTL (the collector could not
+    refresh it this tick — backoff or a concurrent poller) UNLESS it is
+    held (``UsageEntry.held``, ``cswap import-usage``): the store itself
+    refuses to refetch a held row, so the freshness bar must accept a held
+    reading too, or a held candidate past the TTL is refused forever. Also
+    a collector-struck (``invalid_grant``) token (``token_dead()``,
+    unqualified — the same unbound call ``due_candidate`` uses).
+    `_tick_inner`'s consume-first admission HOLD only — sliding to a
+    worse-ranked candidate defeats consume-first's point, so it holds on
+    anything less than fresh or held. `proactive` has its own, looser bar:
+    ``candidate_is_untrustworthy``. `failover` gates on ``token_dead()``
+    alone (a backed-off peer is a fine target when the ACTIVE credential is
+    the one failing).
+    """
+    return (
+        entry is None
+        or not (entry.fresh(now) or entry.held(now))
+        or entry.token_dead()
+    )
+
+
+def candidate_is_untrustworthy(entry: UsageEntry | None, now: float) -> bool:
+    """Whether a candidate carries the INCIDENT'S OWN SIGNATURE, `proactive`'s
+    admission bar — the same one the TUI panel already keys on to mark a row
+    "stale" (``autoview.py``'s ``in_backoff``/``consecutive_failures``
+    check), plus ``token_dead()``.
+
+    Deliberately NOT ``candidate_usage_is_stale``: a merely-old poll
+    (``not entry.fresh(now)``) is not disqualifying on its own —
+    ``decision_value()`` already trusts a row well past ``fresh()``'s TTL
+    (``STALE_OK_S``), and refusing on staleness alone blocks a healthy row a
+    live claim just hasn't re-aged yet exactly as hard as a genuinely bad
+    one. It also refuses the API-key last-resort sentinel forever: that slot
+    is never fetched, so ``fetched_at`` never advances and ``fresh()`` is
+    permanently False. ``entry is None`` is not a ranked OAuth candidate
+    (``_rank`` drops headroom-``None``) and is skipped defensively.
+
+    An active backoff or a run of failures is ALSO not disqualifying on its
+    own: ``fetched_at`` moves only on success and ``backoffUntil``/
+    ``consecutiveFailures`` only on failure, so "succeeded 30s ago, then one
+    poll 429'd" carries both signals while the reading is still fresh and
+    decision-trusted — refusing it here for the whole backoff (up to
+    ``RATE_LIMIT_TRUST_MAX_AGE_S``, hours) contradicts the failover arm's own
+    principle just below: a backed-off peer is a fine target when its cached
+    figures can still be trusted. So the two combine: only a candidate that
+    is BOTH in backoff/failing AND whose reading ``decision_value()`` no
+    longer trusts (``entry.decision_value() is None``) is refused — "we
+    genuinely have no usable reading", not merely "polling is having a bad
+    day".
+    """
+    return (
+        entry is None
+        or entry.token_dead()
+        or (
+            (entry.in_backoff(now) or entry.consecutive_failures > 0)
+            and entry.decision_value() is None
+        )
+    )
+
 
 def _all_above_margin_met(candidate_headroom: float, active_headroom: float) -> bool:
     """Does a candidate beat the active by enough to move, every account over
@@ -405,6 +722,14 @@ def _now_iso() -> str:
     )
 
 
+def _read_state_file(path: Path) -> dict:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def pct_label(value: float) -> str:
     """A percentage for display, as configured: 85.555555 stays itself
     (never a rounded "85.5556") and 99.9 never becomes a lying "100" the
@@ -462,6 +787,18 @@ class PollEvent(AutoSwitchEvent):
     active: dict | None  # account_ref shape, or None
     headroom: dict[str, float | None]  # account number → headroom pct (None=unknown)
     threshold: float
+    # The used-% the ACTIVE account is left at: its own switch threshold when
+    # it has one, else `proactive_switch_bar_pct`. Additive field: absent
+    # (None) callers fall back to `threshold` below.
+    switch_bar: float | None = None
+    # account number → the used-% a candidate is refused at (its own switch
+    # threshold, else the strategy's bar), for `_describe`. Not serialized;
+    # a number it lacks falls back to `switch_bar`.
+    landing_bars: dict[str, float] = field(default_factory=dict)
+    # The tick's strategy, for `human()`: under `dynamic` the active leaves on
+    # raw headroom against its own bar, so the weekly line is not the line it
+    # is quoted against. Not serialized.
+    strategy: str | None = None
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
     # accounts whose usage is unknown this tick. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
@@ -470,6 +807,13 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # account number → its spend (pay-as-you-go credit) reading, when it has
+    # one: {"pct", "used", "limit"}. A spend-only account reports no 5h/7d/
+    # model window at all, so `windows`/`headroom` are structurally empty for
+    # it — exactly the shape `_describe` otherwise reads as "genuinely
+    # unreadable" and prints a bare "?" for, collapsing "no windows by
+    # design" into "could not read". Additive field.
+    spend: dict[str, dict] = field(default_factory=dict)
     # The switch line of the weekly windows (7d and per-model) when one is
     # configured; ``threshold`` stays the 5h window's. Additive field, emitted
     # only when set. Every pct above stays RAW: the lines are applied where
@@ -482,10 +826,14 @@ class PollEvent(AutoSwitchEvent):
             "headroomPct": self.headroom,
             "threshold": self.threshold,
         }
+        if self.switch_bar is not None:
+            fields["switchBar"] = self.switch_bar
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
             fields["windowsPct"] = self.windows
+        if self.spend:
+            fields["spend"] = self.spend
         if self.weekly_threshold is not None:
             fields["weeklyThreshold"] = self.weekly_threshold
         return fields
@@ -493,10 +841,35 @@ class PollEvent(AutoSwitchEvent):
     def _describe(self, num: str) -> str:
         wins = self.windows.get(num)
         if wins:
-            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            text = " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            # WHAT actually blocks this candidate — a full 5h/7d block, or
+            # only its pinned model's window (which the engine's fallback in
+            # `_rank_candidates` can rank around; see `classify_candidate_block`).
+            # This candidate's own landing bar (#321), else the same fallback
+            # as `human()` below: `switch_bar`, never the raw `threshold`
+            # alone under `dynamic`.
+            kind, model = classify_candidate_block(
+                wins.items(),
+                self.landing_bars.get(
+                    num,
+                    self.switch_bar if self.switch_bar is not None else self.threshold,
+                ),
+                self.weekly_threshold,
+            )
+            if kind == "full":
+                text += f" ({model} full)"
+            elif kind == "model":
+                text += f" ({model_block_label(model)})"
+            return text
         h = self.headroom.get(num)
         if h is not None:
             return f"{100 - h:.0f}%"
+        spend = self.spend.get(num)
+        if spend is not None:
+            return (
+                f"$$ {spend['pct']:.0f}% "
+                f"(${spend['used']:,.2f}/${spend['limit']:,.2f})"
+            )
         err = self.fetch_errors.get(num)
         return f"? ({err})" if err else "?"
 
@@ -505,7 +878,9 @@ class PollEvent(AutoSwitchEvent):
             return "poll: no active account"
         num = self.active.get("number")
         h = self.headroom.get(str(num))
-        line = self.threshold
+        # The active's own bar stands in for the 5h line (#321), as in the engine.
+        bar = self.switch_bar if self.switch_bar is not None else self.threshold
+        line = bar
         wins = self.windows.get(str(num))
         if wins:
             # Name the binding window and quote ITS line: "93% used (switch
@@ -514,8 +889,8 @@ class PollEvent(AutoSwitchEvent):
             # #115 ambiguity). Same rule as the engine's trigger.
             binding = binding_window(
                 ((label, pct, None) for label, pct in wins.items()),
-                self.threshold,
-                self.weekly_threshold,
+                bar,
+                None if self.strategy == "dynamic" else self.weekly_threshold,
             )
             used = f"{binding.label} {binding.pct:.0f}% used"
             line = binding.line
@@ -539,8 +914,8 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    # proactive | at-limit | failover | consume-first | priority |
-    # disabled-active | overloaded
+    # proactive | at-limit | failover | consume-first | priority | alternation
+    # | disabled-active | overloaded | weekly-capped
     trigger: str
     from_ref: dict | None
     to_ref: dict | None
@@ -628,11 +1003,18 @@ class AllExhaustedEvent(AutoSwitchEvent):
     # gate: every candidate was read, and the consumer separately requires
     # that one of them still holds room.
     deliberate_wait: bool = False
+    # T0938: the account `earliest_reset_at` is timing, an account_ref shape
+    # (`_ref`) like `active`/`from_ref`/`to_ref` elsewhere -- `_earliest_
+    # recovery` takes the minimum over EVERY account, active included, so
+    # without this `human()` had no way to say whether the wait it announced
+    # was for the active's own reset or a peer's. Additive field.
+    waiting_on: dict | None = None
 
     def _fields(self) -> dict:
         return {
             "earliestResetAt": self.earliest_reset_at,
             "deliberateWait": self.deliberate_wait,
+            "waitingOn": self.waiting_on,
         }
 
     def human(self) -> str:
@@ -641,8 +1023,9 @@ class AllExhaustedEvent(AutoSwitchEvent):
             if self.deliberate_wait
             else "all accounts exhausted"
         )
+        who = f" (Account-{self.waiting_on['number']})" if self.waiting_on else ""
         if self.earliest_reset_at:
-            return f"{what}; earliest reset {self.earliest_reset_at}"
+            return f"{what}; earliest reset {self.earliest_reset_at}{who}"
         return f"{what}; no reset time known"
 
 
@@ -754,6 +1137,31 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     return None
 
 
+def _perishes_before_active(
+    candidate_usage: dict | str | None,
+    active_usage: dict | str | None,
+    now: float,
+) -> bool:
+    """Whether a candidate's 7-day window resets sooner than the active's own
+    (T0758): the active's own headroom will still be there next tick, but a
+    candidate's window that resets first expires whatever it is not spent
+    on. Both read through `_seven_day_reset_ts`. A None (unknown or already
+    past) CANDIDATE reset is never "sooner" -- it sorts to +inf like the
+    ranking key `_rank_dynamic_candidates` already uses, and must keep
+    losing, the same reading `_seven_day_reset_ts` already gives it (past
+    == unknown). A None ACTIVE reset is conservative instead, never +inf:
+    it collapses "just rolled over, nothing pending" with "never fetched"
+    indistinguishably, and only the first of those would justify waiving
+    the floor for every candidate with a real reset at once -- an
+    ambiguous signal must not carry that much weight.
+    """
+    candidate_ts = _seven_day_reset_ts(candidate_usage, now)
+    if candidate_ts is None:
+        return False
+    active_ts = _seven_day_reset_ts(active_usage, now)
+    return active_ts is not None and candidate_ts < active_ts
+
+
 def consume_first_rank_key(
     usage: dict | str | None,
     threshold: float,
@@ -768,16 +1176,18 @@ def consume_first_rank_key(
     Same two tiers ``_rank_candidates`` gates on below the threshold —
     servable (``h > SPENT_HEADROOM_PCT``) before landing-healthy — then
     soonest 7-day reset, most headroom breaking ties. Pulled out so a display
-    built from this key can never disagree with the account the engine would
-    switch to. ``threshold`` is the account's own line and ``scale`` the global
-    one it is measured against (``lines.binding_window``).
+    built from this key agrees with the account the engine picks WHEN the
+    engine itself ranks through this key -- not every ``dynamic`` tick does
+    (see the TUI panel's own comment on this). ``threshold`` is the account's own line
+    and ``scale`` the global one it is measured against (``lines.binding_window``).
     """
     h = oauth.account_headroom(usage, models)
     if h is None:
         h = 0.0
     reset_ts = _seven_day_reset_ts(usage, now)
-    # Landing health and the tie-break against each window's OWN line (lines.py); with one
-    # line ``over`` is ``100 - h >= threshold`` and ``line_headroom`` is ``h``, bit for bit.
+    # Landing health and the tie-break against each window's OWN line (lines.py);
+    # with one line ``over`` is ``100 - h >= threshold`` and ``line_headroom`` is
+    # ``h``, bit for bit.
     binding = binding_window(
         oauth.relevant_windows(usage if isinstance(usage, dict) else None, models),
         threshold,
@@ -814,8 +1224,8 @@ def _binding_recovery_ts(
     are required; without one the threshold cannot change the answer.
 
     TWO RULES, and which one applies depends on whether anything is AT a
-    limit. Below 100 the binding window is the one above (the highest utilization
-    with one line) and its own reset is the answer. Once any window is at or over 100 the account is
+    limit. Below 100 the binding window is the one named above and its
+    own reset is the answer. Once any window is at or over 100 the account is
     back only when the LAST of those blockers resets, which is a different
     window whenever a weekly limit is spent alongside a five-hour one.
 
@@ -918,8 +1328,11 @@ def _every_account_above_threshold(
     active_over: bool | None,
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
-    their own switch lines — the state where "land somewhere healthy" has no
-    answer.
+    their own switch lines (a candidate's own, when it has one) — the state
+    where "land somewhere healthy" has no answer. The ACTIVE is judged past the
+    strategy's threshold AND its own line, whichever is higher (the caller
+    builds both verdicts): an account under its own line is not in trouble, and
+    recovery ranking must not pull it onto a peer with less room.
 
     Requires the active account's own verdict to be known (``None`` = no
     readable window): without it we do not know we are in this state, and
@@ -946,6 +1359,208 @@ def _headroom_by_account(
         )
         for num, value in usage.items()
     }
+
+
+def _dynamic_active_headroom(
+    settings: "AutoSwitchSettings",
+    models: tuple[str, ...],
+    usage: dict[str, dict | str | None],
+    current: str,
+    active_headroom: float | None,
+    thresholds: Mapping[str, float] | None = None,
+) -> float | None:
+    """Widen ``active_headroom`` to the unmodeled 5h/7d value under
+    ``dynamic``, so the trigger classification and every re-rank this tick
+    read the active account on the same basis. ``headroom`` is always
+    model-gated (folds ``models`` in), so a pinned model's own window can
+    read the ACTIVE as blocked while its 5h/7d have real room — this only
+    widens, never narrows, and only runs under ``strategy == "dynamic"``.
+    Both the first classification and the consume-first phase-2 refetch
+    call this on the SAME axis — a second, independent computation at
+    either site is how the trigger and the re-rank end up deciding on
+    different bases within one tick.
+
+    Only when :func:`_model_window_binds_everywhere` says the model window
+    is a fleet-wide blackout: a real candidate still open on the model
+    axis (this account's own window bites nobody else) must read the
+    active as genuinely walled, or the engine calls a fully-blocked active
+    HEALTHY and never leaves it (measured 2026-09-07: pinned on a
+    Fable-100% active for a full poll window with a Fable-82% candidate
+    sitting idle).
+    """
+    if settings.strategy != "dynamic" or not models or active_headroom is None:
+        return active_headroom
+    if not _model_window_binds_everywhere(
+        usage, models, settings.threshold, settings.weekly_threshold, thresholds
+    ):
+        return active_headroom
+    unmodeled = _headroom_by_account(usage, ()).get(current)
+    if unmodeled is not None and unmodeled > active_headroom:
+        return unmodeled
+    return active_headroom
+
+
+def classify_candidate_block(
+    windows: Iterable[tuple[str, float]],
+    threshold: float,
+    weekly_threshold: float | None = None,
+) -> tuple[str, str | None]:
+    """Why one candidate is blocked at ``threshold`` (and ``weekly_threshold``
+    for the weekly windows, when set), given its windows.
+
+    ``windows`` is any iterable of ``(label, pct)`` — the same labels
+    :func:`oauth.relevant_windows` reports, "5h"/"7d" plus each configured
+    model's scoped display name. A window blocks when its OWN pct is at or
+    over ITS OWN line (``lines.window_line``) — the landing gate's own
+    arithmetic (``_rank_candidates_pass``: ``binding.over``, which with one
+    line is ``(100.0 - h) >= bar`` where ``h = 100 - max(pcts)``, i.e. the
+    binding pct itself, and ``bar`` is
+    ``proactive_switch_bar_pct(strategy, settings.threshold)`` — the raw
+    threshold for every strategy but ``dynamic``, #321), read per window
+    instead of folded across all of them. Three outcomes: ``"open"``
+    (nothing blocks), ``"full"`` (a 5h/7d window blocks — no model choice
+    escapes that one, named the same way a model block already is: the
+    first in `windows` order, i.e. 5h before 7d when both block), or
+    ``"model"`` (every blocking window is a scoped model window, naming
+    the first — dropping that model from the criteria set is what escapes
+    it, not moving accounts). This is a report, not a
+    decision: the engine's own model-window fallback in ``_rank_candidates``
+    already acts on the same distinction, so the panel and the decision log
+    read it here instead of re-deriving it and risking a different answer.
+    """
+    blocking = [
+        (label, pct)
+        for label, pct in windows
+        if pct >= window_line(label, threshold, weekly_threshold)
+    ]
+    if not blocking:
+        return "open", None
+    # 5h/7d before models in `relevant_windows` order, so the first
+    # matching entry in `blocking` is deterministically 5h over 7d.
+    full = next((label for label, _ in blocking if label in ("5h", "7d")), None)
+    if full is not None:
+        return "full", full
+    return "model", blocking[0][0]
+
+
+def model_block_label(model: str) -> str:
+    """The shared "blocked by this model's window alone" chip/log text.
+
+    ONE function so the panel, the decision log, and any future
+    ``cswap list`` reader change together (the way ``#320``'s
+    ``chip_label`` does) — a second, independently-worded copy is how a
+    rename like this one (``-only`` -> ``-walled``, the owner read "only"
+    as "can ONLY serve this model", backwards from the intent: the
+    account's 5h/7d still have room, only the model window blocks) drifts
+    between call sites.
+    """
+    return f"{model}-walled"
+
+
+def _model_window_binds_everywhere(
+    usage: dict[str, dict | str | None],
+    models: tuple[str, ...],
+    threshold: float,
+    weekly_threshold: float | None = None,
+    lines: Mapping[str, float] | None = None,
+) -> bool:
+    """True only when the model window blocks every account in ``usage``
+    (model-gated) and at least one of them is blocked ONLY by that window
+    (:func:`classify_candidate_block` returns ``"model"``, never
+    ``"open"``) — i.e. dropping ``models`` is what rescues the fleet, not
+    a stand-in for a genuine 5h/7d exhaustion. "A MODEL WINDOW IS NOT A
+    BLACKOUT" (#321) only holds where staying model-gated is worse than
+    every alternative; the moment ANY account (the active included, since
+    it is always a key of ``usage``) is still OPEN with the model folded
+    in, the window does not bind everywhere. `_rank_candidates`'s retry,
+    the proactive/alternation ranker's copy of it, and
+    `_dynamic_active_headroom`'s widening all consume this ONE predicate
+    rather than re-deriving their own — the duplicated retry (measured
+    2026-09-07: a fleet stuck switching onto, and then pinned on, a
+    Fable-100% wall while a real Fable-82% candidate sat idle) is what
+    happens when they don't.
+
+    An account with NO readable 5h/7d window at all — an unreadable fetch,
+    or a spend-only credit slot — is SKIPPED, never read as "open":
+    ``classify_candidate_block([], threshold)`` returns ``"open"`` for that
+    empty window list exactly as it would for a genuinely open account, so
+    one such account in the fleet silently disarmed this predicate for
+    every genuinely model-only-walled account (measured 2026-09-08: a
+    spend-only slot #8 held `all accounts exhausted` while a real Fable
+    candidate's 5h/7d sat open).
+
+    ``lines`` holds per-account overrides (the tick's ``ThresholdMap``): an
+    account is judged on its own line, the one the ranking lands it on, any
+    other on ``threshold``.
+    """
+    if not models:
+        return False
+    saw_model_only_wall = False
+    for num, value in usage.items():
+        windows = [
+            (label, pct)
+            for label, pct, _ in oauth.relevant_windows(
+                value if isinstance(value, dict) else None, models
+            )
+        ]
+        if not windows:
+            continue
+        outcome, _ = classify_candidate_block(
+            windows, (lines or {}).get(num, threshold), weekly_threshold
+        )
+        if outcome == "open":
+            return False
+        if outcome == "model":
+            saw_model_only_wall = True
+    return saw_model_only_wall
+
+
+def record_manual_switch(
+    switcher: ClaudeAccountSwitcher,
+    source: str,
+    from_ref: dict | None,
+    to_ref: dict | None,
+) -> None:
+    """A hand switch leaves the engine's trace (T1850): a decisions-log line
+    (when ``decision_log`` is on) and, for a real move, ``lastActiveAt`` for
+    BOTH accounts at the hand's own time. Without it the dwell clock reads the
+    engine's stale stamp on the account the owner just chose, and alternation
+    moves them off it a chunk after ITS arrival, not theirs (measured
+    2026-10-05: a hand 2 -> 5 at T+270 s was alternated off at T+662 s). Not
+    ``lastSwitchTo``/``lastSwitchFrom``/``leftTrigger``: the no-return bar is
+    disarmed by a hand switch on purpose.
+
+    Called only through `ClaudeAccountSwitcher._record_manual_switch`, by hand
+    callers (TUI, CLI, menubar) that run with no engine of their own, so it
+    writes the files itself; never by the engine, whose `_perform` holds the
+    state lock across its own switch. Nothing escapes it: a record must never
+    fail the switch it follows.
+    """
+    try:
+        moved = from_ref != to_ref
+        event = (
+            SwitchEvent(trigger=f"manual: {source}", from_ref=from_ref, to_ref=to_ref)
+            if moved
+            else NoSwitchEvent(reason="already-active", detail=f"manual: {source}")
+        )
+        backup_dir = switcher.backup_dir
+        if load_settings(backup_dir).decision_log:
+            decision_logger(backup_dir).info("%s %s", event.ts, event.human())
+        if moved:
+            path = backup_dir / STATE_FILENAME
+            with FileLock(backup_dir / STATE_LOCK_FILENAME):
+                state = _read_state_file(path)
+                stamps = state.get("lastActiveAt")
+                stamps = dict(stamps) if isinstance(stamps, dict) else {}
+                now = switcher._usage_store.clock()
+                for ref in (from_ref, to_ref):
+                    if ref and ref.get("number") is not None:
+                        stamps[str(ref["number"])] = now
+                state["schemaVersion"] = STATE_SCHEMA_VERSION
+                state["lastActiveAt"] = stamps
+                atomic_write_json(path, state)
+    except Exception:  # noqa: BLE001 -- a record must never fail the switch
+        _logger.warning("could not record the manual switch", exc_info=True)
 
 
 def cache_aware_active(settings: AutoSwitchSettings) -> bool:
@@ -1111,6 +1726,14 @@ class AutoSwitchEngine:
         # Per-tick: the first settle gate returned before the health reseed,
         # so the counters in memory are not yet this account's.
         self._tick_settled = False
+        # Per tick too: whether the active is inside the danger band, which
+        # bounds `_next_delay`'s sleep (adr/0010 R2).
+        self._danger_band = False
+        # Per tick too: slot -> own threshold (the tick's ThresholdMap, read with
+        # `.get`, so overrides only), and the headroom the active account is
+        # walled at (its own, or SPENT_HEADROOM_PCT).
+        self._bars: dict[str, float] = {}
+        self._active_wall = SPENT_HEADROOM_PCT
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -1186,14 +1809,10 @@ class AutoSwitchEngine:
     # -- state file ---------------------------------------------------------
 
     def _state_lock(self) -> FileLock:
-        return FileLock(self.state_path.parent / ".autoswitch_state.lock")
+        return FileLock(self.state_path.parent / STATE_LOCK_FILENAME)
 
     def _read_state(self) -> dict:
-        try:
-            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return {}
-        return raw if isinstance(raw, dict) else {}
+        return _read_state_file(self.state_path)
 
     def _mutate_state(self, mutator: Callable[[dict], None]) -> dict:
         """Read-modify-write the state file under its lock; returns new state.
@@ -1465,6 +2084,10 @@ class AutoSwitchEngine:
             and now_ms + FRESHEN_BUFFER_MS >= expires_at
         )
         if not near_expiry:
+            # This proves only that the STORED token outlives the refresh
+            # buffer, never that the account is a live target — that liveness
+            # gap is closed at admission (the stale-usage exclusion above
+            # `_tick_inner`'s freshen loop), not by probing here.
             return "ok"
         # The consume gate serializes every backup-rt POST (the recovery
         # branch in `_fetch_active_usage` is a second call site, under the
@@ -1753,7 +2376,9 @@ class AutoSwitchEngine:
         ]
         return min(values) if values else self.settings.threshold
 
-    def _refresh_poll_policy_inputs(self, thresholds: ThresholdMap) -> None:
+    def _refresh_poll_policy_inputs(
+        self, thresholds: ThresholdMap, weekly_cap: float | None = None
+    ) -> None:
         """Re-pin poll cadence from this tick's threshold map.
 
         ``set_poll_policy_inputs`` used to be called in exactly two places,
@@ -1777,11 +2402,13 @@ class AutoSwitchEngine:
         per-tick cost is one ``switchable_account_numbers()`` read, which
         ``_tick_inner`` already performs for candidate construction.
         """
+        lowest = self._min_effective_threshold(thresholds)
         self.switcher.set_poll_policy_inputs(
-            self._min_effective_threshold(thresholds),
-            self.settings.weekly_threshold,
+            lowest,
+            _capped_weekly_line(weekly_cap, self.settings.weekly_threshold, lowest),
             self._models,
         )
+        self.switcher.set_poll_weekly_cap(weekly_cap)
 
     def _load_health_counters(self, state: dict, current: str) -> None:
         """Seed the unreadable-active counters from the state file.
@@ -1985,14 +2612,40 @@ class AutoSwitchEngine:
         # global rather than raising mid-tick.
         policies = self.switcher.account_policies()
         thresholds = self._resolve_thresholds(settings, policies=policies)
+        active_cap = policies.get(current, AccountPolicy()).weekly_cap
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
-        self._refresh_poll_policy_inputs(thresholds)
+        self._refresh_poll_policy_inputs(thresholds, active_cap)
+        # AN ACCOUNT'S OWN THRESHOLD (the `threshold` key, a used-%) REPLACES
+        # THE STRATEGY'S BAR FOR THAT ACCOUNT ONLY, and only where a bar is
+        # applied: leaving it while it is active (`departure_pct`,
+        # `_active_wall`) and refusing to land on it while it is a candidate
+        # (`cand_bar`, `_rank_dynamic_candidates`), because an account past
+        # its own line would leave again next tick. Land bar and hold bar are
+        # one number per account, so the anti-flap argument of
+        # `_cooldown_yields_to_the_wall` holds per account. `_bars` is that
+        # same map, read with `.get(num, bar)`: it holds the overrides only, so
+        # an account without one falls to the strategy's bar (97 under
+        # `dynamic`), where `thresholds[num]` would give the global. A
+        # preference, not a veto: an active at the real wall, or a fleet
+        # entirely past its lines (`_every_account_above_threshold`), still
+        # takes a peer past its own line rather than ride to the limit and pin
+        # the sessions. Unset reads exactly as before. Poll cadence follows
+        # the fleet's lowest line (`_refresh_poll_policy_inputs`).
+        self._bars = thresholds
+        self._active_wall = _wall_headroom(self._bars.get(current))
         entries, usage, headroom = self._collect_scheduled_usage(
             current,
             quarantined,
             threshold=thresholds[current],
-            weekly_threshold=settings.weekly_threshold,
+            # `dynamic` leaves on raw headroom against the own bar, every
+            # window alike (`_classify_dynamic_trigger`): a weekly line would
+            # put the escalation band above a switch the trigger already makes.
+            weekly_threshold=_capped_weekly_line(
+                active_cap,
+                None if settings.strategy == "dynamic" else settings.weekly_threshold,
+                thresholds[current],
+            ),
             overloaded=is_overloaded,
         )
         # T1313: the collect pass above can itself settle a login restore
@@ -2012,14 +2665,15 @@ class AutoSwitchEngine:
             LoginRestoreOutcome.RESTORED, LoginRestoreOutcome.WAITING,
         ):
             return TickOutcome.NO_ACTION
+        bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
-                # The active account's own line: the number the CLI and TUI
-                # render as "the threshold" must be the one the departure
-                # gate below actually used, or the UI contradicts the engine.
                 threshold=thresholds[current],
+                switch_bar=self._bars.get(current, bar),
+                landing_bars={num: self._bars.get(num, bar) for num in headroom},
+                strategy=settings.strategy,
                 weekly_threshold=settings.weekly_threshold,
                 fetch_errors={
                     num: entry.last_error
@@ -2032,6 +2686,11 @@ class AutoSwitchEngine:
                     if (pcts := _window_pcts(
                         value if isinstance(value, dict) else None, self._models
                     ))
+                },
+                spend={
+                    num: value["spend"]
+                    for num, value in usage.items()
+                    if isinstance(value, dict) and isinstance(value.get("spend"), dict)
                 },
             )
         )
@@ -2057,8 +2716,59 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
+        def _capped(num: str) -> tuple[str, float] | None:
+            """(window, pct) past the account's weekly cap in the CURRENT
+            `usage`, else None. A veto, applied to the active (must leave) and
+            to the candidate set before any ranking or escape reads it."""
+            return weekly_capped(
+                policies.get(num, AccountPolicy()).weekly_cap, usage.get(num)
+            )
+
+        active_capped = _capped(current)
         active_headroom = headroom.get(current)
         active_binding: BindingWindow | None = None
+        # THE ACTUAL (never-widened) MODEL-GATED READING, kept alongside the
+        # widened one below for the dynamic-healthy arm's own walled-escape
+        # (#403): the widen can call an active "healthy" on its 5h/7d while
+        # it is genuinely at 100% on the model this host runs — correct for
+        # trigger classification (a real non-model candidate must not be
+        # abandoned for a false blackout), wrong for "is there really
+        # nothing wrong with sitting here", which is what the escape needs.
+        raw_active_headroom = active_headroom
+        # THE MODEL BASIS, RE-PICKED EACH TICK (dynamic only). `headroom` is
+        # always model-gated (folds `self._models` in), so a pinned model's
+        # own window can read the ACTIVE as blocked while its 5h/7d have
+        # real room — the mirror image of "a model window is not a
+        # blackout" for candidates, applied to the account we are sitting
+        # on. Without this, dynamic departs an account whose 5h/7d have
+        # room for everything except that one model, even though nothing
+        # forces it to leave: the model wall only bites the work that uses
+        # that model, and the landing rule already re-admits that account as
+        # a target once here. `best`/`consume-first` are unaffected — this
+        # only widens `active_headroom`, never narrows it, and only runs
+        # under `strategy == "dynamic"`. The consume-first phase-2 refetch
+        # below re-derives `active_headroom` from a fresh `headroom` too —
+        # calling the same helper there is what keeps them on one axis.
+        active_headroom = _dynamic_active_headroom(
+            settings, self._models, usage, current, active_headroom, thresholds
+        )
+        # adr/0010 R2: two margins of the bar, on the SAME widened reading
+        # the trigger is classified from. `dynamic` only, so `best` and
+        # `consume-first` keep their sleep byte for byte.
+        #
+        # RECOMPUTED HERE AND DELIBERATELY NOT CLEARED with the other
+        # per-tick flags above: every path that leaves this method earlier
+        # (an unreadable store, a raised collector, an API-key active)
+        # would otherwise report "not in band" for an active the LAST tick
+        # measured in it, and the engine would sleep the full interval for
+        # exactly the tick whose reading failed. A carried-over True costs
+        # one extra wake, served from the store inside SERVE_TTL_S; a
+        # carried-over False costs the observation this rule exists for.
+        self._danger_band = (
+            settings.strategy == "dynamic"
+            and active_headroom is not None
+            and active_headroom <= 2 * SPENT_HEADROOM_PCT
+        )
         # A DISABLED ACTIVE IS NOT A LANDING SPOT. `disable` withdraws a slot
         # from automatic selection and `switchable_account_numbers()` honours
         # that for CANDIDATES, but nothing applied it to the slot the engine is
@@ -2087,31 +2797,40 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             trigger = "overloaded"
             overload_detail = f"{window_errors}/{window_calls} 5xx on /v1/messages"
+        elif active_capped is not None:
+            # A CAP IS NOT A LINE: no strategy, cooldown, hysteresis or
+            # no-return bar relaxes it, and "every peer is walled" is no
+            # reason to stay. Its own trigger name for the same reason as
+            # `disabled-active` (`leftTrigger` must not lie); outside the
+            # cooldown and freshness sets, so it leaves now.
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            trigger = "weekly-capped"
         elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
+            departure_pct = self._bars.get(current, settings.threshold)
             # Each window against its OWN line, the closest one decides (see
-            # lines.py). A readable headroom means a readable window, so the
-            # account-wide fallback is unreachable; kept as the exact old test.
+            # lines.py); the account's own bar stands in for the 5h line (and
+            # for the weekly windows while no weekly line is set).
             active_binding = self._binding(
-                usage.get(current), settings, thresholds[current]
+                usage.get(current), settings, threshold=departure_pct
             )
-            below = (
+            if settings.strategy == "dynamic":
+                trigger = _classify_dynamic_trigger(active_headroom, self._active_wall)
+            elif (
                 not active_binding.over
                 if active_binding is not None
-                else (100.0 - active_headroom) < thresholds[current]
-            )
-            if below:
-                if settings.strategy != "consume-first" and not priority_mode:
+                else (100.0 - active_headroom) < departure_pct
+            ):
+                if settings.strategy not in CONSUME_FIRST_STRATEGIES and not priority_mode:
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
                             # Both sides through pct_label: .0f utilization could
                             # display an impossible "100% < 99.9%".
                             detail=_below_line_detail(
-                                active_binding,
-                                active_headroom,
-                                thresholds[current],
+                                active_binding, active_headroom, departure_pct
                             ),
                         )
                     )
@@ -2120,7 +2839,7 @@ class AutoSwitchEngine:
                 # whichever account's weekly window resets soonest, to burn the
                 # most-perishable quota first. Candidate selection decides whether
                 # a sooner-resetting account with room actually exists.
-                trigger = "priority" if priority_mode else "consume-first"
+                trigger = "priority" if priority_mode else settings.strategy
             else:
                 # Exhaustion is physical: at-limit reads the raw headroom.
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
@@ -2172,9 +2891,18 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
+        if (
+            trigger in _COOLDOWN_GATED_TRIGGERS
+            and not _cooldown_yields_to_the_wall(
+                settings.strategy, active_headroom, self._active_wall
+            )
+            and self._in_cooldown(state)
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
+
+        # Priority's strict landing would hold a capped active in place.
+        priority_mode = priority_mode and trigger != "weekly-capped"
 
         # -- candidate selection ------------------------------------------
         # An account the API refused a model request on (another process's
@@ -2192,7 +2920,7 @@ class AutoSwitchEngine:
         candidates = [
             num
             for num in switchable
-            if num != current and num not in quarantined
+            if num != current and num not in quarantined and _capped(num) is None
         ]
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
@@ -2206,8 +2934,508 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
+
+        # #375 items 3-4: `dynamic`'s OWN admission+ranking for its two new/
+        # narrowed triggers, resolved BEFORE `_rank_candidates_pass` ever
+        # runs for either. NEVER that function: its landing-healthy gate is
+        # hysteresis-MARGIN based (`h - active_headroom >= hysteresis_pct`),
+        # which a WARM candidate with less headroom than a cold one can
+        # never clear against an `about_to_wall` active (measured: item 3a's
+        # own "warm ranks first despite less headroom" is unreachable
+        # through it) — item 3's floor is an ABSOLUTE bar, not a margin, so
+        # it replaces that gate rather than layering onto it. `at-limit`/
+        # `failover` keep the unchanged function entirely (their own
+        # trigger literals never reach this block). NOT true once
+        # `model_window_dropped` fires below (#321): on that path the
+        # floor becomes `_blackout_retry_admission_bar`'s RELATIVE margin
+        # over what the active already reads on the unmodeled axis,
+        # precisely because the question there is a genuine rescue against
+        # a dead active, not an ordinary departure from a healthy one.
+        # Deliberately no `cold_floor` at this call site (below, #321
+        # follow-up), unlike the dynamic-healthy arm's own cold bucket: the
+        # `proactive` trigger is only reachable at a widened active headroom
+        # in `(0, SPENT_HEADROOM_PCT]`, where staying put is not an
+        # alternative — there is nothing to price a real cold-switch cost
+        # against, and a literal `cold_switch_cost_pct` floor here refuses
+        # the owner's own pinned rescue
+        # (`test_the_owners_specimen_switches_to_3`, #3 at unmodeled 12
+        # against an active at 3: `max(3 + 3, 20) = 20` would hold it
+        # forever). A next author "restoring" it here breaks that test.
+        #
+        # `_no_return_account` applies here exactly as `_rank`'s own
+        # closure applies it: rank with the account just left barred, and
+        # retry once WITHOUT the bar only when that empties the list AND
+        # `_left_account_recovered` says the barred account is a genuinely
+        # different proposition than when we left it — never on emptiness
+        # alone (n=2 always empties the barred list). `"proactive"` is the
+        # one literal `_no_return_account` itself recognizes, and this
+        # helper (`_dynamic_rank`) is used only by the `proactive` arm
+        # below — the `dynamic-healthy` arm does NOT call it (see that
+        # arm's own comment: the bar would permanently block a deliberate,
+        # healthy alternation between two unchanged accounts).
+        last_active_at = state.get("lastActiveAt")
+        last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
+
+        def _dynamic_rank(cands, hroom, at_now, active_h):
+            recovered = self._left_account_recovered(
+                state, usage, hroom, active_h, settings, at_now, current,
+                thresholds=thresholds,
+            )
+            no_return = self._no_return_account(
+                "proactive", state, hroom, active_h, recovered, settings, current,
+                thresholds=thresholds, usage=usage,
+            )
+
+            def rank(pool):
+                warm, cold = _rank_dynamic_candidates(
+                    pool, hroom, usage, at_now, last_active_at,
+                    settings.cache_ttl_seconds, self._bars,
+                )
+                if not warm and not cold and _about_to_wall(active_h):
+                    # Only an active at the REAL wall lifts the peers' own
+                    # lines (see `_bars` above): one merely past its own line
+                    # stays, or two such accounts would trade places every tick.
+                    warm, cold = _rank_dynamic_candidates(
+                        pool, hroom, usage, at_now, last_active_at,
+                        settings.cache_ttl_seconds,
+                    )
+                return warm, cold
+
+            warm, cold = rank([n for n in cands if n != no_return])
+            bar_active = no_return is not None
+            if no_return is not None and not warm and not cold and recovered:
+                warm, cold = rank(cands)
+                bar_active = False
+            return warm, cold, bar_active
+
+        dynamic_ordered: list[str] | None = None
+        dynamic_any_known = True
+        if settings.strategy == "dynamic" and trigger == "proactive":
+            now = self.clock()
+            warm_ordered, cold_ordered, bar_active = _dynamic_rank(
+                oauth_candidates, headroom, now, active_headroom,
+            )
+            floor_headroom = headroom
+            model_window_dropped = False
+            if (
+                not warm_ordered
+                and not cold_ordered
+                and self._models
+                and _model_window_binds_everywhere(
+                    usage, self._models, settings.threshold,
+                    settings.weekly_threshold, thresholds,
+                )
+            ):
+                # A MODEL WINDOW IS NOT A BLACKOUT (#321) — ONLY where it
+                # binds everywhere (`_model_window_binds_everywhere`, the
+                # one predicate `_rank_candidates`'s own model retry also
+                # consumes): every candidate blocked only by the model set
+                # folds to headroom 0 above and is dropped before ever
+                # being ranked, but only a fleet-wide model wall (the
+                # active included) makes dropping the model set the right
+                # call — retry once on the unmodeled (5h/7d only) axis.
+                unmodeled = _headroom_by_account(usage, ())
+                warm_ordered, cold_ordered, bar_active = _dynamic_rank(
+                    oauth_candidates, unmodeled, now, unmodeled.get(current),
+                )
+                floor_headroom = unmodeled
+                model_window_dropped = True
+            # Item 3c, corrected again (2026-09-23, #321 follow-up): on
+            # THIS arm the `cold_switch_cost_pct` floor is a PREFERENCE,
+            # never a veto (ADR 0010, "Why never-wall beats warm-cache":
+            # "the cold floor is a preference, never a veto" -- not R1,
+            # which is the unrelated land-bar/hold-bar rule). The active is
+            # already walled (headroom in `(0, SPENT_HEADROOM_PCT]`) --
+            # staying put is not an alternative here (see the comment
+            # above `_dynamic_rank`). A flat `>=` filter (pre-#321) dropped
+            # every below-floor candidate outright, so a genuinely spent
+            # active with none clearing the floor sat refused
+            # (`below-floor`) tick after tick and only moved once it hit
+            # 100% (`at-limit`) -- onto the very candidate the floor had
+            # just refused. Taking `cold_ordered` unpartitioned (this
+            # round's first attempt) over-corrected: a below-floor
+            # candidate that merely resets sooner then outranked a
+            # floor-clearing one, landing on the worse account. A STABLE
+            # PARTITION keeps `cold_ordered`'s own order within each half
+            # but always tries every floor-clearing candidate first.
+            if model_window_dropped:
+                cold_floor = _blackout_retry_admission_bar(floor_headroom, current)
+                cold_clears_floor = [
+                    n for n in cold_ordered
+                    if floor_headroom.get(n, 0.0) > cold_floor
+                ]
+                if not warm_ordered and not cold_clears_floor and cold_ordered:
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="below-floor",
+                            detail=(
+                                f"{len(cold_ordered)} cold candidate(s) below "
+                                f"the {pct_label(cold_floor)}% floor"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+            else:
+                floor = settings.cold_switch_cost_pct
+                cold_clears_floor = sorted(
+                    cold_ordered,
+                    key=lambda n: floor_headroom.get(n, 0.0) < floor,
+                )
+            dynamic_ordered = warm_ordered + cold_clears_floor
+            if not dynamic_ordered and bar_active:
+                # The no-return bar (item 2) is holding this, not a
+                # genuinely viable-free fleet -- a deliberate hold pending
+                # recovery, same as before I1.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="no-viable-target",
+                        detail="the only candidate is barred pending recovery",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            if not dynamic_ordered:
+                # I1: nothing cleared even the warm floor, and no bar is
+                # holding it -- fall through to the shared exhausted-fleet
+                # handling below (BLOCKED, the sleep, the api-key last
+                # resort) exactly as best/consume-first do, instead of
+                # returning early.
+                dynamic_any_known = any(
+                    floor_headroom.get(n) is not None for n in oauth_candidates
+                )
+        elif settings.strategy == "dynamic" and trigger == "dynamic-healthy":
+            now = self.clock()
+            # NOT `_dynamic_rank`: the no-return bar would permanently
+            # block F3's deliberate, healthy alternation between two
+            # unchanged accounts (never "recovered").
+            warm_ordered, cold_ordered = _rank_dynamic_candidates(
+                oauth_candidates, headroom, usage, now, last_active_at,
+                settings.cache_ttl_seconds, self._bars,
+            )
+            # Kept alongside `warm_ordered`/`cold_ordered` (which the
+            # retry below may re-rank on the UNMODELED axis): the
+            # non-blackout escape (below, `else`) must stay on the
+            # model-gated axis regardless of whether the retry fires --
+            # same reason `headroom` (never `floor_headroom`) is used
+            # there, so a candidate blocked on the SAME dropped model
+            # window as the active is never mistaken for an escape when
+            # the active still holds real unmodeled headroom of its own
+            # (`blackout_escape` False despite `model_window_dropped`).
+            model_gated_warm, model_gated_cold = warm_ordered, cold_ordered
+            floor_headroom = headroom
+            model_window_dropped = False
+            if (
+                not warm_ordered
+                and not cold_ordered
+                and self._models
+                and _model_window_binds_everywhere(
+                    usage, self._models, settings.threshold,
+                    settings.weekly_threshold, thresholds,
+                )
+            ):
+                # A MODEL WINDOW IS NOT A BLACKOUT (#321), same retry as the
+                # `proactive` arm above: `_dynamic_active_headroom` widens a
+                # fleet-wide-walled active's own headroom to its unmodeled
+                # value, which reads HEALTHY here rather than `at-limit` —
+                # so this arm, not `_rank_candidates`'s own retry, is what
+                # ranks the candidates, and it must drop the model set the
+                # same way once every candidate folds to headroom 0 on it.
+                unmodeled = _headroom_by_account(usage, ())
+                warm_ordered, cold_ordered = _rank_dynamic_candidates(
+                    oauth_candidates, unmodeled, usage, now, last_active_at,
+                    settings.cache_ttl_seconds, self._bars,
+                )
+                floor_headroom = unmodeled
+                model_window_dropped = True
+            # Alternation: a warm partner past the floor, once we've sat
+            # on the active for a full chunk. The floor
+            # (`_clears_the_landing_floor`, per-tier, below) is the ONLY
+            # ordinary admission bar -- no comparison against
+            # `active_headroom` at all (owner, 2026-09-19: periodic
+            # cache-warm rotation never fired on the live fleet; a
+            # `77 vs 28` headroom gap sat refused 38 consecutive ticks on
+            # a since-removed headroom-gap ceiling,
+            # `ALTERNATION_MAX_GIVEBACK_PCT`). That ceiling was
+            # unsatisfiable for exactly the shape it was meant to price: a
+            # partner warmed by departing the active at ITS OWN wall
+            # (`proactive`, `_about_to_wall`) is necessarily a
+            # heavily-spent one, and the ceiling refused that same
+            # partner the moment it cooled toward a healthy active -- a
+            # near-equal pair born from an ordinary alternation swap
+            # (never a wall departure) was never the problem
+            # (`test_alternation_still_fires_for_a_near_equal_warm_
+            # partner` cleared the old ceiling fine). Safe with no ceiling:
+            # headroom is not consumed by switching, so a wide gap gives
+            # back nothing real, and the dwell chunk alone bounds the
+            # cadence (one switch per `alternation_chunk_seconds`) -- an
+            # idle pair (the owner's own shape, nothing spending) just
+            # keeps trading the active back and forth, which IS the
+            # cache-warm rotation asked for; a partner that DOES burn
+            # below the floor during its own chunk simply stops being
+            # admissible next tick, so a genuinely spending pair still
+            # settles rather than ping-ponging. Warm ranks ahead of cold
+            # so the rotation stays a two-account pair either way. One
+            # list, shared with `dynamic_ordered` below, so the fallback
+            # past an untrustworthy top pick lands under the same bar.
+            #
+            # T0758: the floor prices a switch against headroom that will
+            # still be there later -- false for a candidate whose 7-day
+            # window resets BEFORE the active's, since its remaining room
+            # expires unspent regardless. T1850: false for THAT WINDOW
+            # ONLY. A perishing candidate is waived on its 7-day headroom
+            # and no other: its 5h and pinned-model-window headroom (every
+            # window but the 7d, read on the axis `floor_headroom` is on)
+            # must still clear the same per-tier floor below (measured
+            # 2026-10-05: a warm 5h 86 / 7d 61 candidate, headroom 14 and
+            # 5h-bound, was admitted because its 7d reset sooner -- the 5h
+            # window does not perish). It may still come from
+            # `cold_ordered`, and still had to clear `SPENT_HEADROOM_PCT`
+            # to reach either list at all.
+            #
+            # T0758 follow-up: `warm_ordered + cold_ordered`, warm first, so
+            # a lapsed rotation (no partner has switched inside the TTL,
+            # `warm_ordered` empty) restarts on a cold one rather than
+            # holding forever -- `_is_warm` still decides which tier a
+            # candidate sorts into, but no longer whether it is reachable at
+            # all. The floor is a per-tier reading of the same `cold_
+            # switch_cost_pct` (below). A live rotation is unchanged
+            # because `next(iter(...))` still finds its warm partner first
+            # in the concatenation.
+            #
+            # A cold landing is not free the way a warm one is: `cold_
+            # switch_cost_pct` IS the measured re-write cost (settings.py's
+            # own docstring, "~19 5h-points"), so a cold candidate admitted
+            # at the bare floor arrives with only a sliver left -- a real
+            # regression out of a voluntary, unforced move with no wall to
+            # escape. The cold half must still read healthy AFTER paying
+            # the cost, STRICTLY past `SPENT_HEADROOM_PCT` -- `>=` at
+            # exactly `cold_switch_cost_pct + SPENT_HEADROOM_PCT` would
+            # admit a candidate landing at precisely the headroom
+            # `_about_to_wall` itself calls walled (correctness review).
+            # Warm pays no re-write cost, so its floor stays the bare,
+            # unchanged `>=`.
+            cold_set = set(cold_ordered)
+            def _clears_the_landing_floor(n):
+                h = floor_headroom.get(n, 0.0)
+                if _perishes_before_active(usage.get(n), usage.get(current), now):
+                    h = 100.0 - max(
+                        (
+                            pct for label, pct, _ in oauth.relevant_windows(
+                                usage.get(n),
+                                () if model_window_dropped else self._models,
+                            )
+                            if label != "7d"
+                        ),
+                        default=0.0,
+                    )
+                if n in cold_set:
+                    return h - settings.cold_switch_cost_pct > SPENT_HEADROOM_PCT
+                return h >= settings.cold_switch_cost_pct
+            alternation_admissible = [
+                n for n in warm_ordered + cold_ordered
+                if _clears_the_landing_floor(n)
+            ]
+            partner = next(iter(alternation_admissible), None)
+            since = last_active_at.get(current)
+            # #403 BOUNDED WALLED-ESCAPE: `raw_active_headroom` is the
+            # NEVER-widened model-gated reading — the widen above can call
+            # this active "healthy" (dynamic-healthy, not at-limit) purely
+            # because its 5h/7d have room, even while it sits at 100% on the
+            # model this host actually runs. Correct for trigger
+            # classification; wrong for "is it fine to keep sitting here",
+            # which is what decides whether to hold for warmth or escape.
+            # Fires whenever the active is genuinely at its own wall —
+            # `partner`'s existence is no longer a VETO on this escape gate
+            # (the collapse removed it from here only, measured: a warm
+            # partner clearing the ordinary `cold_switch_cost_pct` bar held
+            # a genuinely-walled-right-now active for a full `alternation_
+            # chunk_seconds` before taking the very candidate this escape
+            # would have picked immediately). It is still a hard gate on
+            # the ordinary dwell/alternation branch below (`elif partner is
+            # None or ...`) -- an admissible warm partner not yet dwelt on
+            # still holds there; only THIS escape, urgent by definition,
+            # bypasses it. Lands on whichever admissible candidate (real
+            # headroom, no fixed percentage line) recovers soonest, cold or
+            # warm alike.
+            #
+            # `headroom` (never `floor_headroom`), so a candidate blocked on
+            # the SAME model window as the active — no real improvement,
+            # merely idle 5h/7d nobody can spend while every account is
+            # Fable-walled alike — is never mistaken for an escape (measured:
+            # `floor_headroom`'s unmodeled reading let a peer no better than
+            # the active off the model bar and churned every tick). That
+            # reasoning only holds while the active ITSELF has nothing to
+            # show on the unmodeled axis either: `blackout_escape` requires
+            # BOTH `model_window_dropped` (the retry above fired — a
+            # genuine fleet-wide blackout) AND the active's own
+            # `floor_headroom` failing the same `cold_switch_cost_pct` bar
+            # a candidate must clear — an active that already holds real
+            # unmodeled headroom (own floor_headroom clears the floor) is
+            # not a genuine blackout victim, only walled on the (dropped)
+            # model axis, and admitting a same-or-worse unmodeled peer
+            # there is exactly the swap-for-nothing churn this guards
+            # against (measured: a 3-account fleet all Fable-walled but
+            # holding real, DIFFERING 5h headroom round-robinned onto the
+            # WORSE of the two every tick). Genuinely stranded (own
+            # unmodeled floor_headroom also below the floor, #321's F7) is
+            # the only case that needs the unmodeled axis at all.
+            blackout_escape = (
+                model_window_dropped
+                and floor_headroom.get(current, 0.0) < settings.cold_switch_cost_pct
+            )
+            walled_escape = None
+            if _about_to_wall(raw_active_headroom, self._active_wall):
+                if blackout_escape:
+                    # ONE list, warm and cold together — never `cold_
+                    # ordered` alone (that left a WARM rescue invisible to
+                    # this escape whenever its unmodeled headroom sat under
+                    # `cold_switch_cost_pct`, and `partner`, above, only
+                    # ever looks at warm; a candidate in that gap was
+                    # refused by both). Warm carries no re-write cost, so
+                    # it clears the plain relative margin
+                    # (`_blackout_retry_admission_bar`, #321); a COLD
+                    # candidate still pays `cold_switch_cost_pct` to land
+                    # and must ALSO clear that absolute floor, or a chain
+                    # of merely-relative cold rewrites nets a real loss
+                    # every time it fires (measured: three consecutive
+                    # such rewrites netting +10.5 points of nominal
+                    # headroom for roughly 57 points of real switch cost).
+                    warm_bar = _blackout_retry_admission_bar(floor_headroom, current)
+                    cold_bar = _blackout_retry_admission_bar(
+                        floor_headroom, current, settings.cold_switch_cost_pct
+                    )
+                    escape_candidates = [
+                        n for n in warm_ordered
+                        if floor_headroom.get(n, 0.0) > warm_bar
+                    ] + [
+                        # `>=` on the bare `cold_switch_cost_pct`: this is
+                        # a FORCED move (the active is genuinely walled,
+                        # `_about_to_wall(raw_active_headroom)`), so any
+                        # positive landing beats staying walled -- unlike
+                        # the voluntary alternation admission above
+                        # (`_clears_the_landing_floor`), which prices the
+                        # re-write cost because nothing forces that move.
+                        # A strict `>` here once disagreed with the
+                        # reason label about a candidate sitting at
+                        # exactly the floor (measured: active unmodeled 5,
+                        # a cold peer at exactly 20.0 -- the escape
+                        # refused it while the label called it "cold"
+                        # [clearing the floor, merely dwelling]); the two
+                        # need not match any more, since T0807 moved the
+                        # label onto its own, stricter floor for the
+                        # voluntary path only.
+                        n for n in cold_ordered
+                        if floor_headroom.get(n, 0.0) >= cold_bar
+                    ]
+                else:
+                    # I1: the widened `_about_to_wall`-alone gate above
+                    # also widened THIS branch's reach (no genuine
+                    # fleet-wide blackout, `blackout_escape` False) — it
+                    # had no cold cost term at all, so a cold candidate
+                    # merely resetting sooner could be taken over a
+                    # QUALIFIED warm partner, paying the real
+                    # `cold_switch_cost_pct` rewrite for nothing.
+                    # `model_gated_warm`/`model_gated_cold`, not
+                    # `warm_ordered`/`cold_ordered`/`partner` (which can
+                    # be re-ranked on the UNMODELED axis by the retry
+                    # above): this escape stays on `headroom` always, same
+                    # as the rest of this branch. Only gated on a
+                    # qualified warm alternative's existence, never an
+                    # absolute floor on its own: with none (the #403
+                    # owner specimen — every peer cold, none clearing the
+                    # ordinary bar) this is still the rescue of last
+                    # resort and must admit whatever cold headroom is
+                    # real rather than hold a dead account forever.
+                    model_gated_partner = next(
+                        (
+                            n for n in model_gated_warm
+                            if headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                        ),
+                        None,
+                    )
+                    escape_candidates = model_gated_warm + [
+                        n for n in model_gated_cold
+                        if model_gated_partner is None
+                        or headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                    ]
+                escapees = sorted(
+                    escape_candidates,
+                    # Soonest-reset first; warmth only breaks an exact tie
+                    # (item 4/D) — it never outranks a candidate that comes
+                    # back sooner, and it never keeps the active walled.
+                    key=lambda n: (
+                        _binding_recovery_ts(
+                            usage.get(n),
+                            self._models,
+                            now,
+                            threshold=thresholds[n],
+                            weekly_threshold=settings.weekly_threshold,
+                            scale=_ruler(settings),
+                        ),
+                        0 if _is_warm(n, last_active_at, now, settings.cache_ttl_seconds) else 1,
+                    ),
+                )
+                if escapees:
+                    walled_escape = escapees[0]
+            if walled_escape is not None:
+                if self._in_cooldown(state):
+                    self._emit(NoSwitchEvent(reason="cooldown"))
+                    return TickOutcome.NO_ACTION
+                trigger = "alternation"
+                # I1: the full ranked list, not just its head — a top
+                # escapee whose credential turns out to be struck/backed-
+                # off must not strand the tick when a lower-ranked one is
+                # admissible (the `proactive` arm's own `dynamic_ordered`
+                # is already `warm_ordered + [floor-clearing cold]` for the
+                # same reason).
+                dynamic_ordered = escapees
+            elif (
+                partner is None
+                or since is None
+                or now - since < settings.alternation_chunk_seconds
+            ):
+                # One label per story (item 5): a warm partner not yet
+                # dwelt on, or a cold one below the floor. T0758:
+                # `partner is not None` (a perishing candidate, or now
+                # T0807, a cold one the floor alone already admits) reads
+                # the same as a warm partner here -- held by dwell, not by
+                # the floor -- or `below-floor` would blame a bar that
+                # already admitted it. Nothing can clear
+                # `_clears_the_landing_floor` while `partner is None`
+                # (T0807 dropped the giveback ceiling that used to let a
+                # floor-clearing candidate fall through here as `cold`),
+                # so `below-floor` alone covers every cold candidate left
+                # in this branch.
+                if warm_ordered or partner is not None:
+                    reason = "below-threshold"
+                elif cold_ordered:
+                    reason = "below-floor"
+                else:
+                    reason = "below-threshold"
+                # m1: the active is healthy (not about to wall) here on
+                # EITHER side of `settings.threshold` -- no `< threshold`
+                # comparison, which can print a false "95% < 90%".
+                self._emit(
+                    NoSwitchEvent(
+                        reason=reason,
+                        detail=(
+                            f"active account is healthy ({pct_label(active_headroom)}"
+                            "% headroom, not about to wall)"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            else:
+                if self._in_cooldown(state):
+                    self._emit(NoSwitchEvent(reason="cooldown"))
+                    return TickOutcome.NO_ACTION
+                trigger = "alternation"
+                # I1: the full admissible warm list, not just `partner`
+                # — an untrustworthy top pick must not strand the tick when
+                # a lower-ranked warm candidate is admissible.
+                dynamic_ordered = alternation_admissible
+
         if (
-            trigger in ("consume-first", "priority")
+            trigger in (*CONSUME_FIRST_STRATEGIES, "priority")
             and not oauth_candidates
             and active_headroom is not None
         ):
@@ -2223,7 +3451,7 @@ class AutoSwitchEngine:
                 NoSwitchEvent(
                     reason="below-threshold",
                     detail=_below_line_detail(
-                        active_binding, active_headroom, thresholds[current]
+                        active_binding, active_headroom, departure_pct
                     ),
                 )
             )
@@ -2232,10 +3460,18 @@ class AutoSwitchEngine:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
-            self._emit(NoSwitchEvent(reason="no-candidates"))
+            self._emit(NoSwitchEvent(
+                reason="no-candidates",
+                detail=(
+                    f"Account-{current} is past its weekly cap "
+                    f"({active_capped[0]} {pct_label(active_capped[1])}%) "
+                    "and no other account is eligible"
+                    if active_capped else ""
+                ),
+            ))
             return TickOutcome.BLOCKED
 
-        consume_first = settings.strategy == "consume-first"
+        consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
         # Under priority an overloaded active has no rank to defend (a disabled
         # one is already outside `switchable`).
         active_in_rotation = current in switchable and trigger != "overloaded"
@@ -2358,20 +3594,27 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
-            trigger=trigger,
-            consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
-            usage=usage,
-            headroom=headroom,
-            current=current,
-            active_headroom=active_headroom,
-            settings=settings,
-            now=decided_now,
-            thresholds=thresholds,
-        )
+        if dynamic_ordered is not None:
+            # Already admitted+ranked above (item 3/4) — never re-enter
+            # `_rank_candidates_pass`.
+            ordered, any_known, active_reset_ts, waiting_for_recovery = (
+                dynamic_ordered, dynamic_any_known, None, False
+            )
+        else:
+            ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+                thresholds=thresholds,
+            )
 
-        if (trigger == "consume-first" or priority_mode) and ordered:
+        if (trigger in CONSUME_FIRST_STRATEGIES or priority_mode) and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -2390,8 +3633,13 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
-            active_headroom = headroom.get(current)
+            active_headroom = _dynamic_active_headroom(
+                settings, self._models, usage, current, headroom.get(current),
+                thresholds,
+            )
             decided_now = self.clock()
+            # The fresh rows may have carried a candidate past its cap.
+            oauth_candidates = [n for n in oauth_candidates if _capped(n) is None]
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
@@ -2409,9 +3657,17 @@ class AutoSwitchEngine:
             usage.get(current), headroom.get(current), settings, thresholds[current]
         )
         if (
-            not ordered and api_key_candidates
-            and trigger not in ("consume-first", "priority")
+            not ordered
+            and api_key_candidates
+            and trigger not in (*CONSUME_FIRST_STRATEGIES, "priority")
             and not priority_active_ready
+            # `dynamic` reaches "proactive" at an account's OWN line too, where
+            # staying is a choice: only the real wall must move onto a meter.
+            and not (
+                settings.strategy == "dynamic"
+                and trigger == "proactive"
+                and not _about_to_wall(active_headroom)
+            )
         ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
@@ -2490,7 +3746,7 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
-            if trigger == "consume-first":
+            if trigger in CONSUME_FIRST_STRATEGIES:
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
                 # so an opted-in user can see the strategy working (or inert).
@@ -2550,7 +3806,7 @@ class AutoSwitchEngine:
             # the block above, it kept the ordinary cadence for the whole
             # window and never named the reset it had just measured.
             self._blocked_wait_long = True
-            earliest, all_provable = self._earliest_recovery(usage)
+            earliest, earliest_num, all_provable = self._earliest_recovery(usage)
             earliest_ts = earliest.timestamp() if earliest is not None else None
             if not all_provable:
                 # A blocked account that cannot prove its return may beat any
@@ -2562,6 +3818,7 @@ class AutoSwitchEngine:
                 # which is what it is holding out for.
                 if truly_exhausted:
                     earliest_ts = None
+                    earliest_num = None
             elif earliest_ts is not None:
                 self._sleep_until_ts = earliest_ts + RESET_SLACK_S
             # THE ACTIVE CAN BE BLIND WITHOUT BEING SPENT. `truly_exhausted`
@@ -2625,6 +3882,11 @@ class AutoSwitchEngine:
                         else None
                     ),
                     deliberate_wait=not truly_exhausted,
+                    waiting_on=(
+                        _ref(earliest_num, self.switcher.account_email(earliest_num))
+                        if earliest_num is not None
+                        else None
+                    ),
                 )
             )
             return TickOutcome.BLOCKED
@@ -2641,7 +3903,7 @@ class AutoSwitchEngine:
                 decided_now,
                 threshold=thresholds[current],
                 weekly_threshold=settings.weekly_threshold,
-                scale=settings.threshold,
+                scale=_ruler(settings),
             ),
         )
         transient_failure = False
@@ -2654,35 +3916,101 @@ class AutoSwitchEngine:
                 # loop runs over every candidate.
                 raise _EngineStopped()
             email = self.switcher.account_email(num)
-            if trigger == "consume-first" or (priority_mode and num in oauth_candidates):
+            is_priority = priority_mode and num in oauth_candidates
+            if trigger in _FRESHEN_GATED_TRIGGERS or is_priority:
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
-                # poller, which then serve their stored entries. Consume-first
-                # is opportunistic, not an escape — never act on stale data
-                # or slide to a worse-ranked target; hold and retry next tick.
-                # Priority rotation also requires fresh target data for escapes,
-                # but an unusable active account must not be stranded by one
-                # stale candidate when a lower-ranked fresh target can take over.
+                # poller, which then serve their stored entries. No trigger
+                # is an escape from that — never land on stale or provably
+                # dead cached usage; `_freshen_target` cannot close this gap
+                # itself (its own near-expiry fast path returns "ok" without
+                # ever reading the collector's verdict on this candidate).
+                # `proactive` has no phase-2 refetch of its own, so this reads
+                # the same scheduled-collection entry a backed-off or
+                # repeatedly-failing candidate was already serving stale.
+                # Priority rotation gates every trigger, but an unusable active
+                # account must not be stranded by one stale candidate when a
+                # lower-ranked fresh target can take over.
                 entry = entries.get(num)
-                now = self.clock()
-                # A held reading (`UsageStore.adopt`) is usable here too: the
-                # hold is what refuses `reserve()` the refetch in the first
-                # place, and adopt()'s own docstring promises it stays
-                # decision-trusted while the hold lasts.
-                if entry is None or not (entry.fresh(now) or entry.held(now)):
+                # `self.clock()` short-circuited, not eagerly evaluated: a
+                # None entry must call it zero times, matching every other
+                # clock read on this path (call-order-sensitive tests script
+                # the clock as a fixed sequence).
+                if is_priority:
+                    # Priority rotation lands only on fresh data, escapes and
+                    # failover included: the strict-landing contract has no
+                    # looser bar for a backed-off peer.
+                    unusable = entry is None or candidate_usage_is_stale(
+                        entry, self.clock()
+                    )
+                elif trigger == "failover":
+                    # Failover is the ACTIVE credential failing, and a peer
+                    # in a 429 backoff is exactly what `trust_extended` keeps
+                    # serving past `fresh()`'s TTL so it stays a usable
+                    # target (usage_store's own reasoning). The full
+                    # staleness predicate here would refuse every backed-off
+                    # peer and leave the engine `no-viable-target` on a fleet
+                    # whose credentials are all fine — only a struck
+                    # credential disqualifies a failover target.
+                    unusable = entry is not None and entry.token_dead()
+                elif trigger in ("proactive", "alternation"):
+                    # `candidate_usage_is_stale`'s full staleness bar (a
+                    # merely-old `fetched_at`) permanently refuses the
+                    # API-key last-resort sentinel (never fetched, so never
+                    # fresh) and a decision-trusted row a live claim just
+                    # hasn't re-aged yet. `proactive` never has a phase-2
+                    # refetch of its own to escape a stale-but-fine row with
+                    # (see the comment above), so it gates on the incident's
+                    # own signature instead — see `candidate_is_untrustworthy`.
+                    # `alternation` (#375) is the same shape — a healthy,
+                    # discretionary move with no phase-2 refetch either.
+                    unusable = entry is None or candidate_is_untrustworthy(
+                        entry, self.clock()
+                    )
+                else:
+                    unusable = entry is None or candidate_usage_is_stale(
+                        entry, self.clock()
+                    )
+                if unusable:
+                    if trigger in CONSUME_FIRST_STRATEGIES or is_priority:
+                        # Sliding to a worse-ranked, later-reset candidate
+                        # defeats consume-first's whole point (burn the
+                        # soonest-resetting quota first) — hold instead and
+                        # retry next tick. A priority rotation off a usable
+                        # active holds for the same reason, but is skipped
+                        # past when the active cannot be kept.
+                        self._emit(
+                            NoSwitchEvent(
+                                reason="stale-usage",
+                                detail=(
+                                    f"account {num} usage could not be "
+                                    "refreshed this tick (backoff, a hold, "
+                                    "or a concurrent poller); retrying"
+                                ),
+                            )
+                        )
+                        if is_priority and not priority_active_ready:
+                            continue
+                        return TickOutcome.NO_ACTION
+                    # `proactive`/`failover`: a stale top candidate must not
+                    # park the engine at the wall while a healthy, lower-
+                    # ranked candidate goes untried — skip it. A DISTINCT
+                    # literal from the hold above: this tick abandons the
+                    # candidate and usually goes on to switch, and a watcher
+                    # reading `stale-usage` (the literal of a real stall)
+                    # ahead of a `Switched` line would report the move as a
+                    # stall.
                     self._emit(
                         NoSwitchEvent(
-                            reason="stale-usage",
+                            reason="stale-candidate-skipped",
                             detail=(
-                                f"account {num} usage could not be refreshed "
-                                "this tick (backoff, a hold, or a concurrent "
-                                "poller); retrying"
+                                f"account {num} skipped for admission this "
+                                "tick (usage not refreshable, or its "
+                                "credential is struck)"
                             ),
                         )
                     )
-                    if priority_mode and not priority_active_ready:
-                        continue
-                    return TickOutcome.NO_ACTION
+                    continue
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
@@ -2760,7 +4088,12 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.ERROR
-        self._emit(NoSwitchEvent(reason="no-viable-target"))
+        self._emit(
+            NoSwitchEvent(
+                reason="no-viable-target",
+                detail=f"{len(ordered)} ranked candidate(s), none freshened",
+            )
+        )
         return TickOutcome.BLOCKED
 
     def _no_return_account(
@@ -2852,7 +4185,7 @@ class AutoSwitchEngine:
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
         came_from = state.get("lastSwitchFrom")
-        if trigger not in ("proactive", "consume-first") or came_from is None:
+        if trigger not in ("proactive", *CONSUME_FIRST_STRATEGIES) or came_from is None:
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
@@ -2928,18 +4261,20 @@ class AutoSwitchEngine:
         departure — there is no `leftHeadroom` to diff against and never was
         — so the two signals that do not depend on the active's LIVE state
         are (1) whether the peer, right now, would itself be a healthy place
-        to land: under every one of its own switch lines (`not
-        binding.over`), the same "would the ranking accept this as a landing
-        spot" test the landing gate in `_rank_candidates` already runs on
-        every candidate, reused rather than inventing a fresh
-        constant; and (2), when the landing floor cannot answer, whether the
-        peer's own binding reset is meaningfully sooner than the active's.
-        The landing floor is the exact complement of
-        `_every_account_above_threshold`, so it is UNSATISFIABLE whenever
-        the
-        fleet is all-spent — the recovery leg is what keeps the hold from
-        becoming unconditional in exactly that regime. Neither leg can tell
-        "genuinely recovered" from "was already this good" — there is
+        to land: under every one of its own switch lines (`not binding.over`)
+        -- the complement of `_every_account_above_threshold` for a peer with
+        no switch threshold of its own (deliberately judged at the raw
+        `settings.threshold` and the weekly line, #321, so a peer's own line
+        does not move it), not `_rank_candidates`'s own landing gate, which
+        under `dynamic` reads the wider `proactive_switch_bar_pct` bar
+        instead; the two agree for every OTHER strategy, where `bar`
+        hands `threshold` straight back; and (2), when the landing floor
+        cannot answer, whether the peer's own binding reset is meaningfully
+        sooner than the active's. The landing floor is UNSATISFIABLE
+        whenever the fleet is all-spent — the recovery leg is what keeps
+        the hold from becoming unconditional in exactly that regime. Neither
+        leg can tell "genuinely recovered" from "was already this good" —
+        there is
         nothing recorded to tell them apart. Measured which side the landing
         floor should land on: sweeping mutations of this same leg for the
         ordinary path showed an absolute floor is silently reintroducible
@@ -3069,18 +4404,20 @@ class AutoSwitchEngine:
             # (no departure baseline exists to diff against):
             #
             #   landing   `not peer.over` -- under every one of its own
-            #             lines: would the ranking accept this peer as a
-            #             landing spot right now (the landing gate in
-            #             `_rank_candidates`)?
+            #             lines, the complement of
+            #             `_every_account_above_threshold` for a peer with
+            #             no switch threshold of its own (kept on the raw
+            #             `settings.threshold` and the weekly line, #321; a
+            #             peer's own line is not read), NOT
+            #             `_rank_candidates`'s own landing gate, which
+            #             reads the wider dynamic bar under `dynamic`.
             #   recovery  the peer's binding reset is meaningfully sooner
             #             than the ACTIVE's binding reset. Needed because
-            #             `landing` is the exact complement of `_every_
-            #             account_above_threshold`: whenever the fleet is
-            #             all-spent, `landing` is unsatisfiable by
-            #             construction, so without this leg the bar would
-            #             hold until the active hit its limit. Releasing the
-            #             bar does not choose the peer; the room ranking and
-            #             its margin still decide.
+            #             `landing` is unsatisfiable by construction whenever
+            #             the fleet is all-spent, so without this leg the bar
+            #             would hold until the active hit its limit. Releasing
+            #             the bar does not choose the peer; the room ranking
+            #             and its margin still decide.
             #
             # Burn cannot fake the recovery leg: a reset moves nearer only
             # when a nearer window starts binding, never as a side effect
@@ -3095,7 +4432,7 @@ class AutoSwitchEngine:
                 now,
                 threshold=thresholds[barred],
                 weekly_threshold=settings.weekly_threshold,
-                scale=settings.threshold,
+                scale=_ruler(settings),
             )
             active_recovery_ts = _binding_recovery_ts(
                 usage.get(current),
@@ -3103,7 +4440,7 @@ class AutoSwitchEngine:
                 now,
                 threshold=thresholds[current],
                 weekly_threshold=settings.weekly_threshold,
-                scale=settings.threshold,
+                scale=_ruler(settings),
             )
             # The active's recovery must be a REAL measurement, not merely
             # "larger". `_binding_recovery_ts` returns `inf` in exactly THREE
@@ -3161,11 +4498,45 @@ class AutoSwitchEngine:
         # live without anyone revisiting this function -- silently reading
         # None as "no dominance" would then be exactly the bug the
         # unreadable-active fallback was added for.
+        # FLEET CHURN, dynamic only: a departure recorded with `leftTrigger`
+        # in `CONSUME_FIRST_STRATEGIES` left for RESET ordering, not because
+        # the barred account ran low — so it can dominate the account we
+        # landed on from the moment we left (the docstring's own case), and
+        # re-testing that same dominance here is not evidence of anything
+        # having improved. Measured: a consume-first-style departure to a
+        # sooner-resetting peer, then every following tick re-admitted the
+        # barred account through this leg alone (its headroom never moved)
+        # and the reset-ordering key sent the engine straight back,
+        # ping-ponging on two accounts neither of which ever changed.
+        # Skipped only for that recorded shape — an ordinary (headroom- or
+        # at-limit-driven) departure keeps the leg, exactly as `best` and
+        # `consume-first` still do; those are untouched by this gate.
+        #
+        # BUT the ping-pong this guards against is two accounts flapping on
+        # a VOLUNTARY reset-ordering return, neither of which ever needed to
+        # move. It is not evidence that a FORCED return is wrong: once the
+        # active itself has burned down to the switch threshold, the engine
+        # must land on whatever the strategy would actually pick, same as an
+        # ordinary departure — hiding the best candidate here just delays
+        # the correct switch by a tick or two of cooldown. `active_headroom`
+        # and the active's line `thresholds[current]` are already in hand; no
+        # new state.
+        left_for_reset = (
+            settings.strategy == "dynamic"
+            and state.get("leftTrigger") in CONSUME_FIRST_STRATEGIES
+        )
+        active_at_threshold = (
+            active_headroom is not None
+            and active_headroom <= 100.0 - thresholds[current]
+        )
         if h is not None:
             if active_headroom is not None:
-                if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
+                if (
+                    (not left_for_reset or active_at_threshold)
+                    and h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT
+                ):
                     return True
-            else:
+            elif not left_for_reset:
                 peer = self._binding(
                     usage.get(barred), settings, thresholds[barred]
                 )
@@ -3188,7 +4559,7 @@ class AutoSwitchEngine:
                 now,
                 threshold=thresholds[barred],
                 weekly_threshold=settings.weekly_threshold,
-                scale=settings.threshold,
+                scale=_ruler(settings),
             )
             < was - RECOVERY_HYSTERESIS_S
         )
@@ -3269,22 +4640,102 @@ class AutoSwitchEngine:
         # exactly as this function did before per-account thresholds existed.
         thresholds: Mapping[str, float] | None = None,
     ) -> tuple[list[str], bool, float | None, bool]:
-        """Filter and rank OAuth candidates for this tick's trigger.
+        """Rank on the configured model window, and once on 5h/7d alone if
+        that leaves nothing AND the model window binds everywhere.
 
-        Returns ``(ordered, any_known, active_reset_ts, waiting_for_recovery)``.
-        Pure — no emits, no state writes — so the consume-first two-phase
-        commit can run it twice per tick: on the stored snapshot to decide
-        provisionally, then on the escalated refetch to re-verify before
-        switching.
+        A MODEL WINDOW IS NOT A BLACKOUT — ONLY where it binds everywhere.
+        ``self._models`` folds a pinned model's scoped window into every
+        headroom read, so a candidate whose ONLY over-bar window is that
+        model is dropped as an unhealthy landing exactly like one that is
+        genuinely spent on 5h/7d. When every candidate AND the active
+        carry the same model bar, the ranking empties and the active
+        account is stuck at the wall with 5h/7d room going unused, so the
+        retry drops the model set and re-ranks on 5h/7d alone. But the
+        model-gated pass can also empty because the active itself still
+        has real model headroom and simply outranks every candidate on
+        that axis (nothing wrong with staying put) — dropping the model
+        set THERE moves the fleet onto a wall nothing forced it onto
+        (measured 2026-09-07). ``_model_window_binds_everywhere`` is what
+        tells the two apart: it is false the moment ANY account, active
+        included, is still open with the model folded in. A candidate
+        blocked on 5h/7d as well stays blocked in the second pass too, so
+        this is the whole rule, not half of one — a real blackout still
+        comes back empty and the caller's existing blackout path is
+        untouched.
+        """
+        kw = dict(
+            trigger=trigger,
+            consume_first=consume_first,
+            oauth_candidates=oauth_candidates,
+            no_return=no_return,
+            usage=usage,
+            current=current,
+            settings=settings,
+            now=now,
+            thresholds=thresholds,
+            overload_backoff=overload_backoff,
+        )
+        # THE PRIMARY PASS RANKS ON `headroom`, WHICH IS ALWAYS MODEL-GATED —
+        # so `active_headroom` here must be too, even under `dynamic` where
+        # the caller's copy was widened to the unmodeled 5h/7d value for
+        # trigger classification (`_dynamic_active_headroom`, above). Passing
+        # the widened value through mixed a margin between two different
+        # axes: `h - active_headroom` compared a model-gated candidate to an
+        # unmodeled active, understating the bar and admitting a candidate
+        # the model-gated axis alone would have refused. `headroom.get
+        # (current)` is that same widened value's PRE-widen input, so this is
+        # a no-op for `best`/`consume-first` (never widened) and only changes
+        # `dynamic`'s primary pass.
+        ordered, any_known, active_reset_ts, waiting = self._rank_candidates_pass(
+            models=self._models, headroom=headroom, active_headroom=headroom.get(current), **kw
+        )
+        if settings.strategy != "dynamic":
+            return ordered, any_known, active_reset_ts, waiting
+        result = (ordered, any_known, active_reset_ts, waiting)
+        # `dynamic` ONLY. Any strategy with `self._models` set whose
+        # model-gated pass empties re-ranked on 5h/7d alone and could move
+        # there — including `best`/`consume-first`, which must never
+        # re-target off a plain model-gated exhaustion the owner has not
+        # asked either of them to look past.
+        if (
+            not ordered
+            and self._models
+            and _model_window_binds_everywhere(
+                usage, self._models, settings.threshold,
+                settings.weekly_threshold, thresholds,
+            )
+        ):
+            fallback_headroom = _headroom_by_account(usage, ())
+            fb = self._rank_candidates_pass(
+                models=(),
+                headroom=fallback_headroom,
+                active_headroom=fallback_headroom.get(current),
+                **kw,
+            )
+            if fb[0]:
+                return fb
+        return result
 
-        ``waiting_for_recovery`` is the one thing the caller cannot re-derive
-        without restating four conditions this method already evaluated: an
-        EMPTY ``ordered`` from the at-limit escape means two different things.
-        Either nothing was viable, or the escape ranked on recovery and every
-        peer comes back later than the account we are on — a decision to WAIT,
-        with an end the engine can name. Reported as the same generic block,
-        the second kept the ordinary cadence through a window it had already
-        measured.
+    def _rank_candidates_pass(
+        self,
+        *,
+        models: Sequence[str],
+        trigger: str,
+        consume_first: bool,
+        oauth_candidates: list[str],
+        no_return: str | None,
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+        current: str,
+        active_headroom: float | None,
+        settings: AutoSwitchSettings,
+        now: float,
+        thresholds: Mapping[str, float] | None = None,
+        overload_backoff: dict[str, float] | None = None,
+    ) -> tuple[list[str], bool, float | None, bool]:
+        """Filter and rank OAuth candidates for this tick's trigger, on one
+        window set (``models``); pure, no state writes, called at most
+        twice per tick by ``_rank_candidates`` (see its docstring).
         """
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
@@ -3299,18 +4750,29 @@ class AutoSwitchEngine:
         # proactive gate, so the sort key is the only thing left choosing the
         # target. Read once here; used only by the at-limit key.
         escape_label = (
-            oauth.binding_window_label(usage.get(current), self._models)
+            oauth.binding_window_label(usage.get(current), models)
             if trigger == "at-limit"
             else None
         )
-        # One binding window per account under THIS snapshot's lines — the
-        # consume-first phase-2 refetch hands in fresh `usage`, so nothing the
-        # trigger computed is reused here.
-        bindings = {
-            num: self._binding(usage.get(num), settings, thresholds[num])
-            for num in (*oauth_candidates, current)
-        }
-        active_binding = bindings[current]
+        # THE BAR MOST ADMISSION/RANKING/LABEL DECISIONS BELOW READ (#321):
+        # under `dynamic` this is `proactive_switch_bar_pct`'s 97 (100 -
+        # SPENT_HEADROOM_PCT), not `settings.threshold` (90) — the owner's
+        # live case, account 4 at 7d 95%/headroom 5 with its reset hours
+        # away, is exactly the headroom `dynamic` exists to spend before it
+        # resets, not a blocked candidate. Every other strategy gets
+        # `settings.threshold` back unchanged, so this is a no-op for them.
+        # One exception below, `dynamic_self_walled`, deliberately keeps
+        # `settings.threshold` -- see its own comment for why `bar` would
+        # make that specific check always false.
+        bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
+        # The binding window under THIS snapshot's lines — the consume-first
+        # phase-2 refetch hands in fresh `usage`, so nothing the trigger
+        # computed is reused here. Each account is judged at its own bar (its
+        # own switch threshold, else the strategy's), the weekly windows at
+        # the weekly line when one is set.
+        active_binding = self._binding(
+            usage.get(current), settings, thresholds.get(current, bar), models=models
+        )
         # Policy headroom against the active's own lines, for the hysteresis
         # gate and the sort keys below; raw when it reports no window.
         active_lh = (
@@ -3359,9 +4821,10 @@ class AutoSwitchEngine:
         # failover cannot read it at all, so for them the candidates alone
         # decide.
         over_by_account = {
-            num: (b.over if b is not None else None) for num, b in bindings.items()
+            num: self._over(usage.get(num), settings, models, thresholds[num])
+            for num in oauth_candidates
         }
-        if trigger in ("at-limit", "failover"):
+        if trigger in ("at-limit", "failover", "weekly-capped"):
             all_above = _every_candidate_above_threshold(
                 oauth_candidates, over_by_account
             )
@@ -3369,8 +4832,43 @@ class AutoSwitchEngine:
             all_above = _every_account_above_threshold(
                 oauth_candidates,
                 over_by_account,
-                active_binding.over if active_binding is not None else None,
+                self._over(
+                    usage.get(current),
+                    settings,
+                    models,
+                    max(settings.threshold, thresholds.get(current, 0.0)),
+                ),
             )
+        # THE BINDING WINDOW, not the five-hour one. "About to stop answering"
+        # is distance to the NEAREST wall, which is what `account_headroom`
+        # already measures: an active two points from its WEEKLY limit walls
+        # for a week, and under `--models` a pinned model's scoped window can
+        # sit at 100 while the five-hour read still says 100 points free. Both
+        # cases are invisible to a five-hour-only axis, and the candidate side
+        # of this rule has always used `h`, so the two now ask one question.
+        about_to_wall = _about_to_wall(active_headroom)
+        # The most headroom any candidate with a READABLE row offers. Unknown
+        # headrooms are skipped rather than counted as zero: a row we cannot
+        # read is not evidence of an empty account (one sentinel row, an
+        # expired token or a locked keychain, once parked the engine on the
+        # account resetting LAST). The no-return bar is not filtered out: this
+        # answers whether the FLEET has quota, not which account to move to.
+        best_candidate_headroom = max(
+            (h for h in map(headroom.get, oauth_candidates) if h is not None),
+            default=0.0,
+        )
+        active_recovery_ts = (
+            _binding_recovery_ts(
+                usage.get(current),
+                models,
+                now,
+                threshold=thresholds[current],
+                weekly_threshold=settings.weekly_threshold,
+                scale=_ruler(settings),
+            )
+            if all_above
+            else 0.0  # unread unless all_above; never a live sentinel
+        )
         # AT-LIMIT WAITS ON A KNOWN RETURN WHEN NOTHING IS WORTH HAVING, and
         # only then. The escape skips the landing gate on purpose -- a blocked
         # account is worth leaving for a WORKING one -- so the room key is all
@@ -3388,22 +4886,10 @@ class AutoSwitchEngine:
         #
         # NOT failover: there the active is dead or unreadable, so its
         # recovery time is not a quota fact anyone can wait for.
-        best_candidate_headroom = max(
-            (h for h in map(headroom.get, oauth_candidates) if h is not None),
-            default=0.0,
-        )
-        active_recovery_ts = (
-            _binding_recovery_ts(
-                usage.get(current),
-                self._models,
-                now,
-                threshold=thresholds[current],
-                weekly_threshold=settings.weekly_threshold,
-                scale=settings.threshold,
-            )
-            if all_above
-            else 0.0  # unread unless all_above; never a live sentinel
-        )
+        dynamic_landing = settings.strategy == "dynamic"
+        # ONE NAME FOR BOTH THE GATE AND THE KEY. Deliberately NOT narrowed for
+        # `dynamic` (#321): the `waiting` flag below reads it for every
+        # strategy, including dynamic's own genuine at-limit blackouts.
         by_recovery_axis = (
             all_above
             and trigger == "at-limit"
@@ -3419,6 +4905,32 @@ class AutoSwitchEngine:
             # zero here: `at-limit` is set only when the active is at zero.
             and best_candidate_headroom <= SPENT_HEADROOM_PCT
         )
+        # T0938: `dynamic`'s own landing bar (below) exists to keep a
+        # PROACTIVE move off a still-walled candidate — it has no business
+        # gating the at-limit escape, which is choosing WHERE to be stuck,
+        # not whether to move at all. Scoped to exactly the case
+        # `by_recovery_axis` already carved out for every other strategy
+        # (at-limit, all_above, a knowable return, nothing healthy to land
+        # on): there `dynamic` takes the same wait gate and sort key as
+        # `best`/`consume-first` do, below. Every other dynamic landing
+        # decision (the bar itself, the proactive/all_above case) is
+        # unchanged.
+        #
+        # `about_to_wall` EARNS THE BYPASS; `by_recovery_axis` ALONE DOES
+        # NOT. `by_recovery_axis`'s at-limit disjunct reads
+        # `best_candidate_headroom` (the fleet's best offer), never the
+        # ACTIVE's own headroom — so on the 5h/7d retry (the same "active
+        # not `about_to_wall`" call `test_the_at_limit_arm_never_lands_on_
+        # a_candidate_still_at_the_wall` covers) a fleet where every
+        # candidate happens to sit inside `SPENT_HEADROOM_PCT` made
+        # `by_recovery_axis` true while the active itself was never stuck,
+        # and an escape gated on that alone bypassed the landing-health
+        # gate onto a still-walled candidate the ordinary rule refuses
+        # (measured: `test_the_at_limit_escape_never_bypasses_the_landing_
+        # bar_for_a_healthy_active`, active headroom 8, candidate headroom
+        # 2). "Choosing WHERE to be stuck" presupposes the active IS
+        # stuck.
+        dynamic_at_limit_escape = dynamic_landing and about_to_wall and by_recovery_axis
 
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
@@ -3430,15 +4942,18 @@ class AutoSwitchEngine:
             recovery_ts = (
                 _binding_recovery_ts(
                     usage.get(num),
-                    self._models,
+                    models,
                     now,
                     threshold=thresholds[num],
                     weekly_threshold=settings.weekly_threshold,
-                    scale=settings.threshold,
+                    scale=_ruler(settings),
                 )
                 if all_above
                 else 0.0
             )
+            # This candidate's own line when it has one (see `thresholds`), so the
+            # landing gate and the health tier below read the same number.
+            cand_bar = thresholds.get(num, bar)
             if h <= 0:
                 # SPENT IS NOT DISQUALIFYING WHEN NOTHING CAN SERVE. A limited
                 # session is pinned to the account it was on -- Claude Code
@@ -3470,19 +4985,27 @@ class AutoSwitchEngine:
                 # compares 0.0 to 0.0 and refuses anyway. Do not read a green
                 # suite as permission to delete it -- a precondition belongs in
                 # its guard, not in a sentinel two variables away.
+                #
+                # A CAPPED ACTIVE ASKS NO RECOVERY MARGIN: staying is the one
+                # thing the cap forbids, so with every peer over its lines a
+                # spent one is admitted whenever it returns (the all-above
+                # key below orders them soonest return first).
                 if not (
-                    all_above
-                    and (active_headroom or 0.0) <= 0
-                    and best_candidate_headroom <= SPENT_HEADROOM_PCT
-                    and active_recovery_ts != float("inf")
-                    and recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
+                    (all_above and trigger == "weekly-capped")
+                    or (
+                        all_above
+                        and (active_headroom or 0.0) <= 0
+                        and best_candidate_headroom <= SPENT_HEADROOM_PCT
+                        and active_recovery_ts != float("inf")
+                        and recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
+                    )
                 ):
                     continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
             if now < ((overload_backoff or {}).get(num) or 0):
                 continue  # backed off after an `overloaded` departure; see _perform
-            binding = bindings[num]
+            binding = self._binding(usage.get(num), settings, cand_bar, models=models)
             # Policy headroom against the candidate's own lines, and whether
             # any of them is reached; raw `h` / the single line when it
             # reports no window (a readable headroom rules that out).
@@ -3490,27 +5013,58 @@ class AutoSwitchEngine:
             over = (
                 binding.over
                 if binding is not None
-                else (100.0 - h) >= thresholds[num]
+                else (100.0 - h) >= cand_bar
             )
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
-            if by_recovery_axis and (
-                recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S
+            if (
+                by_recovery_axis
+                or trigger in ("proactive", *CONSUME_FIRST_STRATEGIES)
+                or (trigger == "at-limit" and not about_to_wall)
             ):
-                # A sliver is worth moving to only if it comes back
-                # meaningfully sooner than the account we are on; otherwise
-                # wait. This gates admission and the room key below orders
-                # whoever passes, so the two never disagree about the winner.
-                continue
-            if trigger in ("proactive", "consume-first"):
                 # Landing must be healthy: an account at/over any of its own
-                # lines would re-trigger on the very next tick. At-limit and
-                # failover are escapes that skip this whole block — any account
-                # with real headroom beats a blocked or dead one.
-                if over and not all_above:
+                # lines would re-trigger on the very next tick. At-limit and failover
+                # are escapes that skip this whole block — any account with real
+                # headroom beats a blocked or dead one.
+                #
+                # AT-LIMIT ONLY WHEN `about_to_wall` IS FALSE ON THIS AXIS.
+                # `about_to_wall` is axis-local (computed from the
+                # `active_headroom` this very call was passed), so it is the
+                # one signal that tells apart the two calls `_rank_candidates`
+                # makes with the SAME trigger name: the model-gated pass where
+                # at-limit's premise ("the active is genuinely blocked") holds,
+                # and the 5h/7d retry where the active can easily hold real
+                # headroom on this axis even though the model gate spent it.
+                # The escape's landing-gate bypass is earned by the former, not
+                # inherited by the latter — without this, the retry admitted
+                # ANY readable candidate for an at-limit trigger unconditionally
+                # (measured: a 3-account fleet at the same model bar switched
+                # on every tick, `[2,1,2,1,...]`).
+                # THE LANDING RULE (dynamic only): never admit a candidate
+                # with no room on the axis this pass ranks by, even when
+                # every account is above the threshold — UNLESS the active
+                # itself is genuinely walled (`dynamic_at_limit_escape`,
+                # T0938): there "recovers soonest" is not a future
+                # optimisation, it is the only question left, the same one
+                # `best`/`consume-first`'s own at-limit escape below already
+                # answers on a spent active. The `all_above` escape below
+                # exists so a proactive/at-limit trigger can still move when
+                # nothing currently qualifies, but for a trigger OTHER than
+                # a genuinely walled at-limit, a peer's return is a future
+                # fact, and landing on it NOW moved the engine onto an
+                # account that was ITSELF still blocked (measured live: a
+                # proactive move onto an account whose own 5h was already at
+                # the switch threshold, which the very next tick read as
+                # `cooldown` while still blocked, and the tick after that had
+                # burned worse). `best`/`consume-first` keep the escape
+                # unchanged — this is additive, gated on the strategy AND on
+                # `about_to_wall`, not the strategy alone.
+                if over and not (
+                    (all_above and not dynamic_landing) or dynamic_at_limit_escape
+                ):
                     continue
-                if all_above:
+                if (all_above and not dynamic_landing) or dynamic_at_limit_escape:
                     # Checked before the strategies, because with nothing under
                     # its lines the strategy question is moot: consume-first
                     # exists to spend perishable WEEKLY quota, and every account
@@ -3520,26 +5074,79 @@ class AutoSwitchEngine:
                     # consume_first` catching first filtered on weekly ordering
                     # while the key sorted on room, two different axes, and
                     # left consume-first users with no anti-flap guard at all.)
-                    if not _all_above_margin_met(h, active_headroom or 0.0):
+                    if by_recovery_axis:
+                        # A sliver is worth moving to only if it comes back
+                        # meaningfully sooner than the account we are on;
+                        # otherwise wait. Room is noise here, so the margin
+                        # on it is not asked: it would refuse a peer past a
+                        # hundred percent (`h < 0`) the spent guard admitted.
+                        if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
+                            continue
+                    elif not _all_above_margin_met(h, active_headroom or 0.0):
                         continue
-                elif consume_first:
-                    # Purely proactive on reset ordering: below the threshold,
-                    # only move to accounts whose weekly window resets sooner
-                    # than the active one (above the threshold we must move, so
-                    # any healthy account qualifies and the sort picks soonest).
-                    if trigger == "consume-first" and (
-                        reset_ts is None
-                        or active_reset_ts is None
-                        or reset_ts >= active_reset_ts
+                elif (
+                    trigger in CONSUME_FIRST_STRATEGIES
+                    or settings.strategy == "consume-first"
+                ):
+                    # Below the threshold (`trigger` itself is "consume-first"
+                    # or "dynamic"): purely proactive on reset ordering, only
+                    # move to accounts whose weekly window resets sooner than
+                    # the active one.
+                    #
+                    # `consume-first` STRATEGY, any OTHER trigger (over-
+                    # threshold `proactive`, or `at-limit` with the active not
+                    # `about_to_wall`): admitted unconditionally, no reset
+                    # comparison at all — this is `consume-first`'s BASE
+                    # behaviour, restored on the owner's word that it must
+                    # read exactly as deployed today, and not this PR's to
+                    # change; a real anti-flap gate here is a separate,
+                    # authorized round. `dynamic` does not get this: its own
+                    # `proactive`/`at-limit` triggers fall to the hysteresis
+                    # leg below instead, same as `best`.
+                    #
+                    # `_walled_may_take_any_room` GATED TO `dynamic_landing`.
+                    # `trigger` is literally "consume-first" or "dynamic" only
+                    # for the (non-dynamic) `consume-first` strategy below its
+                    # threshold — `dynamic`'s own trigger classification
+                    # (`_classify_dynamic_trigger`) never produces either
+                    # string, so an ungated call here changed ONLY
+                    # `consume-first`'s own admission (measured: a departure
+                    # threshold above ~97 let a walled consume-first active
+                    # take any real-headroom candidate regardless of reset
+                    # order). `consume-first`'s behaviour is pinned
+                    # byte-identical to base (adr/0009); this PR has no
+                    # authorization to move it, so the escape is inert unless
+                    # `dynamic_landing` — which, for the same reason, this
+                    # branch never reaches (dynamic's triggers fall to the
+                    # hysteresis leg above). Left named, not deleted, so a
+                    # future authorized round for `dynamic` has the mirror
+                    # function ready rather than reinventing it.
+                    if (
+                        trigger in CONSUME_FIRST_STRATEGIES
+                        and not (
+                            dynamic_landing
+                            and _walled_may_take_any_room(about_to_wall, h)
+                        )
+                        and (
+                            reset_ts is None
+                            or active_reset_ts is None
+                            or reset_ts >= active_reset_ts
+                        )
                     ):
                         continue
                 elif active_headroom is not None:
-                    # best: the candidate must beat the active account by the
-                    # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back). Measured in
-                    # policy headroom, so a 7d 93% candidate under a 97 line
-                    # beats a 5h 95% active under 85 — raw headroom (7 vs 5)
+                    # best, and also dynamic's `proactive` trigger (over
+                    # threshold): the candidate must beat the active account
+                    # by the full hysteresis margin (a one-way move like
+                    # 99%→89% qualifies; near-line pairs can't flap back),
+                    # measured in policy headroom (each window against its own
+                    # line, see lines.py) so a 7d 93% candidate under a 97 line
+                    # beats a 5h 95% active under 85 -- raw headroom (7 vs 5)
                     # would park on the account about to hit its limit.
+                    # `active_headroom` is the axis THIS pass ranks by — the
+                    # model-gated one on the primary call, `fallback_headroom
+                    # [current]` on the 5h/7d retry — so a landing is always
+                    # an improvement on the axis that admitted it.
                     if lh - active_lh < settings.hysteresis_pct:
                         continue
             if all_above:
@@ -3551,21 +5158,24 @@ class AutoSwitchEngine:
                 # sooner is plainly better than a lower slot number. It is the
                 # reset of the window the room is measured on, the fullest one
                 # (no lines passed), since its rollover is what gives the
-                # account room again. A spent candidate the guard above
-                # admitted scores 0, not below it: `pct` is copied through
-                # unclamped, so 100.5 would otherwise lose to 100.0 on half a
-                # point this module calls noise, and the reset decides.
+                # account room again. Room clamps at zero: `pct` is copied
+                # through unclamped, so a spent candidate at 100.5 would lose
+                # to one at 100.0 on half a point this module calls noise.
                 #
-                # REVERSED UNDER THE AT-LIMIT WAIT (`by_recovery_axis`): every
-                # peer it admits holds a sliver at most, where a headroom edge
-                # is noise and the only question left is who returns first.
-                # Room breaks an exact tie there.
+                # Under the at-limit wait every peer holds a sliver at most, so
+                # who returns first leads and room breaks the tie. `dynamic`
+                # keeps its T1083 tier in front: a FULL account (h <= 0) serves
+                # nothing until it resets, one at 0 < h serves now.
                 room = -max(h, 0.0)
-                reset = _binding_recovery_ts(usage.get(num), self._models, now)
-                key: tuple = (reset, room) if by_recovery_axis else (room, reset)
+                reset = _binding_recovery_ts(usage.get(num), models, now)
+                key: tuple = (
+                    (dynamic_landing and h <= 0, reset, room)
+                    if by_recovery_axis
+                    else (room, reset)
+                )
             elif consume_first and trigger != "at-limit":
                 # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
+                # policy headroom breaks ties, then sequence order.
                 #
                 # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so an escape
                 # does not belong: `at-limit` is a stopped session. The
@@ -3578,20 +5188,19 @@ class AutoSwitchEngine:
                 #
                 # TWO TIERS AND NOT ONE. Servability and landing health are
                 # different bars — `h > SPENT_HEADROOM_PCT` against
-                # `h > 100 - threshold`, which the user sets — and above 97
-                # the landing gate calls a spent account a legal landing.
-                # Folded together, health hides servability inside its own top
-                # level. Their order is immaterial and needs no test:
-                # servable-but-unhealthy requires a threshold under 97 and
-                # spent-but-healthy over it, so no ONE fleet can hold both --
-                # and it takes both to order a pair differently.
+                # `h > 100 - bar` (#321: `bar` is `proactive_switch_bar_pct`
+                # -- `settings.threshold` itself for consume-first, fixed at
+                # 97 for dynamic). Folded together, health hides servability
+                # inside its own top level. Their order is immaterial and
+                # needs no test: for consume-first, servable-but-unhealthy
+                # needs a threshold under 97 and spent-but-healthy needs one
+                # over it, so no ONE fleet can hold both; under dynamic the
+                # two floors coincide by construction (`bar == 100 -
+                # SPENT_HEADROOM_PCT`) and the tiers simply agree.
                 key = consume_first_rank_key(
-                    usage.get(num),
-                    thresholds[num],
-                    now,
-                    self._models,
+                    usage.get(num), cand_bar, now, models,
                     weekly_threshold=settings.weekly_threshold,
-                    scale=settings.threshold,
+                    scale=_ruler(settings),
                 )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
@@ -3606,13 +5215,13 @@ class AutoSwitchEngine:
                 # one overall wins, walls on the next request, and the tick
                 # after pays a second swap. A spent candidate never reaches
                 # this arm: the spent guard admits one only under `all_above`,
-                # which ranks above.
+                # which ranks on room above.
                 #
                 # Clamped so a window past 100 does not outrank 100.0 on half a
                 # point this module calls noise.
                 escape_h = (
                     oauth.headroom_on_window(
-                        usage.get(num), escape_label, self._models
+                        usage.get(num), escape_label, models
                     )
                     if escape_label
                     else None
@@ -3623,8 +5232,58 @@ class AutoSwitchEngine:
                 # weekly outranks one holding forty on both, walls on the next
                 # request, and the tick after pays a second swap to correct it.
                 # `SPENT_HEADROOM_PCT` is the module's own "can this serve".
+                #
+                # `dynamic` ONLY (never excluded, only re-ranked, so a true
+                # emergency where nothing clears the threshold still lands
+                # somewhere): `escape_h` ranks by the axis that blocked the
+                # ACTIVE, not this candidate's OWN worst window, so a peer
+                # that is itself over `settings.threshold` on a different
+                # axis (its own 5h, say) can outrank one with real headroom
+                # everywhere purely because it happens to be clear on the
+                # window the active is walled on -- landing there re-triggers
+                # the very next tick (measured live, #321 follow-up: a
+                # Fable-100 active passed over a Fable-89/5h-40/7d-65
+                # candidate for a Fable-10/5h-91 one).
+                #
+                # DELIBERATELY THE ACCOUNT'S OWN LINE (`settings.threshold`
+                # when it has none), NOT `bar` (#321).
+                # `bar == 100 - SPENT_HEADROOM_PCT` for dynamic exactly, so
+                # `h > SPENT_HEADROOM_PCT and (100.0 - h) >= bar` would read
+                # `h > 3 and h <= 3` -- always false, silently disabling
+                # this demotion for every dynamic fleet (measured: it
+                # stopped catching the Fable-10/5h-91 case above).
+                #
+                # This does reach real dynamic fleets -- `at-limit` excludes
+                # itself from the reset-ordered `consume_first_rank_key` arm
+                # above (`trigger != "at-limit"`), so an at-limit tick that
+                # is not `all_above` (which ranks on room) lands here, and a
+                # candidate with h in (3, 10] (91%
+                # on its own binding window, say) is demoted by THIS check.
+                # Not a "which candidate is blocked" decision either way --
+                # it only re-ranks within an already-admitted escape set --
+                # so it stays outside #321's scope.
+                # `h > SPENT_HEADROOM_PCT` not asked here: the tier below
+                # checks `h <= SPENT_HEADROOM_PCT` FIRST, so this is only
+                # ever consulted once that has already failed.
+                dynamic_self_walled = dynamic_landing and self._over(
+                    usage.get(num), settings, models, thresholds[num]
+                )
+                # THREE TIERS, NOT TWO. Folding "genuinely unservable" (h <=
+                # SPENT_HEADROOM_PCT) and "self-walled but has real spare
+                # headroom" (`dynamic_self_walled`) into one tier let a
+                # candidate with almost nothing left (h=1, say) beat one
+                # with a real margin (h=5, self-walled only because its OWN
+                # binding window happens to read high) purely on `escape_h`
+                # magnitude -- measured: a 1-point weekly account outranking
+                # a 5-point one because the 1-point account's escape axis
+                # read cleaner. Self-walled is worse than open but still
+                # better than actually dying.
                 key = (
-                    0 if h > SPENT_HEADROOM_PCT else 1,
+                    (
+                        2 if h <= SPENT_HEADROOM_PCT
+                        else 1 if dynamic_self_walled
+                        else 0
+                    ),
                     -max(escape_h if escape_h is not None else lh, 0.0),
                 )
             qualifying.append((key, num))
@@ -3922,10 +5581,21 @@ class AutoSwitchEngine:
         # serialized decision: the loser re-reads the winner's lastSwitchAt
         # and backs off instead of double-switching. No deadlock cycle: the
         # switch path (cswap FileLock + Claude Code locks) never takes the
-        # state lock.
+        # state lock, except for a hand caller's `manual_source` record
+        # (`record_manual_switch`), which the engine never passes.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
+            # `left[0]` is the tick's own widened `active_headroom`, taken
+            # from the same pass the ranking decided on — the recheck must
+            # yield to the wall on the SAME reading the gate above did, or
+            # the bypass is undone here under the lock.
+            if (
+                trigger in _COOLDOWN_GATED_TRIGGERS
+                and not _cooldown_yields_to_the_wall(
+                    self.settings.strategy, left[0], self._active_wall
+                )
+                and self._in_cooldown(state)
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -4002,6 +5672,21 @@ class AutoSwitchEngine:
                 self._overload_backoff[str(state["lastSwitchFrom"])] = (
                     self.clock() + OVERLOAD_BACKOFF_S
                 )
+            # #375: per-account "last touched" epoch — the outgoing account
+            # (so a LATER tick can tell its cache has gone cold) and the
+            # incoming one (`number`, so alternation's chunk timer knows
+            # when we arrived here) — one dict, both purposes, promoted from
+            # the single `lastSwitchAt` scalar above, which only ever
+            # remembered the MOST RECENT switch and lost every earlier
+            # account's own history. `dynamic` only reads it, but every
+            # strategy writes it (cheap, and a later `dynamic` switch needs
+            # the history from before it was ever selected).
+            last_active_at = state.get("lastActiveAt")
+            last_active_at = dict(last_active_at) if isinstance(last_active_at, dict) else {}
+            if state["lastSwitchFrom"] is not None:
+                last_active_at[str(state["lastSwitchFrom"])] = state["lastSwitchAt"]
+            last_active_at[str(number)] = state["lastSwitchAt"]
+            state["lastActiveAt"] = last_active_at
             atomic_write_json(self.state_path, state)
 
         # No explicit `_message_trace_offset` reset here: the switch changes
@@ -4045,24 +5730,67 @@ class AutoSwitchEngine:
     # -- helpers --------------------------------------------------------------
 
     def _binding(
-        self, value: dict | str | None, settings: AutoSwitchSettings, line: float
+        self,
+        value: dict | str | None,
+        settings: AutoSwitchSettings,
+        threshold: float | None = None,
+        *,
+        models: Sequence[str] | None = None,
     ) -> BindingWindow | None:
         """The window binding this account under the tick's lines (see
-        ``lines.binding_window``), or None when it reports no window. ``line``
-        is the account's effective threshold from the tick's map. Reads
-        only ``self._models`` and the ``settings`` it is handed, never
-        ``self.settings``: a tick snapshots its settings once, and the ranking
-        helpers are exercised directly on bare engines."""
+        ``lines.binding_window``), or None when it reports no window. Reads
+        only ``models`` (default ``self._models``) and the ``settings`` it is
+        handed, never ``self.settings``: a tick snapshots its settings once,
+        and the ranking helpers are exercised directly on bare engines. A
+        caller ranking on another window set (dynamic's 5h/7d retry) passes
+        it, so the binding and the headroom beside it read ONE set.
+        ``threshold`` replaces ``settings.threshold`` as the 5h line (and the
+        weekly lines while no weekly line is set): the account's effective
+        threshold from the tick's map, or the strategy's bar (#321). The
+        score stays on ``_ruler``'s one scale."""
         return binding_window(
             oauth.relevant_windows(
-                value if isinstance(value, dict) else None, self._models
+                value if isinstance(value, dict) else None,
+                self._models if models is None else models,
             ),
-            line,
+            settings.threshold if threshold is None else threshold,
             settings.weekly_threshold,
-            scale=settings.threshold,
+            scale=_ruler(settings),
         )
 
+    def _over(
+        self,
+        value: dict | str | None,
+        settings: AutoSwitchSettings,
+        models: Sequence[str] | None = None,
+        threshold: float | None = None,
+    ) -> bool | None:
+        """Whether any window is at or over its line (``_binding``'s
+        verdict); None when the account reports no window."""
+        binding = self._binding(value, settings, threshold, models=models)
+        return None if binding is None else binding.over
+
     def _in_cooldown(self, state: dict) -> bool:
+        """Time-gate a rapid re-switch.
+
+        A model-headroom-based exemption lived here briefly (2026-09-07):
+        exempt a WALLED active (``h <= 0`` on ``self._models``) from the
+        full ``cooldown_seconds``. Reverted — `h <= 0` on that axis is the
+        same predicate that already classifies `at-limit`
+        (`_classify_dynamic_trigger`), and `at-limit` is not in
+        `_COOLDOWN_GATED_TRIGGERS`, so no caller this exemption was meant
+        to help ever reaches it: the roster it was written for bypasses
+        cooldown structurally, before `_in_cooldown` is even called. Where
+        it WAS reachable, it fired on the wrong signal — its own fresh,
+        unwidened store read could show `h <= 0` even after
+        `_dynamic_active_headroom` had already widened the tick's own
+        `active_headroom` and ruled the active NOT walled, so a widened
+        `proactive` tick bypassed cooldown on every tick regardless. The
+        real defect this was chasing (over-trigger holding a walled active)
+        is real but unresolved here — a candidate-aware re-key would need
+        to run after candidate selection, downstream of this call site, not
+        a small change to this function.
+        """
         last = state.get("lastSwitchAt")
         if not isinstance(last, (int, float)):
             return False
@@ -4114,9 +5842,9 @@ class AutoSwitchEngine:
 
     def _earliest_recovery(
         self, usage: dict[str, dict | str | None]
-    ) -> tuple[datetime | None, bool]:
-        """Earliest moment any account becomes usable again (UTC), and whether
-        every blocked account could prove one.
+    ) -> tuple[datetime | None, str | None, bool]:
+        """Earliest moment any account becomes usable again (UTC), which
+        account that is, and whether every blocked account could prove one.
 
         Per account that's the *latest* reset among its ≥100% relevant
         windows — an account blocked on both 5h and a scoped weekly limit
@@ -4124,14 +5852,15 @@ class AutoSwitchEngine:
         accounts, the active one included (its recovery also ends the
         blocked state). A blocked account whose exhausted windows carry no
         reset time at all could recover at any moment. That does not erase
-        what the others proved, so it is reported as the second element
-        rather than by discarding the first: the caller ANNOUNCES the
+        what the others proved, so it is reported as the third element
+        rather than by discarding the first two: the caller ANNOUNCES the
         earliest provable moment and keeps the bounded blocked-cadence
         re-check, rather than sleeping toward a reset that peer may beat."""
         earliest: float | None = None
+        earliest_num: str | None = None
         all_provable = True
         now = self.clock()
-        for value in usage.values():
+        for num, value in usage.items():
             if not isinstance(value, dict):
                 continue
             blocked = [
@@ -4147,9 +5876,14 @@ class AutoSwitchEngine:
                 continue
             if earliest is None or usable_at < earliest:
                 earliest = usable_at
+                earliest_num = num
         if earliest is None:
-            return None, all_provable
-        return datetime.fromtimestamp(earliest, tz=timezone.utc), all_provable
+            return None, None, all_provable
+        return (
+            datetime.fromtimestamp(earliest, tz=timezone.utc),
+            earliest_num,
+            all_provable,
+        )
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         # `human()` is what the TUI panel renders, so log and screen cannot
@@ -4342,8 +6076,24 @@ class AutoSwitchEngine:
             self._models,
         )
 
+    def apply_strategy(self, strategy: str) -> None:
+        """Session override from the TUI: retarget which strategy the next
+        tick ranks by. Same atomic frozen-settings swap as
+        `apply_threshold`, and the same "never written to settings.json"
+        precedent — the TUI mutates its own in-memory copy and hands it
+        here; nothing here touches disk."""
+        self.settings = replace(self.settings, strategy=strategy)
+        # `_danger_band` is deliberately not cleared per tick, so it would
+        # otherwise outlive the strategy it was measured under and cap a
+        # `best`/`consume-first` sleep on the next tick that raises before
+        # the recompute — the one path where a non-dynamic tick reads this
+        # flag at all (adr/0009's fence).
+        self._danger_band = False
+
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
+        if self._danger_band:
+            interval = min(interval, DANGER_INTERVAL_S)
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:
                 delay = self._sleep_until_ts - self.clock()
