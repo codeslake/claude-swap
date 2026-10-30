@@ -264,6 +264,7 @@ def account_card_text(
     now: float | None = None,
     palette: Palette = Palette.DARK,
     cloud_pinned: bool = False,
+    show_tag: bool = True,
 ) -> Text:
     """The full account card: header line + per-window bar rows. Each row's
     tick is the switch line that row is judged against: ``threshold`` on the
@@ -284,7 +285,8 @@ def account_card_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
-    text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if show_tag:
+        text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if cloud_pinned:
@@ -696,12 +698,13 @@ class AccountsPanel(Static):
                         acc, width, threshold=app.threshold_pct,
                         weekly_threshold=app.weekly_threshold_pct, now=now,
                         palette=palette, cloud_pinned=pinned,
+                        show_tag=app.show_org_tag,
                     )
                 )
             elif self._show_minis:
                 row = mini_account_text(
                     acc, now, palette=palette, widths=widths, width=width,
-                    cloud_pinned=pinned,
+                    cloud_pinned=pinned, show_tag=app.show_org_tag,
                 )  # never wraps
                 blocks.append(row)
         if not blocks:
@@ -751,6 +754,7 @@ class AccountCard(Static):
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
             cloud_pinned=self._cloud_pinned,
+            show_tag=self.app.tag_shown(self._acc),
         )
 
 

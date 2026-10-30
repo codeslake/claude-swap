@@ -20,7 +20,7 @@ from textual.worker import WorkerState
 from claude_swap import printer
 from claude_swap.autoswitch import proactive_switch_bar_pct
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.models import AccountsSnapshot
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import (
     AutoSwitchSettings,
@@ -95,9 +95,10 @@ class CswapApp(App):
             self.threshold_pct = None
             self.weekly_threshold_pct = None
         try:
-            self._theme_name = load_ui_settings(switcher.backup_dir).theme
+            ui = load_ui_settings(switcher.backup_dir)
+            self._theme_name, self.show_org_tag = ui.theme, ui.show_org_tag
         except Exception:
-            self._theme_name = "auto"
+            self._theme_name, self.show_org_tag = "auto", True
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)
@@ -460,6 +461,15 @@ class CswapApp(App):
         if isinstance(self.screen, WatchScreen):
             return
         self.push_screen(WatchScreen())
+
+    def tag_shown(self, acc: AccountSnapshot) -> bool:
+        """Whether a list that must tell accounts apart draws ``acc``'s org tag:
+        always with ``ui.showOrgTag``, else only when another listed account
+        shares its email."""
+        if self.show_org_tag:
+            return True
+        accounts = self.snapshot.accounts if self.snapshot else ()
+        return sum(a.email == acc.email for a in accounts) > 1
 
     # -- theme --------------------------------------------------------------
 
