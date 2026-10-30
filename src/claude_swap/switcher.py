@@ -104,7 +104,7 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances, scan_sessions
 from claude_swap import poll_policy
 from claude_swap.lines import weekly_capped
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import load_settings, parse_model_names, settings_stamp
 from claude_swap.usage_store import (
     FetchRecord,
     PERMANENT_AUTH_ERRORS,
@@ -533,10 +533,11 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
-        # (settings mtime, (threshold, weekly_threshold, models)) — see
+        # (settings mtimes, (threshold, weekly_threshold, models)) — see
         # _poll_policy_inputs.
         self._poll_inputs_cache: tuple[
-            float | None, tuple[float, float | None, tuple[str, ...]]
+            tuple[float | None, float | None],
+            tuple[float, float | None, tuple[str, ...]],
         ] | None = None
         self._poll_inputs_override: tuple[float, float | None, tuple[str, ...]] | None = None
         self._poll_weekly_cap: float | None = None
@@ -3075,11 +3076,7 @@ class ClaudeAccountSwitcher:
         stat per pass)."""
         if self._poll_inputs_override is not None:
             return self._poll_inputs_override
-        path = settings_path(self.backup_dir)
-        try:
-            mtime: float | None = path.stat().st_mtime
-        except OSError:
-            mtime = None
+        mtime = settings_stamp(self.backup_dir)
         if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
             return self._poll_inputs_cache[1]
         loaded = load_settings(self.backup_dir)
