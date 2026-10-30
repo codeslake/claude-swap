@@ -603,6 +603,16 @@ def candidate_is_untrustworthy(entry: UsageEntry | None, now: float) -> bool:
         )
     )
 
+# How long a just-probed account (admitted past the reset-unknown gate
+# specifically to learn its weekly reset) is skipped as a probe target again.
+# One hour: long enough to outlast several ordinary poll ticks so a durably
+# unknown reset is not re-probed every cycle (the ping-pong the owner asked
+# to avoid), short enough that a fleet with few candidates is not locked out
+# of its only unmeasured peer for the better part of a day. Cleared early —
+# see `_perform` — the moment the account is switched to again for any
+# reason, since that is itself a fresh chance to learn its reset.
+PROBE_COOLDOWN_S = 3600.0
+
 
 def _all_above_margin_met(candidate_headroom: float, active_headroom: float) -> bool:
     """Does a candidate beat the active by enough to move, every account over
@@ -915,7 +925,7 @@ class PollEvent(AutoSwitchEvent):
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
     # proactive | at-limit | failover | consume-first | priority | alternation
-    # | disabled-active | overloaded | weekly-capped
+    # | disabled-active | overloaded | weekly-capped | probe
     trigger: str
     from_ref: dict | None
     to_ref: dict | None
@@ -943,6 +953,12 @@ class SwitchEvent(AutoSwitchEvent):
             else "?"
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
+        if self.trigger == "probe":
+            # The reason, named in plain words, with the trigger literal
+            # still the LAST parenthesized token on the line -- a decision-log
+            # consumer anchors its trigger match there
+            # (`\(([a-z-]+)\)\s*$`), so anything added must go before it.
+            return f"{prefix} {src} -> {dst} (7d reset unknown) (probe)"
         trigger_label = f"{self.trigger}: {self.detail}" if self.detail else self.trigger
         return f"{prefix} {src} -> {dst} ({trigger_label})"
 
@@ -1162,6 +1178,138 @@ def _perishes_before_active(
     return active_ts is not None and candidate_ts < active_ts
 
 
+def _seven_day_reset_unmeasured(usage: dict | str | None) -> bool:
+    """True only when the weekly reset has never been REPORTED at all —
+    narrower than ``_seven_day_reset_ts``'s ``None``, which also covers a
+    stale snapshot whose ``resets_at`` has since elapsed.
+
+    The elapsed case does not need a separate branch here: a decision value
+    whose own earliest relevant-window reset has already elapsed is null
+    before it ever reaches this function (``UsageEntry.decision_value``), so
+    it already answers True at the ``not isinstance(usage, dict)`` line
+    below, same as a reset that was never reported at all. This predicate
+    only needs to add the ONE case that isn't already null: a present,
+    still-current ``seven_day`` block whose ``resets_at`` key is simply
+    absent from the payload.
+    """
+    if not isinstance(usage, dict):
+        return True
+    window = usage.get("seven_day")
+    if not isinstance(window, dict):
+        return True
+    return _parse_reset_ts(window.get("resets_at")) is None
+
+
+def _probe_source_fresh(entries: dict | None, num: str, now: float) -> bool:
+    """Whether ``num``'s store entry is fresh enough to admit it as a probe
+    target — narrower than ``_tick_inner``'s stale-usage gate (which also
+    accepts ``entry.held(now)``, #325): a probe exists to LEARN an unmeasured
+    weekly reset through a live fetch, and a held row refuses fetching
+    altogether (``_row_eligible``), so admitting one here would spend the
+    tick's one probe slot on a candidate that cannot resolve its reset while
+    the hold lasts. ``entries=None`` (a caller with no store-entry data, e.g.
+    a direct unit-test call predating probing, or a display) skips the gate
+    rather than refusing every candidate.
+    """
+    if entries is None:
+        return True
+    entry = entries.get(num)
+    return entry is not None and entry.fresh(now) and not entry.held(now)
+
+
+def _numeric_probe_cooldown(raw: object) -> dict[str, float]:
+    """``state["probeCooldown"]``, TYPE-GUARDED to a fresh dict of numeric
+    values only -- every writer of ``self._last_probe_cooldown`` (the
+    panel's only view of this record, see its docstring) must filter
+    through this SAME function: a non-dict survives ``... or {}`` unchanged
+    when it is truthy (a non-empty list has no ``.get``), and a dict with a
+    non-numeric value (``{"2": null}``) passes but raises on the
+    ``probe_cooldown.get(num, 0.0) > now`` comparison in
+    ``select_probe_target`` when that key is read. Returning a fresh dict
+    rather than the input also matters when the caller goes on to mutate
+    the original in place (``_perform``'s ``pop``/``[number] =``): publishing
+    anything but a copy would let that later write mutate a dict the panel's
+    thread is reading.
+    """
+    return (
+        {k: v for k, v in raw.items() if isinstance(v, (int, float))}
+        if isinstance(raw, dict)
+        else {}
+    )
+
+
+def select_probe_target(
+    usage: dict[str, dict | str | None],
+    oauth_candidates: Sequence[str],
+    models: Sequence[str],
+    active_usage: dict | str | None,
+    probe_cooldown: dict[str, float] | None,
+    now: float,
+    threshold: float,
+    weekly_threshold: float | None,
+    thresholds: Mapping[str, float] | None = None,
+) -> str | None:
+    """Which account (if any) this fleet admits as this tick's probe
+    target: the readable candidate with the most headroom whose weekly
+    reset is unknown or has already elapsed, and which is not cooling down
+    from a previous probe. The pick is the pool member that
+    ``consume_first_rank_key`` orders first (servability, then line headroom
+    against each window's own line); with one line that is the most raw
+    headroom.
+
+    ONE FUNCTION, TWO READERS — ``_rank_candidates_pass`` calls it (already
+    narrowed to candidates that cleared its own servability/no-return/
+    landing-health gates) to decide the switch; the "Next best" panel calls
+    it on the full candidate list to decide what to DISPLAY. Before this
+    function existed the panel had no notion of probing at all and ranked
+    every candidate with ``probe=False``, so an unknown-reset account read
+    its own absent reset as ``+inf`` (last) there while the engine ranks
+    the same candidate ``-inf`` (first) — the two could name different
+    accounts for the identical fleet. A single shared answer is the fix,
+    not a second, hand-matched copy of the predicate.
+
+    ``active_usage`` (the ACTIVE account's own decision value, not a
+    precomputed timestamp) so both callers can pass what they already have
+    on hand rather than importing this module's private reset-parsing
+    helper. Its weekly reset must be known — an account cannot be ranked on
+    a reset the strategy has refused to ever measure, on either side of the
+    comparison.
+
+    ``thresholds`` maps each account to its own line (``threshold`` is the
+    global one, the ruler); ``None`` reads the global line for every account.
+    """
+    active_reset_ts = _seven_day_reset_ts(active_usage, now)
+    if active_reset_ts is None:
+        return None
+    probe_cooldown = probe_cooldown or {}
+    pool: list[tuple[tuple, str]] = []
+    for num in oauth_candidates:
+        value = usage.get(num)
+        if not _seven_day_reset_unmeasured(value):
+            continue
+        if probe_cooldown.get(num, 0.0) > now:
+            continue
+        # The ranking's own key. Every pool member has an unmeasured reset,
+        # so its reset field is ``inf`` for all of them and the order equals
+        # the ``probe=True`` key's, which is left for the one winner (its
+        # callers read ``probe=True`` as "admitted"). A candidate with no
+        # window reads 0.0 headroom there, so a probe is never refused for it.
+        pool.append((
+            consume_first_rank_key(
+                value,
+                thresholds[num] if thresholds is not None else threshold,
+                now,
+                models,
+                weekly_threshold=weekly_threshold,
+                scale=threshold,
+            ),
+            num,
+        ))
+    if not pool:
+        return None
+    return min(pool, key=lambda t: t[0])[1]
+
+
 def consume_first_rank_key(
     usage: dict | str | None,
     threshold: float,
@@ -1169,6 +1317,7 @@ def consume_first_rank_key(
     models: Sequence[str] = (),
     *,
     weekly_threshold: float | None = None,
+    probe: bool = False,
     scale: float | None = None,
 ) -> tuple:
     """Consume-first sort key for one candidate account.
@@ -1178,8 +1327,16 @@ def consume_first_rank_key(
     soonest 7-day reset, most headroom breaking ties. Pulled out so a display
     built from this key agrees with the account the engine picks WHEN the
     engine itself ranks through this key -- not every ``dynamic`` tick does
-    (see the TUI panel's own comment on this). ``threshold`` is the account's own line
-    and ``scale`` the global one it is measured against (``lines.binding_window``).
+    (see the TUI panel's own comment on this).
+
+    ``probe=True`` is the one account this tick admitted past the reset-
+    unknown gate specifically to learn its reset — it must sort AHEAD of
+    every known reset in its tier, never behind (an unmeasured window is not
+    evidence it resets last), so its reset field reads ``-inf`` instead of
+    the account's own (absent) reset.
+
+    ``threshold`` is the account's own line and ``scale`` the global one it is measured
+    against (``lines.binding_window``).
     """
     h = oauth.account_headroom(usage, models)
     if h is None:
@@ -1199,7 +1356,7 @@ def consume_first_rank_key(
     return (
         0 if h > SPENT_HEADROOM_PCT else 1,
         1 if over else 0,
-        reset_ts if reset_ts is not None else float("inf"),
+        float("-inf") if probe else (reset_ts if reset_ts is not None else float("inf")),
         -lh,
     )
 
@@ -1280,6 +1437,11 @@ def _binding_recovery_ts(
     stamps = [ts for ts in
               (_parse_reset_ts(w[2]) for w in windows if blocking(w[1]))
               if ts is not None]
+    # #325: `usage` here is decision_value()-fed, which already drops any
+    # window whose own reset had elapsed (_drop_rolled_windows) -- so a
+    # `stamps` entry already past cannot reach this `max(stamps) > now`
+    # check any more. No caller does this today: every call site in this
+    # module passes a decision_value()-fed `usage` dict.
     return max(stamps) if stamps and max(stamps) > now else float("inf")
 
 
@@ -1775,6 +1937,16 @@ class AutoSwitchEngine:
         # it. `--once` never reaches that loop, which is why the emit records
         # rather than raises.
         self._consumer_gone = False
+        # `_rank_candidates`'s side channel for its probe pick; see its
+        # docstring. Never read before a tick has ranked at least once.
+        self._last_probe_num: str | None = None
+        # The type-guarded `probeCooldown` this tick read from state (see
+        # `_tick_inner`), cached the same way as `_last_probe_num` so the
+        # "Next best" panel's own `select_probe_target` call can see exactly
+        # the cooldown record the engine ranked against instead of a
+        # hardcoded `None` — a probe the engine is still cooling down from
+        # would otherwise read as fresh to the panel and jump back to the top.
+        self._last_probe_cooldown: dict[str, float] = {}
 
     def _announce_demotion(self) -> None:
         """Say once, on the first tick, that this engine lost the LIVE lock.
@@ -3402,37 +3574,69 @@ class AutoSwitchEngine:
                 or since is None
                 or now - since < settings.alternation_chunk_seconds
             ):
-                # One label per story (item 5): a warm partner not yet
-                # dwelt on, or a cold one below the floor. T0758:
-                # `partner is not None` (a perishing candidate, or now
-                # T0807, a cold one the floor alone already admits) reads
-                # the same as a warm partner here -- held by dwell, not by
-                # the floor -- or `below-floor` would blame a bar that
-                # already admitted it. Nothing can clear
-                # `_clears_the_landing_floor` while `partner is None`
-                # (T0807 dropped the giveback ceiling that used to let a
-                # floor-clearing candidate fall through here as `cold`),
-                # so `below-floor` alone covers every cold candidate left
-                # in this branch.
-                if warm_ordered or partner is not None:
-                    reason = "below-threshold"
-                elif cold_ordered:
-                    reason = "below-floor"
-                else:
-                    reason = "below-threshold"
-                # m1: the active is healthy (not about to wall) here on
-                # EITHER side of `settings.threshold` -- no `< threshold`
-                # comparison, which can print a false "95% < 90%".
-                self._emit(
-                    NoSwitchEvent(
-                        reason=reason,
-                        detail=(
-                            f"active account is healthy ({pct_label(active_headroom)}"
-                            "% headroom, not about to wall)"
-                        ),
+                # UNKNOWN-RESET PROBE, ONE LAST CHECK BEFORE GIVING UP: this
+                # arm's own warm/cold tiers have no notion of an unmeasured
+                # weekly reset at all (#375 predates probing), so a fleet-
+                # wide model wall (`_model_window_binds_everywhere`) that
+                # leaves a never-reported-reset candidate with real
+                # unmodeled headroom would otherwise dwell here forever,
+                # the same defect #325's own `_rank_candidates_pass` probe
+                # exists to close for `consume-first`. NOT gated on
+                # `model_window_dropped` (this arm's own retry flag): that
+                # only fires when BOTH tiers come back empty, but
+                # `_rank_dynamic_candidates` still places a barely-open
+                # model-walled candidate in `cold_ordered` with near-zero
+                # headroom, so the retry never runs and `model_window_
+                # dropped` stays False even though the model window binds
+                # everywhere -- the predicate is asked directly instead.
+                probe_target = (
+                    select_probe_target(
+                        usage, oauth_candidates, (), usage.get(current),
+                        _numeric_probe_cooldown(state.get("probeCooldown")), now,
+                        settings.threshold, settings.weekly_threshold, thresholds,
                     )
+                    if self._models
+                    and _model_window_binds_everywhere(
+                        usage, self._models, settings.threshold,
+                        settings.weekly_threshold, thresholds,
+                    )
+                    else None
                 )
-                return TickOutcome.NO_ACTION
+                if probe_target is not None:
+                    self._last_probe_num = probe_target
+                    dynamic_ordered = [probe_target]
+                else:
+                    # One label per story (item 5): a warm partner not yet
+                    # dwelt on, or a cold one below the floor. T0758:
+                    # `partner is not None` (a perishing candidate, or now
+                    # T0807, a cold one the floor alone already admits) reads
+                    # the same as a warm partner here -- held by dwell, not by
+                    # the floor -- or `below-floor` would blame a bar that
+                    # already admitted it. Nothing can clear
+                    # `_clears_the_landing_floor` while `partner is None`
+                    # (T0807 dropped the giveback ceiling that used to let a
+                    # floor-clearing candidate fall through here as `cold`),
+                    # so `below-floor` alone covers every cold candidate left
+                    # in this branch.
+                    if warm_ordered or partner is not None:
+                        reason = "below-threshold"
+                    elif cold_ordered:
+                        reason = "below-floor"
+                    else:
+                        reason = "below-threshold"
+                    # m1: the active is healthy (not about to wall) here on
+                    # EITHER side of `settings.threshold` -- no `< threshold`
+                    # comparison, which can print a false "95% < 90%".
+                    self._emit(
+                        NoSwitchEvent(
+                            reason=reason,
+                            detail=(
+                                f"active account is healthy ({pct_label(active_headroom)}"
+                                "% headroom, not about to wall)"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
             else:
                 if self._in_cooldown(state):
                     self._emit(NoSwitchEvent(reason="cooldown"))
@@ -3539,6 +3743,9 @@ class AutoSwitchEngine:
                 # legacy escape/no-return heuristics unnecessary. A recovered
                 # higher tier must be able to reclaim work immediately after
                 # the configured cooldown, even when it is the account we left.
+                # Priority never probes: clear the pick a consume-first tick
+                # left, or it would name this switch "probe".
+                self._last_probe_num = None
                 # The overload and refusal bars are not anti-flap: the API is
                 # failing on that account, so they bind here too, and release
                 # on the same escapes as above.
@@ -3602,6 +3809,21 @@ class AutoSwitchEngine:
                         return unbarred
             return ranked
 
+        # The engine's own state, not a fresh read: two-phase commit re-ranks
+        # on later usage but the same tick's cooldown record, so a probe
+        # admitted provisionally and one re-verified on the escalated refetch
+        # can never disagree about which account is in cooldown.
+        #
+        # TYPE-GUARDED like every other state field this file reads back
+        # (`leftHeadroom`'s `isinstance(..., (int, float))`, the explicit
+        # `"leftHeadroom" not in state` probe): a non-dict survives
+        # `... or {}` unchanged when it is truthy (a non-empty list has no
+        # `.get`), and a dict with a non-numeric value (`{"2": null}`)
+        # passes but raises on the comparison below when that key is read.
+        # See `_numeric_probe_cooldown` -- `_perform`'s own write of
+        # `self._last_probe_cooldown` shares this same filter.
+        probe_cooldown = _numeric_probe_cooldown(state.get("probeCooldown"))
+        self._last_probe_cooldown = probe_cooldown
         decided_now = self.clock()
         if dynamic_ordered is not None:
             # Already admitted+ranked above (item 3/4) — never re-enter
@@ -3620,6 +3842,8 @@ class AutoSwitchEngine:
                 active_headroom=active_headroom,
                 settings=settings,
                 now=decided_now,
+                probe_cooldown=probe_cooldown,
+                entries=entries,
                 thresholds=thresholds,
             )
 
@@ -3640,7 +3864,9 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = {
+                num: entry.decision_value(self._models) for num, entry in entries.items()
+            }
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = _dynamic_active_headroom(
                 settings, self._models, usage, current, headroom.get(current),
@@ -3659,6 +3885,8 @@ class AutoSwitchEngine:
                 active_headroom=active_headroom,
                 settings=settings,
                 now=decided_now,
+                probe_cooldown=probe_cooldown,
+                entries=entries,
                 thresholds=thresholds,
             )
 
@@ -3915,6 +4143,9 @@ class AutoSwitchEngine:
                 scale=_ruler(settings),
             ),
         )
+        # The last `_rank`'s probe pick (see `_rank_candidates`'s docstring
+        # for why this is a side channel rather than a 5th tuple field).
+        probe_num = self._last_probe_num
         transient_failure = False
         systemic = ""
         for num in ordered:
@@ -3925,6 +4156,14 @@ class AutoSwitchEngine:
                 # loop runs over every candidate.
                 raise _EngineStopped()
             email = self.switcher.account_email(num)
+            # THE LOGGED TRIGGER, not the tick's classification: every gate
+            # above (cooldown, no-return, landing health) stays keyed on the
+            # real `trigger` ("consume-first"/"dynamic") so this account's
+            # admission is not treated as a different kind of move — only
+            # the switch actually PERFORMED, when it lands on the one
+            # account the ranking admitted for its unknown reset, is named
+            # "probe" for the decision log and the anti-ping-pong record.
+            call_trigger = "probe" if num == probe_num else trigger
             is_priority = priority_mode and num in oauth_candidates
             if trigger in _FRESHEN_GATED_TRIGGERS or is_priority:
                 # The phase-2 refetch is best-effort: the collector refuses
@@ -4024,7 +4263,7 @@ class AutoSwitchEngine:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
                 return self._perform(
-                    num, email, trigger, left_snapshot, switch_detail=overload_detail
+                    num, email, call_trigger, left_snapshot, switch_detail=overload_detail
                 )
             status = self._freshen_target(num, email)
             if self._stop.is_set():
@@ -4067,7 +4306,7 @@ class AutoSwitchEngine:
                 continue
             try:
                 return self._perform(
-                    num, email, trigger, left_snapshot, switch_detail=overload_detail
+                    num, email, call_trigger, left_snapshot, switch_detail=overload_detail
                 )
             except _CandidateDead as exc:
                 if exc.confirmed:
@@ -4532,7 +4771,7 @@ class AutoSwitchEngine:
         # new state.
         left_for_reset = (
             settings.strategy == "dynamic"
-            and state.get("leftTrigger") in CONSUME_FIRST_STRATEGIES
+            and state.get("leftTrigger") in (*CONSUME_FIRST_STRATEGIES, "probe")
         )
         active_at_threshold = (
             active_headroom is not None
@@ -4603,7 +4842,8 @@ class AutoSwitchEngine:
 
         Returns the same four-tuple as ``_rank_candidates``; the last element
         is always False, since this ranking holds and polls rather than
-        waiting on a recovery time.
+        waiting on a recovery time. It never probes: an unknown reset sorts
+        last in its tier rather than being excluded.
         """
         def key(num: str) -> tuple[int, float]:
             reset = _seven_day_reset_ts(usage.get(num), now)
@@ -4644,6 +4884,8 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         now: float,
         overload_backoff: dict[str, float] | None = None,
+        probe_cooldown: dict[str, float] | None = None,
+        entries: dict | None = None,
         # See `_no_return_account`: optional, defaulting to the global line
         # for every account, so a caller without per-account context behaves
         # exactly as this function did before per-account thresholds existed.
@@ -4651,6 +4893,13 @@ class AutoSwitchEngine:
     ) -> tuple[list[str], bool, float | None, bool]:
         """Rank on the configured model window, and once on 5h/7d alone if
         that leaves nothing AND the model window binds everywhere.
+
+        ``self._last_probe_num`` is set (not returned — this method's 4-tuple
+        contract is called directly by tests that predate probing and must
+        not have to learn a 5th field) to the one account this decision
+        admitted past the reset-unknown gate, or ``None``. ``_tick_inner``
+        reads it right after calling this to name the eventual switch
+        "probe" for the decision log; nobody else needs it.
 
         A MODEL WINDOW IS NOT A BLACKOUT — ONLY where it binds everywhere.
         ``self._models`` folds a pinned model's scoped window into every
@@ -4685,6 +4934,8 @@ class AutoSwitchEngine:
             now=now,
             thresholds=thresholds,
             overload_backoff=overload_backoff,
+            probe_cooldown=probe_cooldown,
+            entries=entries,
         )
         # THE PRIMARY PASS RANKS ON `headroom`, WHICH IS ALWAYS MODEL-GATED —
         # so `active_headroom` here must be too, even under `dynamic` where
@@ -4697,10 +4948,11 @@ class AutoSwitchEngine:
         # (current)` is that same widened value's PRE-widen input, so this is
         # a no-op for `best`/`consume-first` (never widened) and only changes
         # `dynamic`'s primary pass.
-        ordered, any_known, active_reset_ts, waiting = self._rank_candidates_pass(
+        ordered, any_known, active_reset_ts, waiting, probe_num = self._rank_candidates_pass(
             models=self._models, headroom=headroom, active_headroom=headroom.get(current), **kw
         )
         if settings.strategy != "dynamic":
+            self._last_probe_num = probe_num
             return ordered, any_known, active_reset_ts, waiting
         result = (ordered, any_known, active_reset_ts, waiting)
         # `dynamic` ONLY. Any strategy with `self._models` set whose
@@ -4724,7 +4976,9 @@ class AutoSwitchEngine:
                 **kw,
             )
             if fb[0]:
-                return fb
+                self._last_probe_num = fb[4]
+                return fb[:4]
+        self._last_probe_num = probe_num
         return result
 
     def _rank_candidates_pass(
@@ -4743,10 +4997,33 @@ class AutoSwitchEngine:
         now: float,
         thresholds: Mapping[str, float] | None = None,
         overload_backoff: dict[str, float] | None = None,
-    ) -> tuple[list[str], bool, float | None, bool]:
+        probe_cooldown: dict[str, float] | None = None,
+        entries: dict | None = None,
+    ) -> tuple[list[str], bool, float | None, bool, str | None]:
         """Filter and rank OAuth candidates for this tick's trigger, on one
-        window set (``models``); pure, no state writes, called at most
-        twice per tick by ``_rank_candidates`` (see its docstring).
+        window set (``models``).
+
+        Returns ``(ordered, any_known, active_reset_ts, waiting_for_recovery,
+        probe_num)`` — ``probe_num`` is the one account (or ``None``) this
+        pass admitted past the reset-unknown gate to learn its reset;
+        ``probe_cooldown`` (account number -> cooldown-until epoch, from the
+        engine's own state file) is the only state this otherwise-pure
+        function reads, mirroring how ``no_return`` already carries a
+        caller-computed decision in rather than reading state itself.
+        Pure — no emits, no state writes — so the consume-first two-phase
+        commit can run it twice per tick: on the stored snapshot to decide
+        provisionally, then on the escalated refetch to re-verify before
+        switching. ``_rank_candidates`` (above) is the entry point every
+        caller uses; it calls this twice at most (see its docstring).
+
+        ``waiting_for_recovery`` is the one thing the caller cannot re-derive
+        without restating four conditions this method already evaluated: an
+        EMPTY ``ordered`` from the at-limit escape means two different things.
+        Either nothing was viable, or the escape ranked on recovery and every
+        peer comes back later than the account we are on — a decision to WAIT,
+        with an end the engine can name. Reported as the same generic block,
+        the second kept the ordinary cadence through a window it had already
+        measured.
         """
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
@@ -4904,11 +5181,13 @@ class AutoSwitchEngine:
             and trigger == "at-limit"
             # A KNOWABLE RETURN FOR THE ACCOUNT WE ARE LEAVING, or there is
             # nothing to rank against. `_binding_recovery_ts` answers `inf` for
-            # unknown AND for already past, so a fleet whose rows have gone
-            # stale makes every recovery `inf` -- `inf >= inf -
-            # RECOVERY_HYSTERESIS_S` then refuses every candidate, and no state
-            # this branch can reach clears it. Waiting is only a choice when
-            # something can say what for.
+            # a reset never reported (the reachable case here; #325 drops a
+            # window whose own reset has already elapsed before this ever
+            # sees it), so a fleet whose rows have gone stale makes every
+            # recovery `inf` -- `inf >= inf - RECOVERY_HYSTERESIS_S` then
+            # refuses every candidate, and no state this branch can reach
+            # clears it. Waiting is only a choice when something can say what
+            # for.
             and active_recovery_ts != float("inf")
             # ONLY THE CANDIDATE SIDE IS ASKED. The active's own headroom is
             # zero here: `at-limit` is set only when the active is at zero.
@@ -4942,6 +5221,17 @@ class AutoSwitchEngine:
         dynamic_at_limit_escape = dynamic_landing and about_to_wall and by_recovery_axis
 
         qualifying: list[tuple[tuple, str]] = []
+        # Candidates otherwise eligible below but held for reset-unknown --
+        # `select_probe_target` (below, after the loop) picks at most one,
+        # so several unknown-reset peers in one tick never race each other
+        # in. Membership here already carries every filter this loop ran
+        # (servability, no-return, landing-health) PLUS `_probe_source_fresh`:
+        # a probe exists to LEARN an unmeasured weekly reset through a live
+        # fetch, so neither a stale store entry (untrustworthy) nor a held
+        # one (`_row_eligible` refuses to fetch it) may ever enter here —
+        # admitted `-inf`, either would sort first in `ordered` and win a
+        # switch this tick can never actually resolve.
+        probe_candidates: list[str] = []
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
@@ -4978,9 +5268,11 @@ class AutoSwitchEngine:
                 # spent candidate while a usable peer exists is what breaks it.
                 #
                 # BOTH RETURNS MUST BE PROVABLE. `_binding_recovery_ts` answers
-                # `inf` for unknown AND for already past, which are opposite
-                # facts: an active whose reset has passed can return at any
-                # moment and must not lose to a peer hours out.
+                # `inf` for a reset never reported -- the reachable case here;
+                # #325 drops a window whose own reset has already elapsed
+                # before this ever sees it, so an active whose reset has
+                # merely passed (and could return at any moment) cannot reach
+                # this call with a known-but-past reset any more.
                 #
                 # `all_above` FIRST. For the escapes it ignores the active, so
                 # an unmeasured one reads `(active_headroom or 0.0)` as spent;
@@ -5130,19 +5422,42 @@ class AutoSwitchEngine:
                     # hysteresis leg above). Left named, not deleted, so a
                     # future authorized round for `dynamic` has the mirror
                     # function ready rather than reinventing it.
-                    if (
-                        trigger in CONSUME_FIRST_STRATEGIES
-                        and not (
-                            dynamic_landing
-                            and _walled_may_take_any_room(about_to_wall, h)
-                        )
-                        and (
-                            reset_ts is None
-                            or active_reset_ts is None
-                            or reset_ts >= active_reset_ts
-                        )
+                    if trigger in CONSUME_FIRST_STRATEGIES and not (
+                        dynamic_landing
+                        and _walled_may_take_any_room(about_to_wall, h)
                     ):
-                        continue
+                        if active_reset_ts is None:
+                            continue
+                        if reset_ts is None:
+                            # UNKNOWN IS NOT DISQUALIFIED — this candidate has
+                            # already cleared every other gate above
+                            # (servable, healthy, not the account we just
+                            # left); only its weekly reset is unmeasured, and
+                            # dropping it here forever is exactly what kept
+                            # it unmeasured: the strategy never activates an
+                            # account it never learns a reset from. Held for
+                            # the single pick after the loop rather than
+                            # queued now — a later candidate in this same
+                            # loop may still turn out healthier, and probing
+                            # is capped at one admission per decision.
+                            #
+                            # The probe is consume-first's BELOW-the-lines case
+                            # only. Every account over its lines ranks on room
+                            # above (an unknown reset sorts last on a room tie)
+                            # and the at-limit wait refuses a return it cannot
+                            # name, so neither reaches this arm.
+                            #
+                            # `select_probe_target` re-applies
+                            # `_seven_day_reset_unmeasured` and the cooldown
+                            # (the shared function both this pass and the
+                            # panel call) -- membership here only needs to be
+                            # fresh enough to admit without risking the
+                            # stale-usage abort below.
+                            if _probe_source_fresh(entries, num, now):
+                                probe_candidates.append(num)
+                            continue
+                        if reset_ts >= active_reset_ts:
+                            continue
                 elif active_headroom is not None:
                     # best, and also dynamic's `proactive` trigger (over
                     # threshold): the candidate must beat the active account
@@ -5299,6 +5614,35 @@ class AutoSwitchEngine:
                     -max(escape_h if escape_h is not None else lh, 0.0),
                 )
             qualifying.append((key, num))
+        # AT MOST ONE PROBE PER DECISION. `select_probe_target` picks the
+        # most LINE headroom among `probe_candidates` (the key's `-lh`, so the
+        # probe is the account the key would order first) -- the shared
+        # function this pass and the "Next best" panel both call, so neither
+        # re-derives the predicate.
+        probe_num = select_probe_target(
+            usage,
+            probe_candidates,
+            models,
+            usage.get(current),
+            probe_cooldown,
+            now,
+            settings.threshold,
+            settings.weekly_threshold,
+            thresholds,
+        )
+        if probe_num is not None:
+            qualifying.append((
+                consume_first_rank_key(
+                    usage.get(probe_num),
+                    thresholds[probe_num],
+                    now,
+                    models,
+                    weekly_threshold=settings.weekly_threshold,
+                    probe=True,
+                    scale=settings.threshold,
+                ),
+                probe_num,
+            ))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying.sort(key=lambda t: t[0])
         ordered = [num for _, num in qualifying]
@@ -5316,7 +5660,7 @@ class AutoSwitchEngine:
             trigger == "at-limit" and by_recovery_axis and not ordered
             and all(headroom.get(n) is not None for n in oauth_candidates)
         )
-        return ordered, any_known, active_reset_ts, waiting
+        return ordered, any_known, active_reset_ts, waiting, probe_num
 
     # -- adaptive usage scheduling ---------------------------------------------
 
@@ -5481,7 +5825,9 @@ class AutoSwitchEngine:
             # under the store lock.
             scheduled=not (stale_candidate_plan or stale_active_plan),
         )
-        usage = {num: entry.decision_value() for num, entry in entries.items()}
+        usage = {
+            num: entry.decision_value(self._models) for num, entry in entries.items()
+        }
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
@@ -5543,7 +5889,9 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = {
+                num: entry.decision_value(self._models) for num, entry in entries.items()
+            }
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
@@ -5601,8 +5949,12 @@ class AutoSwitchEngine:
             # from the same pass the ranking decided on — the recheck must
             # yield to the wall on the SAME reading the gate above did, or
             # the bypass is undone here under the lock.
+            #
+            # "probe" included: it is a consume-first admission (just of an
+            # unknown-reset candidate), and must back off under the same
+            # concurrent-engine race the ordinary consume-first recheck does.
             if (
-                trigger in _COOLDOWN_GATED_TRIGGERS
+                trigger in (*_COOLDOWN_GATED_TRIGGERS, "probe")
                 and not _cooldown_yields_to_the_wall(
                     self.settings.strategy, left[0], self._active_wall
                 )
@@ -5699,6 +6051,48 @@ class AutoSwitchEngine:
                 last_active_at[str(state["lastSwitchFrom"])] = state["lastSwitchAt"]
             last_active_at[str(number)] = state["lastSwitchAt"]
             state["lastActiveAt"] = last_active_at
+            # ANTI-PING-PONG FOR THE PROBE, in the same store as the rest of
+            # this record. Landing HERE, on this account, is itself "being
+            # used" -- whatever cooldown a past probe of it left standing
+            # has already done its job, so it is released unconditionally.
+            # A probe switch then sets a fresh one, so the very next tick
+            # cannot pick the same still-unknown account right back out via
+            # `select_probe_target` -- released early the same way if
+            # anything (a probe or otherwise) switches to it again before
+            # it elapses.
+            #
+            # TYPE-GUARDED: `setdefault` returns the EXISTING value
+            # unchanged when the key is already present but the wrong shape
+            # (a list from a prior corrupt write), and `list.pop(number,
+            # None)` raises `TypeError` (lists only pop by index) — AFTER
+            # `switch_to` above already succeeded, leaving the account
+            # switched with no `lastSwitchAt`/`lastSwitchFrom`/`leftHeadroom`
+            # recorded at all. Replaced rather than trusted, like every
+            # other state field this method writes back.
+            if not isinstance(state.get("probeCooldown"), dict):
+                state["probeCooldown"] = {}
+            probe_cooldown = state["probeCooldown"]
+            probe_cooldown.pop(number, None)
+            if trigger == "probe":
+                probe_cooldown[number] = self.clock() + PROBE_COOLDOWN_S
+            # Refresh the panel's cache HERE too, not only on the next tick's
+            # `_rank_candidates` read: a hand switch (or any other trigger)
+            # that lands on a cooling-down account releases its cooldown on
+            # this same write, and a tick that returns early on `_in_cooldown`
+            # never reaches the other refresh -- leaving the panel naming a
+            # released account as still cooling down, or vice versa.
+            #
+            # TYPE-GUARDED THE SAME WAY as `_rank_candidates`'s read
+            # (`_numeric_probe_cooldown`): this method only pops/sets the
+            # ONE account it just switched to, so a non-numeric entry for
+            # any OTHER account (a hand-edited state file) survives
+            # untouched and would otherwise reach the panel's own
+            # `select_probe_target` call and raise on `None > now`. A
+            # filtered COPY, not `probe_cooldown` itself -- that object IS
+            # `state["probeCooldown"]`, so publishing it unfiltered also
+            # handed the panel's thread a dict this method's own next call
+            # (or the next tick's) can go on mutating in place.
+            self._last_probe_cooldown = _numeric_probe_cooldown(probe_cooldown)
             atomic_write_json(self.state_path, state)
 
         # No explicit `_message_trace_offset` reset here: the switch changes
