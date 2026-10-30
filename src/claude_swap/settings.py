@@ -368,21 +368,21 @@ def load_pin_settings(backup_root: Path) -> PinSettings:
     default = PinSettings()
     if not isinstance(section, dict):
         return default
-    values = {}
-    for json_key, field in (
-        ("desktopFollows", "desktop_follows"),
-        ("connectorsFollowPin", "connectors_follow_pin"),
-    ):
-        fallback = getattr(default, field)
-        value = section.get(json_key, fallback)
-        if not isinstance(value, bool):
-            _logger.warning(
-                "settings.json: pin.%s %r is not true or false; using %r",
-                json_key, value, fallback,
-            )
-            value = fallback
-        values[field] = value
-    return PinSettings(**values)
+    desktop_follows = section.get("desktopFollows", default.desktop_follows)
+    if not isinstance(desktop_follows, bool):
+        _logger.warning(
+            "settings.json: pin.desktopFollows %r is not true or false; using %r",
+            desktop_follows, default.desktop_follows,
+        )
+        desktop_follows = default.desktop_follows
+    connectors = section.get("connectorsFollowPin", default.connectors_follow_pin)
+    if not isinstance(connectors, bool):
+        _logger.warning(
+            "settings.json: pin.connectorsFollowPin %r is not true or false; using %r",
+            connectors, default.connectors_follow_pin,
+        )
+        connectors = default.connectors_follow_pin
+    return PinSettings(desktop_follows=desktop_follows, connectors_follow_pin=connectors)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
