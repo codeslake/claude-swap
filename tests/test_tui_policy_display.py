@@ -275,7 +275,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
 
             plain = app.screen.query_one("#candidates", Static).render().plain
             assert plain.index("user3@example.com") < plain.index("user2@example.com")
-            assert "capped 7d 52% >= 50%" in self._row(plain, "user2@example.com")
+            assert "7d capped" in self._row(plain, "user2@example.com")
 
     async def test_a_session_adjust_moves_only_the_global_line(
         self, tmp_path, fake_engine

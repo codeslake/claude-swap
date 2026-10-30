@@ -842,6 +842,12 @@ class AutoScreen(Screen):
                             tags.append(
                                 Text(f"{blocked_model} full", style=palette.muted)
                             )
+                capped = weekly_capped(acc.policy.weekly_cap, acc.usage.last_good)
+                if capped:
+                    # A weekly cap vetoes the row, so it reads in the status where `<window> full` reads, and replaces
+                    # that label when it names the same window (the stronger claim, not a second one beside it).
+                    tags = [t for t in tags if t.plain != f"{capped[0]} full"]
+                    tags.append(Text(f"{capped[0]} capped", style=palette.sev_warn))
                 statuses[acc.number], tags = Text("  ").join(tags), []  # the status cell ends here, the tag cell starts
                 if acc.disabled:
                     tags.append(Text("auto-swap disabled", style=palette.muted))
@@ -883,15 +889,8 @@ class AutoScreen(Screen):
                         bars.get(acc.number, settings.threshold),
                     )
                 )
-                capped = weekly_capped(acc.policy.weekly_cap, acc.usage.last_good)
                 if capped:
-                    # A veto, not a rank: the engine never lands here.
-                    entry.append(
-                        f"  capped {capped[0]} {capped[1]:.0f}% >= "
-                        f"{acc.policy.weekly_cap:g}%",
-                        style=palette.sev_warn,
-                    )
-                    key = (997.0,)
+                    key = (997.0,)  # behind every row the engine could pick; the tag is in the status cell above
                 ranked.append((key, acc.number))
             # Outside the usage branches on purpose: an account whose usage is
             # unknown still owns the claude.ai side, so the badge must not hang

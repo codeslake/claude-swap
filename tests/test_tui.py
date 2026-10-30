@@ -5723,6 +5723,74 @@ class TestUnswitchableRowsAreListed:
         assert tag > status + len("7d full"), out
         assert rows["open@x.com"] == rows["open@x.com"].rstrip(), out  # nothing after the chips, no trailing pad
 
+    def test_a_weekly_cap_reads_in_the_status_cell_and_moves_no_column(self):
+        """T3093, the owner's report of 2026-10-30: the cap's note (`capped 7d 93% >= 90%`) was appended to the capped row's BODY,
+        after the status cell had closed, so one capped row widened the body column and pushed every row's status cell right. The
+        cap is a status now (`7d capped`, where `7d full` reads) beside the `auto-swap disabled` tag, and with the capped row
+        every status cell starts where it starts without it, at the default width and at 60 columns."""
+        import re
+        from claude_swap.models import AccountPolicy
+        from claude_swap.settings import AutoSwitchSettings
+        from rich.console import Console
+
+        def windows(five, seven):
+            return {"five_hour": {"pct": five}, "seven_day": {"pct": seven}}
+
+        def render(cap):
+            plain = [
+                self._acct(str(n), f"p{n}@x.com", switchable=True, last_good=windows(10.0, 100.0) if n % 2 else windows(100.0, 5.0))
+                for n in (2, 3, 4, 5, 6, 7, 8, 9, 11)  # `7d full` and `5h full`, alternately
+            ]
+            capped = self._acct("10", "cap@x.com", switchable=True, disabled=True, last_good=windows(10.0, 93.0))
+            capped.policy = AccountPolicy(weekly_cap=cap)
+            return self._render(
+                self._snap(self._acct("1", "a@x.com", switchable=True, last_good=windows(50.0, 5.0)), *plain, capped),
+                active="1", settings=AutoSwitchSettings(threshold=90.0, strategy="best"), text=True,
+            )
+
+        def rows(out):
+            return {ln.plain.split()[1]: ln for ln in out.split("\n") if "@x.com" in ln.plain}
+
+        def starts(out):
+            found = {e: re.search(r"7d full|5h full|7d capped", ln.plain) for e, ln in rows(out).items()}
+            return {e: m.start() for e, m in found.items() if m}
+
+        def narrow(out):
+            console = Console(width=60)
+            return {e: " ".join(w.plain for w in ln.wrap(console, 60)) for e, ln in rows(out).items()}
+
+        out, base = render(90.0), render(None)
+        with_cap, without = starts(out), starts(base)
+        assert len(rows(base)) == len(rows(out)) == 10 and len(without) == 9 and len(set(without.values())) == 1, base.plain  # premise
+        assert len(with_cap) == 10 and set(with_cap.values()) == set(without.values()), (with_cap, without, out.plain)
+        row = rows(out)["cap@x.com"].plain
+        assert "7d capped" in row and row.index("auto-swap disabled") > row.index("7d capped"), row
+        assert "93% >= 90%" not in out.plain and "capped 7d" not in out.plain, out.plain
+        # the Static wraps a row wider than the screen; no width branch in `_candidates_text`, so the same rows wrap the same
+        wrapped, wrapped_base = narrow(out), narrow(base)
+        assert {e: v for e, v in wrapped.items() if e != "cap@x.com"} == {e: v for e, v in wrapped_base.items() if e != "cap@x.com"}
+        assert "7d capped" in wrapped["cap@x.com"], wrapped["cap@x.com"]
+
+    def test_the_cap_replaces_the_full_label_of_the_window_it_names(self):
+        """T3093: a 7d window at 100% under a 90% cap would read `7d full  7d capped`; the cap is the stronger claim and
+        replaces the label. The label of another window (`5h full`) stays beside it."""
+        from claude_swap.models import AccountPolicy
+        from claude_swap.settings import AutoSwitchSettings
+
+        def row(five, seven):
+            acct = self._acct("2", "cap@x.com", switchable=True, last_good={"five_hour": {"pct": five}, "seven_day": {"pct": seven}})
+            acct.policy = AccountPolicy(weekly_cap=90.0)
+            out = self._render(
+                self._snap(self._acct("1", "a@x.com", switchable=True), acct),
+                active="1", settings=AutoSwitchSettings(threshold=90.0, strategy="best"),
+            )
+            return next(ln for ln in out.split("\n") if "cap@x.com" in ln)
+
+        full = row(10.0, 100.0)
+        assert "7d capped" in full and "7d full" not in full, full
+        both = row(100.0, 93.0)
+        assert "7d capped" in both and "5h full" in both, both
+
     def test_next_best_percent_columns_align_across_countdown_widths(self):
         """The owner, 2026-09-15 (live auto-switch panel): `5h(⟳3h14m):25%`
         vs `7d(⟳2h4m):100%` -- the countdown's own width varies (`12m`,
