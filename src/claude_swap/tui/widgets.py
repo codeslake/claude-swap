@@ -385,7 +385,7 @@ def spend_row(rows: list[tuple]) -> tuple | None:
 
 
 _MINI_TAG_CAP = 24  # widest "[tag]" a compact row shows, brackets included
-_MINI_NOTE_CAP = 30  # widest note that widens the body column; longer is ellipsized
+_MINI_NOTE_CAP = 30  # widest sentinel label that widens the body column; longer is ellipsized
 _MINI_GAP = "  "
 
 
@@ -395,8 +395,9 @@ class MiniWidths(NamedTuple):
     name: int
     tag: int
     cells: dict[str, int]  # window label -> cell width, in display order
-    note: int  # widest sentinel / "usage unknown" note shown, capped
-    marker: int  # widest "(ahead) (disabled)" marker field shown
+    note: int  # widest note shown: a spend note whole, a sentinel / "usage unknown" note capped
+    marker: int  # widest marker field shown, whichever kinds the rows carry
+    chip: dict[str, int]  # window label -> widest chip label, so its pct starts at one column
 
 
 def _fit(text: Text, width: int) -> Text:
@@ -420,10 +421,18 @@ def _mini_tag(acc: AccountSnapshot, palette: Palette) -> Text:
     return Text.assemble("[", tag, "]", style=palette.muted)
 
 
-def _mini_marks(acc: AccountSnapshot, ahead: bool, palette: Palette) -> Text:
-    """The row's one trailing marker field: ``(ahead)``, ``(disabled)``, then
-    the account's policy badges."""
+def _mini_marks(
+    acc: AccountSnapshot, ahead: bool, cloud_pinned: bool, palette: Palette
+) -> Text:
+    """The row's one trailing marker field: ``(ahead)``, ``○ cloud``,
+    ``(not applying)``, ``(disabled)``, then the account's policy badges."""
     marks = [Text("(ahead)", style=palette.sev_warn)] if ahead else []
+    if cloud_pinned:
+        # Labelled, like the full card: a bare glyph sitting between the
+        # org tag and the usage figures read as decoration, not as a state.
+        marks.append(Text("○ cloud", style=f"bold {palette.sev_warn}"))
+        if pin_is_broken(acc):
+            marks.append(Text("(not applying)", style=f"bold {palette.sev_crit}"))
     if acc.disabled:
         marks.append(Text("(disabled)", style=palette.muted))
     marks.extend(Text(b, style=palette.muted) for b in _policy_badges(acc, ""))
@@ -500,6 +509,10 @@ def _mini_body(
         cell.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
         cell.append(f" · {suffix}", style=palette.muted)
         cells[SPEND_LABEL] = cell
+        if len(cells) == 1:
+            # spend alone is the row's whole usage, like `no plan`: a note, so it starts at
+            # the 5h column and opens no `$$` column for the rows that carry windows
+            return {}, cell, ahead
     # Nothing above rendered — every source `usage_rows` draws from
     # (spend, 5h, 7d, scoped) uses the same truthiness test as the loops
     # above, so `usage_rows` is provably empty here too.
@@ -550,7 +563,9 @@ def mini_widths(
             chip[label] = max(chip.get(label, 0), at)
             rest[label] = max(rest.get(label, 0), cell.cell_len - at)
         if row_note:
-            note = max(note, min(row_note.cell_len, _MINI_NOTE_CAP))
+            # a spend note is the row's whole usage and stays whole, as the spend cell it replaced did
+            whole = row_note.plain.startswith(SPEND_LABEL)
+            note = max(note, row_note.cell_len if whole else min(row_note.cell_len, _MINI_NOTE_CAP))
     # spend is its own cell after every window, wherever it was first seen
     order = sorted(rest, key=lambda label: label == SPEND_LABEL)
     cells = {label: chip[label] + rest[label] for label in order if rest[label]}
