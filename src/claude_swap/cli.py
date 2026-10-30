@@ -142,6 +142,8 @@ Examples:
   cswap pin --set_port N   serve on port N from the next start (0 = dynamic)
   cswap pin --desktop on|off  let the Claude Desktop app's inference follow
                        the account swap (cswap config: pin.desktopFollows)
+  cswap pin --connectors on|off  let claude.ai MCP connectors follow the pinned
+                       account (cswap config: pin.connectorsFollowPin)
   cswap pin --ensure   repair a stale wiring before a launch (rc hooks)
   cswap pin --state    print OK/NOT-OK/UNKNOWN and exit 0, for a monitor
   cswap pin --print-shell-prefix-path  write the opt-in CLAUDE_CODE_SHELL_PREFIX
@@ -205,6 +207,14 @@ Examples:
         help=(
             "Let the Claude Desktop app's inference follow the account swap "
             "(on) or not (off), and print the new state"
+        ),
+    )
+    one_of.add_argument(
+        "--connectors",
+        choices=("on", "off"),
+        help=(
+            "Let claude.ai MCP connectors follow the pinned account (on) or "
+            "not (off), and print the new state"
         ),
     )
     # The launch hook: `--heal` prints its verdict for a human, while this is
@@ -303,6 +313,7 @@ Examples:
                 state=args.state,
                 print_shell_prefix_path=args.print_shell_prefix_path,
                 desktop=args.desktop,
+                connectors=args.connectors,
             )
         )
     except ClaudeSwitchError as e:

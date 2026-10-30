@@ -127,10 +127,13 @@ class UpdateSettings:
 @dataclass(frozen=True)
 class PinSettings:
     """Cloud-pin switches (``pin`` section): ``desktop_follows`` lets the Claude
-    Desktop app's inference follow the account swap. cswap-pin reads it through
-    ``load_pin_settings(backup_dir)``, not by opening the settings files."""
+    Desktop app's inference follow the account swap, ``connectors_follow_pin``
+    lets claude.ai MCP connectors follow the pinned account. cswap-pin reads
+    them through ``load_pin_settings(backup_dir)``, not by opening the settings
+    files."""
 
     desktop_follows: bool = False
+    connectors_follow_pin: bool = False
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -254,6 +257,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "pin", "desktopFollows", "desktop_follows", "bool",
             help="Let the Claude Desktop app's inference follow the account swap (needs the cloud pin)",
+        ),
+        SettingSpec(
+            "pin", "connectorsFollowPin", "connectors_follow_pin", "bool",
+            help="Let claude.ai MCP connectors follow the pinned account (needs the cloud pin)",
         ),
     )
 }
@@ -493,8 +500,15 @@ def load_pin_settings(backup_root: Path) -> PinSettings:
             "settings.json: pin.desktopFollows %r is not true or false; using %r",
             desktop_follows, default.desktop_follows,
         )
-        return default
-    return PinSettings(desktop_follows=desktop_follows)
+        desktop_follows = default.desktop_follows
+    connectors = section.get("connectorsFollowPin", default.connectors_follow_pin)
+    if not isinstance(connectors, bool):
+        _logger.warning(
+            "settings.json: pin.connectorsFollowPin %r is not true or false; using %r",
+            connectors, default.connectors_follow_pin,
+        )
+        connectors = default.connectors_follow_pin
+    return PinSettings(desktop_follows=desktop_follows, connectors_follow_pin=connectors)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:

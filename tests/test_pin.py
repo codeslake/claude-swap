@@ -4554,6 +4554,13 @@ class TestSetShowAndRepinAreThePackagesToRun:
         assert "hunter2" not in cap.out + cap.err, cap
 
 
+# (run kwarg and --flag, settings key, PinSettings field, printed label)
+PIN_SWITCH_FLAGS = [
+    ("desktop", "desktopFollows", "desktop_follows", "Desktop follows"),
+    ("connectors", "connectorsFollowPin", "connectors_follow_pin", "Connectors follow pin"),
+]
+
+
 class TestHealADeadPin:
     """A dead pin must not take the session with it.
 
@@ -4815,13 +4822,13 @@ class TestHealADeadPin:
         # the wrong reason and in the wrong place.)
         def _run(switcher, account, *, clear, heal_only, get_port, get_certdir,
                  set_port, ensure, state, print_shell_prefix_path, everywhere,
-                 desktop):
+                 desktop, connectors):
             seen.update(
                 account=account, clear=clear, heal_only=heal_only,
                 get_port=get_port, get_certdir=get_certdir,
                 set_port=set_port, ensure=ensure, state=state,
                 print_shell_prefix_path=print_shell_prefix_path, everywhere=everywhere,
-                desktop=desktop,
+                desktop=desktop, connectors=connectors,
             )
             return 0
 
@@ -4944,7 +4951,7 @@ class TestHealADeadPin:
             "account": None, "clear": False, "heal_only": True,
             "get_port": False, "get_certdir": False, "set_port": None,
             "ensure": False, "state": False, "print_shell_prefix_path": False,
-            "everywhere": False, "desktop": None,
+            "everywhere": False, "desktop": None, "connectors": None,
         }
 
     def test_get_port_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
@@ -5171,11 +5178,12 @@ class TestHealADeadPin:
                 f"{bad} was accepted as a port"
             )
 
-    def test_desktop_flag_writes_the_key_and_needs_no_package(
-        self, tmp_path, monkeypatch, capsys
+    @pytest.mark.parametrize("flag, key, field, label", PIN_SWITCH_FLAGS)
+    def test_switch_flag_writes_the_key_and_needs_no_package(
+        self, tmp_path, monkeypatch, capsys, flag, key, field, label
     ):
-        """`--desktop on|off` is cswap's own file: the pin reads
-        `{"pin": {"desktopFollows": bool}}` out of settings.json, and the
+        """`--desktop on|off` and `--connectors on|off` are cswap's own file:
+        the pin reads `{"pin": {key: bool}}` out of settings.json, and the
         switch must work in exactly the case a user is fixing the pin."""
         import types
 
@@ -5183,23 +5191,24 @@ class TestHealADeadPin:
         from claude_swap.settings import _read_raw, load_pin_settings, settings_path
 
         def _no_package():
-            raise AssertionError("--desktop resolved the cswap-pin package")
+            raise AssertionError(f"--{flag} resolved the cswap-pin package")
 
         monkeypatch.setattr(pin, "_impl", _no_package)
         monkeypatch.setattr(pin, "_live_impl", _no_package)
         sw = types.SimpleNamespace(backup_dir=tmp_path)
 
-        assert pin.run(sw, None, desktop="on") == 0
-        assert capsys.readouterr().out.strip() == "Desktop follows: on"
-        assert _read_raw(settings_path(tmp_path))["pin"] == {"desktopFollows": True}
-        assert load_pin_settings(tmp_path).desktop_follows is True
+        assert pin.run(sw, None, **{flag: "on"}) == 0
+        assert capsys.readouterr().out.strip() == f"{label}: on"
+        assert _read_raw(settings_path(tmp_path))["pin"] == {key: True}
+        assert getattr(load_pin_settings(tmp_path), field) is True
 
-        assert pin.run(sw, None, desktop="off") == 0
-        assert capsys.readouterr().out.strip() == "Desktop follows: off"
-        assert load_pin_settings(tmp_path).desktop_follows is False
+        assert pin.run(sw, None, **{flag: "off"}) == 0
+        assert capsys.readouterr().out.strip() == f"{label}: off"
+        assert getattr(load_pin_settings(tmp_path), field) is False
 
-    def test_desktop_flag_reports_an_unwritable_settings_file(
-        self, tmp_path, monkeypatch, capsys
+    @pytest.mark.parametrize("flag, key, field, label", PIN_SWITCH_FLAGS)
+    def test_switch_flag_reports_an_unwritable_settings_file(
+        self, tmp_path, monkeypatch, capsys, flag, key, field, label
     ):
         import types
 
@@ -5208,23 +5217,23 @@ class TestHealADeadPin:
 
         settings_path(tmp_path).write_text("{not json")
         sw = types.SimpleNamespace(backup_dir=tmp_path)
-        assert pin.run(sw, None, desktop="on") == 1
+        assert pin.run(sw, None, **{flag: "on"}) == 1
         out, err = capsys.readouterr()
-        assert "Desktop follows" not in out
+        assert label not in out
         assert "not valid JSON" in err, err
 
         def _read_only(*_a, **_k):
             raise OSError("read-only file system")
 
         monkeypatch.setattr("claude_swap.settings.set_setting", _read_only)
-        assert pin.run(sw, None, desktop="off") == 1
+        assert pin.run(sw, None, **{flag: "off"}) == 1
         assert "read-only file system" in capsys.readouterr().err
 
-    def test_bare_pin_also_prints_whether_desktop_follows(
+    def test_bare_pin_also_prints_whether_each_switch_follows(
         self, tmp_path, monkeypatch, capsys
     ):
-        """One line from cswap's own settings read, after the package's status,
-        for the bare show only (a NUM|EMAIL pin does not print it)."""
+        """Two lines from cswap's own settings read, after the package's status,
+        for the bare show only (a NUM|EMAIL pin does not print them)."""
         import types
 
         from claude_swap import pin
@@ -5240,17 +5249,21 @@ class TestHealADeadPin:
 
         assert pin.run(sw, None) == 7
         assert capsys.readouterr().out.splitlines() == [
-            "Pinned: 1 (a@b.c)", "Desktop follows: off"
+            "Pinned: 1 (a@b.c)", "Desktop follows: off", "Connectors follow pin: off"
         ]
         set_setting(tmp_path, "pin.desktopFollows", "on")
+        set_setting(tmp_path, "pin.connectorsFollowPin", "on")
         assert pin.run(sw, None) == 7
         assert capsys.readouterr().out.splitlines() == [
-            "Pinned: 1 (a@b.c)", "Desktop follows: on"
+            "Pinned: 1 (a@b.c)", "Desktop follows: on", "Connectors follow pin: on"
         ]
         assert pin.run(sw, "2") == 7
         assert capsys.readouterr().out == "Pinned: 1 (a@b.c)\n"
 
-    def test_the_cli_takes_desktop_on_or_off_and_nothing_else(self, monkeypatch):
+    @pytest.mark.parametrize("flag", [f[0] for f in PIN_SWITCH_FLAGS])
+    def test_the_cli_takes_the_switch_flag_on_or_off_and_nothing_else(
+        self, monkeypatch, flag
+    ):
         from claude_swap import cli
 
         monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: object())
@@ -5259,14 +5272,14 @@ class TestHealADeadPin:
         seen = []
         monkeypatch.setattr(
             "claude_swap.pin.run",
-            lambda sw, account, **kw: seen.append(kw["desktop"]) or 0)
+            lambda sw, account, **kw: seen.append(kw[flag]) or 0)
         for value in ("on", "off"):
             with pytest.raises(SystemExit) as exc:
-                cli._pin_command(["--desktop", value])
+                cli._pin_command([f"--{flag}", value])
             assert exc.value.code == 0
         assert seen == ["on", "off"]
         with pytest.raises(SystemExit) as exc:
-            cli._pin_command(["--desktop", "maybe"])
+            cli._pin_command([f"--{flag}", "maybe"])
         assert exc.value.code == 2
 
     def test_the_cli_forwards_the_port_flags_and_ensure(self):
@@ -11438,7 +11451,7 @@ class TestAskSwallowsThePackagesOwnExceptions:
 class TestThePinFlagsAreMutuallyExclusive:
     """`cswap pin` takes exactly one of NUM|EMAIL / --clear / --heal /
     --get_port / --get_certdir / --set_port / --ensure / --state /
-    --print-shell-prefix-path / --desktop.
+    --print-shell-prefix-path / --desktop / --connectors.
 
     Every pair has to be refused, and refused with an exit code a shell can
     branch on. A query that silently discarded an action would be
@@ -11448,7 +11461,7 @@ class TestThePinFlagsAreMutuallyExclusive:
     ONE_OF = (["2"], ["--clear"], ["--heal"], ["--get_port"],
               ["--get_certdir"], ["--set_port", "5"], ["--ensure"],
               ["--state"], ["--print-shell-prefix-path"],
-              ["--desktop", "on"])
+              ["--desktop", "on"], ["--connectors", "on"])
 
     def test_every_pair_is_refused(self):
         import itertools

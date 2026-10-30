@@ -3163,6 +3163,13 @@ def contended_fake_engine(monkeypatch):
     return _ContendedFakeEngine
 
 
+# (key, settings key, PinSettings field, summary text) of the Auto view's pin switches
+PIN_TOGGLES = [
+    ("d", "desktopFollows", "desktop_follows", "desktop follows"),
+    ("o", "connectorsFollowPin", "connectors_follow_pin", "connectors follow pin"),
+]
+
+
 @pytest.mark.asyncio
 class TestAutoScreen:
     async def _open(self, pilot):
@@ -3641,8 +3648,9 @@ class TestAutoScreen:
             await pilot.pause()
             assert screen._settings.threshold == 50.0  # spec's lower bound
 
-    async def test_d_flips_the_files_desktop_follows_and_shows_it(
-        self, tmp_path, fake_engine
+    @pytest.mark.parametrize("key, json_key, field, text", PIN_TOGGLES)
+    async def test_pin_toggle_flips_the_files_value_and_shows_it(
+        self, tmp_path, fake_engine, key, json_key, field, text
     ):
         """Persisted (the pin is another process), and it flips what the FILE
         holds now, not the value read at mount or the last one this key wrote."""
@@ -3652,7 +3660,7 @@ class TestAutoScreen:
         from textual.widgets import RichLog, Static
 
         path = tmp_path / "settings.json"
-        path.write_text(_json.dumps({"schemaVersion": 1, "pin": {"desktopFollows": True}}))
+        path.write_text(_json.dumps({"schemaVersion": 1, "pin": {json_key: True}}))
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
         )
@@ -3661,24 +3669,25 @@ class TestAutoScreen:
             await self._open(pilot)
             screen = app.screen
             summary = screen.query_one("#auto-summary", Static)
-            assert "desktop follows on" in summary.render().plain
-            await pilot.press("d")
+            assert f"{text} on" in summary.render().plain
+            await pilot.press(key)
             await pilot.pause()
-            assert load_pin_settings(tmp_path).desktop_follows is False
-            assert "desktop follows off" in summary.render().plain
-            await pilot.press("d")
+            assert getattr(load_pin_settings(tmp_path), field) is False
+            assert f"{text} off" in summary.render().plain
+            await pilot.press(key)
             await pilot.pause()
-            assert load_pin_settings(tmp_path).desktop_follows is True
+            assert getattr(load_pin_settings(tmp_path), field) is True
             # `cswap pin --desktop off` ran meanwhile: the next press flips THAT.
-            path.write_text(_json.dumps({"schemaVersion": 1, "pin": {"desktopFollows": False}}))
-            await pilot.press("d")
+            path.write_text(_json.dumps({"schemaVersion": 1, "pin": {json_key: False}}))
+            await pilot.press(key)
             await pilot.pause()
-            assert load_pin_settings(tmp_path).desktop_follows is True
+            assert getattr(load_pin_settings(tmp_path), field) is True
             log = screen.query_one("#event-log", RichLog)
-            assert any("desktop follows on" in ln.text for ln in log.lines)
+            assert any(f"{text} on" in ln.text for ln in log.lines)
 
-    async def test_d_reports_a_failed_save_and_keeps_the_old_state(
-        self, tmp_path, fake_engine, monkeypatch
+    @pytest.mark.parametrize("key, json_key, field, text", PIN_TOGGLES)
+    async def test_pin_toggle_reports_a_failed_save_and_keeps_the_old_state(
+        self, tmp_path, fake_engine, monkeypatch, key, json_key, field, text
     ):
         import json as _json
 
@@ -3688,7 +3697,7 @@ class TestAutoScreen:
             raise OSError("read-only")
 
         (tmp_path / "settings.json").write_text(
-            _json.dumps({"schemaVersion": 1, "pin": {"desktopFollows": True}})
+            _json.dumps({"schemaVersion": 1, "pin": {json_key: True}})
         )
         monkeypatch.setattr("claude_swap.settings.set_setting", _boom)
         fake = FakeSwitcher(
@@ -3701,11 +3710,11 @@ class TestAutoScreen:
             monkeypatch.setattr(
                 app.screen, "notify", lambda msg, **kw: notes.append(msg)
             )
-            await pilot.press("d")
+            await pilot.press(key)
             await pilot.pause()
             assert len(notes) == 1 and "read-only" in notes[0]
             summary = app.screen.query_one("#auto-summary", Static)
-            assert "desktop follows on" in summary.render().plain
+            assert f"{text} on" in summary.render().plain
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         import json as _json

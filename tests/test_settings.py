@@ -346,44 +346,68 @@ class TestUpdateSettings:
         assert "updates" not in _local_data(tmp_path)
 
 
+@pytest.fixture(
+    params=[
+        ("pin.desktopFollows", "desktopFollows", "desktop_follows"),
+        ("pin.connectorsFollowPin", "connectorsFollowPin", "connectors_follow_pin"),
+    ],
+    ids=lambda p: p[1],
+)
+def pin_switch(request):
+    """(dotted key, JSON key, PinSettings field) of one pin switch."""
+    return request.param
+
+
 class TestPinSettings:
-    def test_missing_file_defaults_off(self, tmp_path: Path):
-        assert load_pin_settings(tmp_path) == PinSettings(desktop_follows=False)
+    def test_missing_file_defaults_off(self, tmp_path: Path, pin_switch):
+        assert load_pin_settings(tmp_path) == PinSettings()
+        assert getattr(PinSettings(), pin_switch[2]) is False
 
-    def test_reads_true(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(
-            json.dumps({"pin": {"desktopFollows": True}})
-        )
-        assert load_pin_settings(tmp_path).desktop_follows is True
+    def test_reads_true(self, tmp_path: Path, pin_switch):
+        _, key, field = pin_switch
+        settings_path(tmp_path).write_text(json.dumps({"pin": {key: True}}))
+        assert getattr(load_pin_settings(tmp_path), field) is True
 
-    def test_non_boolean_falls_back_to_default(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(
-            json.dumps({"pin": {"desktopFollows": "yes"}})
-        )
-        assert load_pin_settings(tmp_path).desktop_follows is False
+    def test_non_boolean_falls_back_to_default(self, tmp_path: Path, pin_switch):
+        _, key, field = pin_switch
+        settings_path(tmp_path).write_text(json.dumps({"pin": {key: "yes"}}))
+        assert getattr(load_pin_settings(tmp_path), field) is False
 
     def test_non_dict_section_loads_as_off(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({"pin": True}))
-        assert load_pin_settings(tmp_path) == PinSettings(desktop_follows=False)
+        assert load_pin_settings(tmp_path) == PinSettings()
 
-    def test_set_and_unset_round_trip_the_on_disk_shape(self, tmp_path: Path):
+    def test_set_and_unset_round_trip_the_on_disk_shape(
+        self, tmp_path: Path, pin_switch
+    ):
         """The key name round-trips; cswap-pin reads it through load_pin_settings."""
         from claude_swap.settings import _read_raw
 
-        assert set_setting(tmp_path, "pin.desktopFollows", "on") is True
-        assert _read_raw(settings_path(tmp_path))["pin"] == {"desktopFollows": True}
-        assert load_pin_settings(tmp_path).desktop_follows is True
-        assert set_setting(tmp_path, "pin.desktopFollows", "off") is False
-        assert load_pin_settings(tmp_path).desktop_follows is False
-        assert unset_setting(tmp_path, "pin.desktopFollows") is True
+        dotted, key, field = pin_switch
+        assert set_setting(tmp_path, dotted, "on") is True
+        assert _read_raw(settings_path(tmp_path))["pin"] == {key: True}
+        assert getattr(load_pin_settings(tmp_path), field) is True
+        assert set_setting(tmp_path, dotted, "off") is False
+        assert getattr(load_pin_settings(tmp_path), field) is False
+        assert unset_setting(tmp_path, dotted) is True
         assert "pin" not in _read_raw(settings_path(tmp_path))
 
-    def test_listed_with_its_default_and_set_flag(self, tmp_path: Path):
+    def test_listed_with_its_default_and_set_flag(self, tmp_path: Path, pin_switch):
+        dotted = pin_switch[0]
         row = {s.dotted: (v, is_set) for s, v, is_set in effective_settings(tmp_path)}
-        assert row["pin.desktopFollows"] == (False, False)
-        set_setting(tmp_path, "pin.desktopFollows", "true")
+        assert row[dotted] == (False, False)
+        set_setting(tmp_path, dotted, "true")
         row = {s.dotted: (v, is_set) for s, v, is_set in effective_settings(tmp_path)}
-        assert row["pin.desktopFollows"] == (True, True)
+        assert row[dotted] == (True, True)
+
+
+def test_a_mistyped_pin_switch_leaves_the_other_as_read(tmp_path: Path):
+    """One bad value must not turn off the switch the owner set."""
+    path = settings_path(tmp_path)
+    path.write_text(json.dumps({"pin": {"desktopFollows": True, "connectorsFollowPin": 1}}))
+    assert load_pin_settings(tmp_path) == PinSettings(desktop_follows=True)
+    path.write_text(json.dumps({"pin": {"desktopFollows": "x", "connectorsFollowPin": True}}))
+    assert load_pin_settings(tmp_path) == PinSettings(connectors_follow_pin=True)
 
 
 class TestSettingSpecs:
