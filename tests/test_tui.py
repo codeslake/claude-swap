@@ -918,13 +918,12 @@ class TestUsageRows:
 
         now = time.time()
         last_good = {"five_hour": {"pct": 0.0}}  # no resets_at at all
-        row = usage_rows(last_good, now)[0]
-        assert row[2] == "resets 5h", row
-        assert row[3] == "resets 5h", row
+        # #199 (owner: a 5h window at 0% is not running, so it draws no row until its first use): nothing is drawn for a reset to be unknown about
+        assert usage_rows(last_good, now) == []
 
         entry = UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
-        assert "resets 5h" in card, card
+        assert "5h" not in card, card
         assert "reset unknown" not in card, card
 
     def test_active_cards_5h_row_reads_refetching_not_a_stale_100pct_reset(self):
@@ -1076,7 +1075,8 @@ class TestMiniAccountText:
             last_good={"five_hour": {"pct": 0.0}}, fetched_at=now, age_s=0.0,
         )
         acc = make_account(1, entry=entry)
-        assert "5h(⟳5h00m):  0%" in mini_account_text(acc, now).plain  # 0%: right-aligned, width 3
+        # #199 (owner: a 5h window at 0% is not running, so it draws no chip until its first use): no chip, so no `⟳?` and no countdown
+        assert "5h" not in mini_account_text(acc, now).plain
 
     def test_a_live_5h_window_with_no_reported_reset_keeps_unknown_marker_on_the_dashboard(
         self,
@@ -6145,7 +6145,9 @@ class TestUnswitchableRowsAreListed:
                 "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
             }),
         ), active="1")
-        assert "5h(⟳5h00m):0%" in out, out
+        # #199 (owner: a 5h window at 0% is not running, so it draws no chip until its first use): the Next-best row has no 5h chip, so no `⟳5h00m`, no `⟳?` and no `reset unknown` for it
+        assert "5h" not in out, out
+        assert "reset unknown" not in out, out
         assert "7d(⟳?):0%" in out, out
 
     def test_a_live_5h_window_with_no_reported_reset_keeps_unknown_marker(self):

@@ -181,7 +181,7 @@ def test_a_running_window_still_renders(shape):
     assert [label for label, *_ in widgets.usage_rows(got, now)] == ["5h", "7d", "Fable"]
     assert _format_usage_lines(got)[0].startswith("5h:")
     assert menubar.usage_summary(got, now).startswith("5h 10%")
-    assert ":10%" in widgets.mini_account_text(_snapshot(got), now).plain
+    assert ": 10%" in widgets.mini_account_text(_snapshot(got), now).plain  # #425: the pct is right-aligned to width 3
     assert tui_data.window_pct(got, "five_hour") == 10.0
     assert "5h 10% · 7d 29%" in menubar.format_title(
         "a@x.com", got, menubar.MenuBarSettings(title_pct="both"), now
@@ -238,7 +238,7 @@ def test_a_429_on_a_no_5h_account_marks_its_binding_window(store, shape):
     # A guess lifts with the mark, not at the real reset days away.
     assert value["seven_day"]["resets_at"] == usage_store._reset_ts_to_resets_at(entry.walled_until)
     assert poll_policy.limiting_reset_ts(value) == pytest.approx(entry.walled_until, abs=1)
-    assert _describe(value) == "7d 100% · Fable 0%"
+    assert _describe(value) == "7d 100% · Fable 0% (7d full)"  # #323: a block label names its window
     assert oauth.binding_window_label(value, ("all",)) == "7d"
     # Nothing 5h-shaped sets the span, not even a phantom reset an hour out.
     assert store.entries(IDENT)["1"].walled_until == pytest.approx(

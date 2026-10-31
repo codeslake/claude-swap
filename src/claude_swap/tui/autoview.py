@@ -579,7 +579,7 @@ class AutoScreen(Screen):
                 or (data.is_no_plan(acc) and acc.number not in ordered_rank)
             ):
                 continue
-            row_windows[acc.number] = oauth.relevant_windows(acc.usage.last_good, models)
+            row_windows[acc.number] = oauth.relevant_windows(oauth.display_usage(acc.usage.last_good), models)  # #199: no chip for a 5h window that is not running
         # The column set is the union of window names over every chip row, in
         # first-seen order; a row without a window gets a blank cell, so no
         # later column moves. (label text, pct text, `(line X%)` note) widths per
