@@ -79,7 +79,7 @@ class AutoSwitchSettings:
     cache_ttl_seconds: float = 3600.0
     # `dynamic` only: the least headroom a COLD candidate needs to be worth
     # the re-write cost (measured: one cold landing cost ~19 5h-points on a
-    # 19-session fleet).
+    # 19-session fleet). The Ultra (Max 20x) figure; a Max 5x account pays 4x it.
     cold_switch_cost_pct: float = 20.0
     # `dynamic` only: how long a healthy active is held before rotating to a
     # warm partner, so both accounts' caches stay inside `cache_ttl_seconds`.
@@ -208,7 +208,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "coldSwitchCostPct", "cold_switch_cost_pct", "float", 0.0, 100.0,
-            help="dynamic: headroom a cold candidate needs to be admitted",
+            help="dynamic: headroom a cold candidate needs to be admitted (Ultra figure, x4 on Max 5x)",
         ),
         SettingSpec(
             "autoswitch", "alternationChunkSeconds", "alternation_chunk_seconds",

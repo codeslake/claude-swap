@@ -10,6 +10,7 @@ The 5h-removed accounts are real captures (slots 7 and 8, 2026-10-31).
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import time
 from datetime import datetime, timedelta, timezone
@@ -24,7 +25,7 @@ from claude_swap.autoswitch import (
     TickOutcome,
     _cold_landing_cost_pct,
 )
-from tests.test_autoswitch import EngineHarness, _iso_at
+from tests.test_autoswitch import EngineHarness, _entry_for, _iso_at
 
 FIXTURES = Path(__file__).parent / "fixtures"
 DAY = 86400.0
@@ -87,12 +88,20 @@ def _track(h: EngineHarness, *, anchor: float, rise: float = 0.0, ran: bool = Fa
     })
 
 
-def _tick(h: EngineHarness, usage: dict, advance: float = 360.0) -> TickOutcome:
+def _tick(
+    h: EngineHarness, usage: dict, advance: float = 360.0, plans: dict | None = None
+) -> TickOutcome:
     """One tick on a NEW engine, as every `cswap auto --once` run (and the first
-    tick after a restart) is: nothing but the state file carries over."""
+    tick after a restart) is: nothing but the state file carries over. ``plans``
+    (account number -> plan label) stamps each store entry's plan."""
     h.clock.advance(advance)
     h.engine = h._make_engine()
-    return h.tick_with_usage(usage)
+    if plans is None:
+        return h.tick_with_usage(usage)
+    return h.tick_with_entries({
+        n: dataclasses.replace(_entry_for(v, h.clock.now), plan=plans.get(n))
+        for n, v in usage.items()
+    })
 
 
 def _reasons(h: EngineHarness) -> list[str]:
@@ -295,6 +304,19 @@ def test_the_cost_is_charged_to_the_7d_when_there_is_no_5h_window():
     assert _cold_landing_cost_pct(None, 20.0) == 20.0  # unreadable: the conservative figure
 
 
+def test_the_cost_is_the_ultra_figure_and_four_times_that_on_max_5x():
+    five = _u(10.0, 85.0)
+    removed = _capture("usage_removed_5h_slot7.json", 85.0)
+    assert _cold_landing_cost_pct(five, 7.0, "Ultra") == 7.0
+    assert _cold_landing_cost_pct(five, 7.0, "Max 5x") == 28.0
+    assert _cold_landing_cost_pct(five, 7.0, None) == 7.0
+    # a tier-less "Max" blob scales 1.0 (undercharged if it is really 5x), as does Pro
+    assert _cold_landing_cost_pct(five, 7.0, "Max") == _cold_landing_cost_pct(five, 7.0, "Pro") == 7.0
+    # the plan scale comes first, the no-5h ratio after it
+    assert _cold_landing_cost_pct(removed, 7.0, "Max 5x") == pytest.approx(28.0 / 4.4)
+    assert _cold_landing_cost_pct(removed, 7.0, "Ultra") == pytest.approx(7.0 / 4.4)
+
+
 @pytest.mark.parametrize(
     "candidate, warm, cost, expect_switch",
     [
@@ -324,6 +346,29 @@ def test_a_cold_landing_on_a_removed_5h_account_is_priced_in_7d(
     _stamp(h, **{"1": chunk + 360.0, **({"2": 120.0} if warm else {})})
     outcome = _tick(h, {"1": _u(30.0), "2": copy.deepcopy(candidate), "3": _u(100.0, 100.0)})
     assert (outcome is TickOutcome.SWITCHED) is expect_switch
+
+
+@pytest.mark.parametrize(
+    "five, expect_switch",
+    [
+        (20.0, False),   # 5h points: 28 - 7 = 21 < step + 3
+        (None, True),    # 7d points: 28 - 7 / 4.4 = 26.4 >= 23
+    ],
+    ids=["running-5h", "removed-5h"],
+)
+def test_the_cold_charge_lands_on_a_pinned_model_window_in_the_unit_the_5h_picks(
+    temp_home, five, expect_switch
+):
+    """The Fable window binds the partner (72%, room 28); the charge lands on it,
+    in 5h points while a 5h window runs and at the 7d ratio once it is gone."""
+    h = _harness(temp_home, cold_switch_cost_pct=7.0, model="Fable")
+    _stamp(h, **{"1": 60.0})
+    _track(h, anchor=0.0)
+    fable = {**_u(five, 20.0), "scoped": [{"name": "Fable", "pct": 72.0}]}
+    outcome = _tick(h, {"1": _u(40.0), "2": fable, "3": _u(100.0, 100.0)})
+    assert (outcome is TickOutcome.SWITCHED) is expect_switch
+    if not expect_switch:
+        assert _reasons(h) == ["below-floor"]
 
 
 def test_the_walled_escape_does_not_call_a_spent_warm_removed_5h_partner_qualified(temp_home):

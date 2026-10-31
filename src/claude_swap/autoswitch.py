@@ -330,12 +330,21 @@ def _is_warm(number: str, last_active_at: dict, now: float, cache_ttl_seconds: f
     return ts is not None and (now - ts) < cache_ttl_seconds
 
 
-# `cold_switch_cost_pct` is measured in 5h points. An account with no 5h window
-# pays a cold landing on its 7d, which is this many times a 5h window's budget
-# (the replay's median 7d units per 1% over its 5h units per 1%: 9.06M / 2.08M,
-# alternation-replay.md, "Calibration"). The same ratio stands in for a pinned
-# model's weekly window, whose budget is not reported.
+# The charge lands on `floor_headroom`, so a pinned model's scoped window can
+# bind it. Only the unit is chosen by windows, and by the 5h alone
+# (`_has_no_five_hour` reads no model window): 5h points where one exists, else
+# 7d points, this many times a 5h window's budget (the replay's median 7d units
+# per 1% over its 5h units per 1%: 9.06M / 2.08M, alternation-replay.md,
+# "Calibration"). A scoped window is charged at that 7d ratio until its own is
+# measured.
 WEEKLY_OVER_FIVE_HOUR = 4.4
+
+# `cold_switch_cost_pct` is the Ultra (Max 20x) figure; a Max 5x account has a
+# quarter of the budget, so the same landing is 4x the percent (the replay's
+# `--big-x 0.25`).
+# shortcut: a tier-less "Max" label scales 1.0 (undercharged if it is really 5x),
+# upgrade when such a blob is seen.
+_PLAN_COST_SCALE = {"Max 5x": 4.0}
 
 
 def _has_no_five_hour(usage: dict | str | None) -> bool:
@@ -346,12 +355,16 @@ def _has_no_five_hour(usage: dict | str | None) -> bool:
     return bool(windows) and all(label != oauth.FIVE_HOUR_LABEL for label, _, _ in windows)
 
 
-def _cold_landing_cost_pct(usage: dict | str | None, cost_pct: float) -> float:
+def _cold_landing_cost_pct(
+    usage: dict | str | None, cost_pct: float, plan: str | None = None
+) -> float:
     """Headroom a cold landing eats on this account's binding window, in that
-    window's own percent. ``cost_pct`` (``cold_switch_cost_pct``) is 5h points,
-    charged as it stands wherever a 5h window exists. With none it is charged
-    to the 7d, never to nothing, converted by ``WEEKLY_OVER_FIVE_HOUR``. The
-    same figure is the bare floor a WARM candidate must clear, never 0."""
+    window's own percent. ``cost_pct`` (``cold_switch_cost_pct``) is Ultra 5h
+    points, scaled by the account's ``plan`` (``_PLAN_COST_SCALE``) and charged
+    as it stands wherever a 5h window exists. With none it is charged to the
+    7d, never to nothing, converted by ``WEEKLY_OVER_FIVE_HOUR``. The same
+    figure is the bare floor a WARM candidate must clear, never 0."""
+    cost_pct *= _PLAN_COST_SCALE.get(plan, 1.0)
     return cost_pct / WEEKLY_OVER_FIVE_HOUR if _has_no_five_hour(usage) else cost_pct
 
 
@@ -2667,9 +2680,12 @@ class AutoSwitchEngine:
 
         # What a cold landing eats and the bare floor a warm one must clear
         # (the same figure), per account: 5h points where a 5h window exists,
-        # 7d points where not.
+        # 7d points where not, scaled by the account's plan.
         def _cold_cost(n: str) -> float:
-            return _cold_landing_cost_pct(usage.get(n), settings.cold_switch_cost_pct)
+            return _cold_landing_cost_pct(
+                usage.get(n), settings.cold_switch_cost_pct,
+                getattr(entries.get(n), "plan", None),
+            )
 
         def _dynamic_rank(cands, hroom, at_now, active_h):
             recovered = self._left_account_recovered(
