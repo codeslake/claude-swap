@@ -23,7 +23,6 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     _cold_landing_cost_pct,
-    _warm_landing_floor_pct,
 )
 from tests.test_autoswitch import EngineHarness, _iso_at
 
@@ -89,7 +88,10 @@ def _track(h: EngineHarness, *, anchor: float, rise: float = 0.0, ran: bool = Fa
 
 
 def _tick(h: EngineHarness, usage: dict, advance: float = 360.0) -> TickOutcome:
+    """One tick on a NEW engine, as every `cswap auto --once` run (and the first
+    tick after a restart) is: nothing but the state file carries over."""
     h.clock.advance(advance)
+    h.engine = h._make_engine()
     return h.tick_with_usage(usage)
 
 
@@ -291,8 +293,6 @@ def test_the_cost_is_charged_to_the_7d_when_there_is_no_5h_window():
     assert _cold_landing_cost_pct(idle, 20.0) == 20.0  # an idle 5h window is still a window
     assert _cold_landing_cost_pct(removed, 20.0) == pytest.approx(20.0 / 4.4)
     assert _cold_landing_cost_pct(None, 20.0) == 20.0  # unreadable: the conservative figure
-    assert _warm_landing_floor_pct(five, 20.0) == 20.0
-    assert _warm_landing_floor_pct(removed, 20.0) == 0.0  # warm pays no re-write
 
 
 @pytest.mark.parametrize(
@@ -300,13 +300,20 @@ def test_the_cost_is_charged_to_the_7d_when_there_is_no_5h_window():
     [
         # a large-context landing (cost 80 5h-points = 18.2 7d-points) on 15 points of 7d room
         (_capture("usage_removed_5h_slot7.json", 85.0), False, 80.0, False),
-        (_capture("usage_removed_5h_slot7.json", 85.0), True, 80.0, True),
+        # warm pays the same figure as its floor (never 0), so 15 < 18.2 is refused too
+        (_capture("usage_removed_5h_slot7.json", 85.0), True, 80.0, False),
+        # 20 points of room: warm clears 18.2, cold does not clear 18.2 + 3
+        (_capture("usage_removed_5h_slot7.json", 80.0), True, 80.0, True),
+        (_capture("usage_removed_5h_slot7.json", 80.0), False, 80.0, False),
         # the default cost is 4.5 7d-points: T3113's case, 15 - 4.5 clears the wall
         (_capture("usage_removed_5h_slot7.json", 85.0), False, 20.0, True),
         # the same 7d room behind a live 5h window keeps today's refusal
         (_u(10.0, 85.0), False, 20.0, False),
     ],
-    ids=["large-cold-removed", "large-warm-removed", "default-cold-removed", "default-cold-live-5h"],
+    ids=[
+        "large-cold-removed", "large-warm-removed", "large-warm-removed-roomy",
+        "large-cold-removed-roomy", "default-cold-removed", "default-cold-live-5h",
+    ],
 )
 def test_a_cold_landing_on_a_removed_5h_account_is_priced_in_7d(
     temp_home, candidate, warm, cost, expect_switch
@@ -319,6 +326,23 @@ def test_a_cold_landing_on_a_removed_5h_account_is_priced_in_7d(
     assert (outcome is TickOutcome.SWITCHED) is expect_switch
 
 
+def test_the_walled_escape_does_not_call_a_spent_warm_removed_5h_partner_qualified(temp_home):
+    """The walled escape drops a cold peer once a QUALIFIED warm partner exists.
+    A warm no-5h account with 4 points of room does not qualify (its floor is the
+    cold figure in its own window, 20 / 4.4 = 4.5, not 0), so the cold peer with
+    15 points that resets sooner is still taken, as it was before the step."""
+    h = _harness(temp_home, model="Fable", threshold=70.0, alternation_chunk_pct=0.0)
+    _stamp(h, **{"2": 120.0})
+    fable = lambda pct, reset=None: [{"name": "Fable", "pct": pct, **({"resets_at": reset} if reset else {})}]  # noqa: E731
+    outcome = _tick(h, {
+        "1": {**_u(30.0, 40.0), "scoped": fable(100.0)},            # walled on Fable
+        "2": {"seven_day": {"pct": 96.0}, "scoped": fable(10.0)},   # warm, no 5h, room 4
+        "3": {**_u(5.0, 10.0), "scoped": fable(85.0, _iso_at(h.clock.now + 3960.0))},  # cold, room 15
+    })
+    assert outcome is TickOutcome.SWITCHED
+    assert h.active_number() == 3
+
+
 # -- planning the forced cold landing ------------------------------------------
 
 
@@ -329,9 +353,9 @@ def test_a_cold_landing_on_a_removed_5h_account_is_priced_in_7d(
         (300.0, 94.0, 10.0, None),  # once per alternationChunkSeconds: the dwell is short
         (700.0, 40.0, 10.0, None),  # the warm partner has room: nothing to plan
         (700.0, 94.0, 80.0, None),  # the cold account would arrive with a sliver after its landing
-        (700.0, 94.0, 75.0, None),  # 25 - 20 = 5 clears the wall but not the active's 20
+        (700.0, 94.0, 58.0, None),  # 42 - 20 = 22: more than the active's 20, short of step + SPENT
     ],
-    ids=["planned", "dwell-short", "warm-room", "cold-sliver", "less-than-staying"],
+    ids=["planned", "dwell-short", "warm-room", "cold-sliver", "short-of-step"],
 )
 def test_the_forced_cold_landing_is_planned_before_the_warm_room_runs_out(
     temp_home, dwell, five_b, five_c, expect
@@ -345,3 +369,29 @@ def test_the_forced_cold_landing_is_planned_before_the_warm_room_runs_out(
     else:
         assert outcome is TickOutcome.SWITCHED and h.active_number() == expect
         assert _trigger(h) == "alternation"
+
+
+def test_the_planned_landing_ranks_by_perish_then_room_not_by_cost(temp_home):
+    """3 resets its 7d in 3 h (use it or lose it), 2 has no 5h window and so the
+    cheaper landing: the planned landing takes 3, the step arm's order."""
+    h = _harness(temp_home)
+    _stamp(h, **{"1": 700.0})  # nobody warm
+    _track(h, anchor=80.0)
+    outcome = _tick(h, {
+        "1": _u(80.0),
+        "2": _capture("usage_removed_5h_slot7.json", 10.0),
+        "3": _u(40.0, 30.0, reset7=h.clock.now + 360.0 + 3 * 3600.0),
+    }, 0.0)
+    assert outcome is TickOutcome.SWITCHED and h.active_number() == 3
+
+
+# -- the label of a tick the step holds ------------------------------------------
+
+
+def test_a_cold_only_fleet_not_yet_due_says_the_step_holds_it_not_the_floor(temp_home):
+    h = _harness(temp_home)
+    _stamp(h, **{"1": 60.0})  # nobody warm
+    _track(h, anchor=40.0)
+    assert _tick(h, {"1": _u(45.0), "2": _u(10.0), "3": _u(100.0, 100.0)}) is TickOutcome.NO_ACTION
+    event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+    assert event.reason == "below-threshold" and "step" in event.detail

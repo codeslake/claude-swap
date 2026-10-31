@@ -350,15 +350,9 @@ def _cold_landing_cost_pct(usage: dict | str | None, cost_pct: float) -> float:
     """Headroom a cold landing eats on this account's binding window, in that
     window's own percent. ``cost_pct`` (``cold_switch_cost_pct``) is 5h points,
     charged as it stands wherever a 5h window exists. With none it is charged
-    to the 7d, never to nothing, converted by ``WEEKLY_OVER_FIVE_HOUR``."""
+    to the 7d, never to nothing, converted by ``WEEKLY_OVER_FIVE_HOUR``. The
+    same figure is the bare floor a WARM candidate must clear, never 0."""
     return cost_pct / WEEKLY_OVER_FIVE_HOUR if _has_no_five_hour(usage) else cost_pct
-
-
-def _warm_landing_floor_pct(usage: dict | str | None, cost_pct: float) -> float:
-    """The bare floor a WARM candidate must clear. A warm landing pays no
-    re-write, so an account with no 5h window has no cost to price (T3113);
-    ``SPENT_HEADROOM_PCT`` still bars a spent one upstream, in the ranking."""
-    return 0.0 if _has_no_five_hour(usage) else cost_pct
 
 
 # A 7d window resetting within this is spent or lost: its account ranks first.
@@ -378,40 +372,44 @@ def _perish_then_room_key(usage: dict | str | None, headroom: float, now: float)
 
 
 def _stay_progress(
-    saved: object,
-    account: str,
-    since: float | None,
-    levels: dict[str, float],
-    prev_levels: dict[str, float] | None,
+    saved: object, account: str, since: float | None, levels: dict[str, float]
 ) -> dict:
     """The tracker of the active's stay after this tick's reading (T3167).
 
     ``anchor`` is the binding window's level at the landing (or at the last
     window roll), ``rise`` the points spent before that roll, ``ran`` whether
-    any window has risen since the landing. A reading that FELL against the
-    last one is a roll: the spend before it is kept (``prev - anchor``) and the
-    stay re-anchors at the new level, so a roll neither stalls the step nor
-    discards what was spent. ``saved`` that is not this stay's tracker (an old
-    state file, another account, another landing, a malformed value) anchors
-    afresh at this reading.
+    any window has risen since the landing, ``levels`` the last reading (kept
+    here, not in memory: a ``--once`` run or a restart builds a new engine).
+    A reading that FELL against the last one is a roll: the spend before it is
+    kept (``prev - anchor``) and the stay re-anchors at the new level, so a roll
+    neither stalls the step nor discards what was spent. ``saved`` that is not
+    this stay's tracker (an old state file, another account, another landing, a
+    malformed value) anchors afresh at this reading.
 
-    shortcut: readings are whole percents and a dip of one point (an
-    out-of-order response) counts as a roll, adding at most a point of spend
-    back; upgrade if the step is ever set under about 5.
+    shortcut: readings are whole percents and a one-point dip (an out-of-order
+    response) counts as a roll, so a reading that flips adds a point of spend
+    per dip, not per stay; upgrade if the step is ever set under about 5.
     """
     level = max(levels.values())
+
+    def num(v: object) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
     valid = (
         isinstance(saved, dict)
         and saved.get("account") == account
         and saved.get("since") == since
-        and all(
-            isinstance(saved.get(k), (int, float)) and not isinstance(saved.get(k), bool)
-            for k in ("anchor", "rise")
-        )
+        and all(num(saved.get(k)) for k in ("anchor", "rise"))
     )
     if not valid:
-        return {"account": account, "since": since, "anchor": level, "rise": 0.0, "ran": False}
+        return {
+            "account": account, "since": since, "anchor": level, "rise": 0.0,
+            "ran": False, "levels": levels,
+        }
     anchor, rise, ran = float(saved["anchor"]), float(saved["rise"]), bool(saved.get("ran"))
+    prev_levels = saved.get("levels")
+    if not (isinstance(prev_levels, dict) and all(map(num, prev_levels.values()))):
+        prev_levels = None
     prev_level = max(prev_levels.values()) if prev_levels else anchor
     if level < prev_level:
         rise += max(prev_level - anchor, 0.0)
@@ -419,7 +417,10 @@ def _stay_progress(
     ran = ran or rise + level - anchor > 0 or any(
         pct > prev_levels.get(label, pct) for label, pct in levels.items() if prev_levels
     )
-    return {"account": account, "since": since, "anchor": anchor, "rise": rise, "ran": ran}
+    return {
+        "account": account, "since": since, "anchor": anchor, "rise": rise,
+        "ran": ran, "levels": levels,
+    }
 
 
 def _step_due(
@@ -1616,9 +1617,8 @@ class AutoSwitchEngine:
         self._bars: dict[str, float] = {}
         self._active_wall = SPENT_HEADROOM_PCT
         # The percent step's tracker: this process's last, kept for a dry run
-        # (which writes no state) and the last tick's windows, for roll detection.
+        # (which writes no state).
         self._stay: dict | None = None
-        self._stay_prev: tuple[str, float | None, dict[str, float]] | None = None
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -2665,13 +2665,11 @@ class AutoSwitchEngine:
         last_active_at = state.get("lastActiveAt")
         last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
 
-        # What a cold landing eats and what a warm one must still clear, per
-        # account: 5h points where a 5h window exists, 7d points where not.
+        # What a cold landing eats and the bare floor a warm one must clear
+        # (the same figure), per account: 5h points where a 5h window exists,
+        # 7d points where not.
         def _cold_cost(n: str) -> float:
             return _cold_landing_cost_pct(usage.get(n), settings.cold_switch_cost_pct)
-
-        def _warm_floor(n: str) -> float:
-            return _warm_landing_floor_pct(usage.get(n), settings.cold_switch_cost_pct)
 
         def _dynamic_rank(cands, hroom, at_now, active_h):
             recovered = self._left_account_recovered(
@@ -2930,7 +2928,7 @@ class AutoSwitchEngine:
                     )
                 if n in cold_set:
                     return h - _cold_cost(n) > SPENT_HEADROOM_PCT
-                return h >= _warm_floor(n)
+                return h >= _cold_cost(n)
             alternation_admissible = [
                 n for n in warm_ordered + cold_ordered
                 if _clears_the_landing_floor(n)
@@ -3058,7 +3056,7 @@ class AutoSwitchEngine:
                     model_gated_partner = next(
                         (
                             n for n in model_gated_warm
-                            if headroom.get(n, 0.0) >= _warm_floor(n)
+                            if headroom.get(n, 0.0) >= _cold_cost(n)
                         ),
                         None,
                     )
@@ -3111,7 +3109,13 @@ class AutoSwitchEngine:
                 # floor-clearing candidate fall through here as `cold`),
                 # so `below-floor` alone covers every cold candidate left
                 # in this branch.
-                if warm_ordered or partner is not None:
+                #
+                # T3167: in step mode a tick the step does not yet call for
+                # returns no partner at all, so the chain above would blame the
+                # floor for what the step holds: `below-threshold`, the
+                # watcher's quiet label for a hold by design.
+                step_holds = settings.alternation_chunk_pct > 0 and not rotation_due
+                if warm_ordered or partner is not None or step_holds:
                     reason = "below-threshold"
                 elif cold_ordered:
                     reason = "below-floor"
@@ -3126,6 +3130,7 @@ class AutoSwitchEngine:
                         detail=(
                             f"active account is healthy ({pct_label(active_headroom)}"
                             "% headroom, not about to wall)"
+                            + ("; the alternation step is not reached" if step_holds else "")
                         ),
                     )
                 )
@@ -5280,20 +5285,15 @@ class AutoSwitchEngine:
         PLANNED FORCED LANDING (the order's requirement 1, which the replay's
         PLAN knob did not meet): when the warm set's room (the active's and
         every warm candidate's headroom above the wall) falls under what the
-        next forced move needs, ``step + SPENT``, the cheapest cold landing that
-        leaves more room than the active has is taken NOW, while the prefix is
-        smallest, at most once per dwell.
+        next forced move needs, ``step + SPENT``, the top ranked cold landing that
+        keeps ``step + SPENT`` after its re-write, and more than the active has,
+        is taken NOW, while the prefix is smallest, at most once per dwell.
         """
         levels = _window_pcts(usage.get(current), ())
         if not levels:
             return [], False
-        prev = self._stay_prev
         saved = self._stay if self.dry_run else state.get("alternation")
-        track = _stay_progress(
-            saved, current, since, levels,
-            prev[2] if prev and prev[:2] == (current, since) else None,
-        )
-        self._stay_prev = (current, since, levels)
+        track = _stay_progress(saved, current, since, levels)
         if track != saved:
             self._stay = track
             if not self.dry_run:
@@ -5317,10 +5317,12 @@ class AutoSwitchEngine:
         )
         if warm_room >= need:
             return [], False
-        # Only where the landing leaves more room than staying has: a sliver
-        # after the re-write just moves the wall (and pays the rewrite twice).
-        landings = [n for n in ranked if n in cold and room(n) > active_headroom]
-        return sorted(landings, key=cold_cost), True
+        # Only where the landing leaves a step's worth of room and more than
+        # staying has: a sliver after the re-write just moves the wall (and pays
+        # the rewrite twice).
+        return [
+            n for n in ranked if n in cold and room(n) >= need and room(n) > active_headroom
+        ], True
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]
