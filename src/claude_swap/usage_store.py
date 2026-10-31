@@ -801,7 +801,7 @@ def _walled_decision_value(
     ``walled``.
 
     Starts from the stored ``seven_day`` and ``scoped``: a reader like
-    autoswitch's ``_seven_day_reset_unmeasured`` must see the real weekly
+    autoswitch's ``_seven_day_reset_ts`` must see the real weekly
     reset, or a walled 5h-only slot reads as "weekly reset never reported" and
     becomes eligible as a last-chance probe target despite the wall. Forces
     ``window``, the one ``mark_at_limit`` found binding, full; with none
@@ -832,7 +832,10 @@ def _walled_decision_value(
 
     def forced(w: dict) -> dict:
         pct = w.get("pct")
-        return w if isinstance(pct, (int, float)) and pct >= 100.0 else {**w, **full}
+        if isinstance(pct, (int, float)) and pct >= 100.0:
+            return w
+        # The stored `clock` and `countdown` describe the real reset, not the mark's.
+        return {k: v for k, v in w.items() if k not in ("clock", "countdown")} | full
 
     seven = value.get("seven_day") or dict(full)
     if window not in (None, oauth.FIVE_HOUR_LABEL):

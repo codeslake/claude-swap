@@ -261,13 +261,18 @@ def test_a_429_on_a_scoped_window_reads_7d_full_for_every_reader(store, dropped)
     entry = store.entries(IDENT)["1"]
     value = entry.decision_value()
     deadline = usage_store._reset_ts_to_resets_at(entry.walled_until)
-    assert value["seven_day"] == {**usage["seven_day"], "pct": 100.0, "resets_at": deadline}
+    stored = {k: v for k, v in usage["seven_day"].items() if k not in ("clock", "countdown")}
+    assert value["seven_day"] == {**stored, "pct": 100.0, "resets_at": deadline}
     assert [(w["pct"], w["resets_at"]) for w in value["scoped"]] == (
         [] if dropped else [(100.0, deadline)]
     )
+    # No stale reset string sits beside the mark's deadline.
+    assert not any("clock" in w or "countdown" in w for w in value["scoped"])
     # A reader whose models leave the name out still reads the slot full.
     assert oauth.account_headroom(value, ()) == 0.0
     assert oauth.account_headroom(value, ("all",)) == 0.0
+    # Both read 100, but the escape ranks peers on the window that walled us.
+    assert oauth.binding_window_label(value, ("all",)) == ("7d" if dropped else "Fable")
     assert poll_policy.limiting_reset_ts(value, ("all",)) == pytest.approx(entry.walled_until, abs=1)
 
 

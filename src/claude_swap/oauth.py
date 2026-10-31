@@ -825,12 +825,15 @@ def binding_window_label(
     window's headroom and throws away WHICH window it was. An escape needs the
     label: a 5-hour limit and a weekly limit want different targets, and a
     ranking that cannot tell them apart optimises the wrong axis for one of
-    them.
+    them. A tie goes to a scoped window: a wall on one forces 7d to 100 beside
+    it, and the scoped window is the one that walled us.
     """
     windows = relevant_windows(usage, models)
     if not windows:
         return None
-    return max(windows, key=lambda w: w[1])[0]
+    return max(
+        windows, key=lambda w: (w[1], w[0] not in (FIVE_HOUR_LABEL, "7d"))
+    )[0]
 
 
 def headroom_on_window(
