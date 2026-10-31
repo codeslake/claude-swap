@@ -2789,6 +2789,8 @@ class AutoSwitchEngine:
             # `_about_to_wall` itself calls walled (correctness review).
             # Warm pays no re-write cost, so its floor stays the bare,
             # unchanged `>=`.
+            # T3113: the cost is in 5h points, charged against the 5h
+            # window only, never the binding one (a no-5h account has none).
             cold_set = set(cold_ordered)
             def _clears_the_landing_floor(n):
                 h = floor_headroom.get(n, 0.0)
@@ -2803,9 +2805,13 @@ class AutoSwitchEngine:
                         ),
                         default=0.0,
                     )
+                h5 = oauth.headroom_on_window(usage.get(n), oauth.FIVE_HOUR_LABEL)
+                cost = settings.cold_switch_cost_pct
                 if n in cold_set:
-                    return h - settings.cold_switch_cost_pct > SPENT_HEADROOM_PCT
-                return h >= settings.cold_switch_cost_pct
+                    h5_ok = h5 is None or h5 - cost > SPENT_HEADROOM_PCT
+                else:
+                    h5_ok = h5 is None or h5 >= cost
+                return h > SPENT_HEADROOM_PCT and h5_ok
             alternation_admissible = [
                 n for n in warm_ordered + cold_ordered
                 if _clears_the_landing_floor(n)

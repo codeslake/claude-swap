@@ -7296,6 +7296,36 @@ class TestWarmthAndAlternation375:
         assert reasons == ["below-threshold"], reasons
         assert h.active_number() == 1
 
+    @pytest.mark.parametrize(
+        "candidate, warm, switches",
+        [
+            # T3113: the re-write cost is 5h points, charged on the 5h
+            # window only. No 5h window: a 7d-bound candidate is not taxed.
+            pytest.param({"seven_day": {"pct": 80.0}}, False, True, id="cold-no-5h-admitted"),
+            pytest.param(_usage7(80.0, 0.0), False, False, id="cold-live-5h-refused"),
+            pytest.param({"seven_day": {"pct": 85.0}}, True, True, id="warm-no-5h-admitted"),
+            pytest.param(_usage7(85.0, 0.0), True, False, id="warm-live-5h-refused"),
+        ],
+    )
+    def test_t3113_the_rewrite_cost_is_charged_on_the_5h_window_only(
+        self, temp_home, candidate, warm, switches
+    ):
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        stamps = {"1": h.clock.now - chunk}
+        if warm:
+            stamps["2"] = h.clock.now - 10.0
+        self._seed_last_active_at(h, stamps)
+        outcome = h.tick_with_usage({"1": _usage(50.0), "2": candidate})
+        if switches:
+            assert outcome is TickOutcome.SWITCHED, outcome
+            sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+            assert sw.trigger == "alternation", sw.trigger
+            assert h.active_number() == 2
+        else:
+            assert outcome is TickOutcome.NO_ACTION, outcome  # dwell is elapsed
+            assert h.active_number() == 1
+
     # -- no-return bar on the proactive/about_to_wall arm -----------------
 
     def test_no_return_bar_blocks_a_spent_peer_even_when_its_reset_recovered(
@@ -7661,7 +7691,7 @@ class TestWarmthAndAlternation375:
         self._seed_last_active_at(h, {"1": now - chunk - 1.0})
         usage = {
             "1": _usage7(0.0, 18.0, _iso_at(now + 1 * 3600)),    # active: headroom 82, resets sooner
-            "2": _usage7(0.0, 95.0, _iso_at(now + 10 * 86400)),  # cold: headroom 5, resets LATER
+            "2": _usage7(95.0, 0.0, _iso_at(now + 10 * 86400)),  # cold: headroom 5 (5h-bound), resets LATER
         }
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.NO_ACTION, (
@@ -7713,7 +7743,7 @@ class TestWarmthAndAlternation375:
         self._seed_last_active_at(h, {"1": now - chunk - 1.0})
         usage = {
             "1": _usage(78.0),                              # active: headroom 22, NO 7d reset known
-            "2": _usage7(0.0, 96.0, _iso_at(now + 3600)),    # headroom 4, real reset in 1h
+            "2": _usage7(96.0, 0.0, _iso_at(now + 3600)),    # headroom 4 (5h-bound), real reset in 1h
         }
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.NO_ACTION, (
