@@ -266,8 +266,8 @@ def test_format_usage_log_full():
 
 
 def test_format_usage_log_without_clock():
-    usage = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 12.0}}
-    assert menubar.format_usage_log("a@x.com", usage) == "usage a@x.com: 5h 0% · 7d 12%"
+    usage = {"five_hour": {"pct": 4.0}, "seven_day": {"pct": 12.0}}
+    assert menubar.format_usage_log("a@x.com", usage) == "usage a@x.com: 5h 4% · 7d 12%"
 
 
 def test_format_usage_log_partial_window():
@@ -319,12 +319,12 @@ def test_format_title_7d_only():
 
 def test_format_title_both_windows():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 42% · 18%"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 5h 42% · 7d 18%"
 
 
 def test_format_title_both_windows_with_name():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42% · 18%"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 5h 42% · 7d 18%"
 
 
 def test_format_title_icon_only_when_off():
@@ -345,7 +345,7 @@ def test_format_title_scoped_after_windows_multiple_models():
         **_USAGE,
         "scoped": [{"name": "Fable", "pct": 55.0}, {"name": "Opus", "pct": 7.0}],
     }
-    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ 42% · 18% · Fable 55% · Opus 7%"
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ 5h 42% · 7d 18% · Fable 55% · Opus 7%"
 
 
 def test_format_title_scoped_off_by_default():
@@ -375,7 +375,7 @@ def test_format_title_both_drops_unavailable_windows():
 def test_format_title_both_keeps_available_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     # only 5h present -> 7d dropped, no trailing separator
-    assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 9%"
+    assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 5h 9%"
 
 
 # --- reset-time helpers --------------------------------------------------------
@@ -461,6 +461,7 @@ class _FakeEntry:
         self.sentinel = sentinel
         self.last_good = last_good
         self.fetched_at = fetched_at
+        self.plan = None
 
 
 class _FakeAcct:
