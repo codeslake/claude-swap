@@ -503,11 +503,17 @@ class TestTryRefreshOAuthCredentials:
     _make_credentials = staticmethod(TestRefreshOAuthCredentials._make_credentials)
 
     @staticmethod
-    def _http_error(code, body: bytes, msg="err"):
+    def _http_error(code, body: bytes, msg="err", headers=None):
+        import email.message
         import io
 
+        hdrs = None
+        if headers is not None:
+            hdrs = email.message.Message()
+            for k, v in headers.items():
+                hdrs[k] = v
         return urllib.error.HTTPError(
-            oauth.OAUTH_TOKEN_URL, code, msg, hdrs=None, fp=io.BytesIO(body)
+            oauth.OAUTH_TOKEN_URL, code, msg, hdrs=hdrs, fp=io.BytesIO(body)
         )
 
     def test_success_rotates_and_has_no_error(self):
@@ -687,6 +693,52 @@ class TestTryRefreshOAuthCredentials:
         ):
             outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
         assert outcome.error == "transient"
+
+    def _transient_info(self, caplog, exc):
+        """The INFO lines of one refresh POST that raised ``exc``."""
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=exc), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            outcome = oauth.try_refresh_oauth_credentials(
+                self._make_credentials(), slot="3"
+            )
+        assert outcome.error == "transient"
+        return [r.getMessage() for r in caplog.records]
+
+    @pytest.mark.parametrize(
+        "code,headers,cause",
+        [
+            (429, {"Retry-After": "30", "X-Request-Id": "req_abc"},
+             "HTTP 429, retry-after=30, x-request-id=req_abc"),
+            (500, None, "HTTP 500"),
+            (429, {}, "HTTP 429"),
+            # CR/LF and spaces stripped (no forged line), an emptied value omitted.
+            (429, {"Retry-After": "\r\n ", "X-Request-Id": "req_a\r\nForged: x"},
+             "HTTP 429, x-request-id=req_aForged:x"),
+            (429, {"X-Request-Id": "A" * 200}, "HTTP 429, x-request-id=" + "A" * 64),
+        ],
+    )
+    def test_transient_http_failure_log_names_status_and_headers(
+        self, caplog, code, headers, cause
+    ):
+        body = b'{"detail": "BODYTEXT old-access old-refresh"}'
+        err = self._http_error(code, body, headers=headers)
+        messages = self._transient_info(caplog, err)
+        assert messages == [
+            f"Refresh POST for account 3: failed (transient): {cause}"
+        ]
+
+    @pytest.mark.parametrize(
+        "exc,name",
+        [
+            (TimeoutError("old-refresh BODYTEXT"), "TimeoutError"),
+            (urllib.error.URLError("old-access BODYTEXT"), "URLError"),
+        ],
+    )
+    def test_transient_exception_log_names_the_class_only(self, caplog, exc, name):
+        messages = self._transient_info(caplog, exc)
+        assert messages == [
+            f"Refresh POST for account 3: failed (transient): {name}"
+        ]
 
     def test_missing_refresh_token_is_permanent(self):
         creds = json.dumps({"claudeAiOauth": {"accessToken": "a", "expiresAt": 0}})

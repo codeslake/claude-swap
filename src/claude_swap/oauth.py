@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -291,12 +292,33 @@ def try_refresh_oauth_credentials(
             if err in ("invalid_grant", "invalid_client"):
                 _logger.info("Refresh POST for account %s: failed (%s)", slot, err)
                 return RefreshOutcome(None, err)
-        _logger.info("Refresh POST for account %s: failed (transient)", slot)
+        _logger.info(
+            "Refresh POST for account %s: failed (transient): %s", slot, _transient_cause(e)
+        )
         return RefreshOutcome(None, "transient")
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
-        _logger.info("Refresh POST for account %s: failed (transient)", slot)
+        _logger.info(
+            "Refresh POST for account %s: failed (transient): %s", slot, _transient_cause(e)
+        )
         return RefreshOutcome(None, "transient")
+
+
+def _transient_cause(e: Exception) -> str:
+    """Log-safe cause of a transient refresh failure: never the body or ``str(e)``.
+
+    Header values are server-controlled, so only a safe character set is kept
+    (a folded header can carry CR/LF and would forge a log line) and capped.
+    """
+    if not isinstance(e, urllib.error.HTTPError):
+        return type(e).__name__
+    parts = [f"HTTP {e.code}"]
+    headers = e.headers or {}  # None when the error was built without hdrs
+    for name in ("retry-after", "x-request-id"):
+        value = re.sub(r"[^A-Za-z0-9._:-]", "", str(headers.get(name) or ""))[:64]
+        if value:
+            parts.append(f"{name}={value}")
+    return ", ".join(parts)
 
 
 def _parse_token_account(resp_data: dict) -> dict | None:
