@@ -7340,6 +7340,7 @@ class TestDynamicStrategy:
     def _owner_harness(self, temp_home, *, active_num: int) -> EngineHarness:
         h = EngineHarness(
             temp_home, model="Fable", threshold=90.0, strategy="dynamic",
+            alternation_chunk_pct=0.0,  # the time-only dwell this class pins
         )
         order = [active_num] + [n for n in (1, 2, 3, 4, 5, 6) if n != active_num]
         for num in order:
@@ -7693,6 +7694,9 @@ class TestWarmthAndAlternation375:
     """
 
     def _harness(self, temp_home, **kwargs):
+        # The percent step (T3167, tests/test_alternation_step.py) is off here:
+        # this class pins the time-only alternation `alternationChunkPct` 0 keeps.
+        kwargs.setdefault("alternation_chunk_pct", 0.0)
         h = EngineHarness(temp_home, strategy="dynamic", **kwargs)
         h.seed(1, "acct1@example.invalid")
         h.seed(2, "acct2@example.invalid")
@@ -20033,17 +20037,25 @@ class TestPerAccountSwitchThreshold:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    @pytest.mark.parametrize("strategy", ["dynamic", "consume-first"])
-    def test_the_soonest_reset_ordering_is_unchanged(self, temp_home, strategy):
+    @pytest.mark.parametrize(
+        "strategy, third_resets_in, expect",
+        [
+            ("consume-first", 2 * 86400, 3),  # the sooner weekly reset wins
+            # dynamic (T3167): a reset within a day first, the rest by room
+            ("dynamic", 2 * 86400, 2),
+            ("dynamic", 20 * 3600, 3),
+        ],
+    )
+    def test_the_soonest_reset_ordering(self, temp_home, strategy, third_resets_in, expect):
         h = self._harness(temp_home, strategy)
         self._set(h, 1, 80.0)
         outcome = h.tick_with_usage({
             "1": self._use(h, 85, 9 * 86400),
             "2": self._use(h, 40, 5 * 86400),
-            "3": self._use(h, 60, 2 * 86400),
+            "3": self._use(h, 60, third_resets_in),
         })
         assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 3, "the sooner weekly reset still wins"
+        assert h.active_number() == expect
 
     def test_an_own_threshold_above_the_strategys_keeps_the_account_landable(
         self, temp_home

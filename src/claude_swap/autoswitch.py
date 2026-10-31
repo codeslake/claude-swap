@@ -509,6 +509,117 @@ def _unreadable_reason(entries: dict | None, num: str, now: float) -> str:
     return "usage unreadable"
 
 
+# `cold_switch_cost_pct` is measured in 5h points. An account with no 5h window
+# pays a cold landing on its 7d, which is this many times a 5h window's budget
+# (the replay's median 7d units per 1% over its 5h units per 1%: 9.06M / 2.08M,
+# alternation-replay.md, "Calibration"). The same ratio stands in for a pinned
+# model's weekly window, whose budget is not reported.
+WEEKLY_OVER_FIVE_HOUR = 4.4
+
+
+def _has_no_five_hour(usage: dict | str | None) -> bool:
+    """Whether a readable usage reports windows and none is a 5h one (the
+    window was removed: ``five_hour`` null or absent). An idle ``{0, null}`` 5h
+    is still a window, and an unreadable reading is not "no 5h window"."""
+    windows = oauth.relevant_windows(usage if isinstance(usage, dict) else None, ())
+    return bool(windows) and all(label != oauth.FIVE_HOUR_LABEL for label, _, _ in windows)
+
+
+def _cold_landing_cost_pct(usage: dict | str | None, cost_pct: float) -> float:
+    """Headroom a cold landing eats on this account's binding window, in that
+    window's own percent. ``cost_pct`` (``cold_switch_cost_pct``) is 5h points,
+    charged as it stands wherever a 5h window exists. With none it is charged
+    to the 7d, never to nothing, converted by ``WEEKLY_OVER_FIVE_HOUR``. The
+    same figure is the bare floor a WARM candidate must clear, never 0."""
+    return cost_pct / WEEKLY_OVER_FIVE_HOUR if _has_no_five_hour(usage) else cost_pct
+
+
+# A 7d window resetting within this is spent or lost: its account ranks first.
+PERISH_SOON_S = 24 * 3600.0
+
+
+def _perish_then_room_key(usage: dict | str | None, headroom: float, now: float) -> tuple:
+    """Sort key (T3167, the replay's ``rank_new``): accounts whose 7d resets
+    within ``PERISH_SOON_S`` first, soonest first (use it or lose it); the rest
+    by most headroom. An account reset to 0% and not used since reports no
+    ``resets_at``: it sits in the second group at full headroom, so it ranks
+    first there, never last as the old "unknown reset sorts to +inf" key had it."""
+    reset_ts = _seven_day_reset_ts(usage, now)
+    if reset_ts is not None and reset_ts - now <= PERISH_SOON_S:
+        return (0, reset_ts, -headroom)
+    return (1, 0.0, -headroom)
+
+
+def _stay_progress(
+    saved: object, account: str, since: float | None, levels: dict[str, float]
+) -> dict:
+    """The tracker of the active's stay after this tick's reading (T3167).
+
+    ``anchor`` is the binding window's level at the landing (or at the last
+    window roll), ``rise`` the points spent before that roll, ``ran`` whether
+    any window has risen since the landing, ``levels`` the last reading (kept
+    here, not in memory: a ``--once`` run or a restart builds a new engine).
+    A reading that FELL against the last one is a roll: the spend before it is
+    kept (``prev - anchor``) and the stay re-anchors at the new level, so a roll
+    neither stalls the step nor discards what was spent. ``saved`` that is not
+    this stay's tracker (an old state file, another account, another landing, a
+    malformed value) anchors afresh at this reading.
+
+    shortcut: readings are whole percents and a one-point dip (an out-of-order
+    response) counts as a roll, so a reading that flips adds a point of spend
+    per dip, not per stay; upgrade if the step is ever set under about 5.
+    """
+    level = max(levels.values())
+
+    def num(v: object) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    valid = (
+        isinstance(saved, dict)
+        and saved.get("account") == account
+        and saved.get("since") == since
+        and all(num(saved.get(k)) for k in ("anchor", "rise"))
+    )
+    if not valid:
+        return {
+            "account": account, "since": since, "anchor": level, "rise": 0.0,
+            "ran": False, "levels": levels,
+        }
+    anchor, rise, ran = float(saved["anchor"]), float(saved["rise"]), bool(saved.get("ran"))
+    prev_levels = saved.get("levels")
+    if not (isinstance(prev_levels, dict) and all(map(num, prev_levels.values()))):
+        prev_levels = None
+    prev_level = max(prev_levels.values()) if prev_levels else anchor
+    if level < prev_level:
+        rise += max(prev_level - anchor, 0.0)
+        anchor = level
+    ran = ran or rise + level - anchor > 0 or any(
+        pct > prev_levels.get(label, pct) for label, pct in levels.items() if prev_levels
+    )
+    return {
+        "account": account, "since": since, "anchor": anchor, "rise": rise,
+        "ran": ran, "levels": levels,
+    }
+
+
+def _step_due(
+    track: dict, level: float, now: float, since: float | None, step: float, dwell_s: float
+) -> bool:
+    """Whether the stay has spent ``step`` points, or the step cannot be
+    measured: the dwell is served, traffic ran, and the whole-percent reading
+    has not moved since the landing. A stay whose reading moved by less than
+    the step keeps waiting for it; an active that served nothing never rotates."""
+    if track["rise"] + level - track["anchor"] >= step:
+        return True
+    return (
+        since is not None
+        and now - since >= dwell_s
+        and track["ran"]
+        and track["rise"] == 0.0
+        and int(level) == int(track["anchor"])
+    )
+
+
 def _rank_dynamic_candidates(
     oauth_candidates: Sequence[str],
     headroom: dict[str, float | None],
@@ -521,8 +632,8 @@ def _rank_dynamic_candidates(
     bars: dict[str, float] | None = None,
 ) -> tuple[list[str], list[str]]:
     """WARM-tiered candidates for a `dynamic` proactive/alternation switch
-    (#375 item 3), each tier soonest-weekly-reset first (`dynamic`'s own
-    ranking key elsewhere in this file) then most headroom — never the
+    (#375 item 3), each tier by `_perish_then_room_key` (a 7d reset within a
+    day first, the rest by most headroom; T3167), never the
     hysteresis-margin key `best` uses, since a wall is coming either way and
     the question is only which account serves it, same reasoning
     `_rank_candidates_pass`'s at-limit escape already applies. EVERY
@@ -561,8 +672,7 @@ def _rank_dynamic_candidates(
                 else "no headroom left"
             )
             continue
-        reset_ts = _seven_day_reset_ts(usage.get(num), now)
-        key = (reset_ts if reset_ts is not None else float("inf"), -h)
+        key = _perish_then_room_key(usage.get(num), h, now)
         bucket = warm if _is_warm(num, last_active_at, now, cache_ttl_seconds) else cold
         bucket.append((key, num))
     warm.sort(key=lambda t: t[0])
@@ -1960,6 +2070,9 @@ class AutoSwitchEngine:
         # walled at (its own, or SPENT_HEADROOM_PCT).
         self._bars: dict[str, float] = {}
         self._active_wall = SPENT_HEADROOM_PCT
+        # The percent step's tracker: this process's last, kept for a dry run
+        # (which writes no state).
+        self._stay: dict | None = None
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -3215,6 +3328,12 @@ class AutoSwitchEngine:
         last_active_at = state.get("lastActiveAt")
         last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
 
+        # What a cold landing eats and the bare floor a warm one must clear
+        # (the same figure), per account: 5h points where a 5h window exists,
+        # 7d points where not.
+        def _cold_cost(n: str) -> float:
+            return _cold_landing_cost_pct(usage.get(n), settings.cold_switch_cost_pct)
+
         def _dynamic_rank(cands, hroom, at_now, active_h):
             recovered = self._left_account_recovered(
                 state, usage, hroom, active_h, settings, at_now, current,
@@ -3318,10 +3437,9 @@ class AutoSwitchEngine:
                     )
                     return TickOutcome.NO_ACTION
             else:
-                floor = settings.cold_switch_cost_pct
                 cold_clears_floor = sorted(
                     cold_ordered,
-                    key=lambda n: floor_headroom.get(n, 0.0) < floor,
+                    key=lambda n: floor_headroom.get(n, 0.0) < _cold_cost(n),
                 )
             dynamic_ordered = warm_ordered + cold_clears_floor
             if not dynamic_ordered and bar_active:
@@ -3394,6 +3512,11 @@ class AutoSwitchEngine:
                 )
                 floor_headroom = unmodeled
                 model_window_dropped = True
+            # T3167: with `alternation_chunk_pct` > 0 (the default) the percent
+            # step below decides WHEN and over WHICH list (warm and cold in
+            # one, no perishing waiver); everything here describes the
+            # time-only arm (`alternationChunkPct` 0).
+            #
             # Alternation: a warm partner past the floor, once we've sat
             # on the active for a full chunk. The floor
             # (`_clears_the_landing_floor`, per-tier, below) is the ONLY
@@ -3476,14 +3599,24 @@ class AutoSwitchEngine:
                         default=0.0,
                     )
                 if n in cold_set:
-                    return h - settings.cold_switch_cost_pct > SPENT_HEADROOM_PCT
-                return h >= settings.cold_switch_cost_pct
+                    return h - _cold_cost(n) > SPENT_HEADROOM_PCT
+                return h >= _cold_cost(n)
             alternation_admissible = [
                 n for n in warm_ordered + cold_ordered
                 if _clears_the_landing_floor(n)
             ]
-            partner = next(iter(alternation_admissible), None)
             since = last_active_at.get(current)
+            rotation_due = since is not None and now - since >= settings.alternation_chunk_seconds
+            if settings.alternation_chunk_pct > 0:
+                # T3167: the step replaces the dwell timer (and, with it, the
+                # warm-before-cold split and the perishing waiver below).
+                alternation_admissible, rotation_due = self._step_alternation(
+                    state=state, usage=usage, current=current, since=since, now=now,
+                    settings=settings, warm_ordered=warm_ordered,
+                    cold_ordered=cold_ordered, floor_headroom=floor_headroom,
+                    active_headroom=active_headroom, cold_cost=_cold_cost,
+                )
+            partner = next(iter(alternation_admissible), None)
             # #403 BOUNDED WALLED-ESCAPE: `raw_active_headroom` is the
             # NEVER-widened model-gated reading — the widen above can call
             # this active "healthy" (dynamic-healthy, not at-limit) purely
@@ -3528,7 +3661,7 @@ class AutoSwitchEngine:
             # the only case that needs the unmodeled axis at all.
             blackout_escape = (
                 model_window_dropped
-                and floor_headroom.get(current, 0.0) < settings.cold_switch_cost_pct
+                and floor_headroom.get(current, 0.0) < _cold_cost(current)
             )
             walled_escape = None
             if _about_to_wall(raw_active_headroom, self._active_wall):
@@ -3548,9 +3681,6 @@ class AutoSwitchEngine:
                     # such rewrites netting +10.5 points of nominal
                     # headroom for roughly 57 points of real switch cost).
                     warm_bar = _blackout_retry_admission_bar(floor_headroom, current)
-                    cold_bar = _blackout_retry_admission_bar(
-                        floor_headroom, current, settings.cold_switch_cost_pct
-                    )
                     escape_candidates = [
                         n for n in warm_ordered
                         if floor_headroom.get(n, 0.0) > warm_bar
@@ -3572,7 +3702,9 @@ class AutoSwitchEngine:
                         # label onto its own, stricter floor for the
                         # voluntary path only.
                         n for n in cold_ordered
-                        if floor_headroom.get(n, 0.0) >= cold_bar
+                        if floor_headroom.get(n, 0.0) >= _blackout_retry_admission_bar(
+                            floor_headroom, current, _cold_cost(n)
+                        )
                     ]
                 else:
                     # I1: the widened `_about_to_wall`-alone gate above
@@ -3596,14 +3728,14 @@ class AutoSwitchEngine:
                     model_gated_partner = next(
                         (
                             n for n in model_gated_warm
-                            if headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                            if headroom.get(n, 0.0) >= _cold_cost(n)
                         ),
                         None,
                     )
                     escape_candidates = model_gated_warm + [
                         n for n in model_gated_cold
                         if model_gated_partner is None
-                        or headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                        or headroom.get(n, 0.0) >= _cold_cost(n)
                     ]
                 escapees = sorted(
                     escape_candidates,
@@ -3636,11 +3768,7 @@ class AutoSwitchEngine:
                 # is already `warm_ordered + [floor-clearing cold]` for the
                 # same reason).
                 dynamic_ordered = escapees
-            elif (
-                partner is None
-                or since is None
-                or now - since < settings.alternation_chunk_seconds
-            ):
+            elif partner is None or not rotation_due:
                 # UNKNOWN-RESET PROBE, ONE LAST CHECK BEFORE GIVING UP: this
                 # arm's own warm/cold tiers have no notion of an unmeasured
                 # weekly reset at all (#375 predates probing), so a fleet-
@@ -3685,7 +3813,13 @@ class AutoSwitchEngine:
                     # floor-clearing candidate fall through here as `cold`),
                     # so `below-floor` alone covers every cold candidate left
                     # in this branch.
-                    if warm_ordered or partner is not None:
+                    #
+                    # T3167: in step mode a tick the step does not yet call for
+                    # returns no partner at all, so the chain above would blame the
+                    # floor for what the step holds: `below-threshold`, the
+                    # watcher's quiet label for a hold by design.
+                    step_holds = settings.alternation_chunk_pct > 0 and not rotation_due
+                    if warm_ordered or partner is not None or step_holds:
                         reason = "below-threshold"
                     elif cold_ordered:
                         reason = "below-floor"
@@ -3700,6 +3834,7 @@ class AutoSwitchEngine:
                             detail=(
                                 f"active account is healthy ({pct_label(active_headroom)}"
                                 "% headroom, not about to wall)"
+                                + ("; the alternation step is not reached" if step_holds else "")
                             ),
                         )
                     )
@@ -6307,6 +6442,76 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _step_alternation(
+        self,
+        *,
+        state: dict,
+        usage: dict[str, dict | str | None],
+        current: str,
+        since: float | None,
+        now: float,
+        settings: AutoSwitchSettings,
+        warm_ordered: Sequence[str],
+        cold_ordered: Sequence[str],
+        floor_headroom: dict[str, float | None],
+        active_headroom: float,
+        cold_cost: Callable[[str], float],
+    ) -> tuple[list[str], bool]:
+        """`dynamic`'s percent step (T3167): ``(ordered, ready)``, the targets a
+        rotation may land on and whether it should happen now.
+
+        The step is measured on the active's 5h/7d windows (the replay's
+        binding window; a model window gates a landing, it does not time a
+        stay). Warm and cold candidates compete in ONE list by
+        `_perish_then_room_key`; a candidate must keep ``step + SPENT`` points
+        after the landing's re-write is charged to it (cold only), the replay's
+        ``h >= step + SPENT + landing %``. NOT shipped: the replay's "landing
+        under 1% of its larger window" veto, which needs the prefix size the
+        engine cannot see; the replay finds it never binds (B=1 and B=100 give
+        the same rows).
+
+        PLANNED FORCED LANDING (the order's requirement 1, which the replay's
+        PLAN knob did not meet): when the warm set's room (the active's and
+        every warm candidate's headroom above the wall) falls under what the
+        next forced move needs, ``step + SPENT``, the top ranked cold landing that
+        keeps ``step + SPENT`` after its re-write, and more than the active has,
+        is taken NOW, while the prefix is smallest, at most once per dwell.
+        """
+        levels = _window_pcts(usage.get(current), ())
+        if not levels:
+            return [], False
+        saved = self._stay if self.dry_run else state.get("alternation")
+        track = _stay_progress(saved, current, since, levels)
+        if track != saved:
+            self._stay = track
+            if not self.dry_run:
+                self._mutate_state(lambda st: st.__setitem__("alternation", track))
+        step = settings.alternation_chunk_pct
+        need = step + SPENT_HEADROOM_PCT
+        cold = set(cold_ordered)
+        dwell = settings.alternation_chunk_seconds
+        h = {n: floor_headroom.get(n) or 0.0 for n in (*warm_ordered, *cold_ordered)}
+        ranked = sorted(h, key=lambda n: _perish_then_room_key(usage.get(n), h[n], now))
+
+        def room(n: str) -> float:
+            return h[n] - (cold_cost(n) if n in cold else 0.0)
+
+        if _step_due(track, max(levels.values()), now, since, step, dwell):
+            return [n for n in ranked if room(n) >= need], True
+        if since is None or now - since < dwell:
+            return [], False
+        warm_room = max(active_headroom - SPENT_HEADROOM_PCT, 0.0) + sum(
+            max(h[n] - SPENT_HEADROOM_PCT, 0.0) for n in warm_ordered
+        )
+        if warm_room >= need:
+            return [], False
+        # Only where the landing leaves a step's worth of room and more than
+        # staying has: a sliver after the re-write just moves the wall (and pays
+        # the rewrite twice).
+        return [
+            n for n in ranked if n in cold and room(n) >= need and room(n) > active_headroom
+        ], True
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]
