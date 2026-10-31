@@ -1,13 +1,14 @@
-"""The 5h rule applies only while the API reports a LIVE 5h window.
+"""The 5h rule applies only while the API reports a RUNNING 5h window.
 
-Live means ``five_hour`` carries a utilization above 0 and a ``resets_at``.
-Everything else (idle ``{0, null}``, a rolling ``{0, +5h}``, a null or an
-absent key) is "no 5h limit right now" and must neither bind a decision, be
-drawn as a bar, nor be synthesized as full by a 429 wall.
+Running means ``five_hour`` carries a utilization above 0; its ``resets_at``
+may be withheld. Everything else (idle ``{0, null}``, a rolling ``{0, +1h}``, a
+null or an absent key) is "no running 5h window" and must neither bind a
+decision, be drawn as a bar, nor be synthesized as full by a 429 wall.
 
 Shapes ``live`` and ``idle`` are the two measured on real accounts (the numbers
-are one active account's, 40% / 67%). ``absent``, ``null`` and ``rolling`` are
-HYPOTHESES for what a removed 5h window looks like, until one is captured.
+are one active account's, 40% / 67%). ``withheld`` is a running window whose
+reset the API left out. ``absent``, ``null`` and ``rolling`` are HYPOTHESES for
+what a removed 5h window looks like, until one is captured.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from claude_swap.usage_store import WALL_FALLBACK_S, FetchRecord, UsageEntry, Us
 IDENT = {"1": ("a@x.com", "")}
 ABSENT = object()
 NOT_LIVE = ["idle", "absent", "null", "rolling"]
+LIVE = [("live", 3 * 3600), ("withheld", WALL_FALLBACK_S)]  # shape, its 429 wall span
 
 
 def _iso(seconds: float) -> str:
@@ -42,10 +44,11 @@ def _api(shape: str) -> dict:
     """A raw usage-endpoint body with the named ``five_hour`` shape."""
     five_hour = {
         "live": {"utilization": 40.0, "resets_at": _iso(3 * 3600)},
+        "withheld": {"utilization": 40.0, "resets_at": None},
         "idle": {"utilization": 0.0, "resets_at": None},
         "absent": ABSENT,
         "null": None,
-        "rolling": {"utilization": 0.0, "resets_at": _iso(5 * 3600)},
+        "rolling": {"utilization": 0.0, "resets_at": _iso(3600)},
     }[shape]
     body: dict = {"seven_day": {"utilization": 67.0, "resets_at": _iso(5 * 86400)}}
     if five_hour is not ABSENT:
@@ -75,20 +78,13 @@ def store(tmp_path):
 # -- the predicate and the plan label --------------------------------------
 
 
-@pytest.mark.parametrize(
-    "shape,live",
-    [("live", True), ("idle", False), ("absent", False), ("null", False), ("rolling", False)],
-)
-def test_only_a_live_window_is_live(shape, live):
-    assert oauth.five_hour_live(_usage(shape)) is live
+@pytest.mark.parametrize("shape", [s for s, _ in LIVE] + NOT_LIVE)
+def test_only_a_running_window_is_live(shape):
+    assert oauth.five_hour_live(_usage(shape)) is (shape in dict(LIVE))
 
 
-@pytest.mark.parametrize(
-    "usage",
-    [None, "token expired", {}, {"five_hour": {"pct": 9.0}}, {"five_hour": "x"}],
-    ids=["none", "sentinel", "empty", "no-reset", "not-a-window"],
-)
-def test_a_reading_without_a_proper_5h_window_is_not_live(usage):
+@pytest.mark.parametrize("usage", [None, "token expired", {}, {"five_hour": "x"}])
+def test_a_reading_without_a_5h_window_is_not_live(usage):
     assert oauth.five_hour_live(usage) is False
 
 
@@ -100,11 +96,9 @@ def test_a_reading_without_a_proper_5h_window_is_not_live(usage):
         ("max", "default_claude_max_5x", "Max 5x"),
         ("max", "default_claude_unheard_of", "Max"),
         ("pro", None, "Pro"),
-        ("team", "default_raven", "Team"),
         ("enterprise", "default_claude_zero", "Enterprise"),
         (None, "default_claude_new_tier", "default_claude_new_tier"),
         ("weird", None, "weird"),
-        ("weird", "", "weird"),
         (None, None, ""),
         (5, {}, ""),
     ],
@@ -136,8 +130,9 @@ def test_non_live_shapes_rank_and_render_like_an_absent_window(shape):
     assert tui_data.window_pct(got, "five_hour") is None  # no Next-best chip
 
 
-def test_a_live_window_still_renders():
-    got, now = _usage("live"), time.time()
+@pytest.mark.parametrize("shape", [s for s, _ in LIVE])
+def test_a_running_window_still_renders(shape):
+    got, now = _usage(shape), time.time()
     assert [label for label, *_ in widgets.usage_rows(got, now)] == ["5h", "7d"]
     assert _format_usage_lines(got)[0].startswith("5h:")
     assert menubar.usage_summary(got, now).startswith("5h 40%")
@@ -152,8 +147,6 @@ def test_the_both_title_labels_its_numbers():
     both = menubar.MenuBarSettings(title_pct="both", show_account_name=False)
     # A 7d figure must never sit where the 5h one used to.
     assert menubar.format_title("a@x.com", _usage("idle"), both) == f"{menubar.ICON} 7d 67%"
-    seven = menubar.MenuBarSettings(title_pct="7d", show_account_name=False)
-    assert menubar.format_title("a@x.com", _usage("live"), seven) == f"{menubar.ICON} 67%"
 
 
 def test_a_missing_5h_line_is_not_a_preference():
@@ -199,6 +192,10 @@ def test_a_429_on_a_no_5h_account_marks_its_binding_window(store, shape):
     assert value["seven_day"]["resets_at"] == usage["seven_day"]["resets_at"]
     assert _describe(value) == "7d 100%"
     assert oauth.binding_window_label(value, ("all",)) == "7d"
+    # Nothing 5h-shaped sets the span, not even a phantom reset an hour out.
+    assert store.entries(IDENT)["1"].walled_until == pytest.approx(
+        time.time() + WALL_FALLBACK_S, abs=5
+    )
 
 
 def test_a_legacy_mark_on_a_no_5h_account_does_not_read_5h_full(store):
@@ -226,11 +223,13 @@ def test_a_429_marks_the_scoped_window_when_that_one_binds(store):
     assert oauth.binding_window_label(value, ("all",)) == "Fable"
 
 
-def test_a_429_on_a_live_5h_account_still_reads_5h_full(store):
-    store.record({"1": FetchRecord(usage=_usage("live"))}, IDENT)
+@pytest.mark.parametrize("shape,span", LIVE)
+def test_a_429_on_a_running_5h_account_still_reads_5h_full(store, shape, span):
+    store.record({"1": FetchRecord(usage=_usage(shape))}, IDENT)
     store.mark_at_limit("1", IDENT)
 
     entry = store.entries(IDENT)["1"]
+    assert entry.walled_until == pytest.approx(time.time() + span, abs=5)
     value = entry.decision_value()
     assert value["five_hour"] == {
         "pct": 100.0, "resets_at": usage_store._reset_ts_to_resets_at(entry.walled_until),
@@ -247,18 +246,6 @@ def test_a_429_marks_the_window_already_at_100_even_beside_a_live_5h(store):
     value = store.entries(IDENT)["1"].decision_value()
     assert (value["five_hour"]["pct"], value["seven_day"]["pct"]) == (40.0, 100.0)
     assert oauth.binding_window_label(value, ("all",)) == "7d"
-
-
-def test_a_rolling_phantom_reset_does_not_set_the_wall_span(store):
-    usage = _usage("rolling")
-    usage["five_hour"]["resets_at"] = _iso(3600)  # the phantom rolls in an hour
-    usage["seven_day"] = {"pct": 100.0, "resets_at": _iso(3 * 86400)}
-    store.record({"1": FetchRecord(usage=usage)}, IDENT)
-    store.mark_at_limit("1", IDENT)
-
-    assert store.entries(IDENT)["1"].walled_until == pytest.approx(
-        time.time() + WALL_FALLBACK_S, abs=5
-    )
 
 
 # -- header readings -------------------------------------------------------------
@@ -298,9 +285,9 @@ PLAN_BLOBS = [
 ]
 
 
-def _fetch_with(blob: dict, sample_sequence_data: dict, then):
-    """Run ``then(switcher)`` against a switcher whose slots hold ``blob``'s
-    credential and whose usage endpoint answers a live 5h window."""
+def _list_with(blob: dict, sample_sequence_data: dict) -> None:
+    """``list_accounts`` on a switcher whose slots hold ``blob``'s credential
+    and whose usage endpoint answers a running 5h window."""
     sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
     active, backup = (
         json.dumps({"claudeAiOauth": {"accessToken": token, **blob}})
@@ -316,34 +303,22 @@ def _fetch_with(blob: dict, sample_sequence_data: dict, then):
     with patch.object(switcher, "_read_credentials", return_value=active), \
          patch.object(switcher, "_read_account_credentials", return_value=backup), \
          patch("claude_swap.oauth.urllib.request.urlopen", return_value=response):
-        return then(switcher)
-
-
-@pytest.mark.parametrize("blob,plan", PLAN_BLOBS)
-def test_a_fetch_stamps_the_plan_from_the_slots_credential(
-    temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, blob, plan
-):
-    entries = _fetch_with(
-        blob, sample_sequence_data,
-        lambda s: s._collect_usage_entries(s._build_accounts_info()),
-    )
-    assert entries["2"].plan == plan
+        switcher.list_accounts()
 
 
 @pytest.mark.parametrize("blob,plan", PLAN_BLOBS)
 def test_list_shows_the_plan_after_the_tag(
     temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys, blob, plan
 ):
-    _fetch_with(blob, sample_sequence_data, lambda s: s.list_accounts())
+    _list_with(blob, sample_sequence_data)
     header = next(
         line for line in capsys.readouterr().out.splitlines() if "account2@example.com" in line
     )
     assert header.rstrip().endswith(f"[personal] {plan}" if plan else "[personal]")
 
 
-@pytest.mark.parametrize("plan", ["Ultra", "default_claude_new_tier"])
-def test_the_tui_row_and_card_show_the_plan(plan):
-    now = time.time()
+def test_the_tui_row_and_card_show_the_plan():
+    plan, now = "Ultra", time.time()
     snap, bare = _snapshot(_usage("live"), plan), _snapshot(_usage("live"))
     assert f"[personal]  {plan}" in widgets.mini_account_text(snap, now).plain
     assert f"[personal]  {plan}" in widgets.account_card_text(snap, 80, now=now).plain

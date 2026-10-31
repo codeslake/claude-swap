@@ -237,7 +237,7 @@ def usage_summary(
         return "usage unavailable"
     if now is None:
         now = time.time()
-    usage = oauth.display_usage(usage)  # no 5h segment for a window that is not live
+    usage = oauth.display_usage(usage)  # no 5h segment without a running 5h window
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
@@ -328,7 +328,7 @@ def format_title(
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
-    active_usage = oauth.display_usage(active_usage)  # a 5h that is not live shows nothing
+    active_usage = oauth.display_usage(active_usage)  # no running 5h window shows no 5h
     # Both numbers are labelled: with the 5h window gone the one left would
     # otherwise be a 7d figure sitting where the 5h one used to be.
     both = settings.title_pct == "both"

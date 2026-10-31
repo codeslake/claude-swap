@@ -710,26 +710,25 @@ FIVE_HOUR_LABEL = "5h"
 
 
 def five_hour_live(usage: dict | str | None) -> bool:
-    """Whether the reading carries a LIVE 5-hour window.
+    """Whether the reading carries a RUNNING 5-hour window: a utilization above 0.
 
-    The 5h rule applies only to a window the API reports as running: a
-    utilization above 0 and a ``resets_at``. An absent or null ``five_hour``,
-    the idle ``{0, resets_at: null}`` and a ``{0, rolling resets_at}`` all read
-    "no 5h limit right now". The plan name never decides this: the 5h window is
-    being removed account by account.
+    An absent or null ``five_hour`` and the idle ``{0, resets_at: null}`` are
+    "no running 5h window", and so is a ``{0, rolling resets_at}``. A reset
+    time is not required: a running window whose reset the API withholds is
+    still running. The plan name never decides this: the 5h window is being
+    removed account by account.
+
+    shortcut: a window that rounds to 0% on its first poll draws no 5h chip for
+    one poll, upgrade when the API names a removed window.
     """
     window = usage.get("five_hour") if isinstance(usage, dict) else None
-    return (
-        isinstance(window, dict)
-        and isinstance(window.get("pct"), (int, float))
-        and window["pct"] > 0
-        and window.get("resets_at") is not None
-    )
+    pct = window.get("pct") if isinstance(window, dict) else None
+    return isinstance(pct, (int, float)) and pct > 0
 
 
 def display_usage(usage: dict | str | None) -> dict | str | None:
-    """``usage`` with a 5h window that is not live left out, for the screens:
-    no bar, chip or "resets" text is drawn for a window that does not exist."""
+    """``usage`` with a 5h window that is not running left out, for the screens:
+    no bar, chip or "resets" text is drawn for a window that is not running."""
     if isinstance(usage, dict) and "five_hour" in usage and not five_hour_live(usage):
         return {k: v for k, v in usage.items() if k != "five_hour"}
     return usage

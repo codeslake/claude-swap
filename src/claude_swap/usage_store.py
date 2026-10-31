@@ -807,10 +807,10 @@ def _walled_decision_value(
     eligible as a last-chance probe target despite the wall. Forces ONE
     window full: ``window``, the one ``mark_at_limit`` found binding. With
     none recorded (a legacy mark, or no stored reading at the time) it is 5h.
-    Either way a reading with no live 5h marks 7d instead, so such an account
-    is never read "5h full". A 5h window is forced only at the mark's own
-    deadline (``walled_until``, its ``resets_at``); a weekly one keeps its real
-    reset. ``seven_day`` is synthesized the same way when nothing stored
+    Either way a reading with no running 5h window marks 7d instead, so such an
+    account is never read "5h full". A 5h window is forced only at the mark's
+    own deadline (``walled_until``, its ``resets_at``); a weekly one keeps its
+    real reset. ``seven_day`` is synthesized the same way when nothing stored
     carries it, so every window carries the mark's deadline instead of one
     appearing unmeasured.
     """
@@ -822,7 +822,7 @@ def _walled_decision_value(
         k: v for k, v in last_good.items() if k in ("seven_day", "scoped")
     } if isinstance(last_good, dict) else {}
     if window in (None, oauth.FIVE_HOUR_LABEL) and last_good and not oauth.five_hour_live(last_good):
-        window = "7d"  # never "5h full" for an account with no live 5h
+        window = "7d"  # never "5h full" with no running 5h window
     if window in (None, oauth.FIVE_HOUR_LABEL):
         value["five_hour"] = dict(full)
     elif oauth.five_hour_live(last_good):
@@ -1665,13 +1665,13 @@ class UsageStore:
         far-future) reset is capped at the fallback instead, well before its
         own reset: the mark lifts on the trade that a possibly-early release
         beats parking it for days; ``WALL_FALLBACK_S`` from now alone when no
-        reading is stored to key it on. A 5h window that is not live
+        reading is stored to key it on. A 5h window that is not running
         (``oauth.five_hour_live``) takes no part in the span, and is never the
-        window marked full (see ``walledWindow``). While the mark has not expired, ``entries()``
-        reports the slot as walled and ``UsageEntry.decision_value()`` reads
-        it full for decisions, whatever a later poll says (a successful poll
-        does not clear the mark early). A repeated call overwrites any prior
-        mark with this newer observation.
+        window marked full (see ``walledWindow``). While the mark has not
+        expired, ``entries()`` reports the slot as walled and
+        ``UsageEntry.decision_value()`` reads it full for decisions, whatever
+        a later poll says (a successful poll does not clear the mark early). A
+        repeated call overwrites any prior mark with this newer observation.
         """
         now = self.clock()
         fallback = now + WALL_FALLBACK_S
@@ -1679,8 +1679,7 @@ class UsageStore:
         def apply(_num: str, row: dict) -> None:
             last_good = row.get("lastGood")
             five_live = oauth.five_hour_live(last_good)
-            # A 5h window that is not live is no window: its reset sets no
-            # span and its percentage is no wall.
+            # A 5h window that is not running sets no span and is no wall.
             readings = [
                 w for w in oauth.relevant_windows(last_good, models)
                 if five_live or w[0] != oauth.FIVE_HOUR_LABEL
@@ -1702,7 +1701,7 @@ class UsageStore:
             row["walledUntil"] = until if wall_until is None else min(until, wall_until)
             row["walledUuid"] = account_uuid
             # The 429 does not name its window on this path: one already at
-            # 100 in the stored reading is the wall, else a live 5h is the
+            # 100 in the stored reading is the wall, else a running 5h is the
             # long-standing guess, else the highest weekly one. No reading, no
             # guess (None keeps the full 5h-and-7d synthesis).
             top = max(readings, key=lambda w: w[1], default=("7d", 0.0))
@@ -1780,9 +1779,9 @@ class UsageStore:
 
         Returns True when a reading was recorded (a 5h or 7d utilization
         header was present and the row was eligible); False, recording
-        nothing, otherwise. A reply with no 5h header (an account with no 5h
-        window) still records its 7d reading, and the stored 5h is left as it
-        was until the next poll.
+        nothing, otherwise. A reply with no 5h header (an account with no
+        running 5h window) still records its 7d reading, and the stored 5h is
+        left as it was until the next poll.
         """
         five_pct = _header_pct(headers, USAGE_HEADER_5H_PCT)
         seven_pct = _header_pct(headers, USAGE_HEADER_7D_PCT)

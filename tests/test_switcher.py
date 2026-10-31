@@ -661,7 +661,7 @@ class TestStatusCache:
 
         UsageStore(switcher.backup_dir / "cache").record(
             {"1": FetchRecord(usage={
-                "five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h", "resets_at": "2099-01-01T00:00:00Z"},
+                "five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
                 "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"},
             })},
             {"1": ("test@example.com", "")},
@@ -689,7 +689,7 @@ class TestStatusCache:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
         usage_result = {
-            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m", "resets_at": "2099-01-01T00:00:00Z"},
+            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
             "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
         }
 
@@ -1494,7 +1494,7 @@ class TestListAccountsUsage:
     def test_list_shows_usage_null_reset(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
-        """An idle five_hour (0%, resets_at null) is no live window: it draws no
+        """An idle five_hour (0%, resets_at null) is no running window: it draws no
         row, and the seven_day line at 100% still renders."""
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
@@ -1741,11 +1741,11 @@ class TestListAccountsUsage:
         UsageStore(switcher.backup_dir / "cache").record(
             {
                 "1": FetchRecord(usage={
-                    "five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h", "resets_at": "2099-01-01T00:00:00Z"},
+                    "five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
                     "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"},
                 }),
                 "2": FetchRecord(usage={
-                    "five_hour": {"pct": 80, "clock": "Jan 1 04:00", "countdown": "30m", "resets_at": "2099-01-01T00:00:00Z"},
+                    "five_hour": {"pct": 80, "clock": "Jan 1 04:00", "countdown": "30m"},
                     "seven_day": {"pct": 90, "clock": "Jan 3 03:00", "countdown": "3d"},
                 }),
             },
@@ -1784,12 +1784,12 @@ class TestListAccountsUsage:
             switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 400
         )
         backdated.record(
-            {"1": FetchRecord(usage={"five_hour": {"pct": 25, "resets_at": "2099-01-01T00:00:00Z"}})},
+            {"1": FetchRecord(usage={"five_hour": {"pct": 25}})},
             {"1": ("test@example.com", "")},
         )
 
         usage_result = {
-            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m", "resets_at": "2099-01-01T00:00:00Z"},
+            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
             "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
         }
 
@@ -1820,7 +1820,7 @@ class TestListAccountsUsage:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
         usage_result = {
-            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m", "resets_at": "2099-01-01T00:00:00Z"},
+            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
             "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
         }
         with patch.object(switcher, "_read_active_credentials",
@@ -1858,14 +1858,14 @@ class TestListAccountsUsage:
             switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 400
         )
         backdated.record(
-            {"1": FetchRecord(usage={"five_hour": {"pct": 25, "resets_at": "2099-01-01T00:00:00Z"}})}, ident1
+            {"1": FetchRecord(usage={"five_hour": {"pct": 25}})}, ident1
         )
         switcher._usage_store.set_poll_plan(
             {"1": (time_mod.time() + 600.0, 600.0)}, ident1
         )
 
         usage_result = {
-            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m", "resets_at": "2099-01-01T00:00:00Z"},
+            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
             "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
         }
         with patch.object(switcher, "_read_active_credentials",
@@ -2042,7 +2042,7 @@ class TestListAccountsUsage:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
         usage_result = {
-            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m", "resets_at": "2099-01-01T00:00:00Z"},
+            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
             "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
         }
 
@@ -10677,7 +10677,7 @@ class TestFormatUsageLines:
 
     def test_scoped_lines_render_per_model_with_at_limit_marker(self):
         usage = {
-            "five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m", "resets_at": "2099-01-01T00:00:00Z"},
+            "five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"},
             "seven_day": {"pct": 72.0, "clock": "21:59", "countdown": "3h"},
             "scoped": [
                 {"name": "Fable", "pct": 100.0, "clock": "21:59", "countdown": "3h"},
@@ -10774,6 +10774,7 @@ class TestFormatUsageLines:
 
     def test_scoped_labels_align_columns_with_standard_windows(self):
         usage = {
+            "five_hour": {"pct": 0.0},
             "seven_day": {"pct": 62.0, "clock": "Jul 5 08:59", "countdown": "1d 19h"},
             "scoped": [
                 {"name": "Fable", "pct": 100.0, "clock": "Jul 5 08:59", "countdown": "1d 19h"},
@@ -10786,9 +10787,9 @@ class TestFormatUsageLines:
         assert len({line.index("%") for line in lines}) == 1
 
     def test_standard_windows_alone_keep_legacy_layout(self):
-        usage = {"seven_day": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"}}
+        usage = {"five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"}}
         lines = _format_usage_lines(usage)
-        assert lines == ["7d:   7%   resets 20:39         in 1h 30m"]
+        assert lines == ["5h:   7%   resets 20:39         in 1h 30m"]
 
     def test_seven_day_ahead_of_pace_marker(self):
         # 1 day elapsed of the week (resets_at 6 days out), 50% used -> far
@@ -22473,9 +22474,7 @@ class TestFailedReadingLosesToAFresherWorseReading:
 
     @staticmethod
     def _usage(pct: float) -> dict:
-        # A reset time makes the 5h window live (oauth.five_hour_live).
-        reset = "2099-01-01T00:00:00Z"
-        return {"five_hour": {"pct": pct, "resets_at": reset}, "seven_day": {"pct": 0.0}}
+        return {"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}}
 
     def _decision_usage(self, s: ClaudeAccountSwitcher) -> dict:
         entries = s._usage_store.entries(self._IDENT)
@@ -22622,9 +22621,9 @@ class TestSwitchPersistsTheAtLimitMark:
         # A fresh poll reading a healthy 58% afterwards does not clear the
         # mark early -- decision_value() still reports the slot full.
         s._usage_store.record(
-            {"1": FetchRecord(usage={
-                "five_hour": {"pct": 58.0, "resets_at": "2099-01-01T00:00:00Z"}, "seven_day": {"pct": 0.0},
-            })},
+            {"1": FetchRecord(
+                usage={"five_hour": {"pct": 58.0}, "seven_day": {"pct": 0.0}}
+            )},
             ident,
         )
         entry = s._usage_store.entries(ident)["1"]

@@ -170,7 +170,7 @@ def _pace_marker(window: dict, fetched_at: float | None) -> str:
 def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[str]:
     # Collect (label, body) rows first, then pad every label to the widest one so
     # per-model names (e.g. "Fable") don't shift the columns of the other lines.
-    usage = oauth.display_usage(usage)  # no 5h row for a window that is not live
+    usage = oauth.display_usage(usage)  # no 5h row without a running 5h window
     rows: list[tuple[str, str]] = []
     spend = usage.get("spend")
     if spend:

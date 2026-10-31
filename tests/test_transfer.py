@@ -2653,10 +2653,7 @@ class TestImportUsage:
         identity = {"1": ("alice@example.com", "")}
         s._usage_store.record(
             {"1": FetchRecord(
-                usage={
-                    "five_hour": {"pct": 37.0, "resets_at": "2099-01-01T00:00:00Z"},
-                    "seven_day": {"pct": 10.0},
-                }
+                usage={"five_hour": {"pct": 37.0}, "seven_day": {"pct": 10.0}}
             )},
             identity,
         )

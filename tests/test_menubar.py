@@ -109,12 +109,8 @@ def test_settings_ignores_unknown_and_bad_types(tmp_path: Path):
     assert s.show_account_name is False
 
 
-# A 5h window with a reset time is live (oauth.five_hour_live). This one is
-# long past, so the summaries carry no clock-dependent countdown for it.
-_RESET = "2000-01-01T00:00:00Z"
-
 _USAGE = {
-    "five_hour": {"pct": 42.0, "resets_at": _RESET},
+    "five_hour": {"pct": 42.0},
     "seven_day": {"pct": 18.0},
     "spend": {"pct": 30.0, "used": 3.0, "limit": 10.0},
 }
@@ -137,14 +133,14 @@ def test_usage_summary_dict():
 
 
 def test_usage_summary_partial_windows():
-    assert menubar.usage_summary({"five_hour": {"pct": 5.0, "resets_at": _RESET}}) == "5h 5%"
+    assert menubar.usage_summary({"five_hour": {"pct": 5.0}}) == "5h 5%"
 
 
 def test_usage_summary_includes_scoped_model_limits():
     # Per-model weekly limits (e.g. Fable) come through as usage["scoped"], after
     # 5h/7d and before spend.
     usage = {
-        "five_hour": {"pct": 82.0, "resets_at": _RESET},
+        "five_hour": {"pct": 82.0},
         "seven_day": {"pct": 12.0},
         "scoped": [{"name": "Fable", "pct": 4.0}],
         "spend": {"pct": 30.0},
@@ -379,9 +375,7 @@ def test_format_title_both_drops_unavailable_windows():
 def test_format_title_both_keeps_available_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     # only 5h present -> 7d dropped, no trailing separator
-    assert menubar.format_title(
-        "loc@x.com", {"five_hour": {"pct": 9.0, "resets_at": _RESET}}, s
-    ) == "⇄ 5h 9%"
+    assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 5h 9%"
 
 
 # --- reset-time helpers --------------------------------------------------------
@@ -546,7 +540,7 @@ def test_usage_summary_reflects_passed_weekly_reset():
     # 7d reset a day ago: show it as reset (0%) with the next weekly boundary,
     # from the static schedule alone. 5h is untouched (dynamic session window).
     usage = {
-        "five_hour": {"pct": 10.0, "resets_at": _iso(-3600)},
+        "five_hour": {"pct": 10.0},
         "seven_day": {"pct": 95.0, "resets_at": _iso(-86400)},
     }
     assert menubar.usage_summary(usage, _NOW) == "5h 10% · 7d 0% (6d 0h)"
