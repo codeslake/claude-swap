@@ -800,22 +800,21 @@ def _walled_decision_value(
     """The synthetic full reading ``UsageEntry.decision_value`` reports while
     ``walled``.
 
-    Keeps whatever the stored reading knows about the OTHER windows
-    (``seven_day``, ``scoped``) unchanged — a reader like autoswitch's
-    ``_seven_day_reset_unmeasured`` must see the real weekly reset, or a
-    walled 5h-only slot reads as "weekly reset never reported" and becomes
-    eligible as a last-chance probe target despite the wall. Forces ONE
-    window full: ``window``, the one ``mark_at_limit`` found binding. With
-    none recorded (a legacy mark, or no stored reading at the time) it is 5h.
+    Starts from the stored ``seven_day`` and ``scoped``: a reader like
+    autoswitch's ``_seven_day_reset_unmeasured`` must see the real weekly
+    reset, or a walled 5h-only slot reads as "weekly reset never reported" and
+    becomes eligible as a last-chance probe target despite the wall. Forces
+    ``window``, the one ``mark_at_limit`` found binding, full; with none
+    recorded (a legacy mark, or no stored reading at the time) it is 5h.
     Either way a reading with no running 5h window marks 7d instead, so such an
-    account is never read "5h full". A window forced full carries the mark's
-    own deadline (``walled_until``, its ``resets_at``) unless the stored one
-    already reads 100%, which keeps its real reset: a guess lifts with the
-    mark, not days later. A named window other than 5h forces 7d too, the one
-    every reader includes: a reader's models may leave a scoped name out, and a
-    later poll may stop listing it. ``seven_day`` is synthesized the same way
-    when nothing stored carries it, so every window carries the mark's deadline
-    instead of one appearing unmeasured.
+    account is never read "5h full". A named window other than 5h forces 7d
+    too, the one every reader includes: a reader's models may leave a scoped
+    name out, and a later poll may stop listing it. A window forced full
+    carries the mark's own deadline (``walled_until``, its ``resets_at``)
+    unless the stored one already reads 100%, which keeps its real reset: a
+    guess lifts with the mark, not days later. ``seven_day`` is synthesized the
+    same way when nothing stored carries it, so every window carries the
+    mark's deadline instead of one appearing unmeasured.
     """
     resets_at = _reset_ts_to_resets_at(walled_until) if walled_until is not None else None
     full: dict = {"pct": 100.0}
