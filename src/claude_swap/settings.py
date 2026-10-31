@@ -79,7 +79,8 @@ class AutoSwitchSettings:
     cache_ttl_seconds: float = 3600.0
     # `dynamic` only: the least headroom a COLD candidate needs to be worth
     # the re-write cost (measured: one cold landing cost ~19 5h-points on a
-    # 19-session fleet).
+    # 19-session fleet). Charged on the 5h window only: a candidate with no
+    # 5h window is not taxed, and a blackout keeps the bar on the binding one.
     cold_switch_cost_pct: float = 20.0
     # `dynamic` only: how long a healthy active is held before rotating to a
     # warm partner, so both accounts' caches stay inside `cache_ttl_seconds`.

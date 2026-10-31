@@ -2761,9 +2761,12 @@ class AutoSwitchEngine:
             # and no other: its 5h headroom must still clear the same
             # per-tier floor below (measured 2026-10-05: a warm 5h 86 /
             # 7d 61 candidate, headroom 14 and 5h-bound, was admitted
-            # because its 7d reset sooner -- the 5h window does not perish). It may still come from
-            # `cold_ordered`, and still had to clear `SPENT_HEADROOM_PCT`
-            # to reach either list at all.
+            # because its 7d reset sooner -- the 5h window does not
+            # perish). Outside a blackout the model and weekly windows
+            # (scoped windows are weekly, oauth.py `relevant_windows`)
+            # carry only the bare `SPENT_HEADROOM_PCT` floor. It may still
+            # come from `cold_ordered`, and still had to clear
+            # `SPENT_HEADROOM_PCT` to reach either list at all.
             #
             # T0758 follow-up: `warm_ordered + cold_ordered`, warm first, so
             # a lapsed rotation (no partner has switched inside the TTL,
@@ -2780,13 +2783,13 @@ class AutoSwitchEngine:
             # own docstring, "~19 5h-points"), so a cold candidate admitted
             # at the bare floor arrives with only a sliver left -- a real
             # regression out of a voluntary, unforced move with no wall to
-            # escape. The cold half must still read healthy AFTER paying
-            # the cost, STRICTLY past `SPENT_HEADROOM_PCT` -- `>=` at
-            # exactly `cold_switch_cost_pct + SPENT_HEADROOM_PCT` would
-            # admit a candidate landing at precisely the headroom
-            # `_about_to_wall` itself calls walled (correctness review).
-            # Warm pays no re-write cost, so its floor stays the bare,
-            # unchanged `>=`.
+            # escape. The cold half must still read healthy on the 5h
+            # window AFTER paying the cost, STRICTLY past
+            # `SPENT_HEADROOM_PCT` -- `>=` at exactly
+            # `cold_switch_cost_pct + SPENT_HEADROOM_PCT` would admit a
+            # candidate landing at precisely the headroom `_about_to_wall`
+            # itself calls walled (correctness review). Warm pays no
+            # re-write cost, so its 5h floor stays the bare, unchanged `>=`.
             # T3113: the cost is in 5h points, charged against the 5h
             # window only, never the binding one (a no-5h account has none).
             cold_set = set(cold_ordered)
@@ -2803,13 +2806,17 @@ class AutoSwitchEngine:
                         ),
                         default=0.0,
                     )
-                h5 = oauth.headroom_on_window(usage.get(n), oauth.FIVE_HOUR_LABEL)
+                # In a blackout every candidate is walled on the model, so a
+                # landing buys nothing and the bar stays on the binding window.
+                charged = h if model_window_dropped else oauth.headroom_on_window(
+                    usage.get(n), oauth.FIVE_HOUR_LABEL
+                )
                 cost = settings.cold_switch_cost_pct
                 if n in cold_set:
-                    h5_ok = h5 is None or h5 - cost > SPENT_HEADROOM_PCT
+                    charged_ok = charged is None or charged - cost > SPENT_HEADROOM_PCT
                 else:
-                    h5_ok = h5 is None or h5 >= cost
-                return h > SPENT_HEADROOM_PCT and h5_ok
+                    charged_ok = charged is None or charged >= cost
+                return h > SPENT_HEADROOM_PCT and charged_ok
             alternation_admissible = [
                 n for n in warm_ordered + cold_ordered
                 if _clears_the_landing_floor(n)

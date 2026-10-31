@@ -7682,10 +7682,10 @@ class TestWarmthAndAlternation375:
     def test_control_the_floor_still_binds_when_the_candidates_reset_is_later(
         self, temp_home
     ):
-        """Same shape, but #2 is 5h-bound and its reset is LATER than
-        #1's -- not perishing, so today's floor still refuses it
-        (`below-floor`, the same hold this scenario reports without the
-        fix)."""
+        """Pins the 5h veto: #2 is 5h-bound (5h 95, headroom 5, under the
+        cold cost), so the floor refuses it (`below-floor`) whatever the
+        order of the two 7d resets -- the 5h window does not perish, and
+        the 7d waiver never lifts it. (Here #2's reset is also LATER.)"""
         h = self._harness(temp_home, threshold=90.0)
         chunk = h.engine.settings.alternation_chunk_seconds
         now = h.clock.now
@@ -7727,14 +7727,13 @@ class TestWarmthAndAlternation375:
     def test_a_perishing_candidate_still_needs_a_real_active_reset(
         self, temp_home
     ):
-        """`_perishes_before_active` stays conservative when the ACTIVE's
-        own 7-day reset is unknown (no `resets_at` at all here, via the
-        bare `_usage()` helper): an unread datum must not waive the floor
-        for every candidate with a real reset -- it is never distinguish-
-        able from "never fetched" versus "genuinely nothing pending", and
-        only the first of those would justify it. The candidate side still
-        reads its own real, sooner reset; only the missing ACTIVE side
-        withholds the exemption."""
+        """Pins the 5h veto, not the reset ordering: #2 is 5h-bound (5h
+        96, headroom 4, under the cold cost) with a real, sooner 7d reset
+        while the ACTIVE's is unknown (bare `_usage()`), and the floor
+        refuses it (`below-floor`) on the 5h window either way, since a
+        perishing waiver covers the 7d alone. (The 5h veto decides here;
+        this row no longer discriminates the unread-ACTIVE-reset reading
+        in `_perishes_before_active`.)"""
         h = self._harness(temp_home, threshold=90.0)
         chunk = h.engine.settings.alternation_chunk_seconds
         now = h.clock.now
@@ -16284,6 +16283,42 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
             "clear both"
         )
         assert h.active_number() == 1
+
+    @pytest.mark.parametrize(
+        "cold_days_out, cold_five_h, expect_switch",
+        [(4, 0, False), (3, 0, True), (3, 90, False)],
+    )
+    def test_the_blackout_bar_holds_once_the_dwell_has_elapsed(
+        self, temp_home, cold_days_out, cold_five_h, expect_switch
+    ):
+        """[I]: the 5h-only landing floor read the cold cost off the 5h
+        window, so in a blackout (every account Fable-walled, the 5h clear
+        on both) a cold #3 at unmodeled 15 (7d 85) passed the floor with a
+        5h headroom of 100, and the dwell-elapsed alternation landed on it
+        although the escape's `cold_bar` (20) refused it -- and next chunk
+        the warm floor took #1 back, two walled accounts trading every
+        chunk. The sibling test above only held because it seeds no
+        `lastActiveAt`. In a blackout the bar stays on the binding window.
+        A candidate whose 7d resets sooner (days_out 3) is still waived
+        on the 7d alone (T1850); its 5h still has to clear.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a1@example.invalid", 1)
+        h.engine._mutate_state(
+            lambda s: s.update(lastActiveAt={"1": h.clock.now - 700.0})
+        )
+        fleet = {
+            "1": self._u(0, 95, 100, days_out=4),  # active: unmodeled headroom 5
+            "3": self._u(cold_five_h, 85, 100, days_out=cold_days_out),  # cold
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert (outcome is TickOutcome.SWITCHED) is expect_switch, (
+            f"got {outcome!r} -- the dwell has elapsed; a blackout landing "
+            "buys nothing, so only a 7d-perishing candidate may be taken"
+        )
+        assert h.active_number() == (3 if expect_switch else 1)
 
     def test_the_non_blackout_escape_still_prices_a_cold_landing(
         self, temp_home
