@@ -439,12 +439,39 @@ def try_refresh_oauth_credentials(
             if err in ("invalid_grant", "invalid_client"):
                 _logger.info("Refresh POST for account %s: failed (%s)", slot, err)
                 return RefreshOutcome(None, err)
-        _logger.info("Refresh POST for account %s: failed (transient)", slot)
+        _logger.info(
+            "Refresh POST for account %s: failed (transient): %s", slot, _transient_cause(e)
+        )
         return RefreshOutcome(None, "transient")
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
-        _logger.info("Refresh POST for account %s: failed (transient)", slot)
+        _logger.info(
+            "Refresh POST for account %s: failed (transient): %s", slot, _transient_cause(e)
+        )
         return RefreshOutcome(None, "transient")
+
+
+def _transient_cause(e: Exception) -> str:
+    """Log-safe cause of a transient refresh failure: never the body or ``str(e)``.
+
+    Header values are server-controlled, so only a safe character set is kept
+    (a folded header can carry CR/LF and would forge a log line) and capped.
+    """
+    if not isinstance(e, urllib.error.HTTPError):
+        # urllib wraps every connect-phase OSError in URLError(err): name the
+        # wrapped class too, or timeout, refused, DNS and TLS all read alike.
+        reason = e.reason if isinstance(e, urllib.error.URLError) else None
+        if isinstance(reason, BaseException):
+            return f"{type(e).__name__}({type(reason).__name__})"
+        return type(e).__name__
+    parts = [f"HTTP {e.code}"]
+    headers = e.headers or {}  # None when the error was built without hdrs
+    for name in ("retry-after", "x-request-id"):
+        raw = str(headers.get(name) or "")
+        value = "".join(c for c in raw if c.isascii() and (c.isalnum() or c in " ._:-"))[:64].strip()
+        if value:
+            parts.append(f"{name}={value}")
+    return ", ".join(parts)
 
 
 def _parse_token_account(resp_data: dict) -> dict | None:
