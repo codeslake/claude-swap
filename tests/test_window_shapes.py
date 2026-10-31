@@ -5,12 +5,14 @@ may be withheld. Everything else (idle ``{0, null}``, a rolling ``{0, +1h}``, a
 null or an absent key) is "no running 5h window" and must neither bind a
 decision, be drawn as a bar, nor be synthesized as full by a 429 wall.
 
-Shapes ``live`` and ``idle`` are real captures (2026-10-30), trimmed to the
-keys the parser reads: a running-5h account (10% / 29%) and a weekly-walled one
-(7d 100%) with an idle 5h. ``withheld`` is the running capture with its reset
-left out. ``absent``, ``null`` and ``rolling`` are HYPOTHESES for what a
-removed 5h window looks like, built on the walled capture, until one is
-captured.
+Shapes ``live``, ``idle`` and ``removed`` are real captures, trimmed to the
+keys the parser reads: a running-5h account (10% / 29%, 2026-10-30), a
+weekly-walled one (7d 100%) with an idle 5h (2026-10-30), and slot 8 with its
+5h limit removed (2026-10-31): ``five_hour`` null AND no ``session`` entry in
+``limits``, 7d 97%. So ``null`` is MEASURED. ``withheld`` is the running
+capture with its reset left out. ``absent`` and ``rolling`` are HYPOTHESES for
+what a removed 5h window looks like, built on the walled capture, until one is
+captured; ``null`` also stays there as the same shape on the walled body.
 """
 
 from __future__ import annotations
@@ -33,9 +35,10 @@ from claude_swap.usage_store import WALL_FALLBACK_S, FetchRecord, UsageEntry, Us
 
 FIXTURES = Path(__file__).parent / "fixtures"
 CAPTURED_AT = datetime(2026, 10, 31, 1, 8, 56, tzinfo=timezone.utc)
-SHIFT = timedelta(0)
+REMOVED_AT = datetime(2026, 10, 31, 5, 21, 25, tzinfo=timezone.utc)
+NOW = CAPTURED_AT
 IDENT = {"1": ("a@x.com", "")}
-NOT_LIVE = ["idle", "absent", "null", "rolling"]
+NOT_LIVE = ["idle", "removed", "absent", "null", "rolling"]
 # shape, its 429 wall span (the capture's 5h reset was 4h51m04s ahead)
 LIVE = [("live", 4 * 3600 + 51 * 60 + 4), ("withheld", WALL_FALLBACK_S)]
 
@@ -47,18 +50,19 @@ def _iso(seconds: float) -> str:
 
 @pytest.fixture(autouse=True)
 def _moved_on():
-    """Fix, for one test, how far on from the capture the resets are moved."""
-    global SHIFT
-    SHIFT = datetime.now(timezone.utc) - CAPTURED_AT
+    """Fix, for one test, the instant the captures' resets are moved on to."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
-def _capture(name: str) -> dict:
-    """A captured body with every reset moved on by SHIFT, so its windows are
-    as far ahead of now as they were then."""
+def _capture(name: str, taken: datetime = CAPTURED_AT) -> dict:
+    """A captured body with every reset moved on by NOW - ``taken``, so its
+    windows are as far ahead of now as they were then."""
+    shift = NOW - taken
 
     def moved(window: dict) -> dict:
         if window.get("resets_at"):
-            window["resets_at"] = (datetime.fromisoformat(window["resets_at"]) + SHIFT).isoformat()
+            window["resets_at"] = (datetime.fromisoformat(window["resets_at"]) + shift).isoformat()
         return window
 
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"), object_hook=moved)
@@ -66,6 +70,8 @@ def _capture(name: str) -> dict:
 
 def _api(shape: str) -> dict:
     """A raw usage-endpoint body with the named ``five_hour`` shape."""
+    if shape == "removed":
+        return _capture("usage_removed_5h.json", REMOVED_AT)
     if shape in ("live", "withheld"):
         body = _capture("usage_running_5h.json")
         if shape == "withheld":
@@ -145,7 +151,11 @@ def test_plan_label(subscription, tier, label):
 
 @pytest.mark.parametrize("shape", NOT_LIVE)
 def test_non_live_shapes_rank_and_render_like_an_absent_window(shape):
-    ref, got, now = _usage("absent"), _usage(shape), time.time()
+    # The reference is the same body with its 5h key dropped: "removed" is a
+    # different account from the walled one, so another shape's 7d is no match.
+    ref_body = _api(shape)
+    ref_body.pop("five_hour", None)
+    ref, got, now = oauth.build_usage_result(ref_body), _usage(shape), time.time()
     # The two rank lines guard no-regression: they hold on the old code too.
     assert oauth.account_headroom(got) == oauth.account_headroom(ref)
     assert consume_first_rank_key(got, 90.0, now) == consume_first_rank_key(ref, 90.0, now)
