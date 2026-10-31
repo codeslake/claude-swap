@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import math
-import re
 import sys
 import urllib.error
 import urllib.request
@@ -320,7 +319,8 @@ def _transient_cause(e: Exception) -> str:
     parts = [f"HTTP {e.code}"]
     headers = e.headers or {}  # None when the error was built without hdrs
     for name in ("retry-after", "x-request-id"):
-        value = re.sub(r"[^A-Za-z0-9._: -]", "", str(headers.get(name) or ""))[:64].strip()
+        raw = str(headers.get(name) or "")
+        value = "".join(c for c in raw if c.isascii() and (c.isalnum() or c in " ._:-"))[:64].strip()
         if value:
             parts.append(f"{name}={value}")
     return ", ".join(parts)

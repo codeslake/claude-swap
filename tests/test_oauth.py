@@ -718,6 +718,8 @@ class TestTryRefreshOAuthCredentials:
             (429, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"},
              "HTTP 429, retry-after=Wed 21 Oct 2015 07:28:00 GMT"),
             (429, {"X-Request-Id": "A" * 200}, "HTTP 429, x-request-id=" + "A" * 64),
+            # str.isalnum() is True for non-ASCII letters and digits; they are dropped.
+            (429, {"X-Request-Id": "réq٣"}, "HTTP 429, x-request-id=rq"),
         ],
     )
     def test_transient_http_failure_log_names_status_and_headers(
