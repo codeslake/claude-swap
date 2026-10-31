@@ -5,10 +5,12 @@ may be withheld. Everything else (idle ``{0, null}``, a rolling ``{0, +1h}``, a
 null or an absent key) is "no running 5h window" and must neither bind a
 decision, be drawn as a bar, nor be synthesized as full by a 429 wall.
 
-Shapes ``live`` and ``idle`` are the two measured on real accounts (the numbers
-are one active account's, 40% / 67%). ``withheld`` is a running window whose
-reset the API left out. ``absent``, ``null`` and ``rolling`` are HYPOTHESES for
-what a removed 5h window looks like, until one is captured.
+Shapes ``live`` and ``idle`` are real captures (2026-10-30), trimmed to the
+keys the parser reads: a running-5h account (10% / 29%) and a weekly-walled one
+(7d 100%) with an idle 5h. ``withheld`` is the running capture with its reset
+left out. ``absent``, ``null`` and ``rolling`` are HYPOTHESES for what a
+removed 5h window looks like, built on the walled capture, until one is
+captured.
 """
 
 from __future__ import annotations
@@ -29,10 +31,13 @@ from claude_swap.switcher import ClaudeAccountSwitcher, _format_usage_lines
 from claude_swap.tui import data as tui_data, widgets
 from claude_swap.usage_store import WALL_FALLBACK_S, FetchRecord, UsageEntry, UsageStore
 
+FIXTURES = Path(__file__).parent / "fixtures"
+CAPTURED_AT = datetime(2026, 10, 31, 1, 8, 56, tzinfo=timezone.utc)
+SHIFT = timedelta(0)
 IDENT = {"1": ("a@x.com", "")}
-ABSENT = object()
 NOT_LIVE = ["idle", "absent", "null", "rolling"]
-LIVE = [("live", 3 * 3600), ("withheld", WALL_FALLBACK_S)]  # shape, its 429 wall span
+# shape, its 429 wall span (the capture's 5h reset was 4h51m04s ahead)
+LIVE = [("live", 4 * 3600 + 51 * 60 + 4), ("withheld", WALL_FALLBACK_S)]
 
 
 def _iso(seconds: float) -> str:
@@ -40,19 +45,39 @@ def _iso(seconds: float) -> str:
     return when.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+@pytest.fixture(autouse=True)
+def _moved_on():
+    """Fix, for one test, how far on from the capture the resets are moved."""
+    global SHIFT
+    SHIFT = datetime.now(timezone.utc) - CAPTURED_AT
+
+
+def _capture(name: str) -> dict:
+    """A captured body with every reset moved on by SHIFT, so its windows are
+    as far ahead of now as they were then."""
+
+    def moved(window: dict) -> dict:
+        if window.get("resets_at"):
+            window["resets_at"] = (datetime.fromisoformat(window["resets_at"]) + SHIFT).isoformat()
+        return window
+
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"), object_hook=moved)
+
+
 def _api(shape: str) -> dict:
     """A raw usage-endpoint body with the named ``five_hour`` shape."""
-    five_hour = {
-        "live": {"utilization": 40.0, "resets_at": _iso(3 * 3600)},
-        "withheld": {"utilization": 40.0, "resets_at": None},
-        "idle": {"utilization": 0.0, "resets_at": None},
-        "absent": ABSENT,
-        "null": None,
-        "rolling": {"utilization": 0.0, "resets_at": _iso(3600)},
-    }[shape]
-    body: dict = {"seven_day": {"utilization": 67.0, "resets_at": _iso(5 * 86400)}}
-    if five_hour is not ABSENT:
-        body["five_hour"] = five_hour
+    if shape in ("live", "withheld"):
+        body = _capture("usage_running_5h.json")
+        if shape == "withheld":
+            body["five_hour"]["resets_at"] = None
+        return body
+    body = _capture("usage_weekly_walled_idle_5h.json")
+    if shape == "absent":
+        del body["five_hour"]
+    elif shape == "null":
+        body["five_hour"] = None
+    elif shape == "rolling":
+        body["five_hour"] = {"utilization": 0.0, "resets_at": _iso(3600)}
     return body
 
 
@@ -133,20 +158,28 @@ def test_non_live_shapes_rank_and_render_like_an_absent_window(shape):
 @pytest.mark.parametrize("shape", [s for s, _ in LIVE])
 def test_a_running_window_still_renders(shape):
     got, now = _usage(shape), time.time()
-    assert [label for label, *_ in widgets.usage_rows(got, now)] == ["5h", "7d"]
+    assert [label for label, *_ in widgets.usage_rows(got, now)] == ["5h", "7d", "Fable"]
     assert _format_usage_lines(got)[0].startswith("5h:")
-    assert menubar.usage_summary(got, now).startswith("5h 40%")
-    assert ":40%" in widgets.mini_account_text(_snapshot(got), now).plain
-    assert tui_data.window_pct(got, "five_hour") == 40.0
-    assert "5h 40% · 7d 67%" in menubar.format_title(
+    assert menubar.usage_summary(got, now).startswith("5h 10%")
+    assert ":10%" in widgets.mini_account_text(_snapshot(got), now).plain
+    assert tui_data.window_pct(got, "five_hour") == 10.0
+    assert "5h 10% · 7d 29%" in menubar.format_title(
         "a@x.com", got, menubar.MenuBarSettings(title_pct="both"), now
     )
+
+
+def test_the_weekly_walled_capture_renders_no_5h_and_its_7d_at_100():
+    got, now = _usage("idle"), time.time()
+    assert oauth.five_hour_live(got) is False
+    assert [(label, pct) for label, pct, *_ in widgets.usage_rows(got, now)] == [
+        ("7d", 100.0), ("Fable", 0.0),
+    ]
 
 
 def test_the_both_title_labels_its_numbers():
     both = menubar.MenuBarSettings(title_pct="both", show_account_name=False)
     # A 7d figure must never sit where the 5h one used to.
-    assert menubar.format_title("a@x.com", _usage("idle"), both) == f"{menubar.ICON} 7d 67%"
+    assert menubar.format_title("a@x.com", _usage("idle"), both) == f"{menubar.ICON} 7d 100%"
 
 
 def test_a_missing_5h_line_is_not_a_preference():
@@ -190,7 +223,7 @@ def test_a_429_on_a_no_5h_account_marks_its_binding_window(store, shape):
     assert "five_hour" not in value
     assert value["seven_day"]["pct"] == 100.0
     assert value["seven_day"]["resets_at"] == usage["seven_day"]["resets_at"]
-    assert _describe(value) == "7d 100%"
+    assert _describe(value) == "7d 100% · Fable 0%"
     assert oauth.binding_window_label(value, ("all",)) == "7d"
     # Nothing 5h-shaped sets the span, not even a phantom reset an hour out.
     assert store.entries(IDENT)["1"].walled_until == pytest.approx(
@@ -234,7 +267,7 @@ def test_a_429_on_a_running_5h_account_still_reads_5h_full(store, shape, span):
     assert value["five_hour"] == {
         "pct": 100.0, "resets_at": usage_store._reset_ts_to_resets_at(entry.walled_until),
     }
-    assert value["seven_day"]["pct"] == 67.0
+    assert value["seven_day"]["pct"] == 29.0
 
 
 def test_a_429_marks_the_window_already_at_100_even_beside_a_live_5h(store):
@@ -244,7 +277,7 @@ def test_a_429_marks_the_window_already_at_100_even_beside_a_live_5h(store):
     store.mark_at_limit("1", IDENT)
 
     value = store.entries(IDENT)["1"].decision_value()
-    assert (value["five_hour"]["pct"], value["seven_day"]["pct"]) == (40.0, 100.0)
+    assert (value["five_hour"]["pct"], value["seven_day"]["pct"]) == (10.0, 100.0)
     assert oauth.binding_window_label(value, ("all",)) == "7d"
 
 
@@ -260,7 +293,7 @@ def test_a_reply_without_a_5h_header_keeps_the_7d_reading(store):
     ) is True
     last_good = store.entries(IDENT)["1"].last_good
     assert last_good["seven_day"]["pct"] == pytest.approx(55.0)
-    assert last_good["five_hour"]["pct"] == 40.0  # left as polled until the next poll
+    assert last_good["five_hour"]["pct"] == 10.0  # left as polled until the next poll
     assert last_good["scoped"] == scoped
 
 
@@ -328,5 +361,5 @@ def test_the_tui_row_and_card_show_the_plan():
 
 def test_the_menubar_row_shows_the_plan():
     row = menubar.format_account_label("2", "b@x.com", _usage("live"), plan="Ultra")
-    assert row.startswith("2  b@x.com  Ultra  5h 40%")
+    assert row.startswith("2  b@x.com  Ultra  5h 10%")
     assert "Ultra" not in menubar.format_account_label("2", "b@x.com", _usage("live"))
