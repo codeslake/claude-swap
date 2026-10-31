@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import oauth, pace
+from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
@@ -124,7 +124,6 @@ def usage_rows(
     rows also carry a "(ahead of pace)" marker when meaningfully ahead of the
     week's expected usage (issue #125) — never the 5h row.
     """
-    last_good = oauth.display_usage(last_good)
     if not isinstance(last_good, dict):
         return []
     rows: list[tuple[str, float, str, str]] = []
@@ -203,8 +202,6 @@ def account_card_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
-    if acc.usage.plan:
-        text.append(f"  {acc.usage.plan}", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
@@ -304,8 +301,6 @@ def mini_account_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
-    if acc.usage.plan:
-        text.append(f"  {acc.usage.plan}", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     for badge in _policy_badges(acc, "  "):
@@ -318,7 +313,7 @@ def mini_account_text(
         text.append(data.sentinel_label(sentinel), style=style)
         return text
 
-    last_good = oauth.display_usage(acc.usage.last_good)
+    last_good = acc.usage.last_good
     fetched_at = acc.usage.fetched_at
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
     parts = 0

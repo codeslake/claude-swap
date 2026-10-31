@@ -5070,24 +5070,6 @@ class TestModelAwareSwitch:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    def test_a_scoped_wall_escapes_to_the_peer_with_room_on_that_window(self, temp_home):
-        # A walled decision value reads 7d AND Fable at 100; the escape must
-        # rank on Fable, the window that walled us, not on the 7d tie-mate.
-        h = self._seed(temp_home, model="all")
-
-        def usage(fable, weekly):
-            return {"five_hour": {"pct": 0.0}, "seven_day": {"pct": weekly},
-                    "scoped": [{"name": "Fable", "pct": fable}]}
-
-        outcome = h.tick_with_usage({
-            "1": {"seven_day": {"pct": 100.0},
-                  "scoped": [{"name": "Fable", "pct": 100.0}]},
-            "2": usage(95, 10),
-            "3": usage(10, 50),
-        })
-        assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 3
-
     def test_all_sentinel_binds_every_scoped_window(self, temp_home):
         # "all" needs no names: each account's own scoped windows bind,
         # whatever they're called.

@@ -709,54 +709,6 @@ def build_usage_result(data: dict) -> dict | None:
 FIVE_HOUR_LABEL = "5h"
 
 
-def five_hour_live(usage: dict | str | None) -> bool:
-    """Whether the reading carries a RUNNING 5-hour window: a utilization above 0.
-
-    An absent or null ``five_hour`` and the idle ``{0, resets_at: null}`` are
-    "no running 5h window", and so is a ``{0, rolling resets_at}``. A reset
-    time is not required: a running window whose reset the API withholds is
-    still running. The plan name never decides this: the 5h window is being
-    removed account by account.
-
-    shortcut: a window that rounds to 0% on its first poll draws no 5h chip for
-    one poll, upgrade when the API names a removed window.
-    """
-    window = usage.get("five_hour") if isinstance(usage, dict) else None
-    pct = window.get("pct") if isinstance(window, dict) else None
-    return isinstance(pct, (int, float)) and pct > 0
-
-
-def display_usage(usage: dict | str | None) -> dict | str | None:
-    """``usage`` with a 5h window that is not running left out, for the screens:
-    no bar, chip or "resets" text is drawn for a window that is not running."""
-    if isinstance(usage, dict) and "five_hour" in usage and not five_hour_live(usage):
-        return {k: v for k, v in usage.items() if k != "five_hour"}
-    return usage
-
-
-_PLAN_BY_SUBSCRIPTION = {
-    "pro": "Pro", "team": "Team", "enterprise": "Enterprise", "max": "Max",
-}
-
-
-def plan_label(subscription_type: object, rate_limit_tier: object) -> str:
-    """The plan a stored credential names, for display only.
-
-    Read from the blob's own ``subscriptionType`` / ``rateLimitTier`` and never
-    a decision input. A tier naming max_20x or ultra reads "Ultra" (the 20x
-    plan was renamed), max_5x reads "Max 5x"; else the subscription type's name;
-    else whatever the blob says, as given; else "".
-    """
-    tier = rate_limit_tier.strip() if isinstance(rate_limit_tier, str) else ""
-    sub = subscription_type.strip() if isinstance(subscription_type, str) else ""
-    lowered = tier.lower()
-    if "max_20x" in lowered or "ultra" in lowered:
-        return "Ultra"
-    if "max_5x" in lowered:
-        return "Max 5x"
-    return _PLAN_BY_SUBSCRIPTION.get(sub.lower()) or tier or sub
-
-
 def relevant_windows(
     usage: dict | None, models: Sequence[str] = ()
 ) -> list[tuple[str, float, str | None]]:
@@ -825,15 +777,12 @@ def binding_window_label(
     window's headroom and throws away WHICH window it was. An escape needs the
     label: a 5-hour limit and a weekly limit want different targets, and a
     ranking that cannot tell them apart optimises the wrong axis for one of
-    them. A tie goes to a scoped window: a wall on one forces 7d to 100 beside
-    it, and the scoped window is the one that walled us.
+    them.
     """
     windows = relevant_windows(usage, models)
     if not windows:
         return None
-    return max(
-        windows, key=lambda w: (w[1], w[0] not in (FIVE_HOUR_LABEL, "7d"))
-    )[0]
+    return max(windows, key=lambda w: w[1])[0]
 
 
 def headroom_on_window(

@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import oauth, pace
+from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
@@ -237,7 +237,6 @@ def usage_summary(
         return "usage unavailable"
     if now is None:
         now = time.time()
-    usage = oauth.display_usage(usage)  # no 5h segment without a running 5h window
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
@@ -286,13 +285,11 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
-    plan: str | None = None,
 ) -> str:
     """Build one account row's menu label."""
     label = f"{alias}  ({email})" if alias else email
     marker = "  (disabled)" if disabled else ""
-    plan_note = f"  {plan}" if plan else ""
-    return f"{num}  {label}{marker}{plan_note}  {usage_summary(usage, now, fetched_at)}"
+    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
 
 
 def auto_switch_item(enabled: bool, engine) -> tuple[str, int]:
@@ -328,20 +325,16 @@ def format_title(
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
-    active_usage = oauth.display_usage(active_usage)  # no running 5h window shows no 5h
-    # Both numbers are labelled: with the 5h window gone the one left would
-    # otherwise be a 7d figure sitting where the 5h one used to be.
-    both = settings.title_pct == "both"
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
-            segments.append(f"{'5h ' if both else ''}{p:.0f}%")
+            segments.append(f"{p:.0f}%")
     if settings.title_pct in ("7d", "both"):
         seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
         seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
         p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
-            segments.append(f"{'7d ' if both else ''}{p:.0f}%")
+            segments.append(f"{p:.0f}%")
     if settings.title_scoped and isinstance(active_usage, dict):
         # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
         # dropdown rows; named so multiple scoped models stay distinguishable.
@@ -362,7 +355,6 @@ def format_usage_log(email: str, usage: dict | str | None) -> str | None:
     window is available (sentinels, ``None``, or spend-only) so callers can skip
     logging nothing.
     """
-    usage = oauth.display_usage(usage)  # no 5h segment without a running 5h window
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         pct = _window_pct(usage, key)
@@ -425,7 +417,6 @@ EMPTY_SNAPSHOT: dict = {
     "active_email": None,
     "active_usage": None,
     "active_alias": None,
-    "plans": {},
 }
 
 
@@ -434,20 +425,17 @@ def _adapt_snapshot(snap) -> dict:
 
     Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
     "active_email": str | None, "active_usage": dict | str | None,
-    "active_alias": str | None, "plans": {slot: plan label}}``. The snapshot itself is produced by
+    "active_alias": str | None}``. The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
     fetching, no I/O. Per-account ``fetched_at`` is the underlying
     measurement's fetch time, used only for the pace marker (issue #125).
     """
     accounts = []
-    plans = {}
     active_email = None
     active_usage = None
     active_alias = None
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
-        if acc.usage.plan:
-            plans[acc.number] = acc.usage.plan
         accounts.append(
             (
                 acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
@@ -461,7 +449,6 @@ def _adapt_snapshot(snap) -> dict:
         "active_email": active_email,
         "active_usage": active_usage,
         "active_alias": active_alias,
-        "plans": plans,
     }
 
 
@@ -831,8 +818,7 @@ def run(switcher) -> int:
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at,
-                        plan=self.snapshot.get("plans", {}).get(num),
+                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
                     ),
                     callback=self._make_switch_to(num),
                 )

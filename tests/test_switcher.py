@@ -1494,8 +1494,7 @@ class TestListAccountsUsage:
     def test_list_shows_usage_null_reset(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
-        """An idle five_hour (0%, resets_at null) is no running window: it draws no
-        row, and the seven_day line at 100% still renders."""
+        """When five_hour.resets_at is null and seven_day is at 100%, display both correctly."""
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
         backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
@@ -1519,7 +1518,7 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "5h:" not in output
+        assert "5h:   0%" in output
         assert "7d: 100%" in output
         assert "usage unavailable" not in output
 
@@ -10782,8 +10781,9 @@ class TestFormatUsageLines:
         }
         lines = _format_usage_lines(usage)
         # Labels are padded to the widest ("Fable:"), so the % column lines up.
-        assert lines[0].startswith("7d:     62%   resets Jul 5 08:59")
-        assert lines[1].startswith("Fable: 100%   resets Jul 5 08:59")
+        assert lines[0] == "5h:      0%"
+        assert lines[1].startswith("7d:     62%   resets Jul 5 08:59")
+        assert lines[2].startswith("Fable: 100%   resets Jul 5 08:59")
         assert len({line.index("%") for line in lines}) == 1
 
     def test_standard_windows_alone_keep_legacy_layout(self):
