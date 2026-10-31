@@ -18779,7 +18779,8 @@ class TestTheDynamicArmsHonourTheOverloadAndRefusalBar:
     @pytest.mark.parametrize("arm", ["proactive", "alternation", "retry"])
     def test_a_barred_partner_is_not_landed_on(self, temp_home, arm, bar):
         active, usage, state, held = self.ARMS[arm]
-        h = EngineHarness(temp_home, strategy="dynamic")
+        # T3167: the percent step (#321, default 20) is off here: the arms below pin the time-only dwell.
+        h = EngineHarness(temp_home, strategy="dynamic", alternation_chunk_pct=0.0)
         for n in (1, 2):
             h.seed(n, f"acct{n}@example.invalid")
         h.make_live(f"acct{active}@example.invalid", active)
