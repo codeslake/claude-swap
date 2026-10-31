@@ -709,6 +709,55 @@ def build_usage_result(data: dict) -> dict | None:
 FIVE_HOUR_LABEL = "5h"
 
 
+def five_hour_live(usage: dict | str | None) -> bool:
+    """Whether the reading carries a LIVE 5-hour window.
+
+    The 5h rule applies only to a window the API reports as running: a
+    utilization above 0 and a ``resets_at``. An absent or null ``five_hour``,
+    the idle ``{0, resets_at: null}`` and a ``{0, rolling resets_at}`` all read
+    "no 5h limit right now". The plan name never decides this: the 5h window is
+    being removed account by account.
+    """
+    window = usage.get("five_hour") if isinstance(usage, dict) else None
+    return (
+        isinstance(window, dict)
+        and isinstance(window.get("pct"), (int, float))
+        and window["pct"] > 0
+        and window.get("resets_at") is not None
+    )
+
+
+def display_usage(usage: dict | str | None) -> dict | str | None:
+    """``usage`` with a 5h window that is not live left out, for the screens:
+    no bar, chip or "resets" text is drawn for a window that does not exist."""
+    if isinstance(usage, dict) and "five_hour" in usage and not five_hour_live(usage):
+        return {k: v for k, v in usage.items() if k != "five_hour"}
+    return usage
+
+
+_PLAN_BY_SUBSCRIPTION = {
+    "pro": "Pro", "team": "Team", "enterprise": "Enterprise", "max": "Max",
+}
+
+
+def plan_label(subscription_type: object, rate_limit_tier: object) -> str:
+    """The plan a stored credential names, for display only.
+
+    Read from the blob's own ``subscriptionType`` / ``rateLimitTier`` and never
+    a decision input. A tier naming max_20x or ultra reads "Ultra" (the 20x
+    plan was renamed), max_5x reads "Max 5x"; else the subscription type's name;
+    else whatever the blob says, as given; else "".
+    """
+    tier = rate_limit_tier.strip() if isinstance(rate_limit_tier, str) else ""
+    sub = subscription_type.strip() if isinstance(subscription_type, str) else ""
+    lowered = tier.lower()
+    if "max_20x" in lowered or "ultra" in lowered:
+        return "Ultra"
+    if "max_5x" in lowered:
+        return "Max 5x"
+    return _PLAN_BY_SUBSCRIPTION.get(sub.lower()) or tier or sub
+
+
 def relevant_windows(
     usage: dict | None, models: Sequence[str] = ()
 ) -> list[tuple[str, float, str | None]]:

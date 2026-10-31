@@ -330,6 +330,9 @@ class FetchRecord:
     # persists: later passes skip the request while the credential still
     # carries that token, and a success clears it.
     rejected_fp: str | None = None
+    # The plan label (``oauth.plan_label``) of the credential the fetch held.
+    # Display only; stamped on the row beside ``lastGood``, never inside it.
+    plan: str | None = None
 
 
 @dataclass(frozen=True)
@@ -394,6 +397,9 @@ class UsageEntry:
     # `_seven_day_reset_unmeasured` sees a real deadline rather than "never
     # reported" and can't pick the walled slot as a last-chance probe target.
     walled_until: float | None = None
+    # The window the mark found binding (``mark_at_limit``): "5h", "7d" or a
+    # per-model name; None on a legacy mark or one made with no stored reading.
+    walled_window: str | None = None
     # Attempts still inside the trailing ATTEMPT_WINDOW_S (the same pruned
     # count _row_eligible refuses reserve() on at ATTEMPTS_PER_HOUR_MAX).
     # Exposed so a read-model consumer like due_candidate can honor the same
@@ -406,6 +412,8 @@ class UsageEntry:
     # Until when `UsageStore.mark_refused` keeps this slot out of the engine's
     # landing pick; None once lapsed. Overrides no reading, unlike `walled`.
     refused_until: float | None = None
+    # The stamped plan label, for display (see ``FetchRecord.plan``).
+    plan: str | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -507,7 +515,9 @@ class UsageEntry:
         if self.sentinel is not None:
             return self.sentinel
         if self.walled:
-            return _walled_decision_value(self.last_good, self.walled_until)
+            return _walled_decision_value(
+                self.last_good, self.walled_until, self.walled_window
+            )
         if (
             self.last_good is not None
             and self.age_s is not None
@@ -782,7 +792,11 @@ def _legacy_wall_is_contradicted(
     return bool(pcts) and max(pcts) < 100.0
 
 
-def _walled_decision_value(last_good: dict | None, walled_until: float | None) -> dict:
+def _walled_decision_value(
+    last_good: dict | None,
+    walled_until: float | None,
+    window: str | None = None,
+) -> dict:
     """The synthetic full reading ``UsageEntry.decision_value`` reports while
     ``walled``.
 
@@ -790,25 +804,34 @@ def _walled_decision_value(last_good: dict | None, walled_until: float | None) -
     (``seven_day``, ``scoped``) unchanged — a reader like autoswitch's
     ``_seven_day_reset_unmeasured`` must see the real weekly reset, or a
     walled 5h-only slot reads as "weekly reset never reported" and becomes
-    eligible as a last-chance probe target despite the wall. Forces
-    ``five_hour`` to full at the mark's own deadline (``walled_until``, its
-    ``resets_at``); with no stored reading to keep, ``seven_day`` is
-    synthesized the same way so both windows carry the mark's deadline
-    instead of one appearing unmeasured.
+    eligible as a last-chance probe target despite the wall. Forces ONE
+    window full: ``window``, the one ``mark_at_limit`` found binding, and
+    5h when none was recorded (a legacy mark, or no stored reading at the
+    time). A 5h window is forced only at the mark's own deadline
+    (``walled_until``, its ``resets_at``); a weekly one keeps its real reset.
+    ``seven_day`` is synthesized the same way when nothing stored carries it,
+    so every window carries the mark's deadline instead of one appearing
+    unmeasured. An account whose 5h is not live is never read "5h full".
     """
     resets_at = _reset_ts_to_resets_at(walled_until) if walled_until is not None else None
-    five_hour: dict = {"pct": 100.0}
+    full: dict = {"pct": 100.0}
     if resets_at is not None:
-        five_hour["resets_at"] = resets_at
+        full["resets_at"] = resets_at
     value: dict = {
         k: v for k, v in last_good.items() if k in ("seven_day", "scoped")
     } if isinstance(last_good, dict) else {}
-    if "seven_day" not in value:
-        seven_day: dict = {"pct": 100.0}
-        if resets_at is not None:
-            seven_day["resets_at"] = resets_at
-        value["seven_day"] = seven_day
-    value["five_hour"] = five_hour
+    if window in (None, oauth.FIVE_HOUR_LABEL):
+        value["five_hour"] = dict(full)
+    elif oauth.five_hour_live(last_good):
+        value["five_hour"] = last_good["five_hour"]
+    seven = value.get("seven_day")
+    if seven is None or window == "7d":
+        value["seven_day"] = {**(seven or full), "pct": 100.0}
+    if window not in (None, oauth.FIVE_HOUR_LABEL, "7d"):
+        value["scoped"] = [
+            {**w, "pct": 100.0} if w.get("name") == window else w
+            for w in value.get("scoped") or []
+        ]
     return value
 
 
@@ -1273,6 +1296,11 @@ class UsageStore:
                     )
                 ),
                 walled_until=walled_until,
+                walled_window=(
+                    row["walledWindow"]
+                    if isinstance(row.get("walledWindow"), str)
+                    else None
+                ),
                 attempts_in_window=len(_pruned_attempts(row, now)),
                 held_until=held_until,
                 refused_until=(
@@ -1280,6 +1308,7 @@ class UsageStore:
                     if refused_until is not None and now < refused_until
                     else None
                 ),
+                plan=row["plan"] if isinstance(row.get("plan"), str) else None,
             )
         return out
 
@@ -1428,6 +1457,8 @@ class UsageStore:
                     row["rejectedFingerprint"] = rec.rejected_fp
                 return
             row["lastAttemptAt"] = now
+            if rec.plan:
+                row["plan"] = rec.plan
             if rec.error is None:
                 usage, held = rec.usage, []
                 # Hold once: a stamped row's next success is believed as is,
@@ -1631,7 +1662,9 @@ class UsageStore:
         far-future) reset is capped at the fallback instead, well before its
         own reset: the mark lifts on the trade that a possibly-early release
         beats parking it for days; ``WALL_FALLBACK_S`` from now alone when no
-        reading is stored to key it on. While the mark has not expired, ``entries()``
+        reading is stored to key it on. A 5h window that is not live
+        (``oauth.five_hour_live``) takes no part in the span, and is never the
+        window marked full (see ``walledWindow``). While the mark has not expired, ``entries()``
         reports the slot as walled and ``UsageEntry.decision_value()`` reads
         it full for decisions, whatever a later poll says (a successful poll
         does not clear the mark early). A repeated call overwrites any prior
@@ -1641,9 +1674,17 @@ class UsageStore:
         fallback = now + WALL_FALLBACK_S
 
         def apply(_num: str, row: dict) -> None:
+            last_good = row.get("lastGood")
+            five_live = oauth.five_hour_live(last_good)
+            # A 5h window that is not live is no window: its reset sets no
+            # span and its percentage is no wall.
+            readings = [
+                w for w in oauth.relevant_windows(last_good, models)
+                if five_live or w[0] != oauth.FIVE_HOUR_LABEL
+            ]
             windows = [
                 (pct, ts)
-                for _, pct, resets_at in oauth.relevant_windows(row.get("lastGood"), models)
+                for _, pct, resets_at in readings
                 if (ts := parse_reset_ts(resets_at)) is not None
             ]
             full = [ts for pct, ts in windows if pct >= 100.0]
@@ -1657,6 +1698,14 @@ class UsageStore:
                 until = min(rolled) if rolled else ahead
             row["walledUntil"] = until if wall_until is None else min(until, wall_until)
             row["walledUuid"] = account_uuid
+            # The 429 does not name its window on this path: a live 5h is the
+            # long-standing guess, else the highest weekly one. No reading, no
+            # guess (None keeps the full 5h-and-7d synthesis).
+            row["walledWindow"] = (
+                None if not isinstance(last_good, dict)
+                else oauth.FIVE_HOUR_LABEL if five_live
+                else max(readings, key=lambda w: w[1], default=("7d",))[0]
+            )
 
         self._mutate(identities, [num], apply)
 
@@ -1724,14 +1773,16 @@ class UsageStore:
         ``last429At`` and ``backoffUntil`` are left untouched, so no
         endpoint poll is invited before the backoff itself clears.
 
-        Returns True when a reading was recorded (the 5h utilization header
-        was present and the row was eligible); False, recording nothing,
-        otherwise.
+        Returns True when a reading was recorded (a 5h or 7d utilization
+        header was present and the row was eligible); False, recording
+        nothing, otherwise. A reply with no 5h header (an account with no 5h
+        window) still records its 7d reading, and the stored 5h is left as it
+        was until the next poll.
         """
         five_pct = _header_pct(headers, USAGE_HEADER_5H_PCT)
-        if five_pct is None:
-            return False
         seven_pct = _header_pct(headers, USAGE_HEADER_7D_PCT)
+        if five_pct is None and seven_pct is None:
+            return False
         five_reset = _header_reset(headers, USAGE_HEADER_5H_RESET)
         seven_reset = _header_reset(headers, USAGE_HEADER_7D_RESET)
         recorded = False
@@ -1746,10 +1797,11 @@ class UsageStore:
             recorded = True
             now = self.clock()
             last_good = dict(row.get("lastGood") or {})
-            five_entry: dict = {"pct": five_pct}
-            if five_reset is not None:
-                five_entry["resets_at"] = five_reset
-            last_good["five_hour"] = five_entry
+            if five_pct is not None:
+                five_entry: dict = {"pct": five_pct}
+                if five_reset is not None:
+                    five_entry["resets_at"] = five_reset
+                last_good["five_hour"] = five_entry
             if seven_pct is not None:
                 seven_entry: dict = {"pct": seven_pct}
                 if seven_reset is not None:

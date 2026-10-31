@@ -170,6 +170,7 @@ def _pace_marker(window: dict, fetched_at: float | None) -> str:
 def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[str]:
     # Collect (label, body) rows first, then pad every label to the widest one so
     # per-model names (e.g. "Fable") don't shift the columns of the other lines.
+    usage = oauth.display_usage(usage)  # no 5h row for a window that is not live
     rows: list[tuple[str, str]] = []
     spend = usage.get("spend")
     if spend:
@@ -7190,9 +7191,15 @@ class ClaudeAccountSwitcher:
                 time.sleep(idx * _FETCH_STAGGER_S)
             num = str(info[0])
             entry = entries.get(num) if entries else None
-            return num, self._fetch_account_usage(
+            record = self._fetch_account_usage(
                 info, entry.rejected_fingerprint if entry else None
             )
+            # The blob the fetch already holds names the plan: no extra read.
+            blob = oauth.extract_oauth_data(info[5]) or {}
+            plan = oauth.plan_label(
+                blob.get("subscriptionType"), blob.get("rateLimitTier")
+            )
+            return num, dataclasses.replace(record, plan=plan or None)
 
         with ThreadPoolExecutor() as executor:
             return dict(
@@ -8565,8 +8572,10 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
-            print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
-            for line in _usage_entry_lines(entries[str(num)]):
+            entry = entries[str(num)]
+            plan = f" {muted(entry.plan)}" if entry.plan else ""
+            print(f"  {num}: {label} {muted(f'[{tag}]')}{plan}{markers}")
+            for line in _usage_entry_lines(entry):
                 print(f"     {line}")
 
             if show_token_status:
