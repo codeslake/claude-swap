@@ -5,14 +5,15 @@ may be withheld. Everything else (idle ``{0, null}``, a rolling ``{0, +1h}``, a
 null or an absent key) is "no running 5h window" and must neither bind a
 decision, be drawn as a bar, nor be synthesized as full by a 429 wall.
 
-Shapes ``live``, ``idle`` and ``removed`` are real captures, trimmed to the
-keys the parser reads: a running-5h account (10% / 29%, 2026-10-30), a
-weekly-walled one (7d 100%) with an idle 5h (2026-10-30), and slot 8 with its
-5h limit removed (2026-10-31): ``five_hour`` null AND no ``session`` entry in
-``limits``, 7d 97%. So ``null`` is MEASURED. ``withheld`` is the running
-capture with its reset left out. ``absent`` and ``rolling`` are HYPOTHESES for
-what a removed 5h window looks like, built on the walled capture, until one is
-captured; ``null`` also stays there as the same shape on the walled body.
+Shapes ``live``, ``idle`` and ``removed`` are real captures. ``live`` and
+``idle`` (2026-10-30) are trimmed to the keys the parser reads: a running-5h
+account (10% / 29%) and a weekly-walled one (7d 100%) with an idle 5h.
+``removed`` (slot 8, 2026-10-31) is the raw body of an account whose 5h limit
+was removed: ``five_hour`` null AND no ``session`` entry in ``limits``, 7d 97%.
+So ``null`` is MEASURED; the ``null`` shape stays too, as the same value on the
+walled body. ``withheld`` is the running capture with its reset left out.
+``absent`` and ``rolling`` are HYPOTHESES: no capture has shown either, so they
+are built on the walled capture.
 """
 
 from __future__ import annotations
@@ -35,8 +36,7 @@ from claude_swap.usage_store import WALL_FALLBACK_S, FetchRecord, UsageEntry, Us
 
 FIXTURES = Path(__file__).parent / "fixtures"
 CAPTURED_AT = datetime(2026, 10, 31, 1, 8, 56, tzinfo=timezone.utc)
-REMOVED_AT = datetime(2026, 10, 31, 5, 21, 25, tzinfo=timezone.utc)
-NOW = CAPTURED_AT
+SHIFT = timedelta(0)
 IDENT = {"1": ("a@x.com", "")}
 NOT_LIVE = ["idle", "removed", "absent", "null", "rolling"]
 # shape, its 429 wall span (the capture's 5h reset was 4h51m04s ahead)
@@ -50,19 +50,18 @@ def _iso(seconds: float) -> str:
 
 @pytest.fixture(autouse=True)
 def _moved_on():
-    """Fix, for one test, the instant the captures' resets are moved on to."""
-    global NOW
-    NOW = datetime.now(timezone.utc)
+    """Fix, for one test, how far on from the capture the resets are moved."""
+    global SHIFT
+    SHIFT = datetime.now(timezone.utc) - CAPTURED_AT
 
 
-def _capture(name: str, taken: datetime = CAPTURED_AT) -> dict:
-    """A captured body with every reset moved on by NOW - ``taken``, so its
-    windows are as far ahead of now as they were then."""
-    shift = NOW - taken
+def _capture(name: str) -> dict:
+    """A captured body with every reset moved on by SHIFT, so its windows are
+    as far ahead of now as they were then."""
 
     def moved(window: dict) -> dict:
         if window.get("resets_at"):
-            window["resets_at"] = (datetime.fromisoformat(window["resets_at"]) + shift).isoformat()
+            window["resets_at"] = (datetime.fromisoformat(window["resets_at"]) + SHIFT).isoformat()
         return window
 
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"), object_hook=moved)
@@ -71,7 +70,7 @@ def _capture(name: str, taken: datetime = CAPTURED_AT) -> dict:
 def _api(shape: str) -> dict:
     """A raw usage-endpoint body with the named ``five_hour`` shape."""
     if shape == "removed":
-        return _capture("usage_removed_5h.json", REMOVED_AT)
+        return _capture("usage_removed_5h.json")
     if shape in ("live", "withheld"):
         body = _capture("usage_running_5h.json")
         if shape == "withheld":
