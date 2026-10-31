@@ -7682,9 +7682,10 @@ class TestWarmthAndAlternation375:
     def test_control_the_floor_still_binds_when_the_candidates_reset_is_later(
         self, temp_home
     ):
-        """Same two accounts, but #2's reset is LATER than #1's -- not
-        perishing, so today's floor still refuses it (`below-floor`, the
-        same hold this scenario reports without the fix)."""
+        """Same shape, but #2 is 5h-bound and its reset is LATER than
+        #1's -- not perishing, so today's floor still refuses it
+        (`below-floor`, the same hold this scenario reports without the
+        fix)."""
         h = self._harness(temp_home, threshold=90.0)
         chunk = h.engine.settings.alternation_chunk_seconds
         now = h.clock.now

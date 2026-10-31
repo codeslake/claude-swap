@@ -2758,12 +2758,10 @@ class AutoSwitchEngine:
             # window resets BEFORE the active's, since its remaining room
             # expires unspent regardless. T1850: false for THAT WINDOW
             # ONLY. A perishing candidate is waived on its 7-day headroom
-            # and no other: its 5h and pinned-model-window headroom (every
-            # window but the 7d, read on the axis `floor_headroom` is on)
-            # must still clear the same per-tier floor below (measured
-            # 2026-10-05: a warm 5h 86 / 7d 61 candidate, headroom 14 and
-            # 5h-bound, was admitted because its 7d reset sooner -- the 5h
-            # window does not perish). It may still come from
+            # and no other: its 5h headroom must still clear the same
+            # per-tier floor below (measured 2026-10-05: a warm 5h 86 /
+            # 7d 61 candidate, headroom 14 and 5h-bound, was admitted
+            # because its 7d reset sooner -- the 5h window does not perish). It may still come from
             # `cold_ordered`, and still had to clear `SPENT_HEADROOM_PCT`
             # to reach either list at all.
             #
