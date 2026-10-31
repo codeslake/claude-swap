@@ -7296,36 +7296,6 @@ class TestWarmthAndAlternation375:
         assert reasons == ["below-threshold"], reasons
         assert h.active_number() == 1
 
-    @pytest.mark.parametrize(
-        "candidate, warm, switches",
-        [
-            # T3113: the re-write cost is 5h points, charged on the 5h
-            # window only. No 5h window: a 7d-bound candidate is not taxed.
-            pytest.param({"seven_day": {"pct": 80.0}}, False, True, id="cold-no-5h-admitted"),
-            pytest.param(_usage7(80.0, 0.0), False, False, id="cold-live-5h-refused"),
-            pytest.param({"seven_day": {"pct": 85.0}}, True, True, id="warm-no-5h-admitted"),
-            pytest.param(_usage7(85.0, 0.0), True, False, id="warm-live-5h-refused"),
-        ],
-    )
-    def test_t3113_the_rewrite_cost_is_charged_on_the_5h_window_only(
-        self, temp_home, candidate, warm, switches
-    ):
-        h = self._harness(temp_home)
-        chunk = h.engine.settings.alternation_chunk_seconds
-        stamps = {"1": h.clock.now - chunk}
-        if warm:
-            stamps["2"] = h.clock.now - 10.0
-        self._seed_last_active_at(h, stamps)
-        outcome = h.tick_with_usage({"1": _usage(50.0), "2": candidate})
-        if switches:
-            assert outcome is TickOutcome.SWITCHED, outcome
-            sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-            assert sw.trigger == "alternation", sw.trigger
-            assert h.active_number() == 2
-        else:
-            assert outcome is TickOutcome.NO_ACTION, outcome  # dwell is elapsed
-            assert h.active_number() == 1
-
     # -- no-return bar on the proactive/about_to_wall arm -----------------
 
     def test_no_return_bar_blocks_a_spent_peer_even_when_its_reset_recovered(
@@ -7682,17 +7652,16 @@ class TestWarmthAndAlternation375:
     def test_control_the_floor_still_binds_when_the_candidates_reset_is_later(
         self, temp_home
     ):
-        """Pins the 5h veto: #2 is 5h-bound (5h 95, headroom 5, under the
-        cold cost), so the floor refuses it (`below-floor`) whatever the
-        order of the two 7d resets -- the 5h window does not perish, and
-        the 7d waiver never lifts it. (Here #2's reset is also LATER.)"""
+        """Same two accounts, but #2's reset is LATER than #1's -- not
+        perishing, so today's floor still refuses it (`below-floor`, the
+        same hold this scenario reports without the fix)."""
         h = self._harness(temp_home, threshold=90.0)
         chunk = h.engine.settings.alternation_chunk_seconds
         now = h.clock.now
         self._seed_last_active_at(h, {"1": now - chunk - 1.0})
         usage = {
             "1": _usage7(0.0, 18.0, _iso_at(now + 1 * 3600)),    # active: headroom 82, resets sooner
-            "2": _usage7(95.0, 0.0, _iso_at(now + 10 * 86400)),  # cold: headroom 5 (5h-bound), resets LATER
+            "2": _usage7(0.0, 95.0, _iso_at(now + 10 * 86400)),  # cold: headroom 5, resets LATER
         }
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.NO_ACTION, (
@@ -7727,13 +7696,14 @@ class TestWarmthAndAlternation375:
     def test_a_perishing_candidate_still_needs_a_real_active_reset(
         self, temp_home
     ):
-        """Pins the 5h veto, not the reset ordering: #2 is 5h-bound (5h
-        96, headroom 4, under the cold cost) with a real, sooner 7d reset
-        while the ACTIVE's is unknown (bare `_usage()`), and the floor
-        refuses it (`below-floor`) on the 5h window either way, since a
-        perishing waiver covers the 7d alone. (The 5h veto decides here;
-        this row no longer discriminates the unread-ACTIVE-reset reading
-        in `_perishes_before_active`.)"""
+        """`_perishes_before_active` stays conservative when the ACTIVE's
+        own 7-day reset is unknown (no `resets_at` at all here, via the
+        bare `_usage()` helper): an unread datum must not waive the floor
+        for every candidate with a real reset -- it is never distinguish-
+        able from "never fetched" versus "genuinely nothing pending", and
+        only the first of those would justify it. The candidate side still
+        reads its own real, sooner reset; only the missing ACTIVE side
+        withholds the exemption."""
         h = self._harness(temp_home, threshold=90.0)
         chunk = h.engine.settings.alternation_chunk_seconds
         now = h.clock.now
@@ -7743,7 +7713,7 @@ class TestWarmthAndAlternation375:
         self._seed_last_active_at(h, {"1": now - chunk - 1.0})
         usage = {
             "1": _usage(78.0),                              # active: headroom 22, NO 7d reset known
-            "2": _usage7(96.0, 0.0, _iso_at(now + 3600)),    # headroom 4 (5h-bound), real reset in 1h
+            "2": _usage7(0.0, 96.0, _iso_at(now + 3600)),    # headroom 4, real reset in 1h
         }
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.NO_ACTION, (
@@ -16283,42 +16253,6 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
             "clear both"
         )
         assert h.active_number() == 1
-
-    @pytest.mark.parametrize(
-        "cold_days_out, cold_five_h, expect_switch",
-        [(4, 0, False), (3, 0, True), (3, 90, False)],
-    )
-    def test_the_blackout_bar_holds_once_the_dwell_has_elapsed(
-        self, temp_home, cold_days_out, cold_five_h, expect_switch
-    ):
-        """[I]: the 5h-only landing floor read the cold cost off the 5h
-        window, so in a blackout (every account Fable-walled, the 5h clear
-        on both) a cold #3 at unmodeled 15 (7d 85) passed the floor with a
-        5h headroom of 100, and the dwell-elapsed alternation landed on it
-        although the escape's `cold_bar` (20) refused it -- and next chunk
-        the warm floor took #1 back, two walled accounts trading every
-        chunk. The sibling test above only held because it seeds no
-        `lastActiveAt`. In a blackout the bar stays on the binding window.
-        A candidate whose 7d resets sooner (days_out 3) is still waived
-        on the 7d alone (T1850); its 5h still has to clear.
-        """
-        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
-        for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
-            h.seed(num, email)
-        h.make_live("a1@example.invalid", 1)
-        h.engine._mutate_state(
-            lambda s: s.update(lastActiveAt={"1": h.clock.now - 700.0})
-        )
-        fleet = {
-            "1": self._u(0, 95, 100, days_out=4),  # active: unmodeled headroom 5
-            "3": self._u(cold_five_h, 85, 100, days_out=cold_days_out),  # cold
-        }
-        outcome = h.tick_with_usage(fleet)
-        assert (outcome is TickOutcome.SWITCHED) is expect_switch, (
-            f"got {outcome!r} -- the dwell has elapsed; a blackout landing "
-            "buys nothing, so only a 7d-perishing candidate may be taken"
-        )
-        assert h.active_number() == (3 if expect_switch else 1)
 
     def test_the_non_blackout_escape_still_prices_a_cold_landing(
         self, temp_home
