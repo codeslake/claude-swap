@@ -311,11 +311,16 @@ def _transient_cause(e: Exception) -> str:
     (a folded header can carry CR/LF and would forge a log line) and capped.
     """
     if not isinstance(e, urllib.error.HTTPError):
+        # urllib wraps every connect-phase OSError in URLError(err): name the
+        # wrapped class too, or timeout, refused, DNS and TLS all read alike.
+        reason = e.reason if isinstance(e, urllib.error.URLError) else None
+        if isinstance(reason, BaseException):
+            return f"{type(e).__name__}({type(reason).__name__})"
         return type(e).__name__
     parts = [f"HTTP {e.code}"]
     headers = e.headers or {}  # None when the error was built without hdrs
     for name in ("retry-after", "x-request-id"):
-        value = re.sub(r"[^A-Za-z0-9._:-]", "", str(headers.get(name) or ""))[:64]
+        value = re.sub(r"[^A-Za-z0-9._: -]", "", str(headers.get(name) or ""))[:64].strip()
         if value:
             parts.append(f"{name}={value}")
     return ", ".join(parts)

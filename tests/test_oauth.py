@@ -711,9 +711,12 @@ class TestTryRefreshOAuthCredentials:
              "HTTP 429, retry-after=30, x-request-id=req_abc"),
             (500, None, "HTTP 500"),
             (429, {}, "HTTP 429"),
-            # CR/LF and spaces stripped (no forged line), an emptied value omitted.
+            # CR/LF dropped (no forged line), an emptied value omitted.
             (429, {"Retry-After": "\r\n ", "X-Request-Id": "req_a\r\nForged: x"},
-             "HTTP 429, x-request-id=req_aForged:x"),
+             "HTTP 429, x-request-id=req_aForged: x"),
+            # An RFC 9110 HTTP-date keeps its spaces.
+            (429, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"},
+             "HTTP 429, retry-after=Wed 21 Oct 2015 07:28:00 GMT"),
             (429, {"X-Request-Id": "A" * 200}, "HTTP 429, x-request-id=" + "A" * 64),
         ],
     )
@@ -732,6 +735,11 @@ class TestTryRefreshOAuthCredentials:
         [
             (TimeoutError("old-refresh BODYTEXT"), "TimeoutError"),
             (urllib.error.URLError("old-access BODYTEXT"), "URLError"),
+            # urllib wraps a connect-phase OSError: the wrapped class tells them apart.
+            (urllib.error.URLError(ConnectionRefusedError("old-refresh BODYTEXT")),
+             "URLError(ConnectionRefusedError)"),
+            (urllib.error.URLError(TimeoutError("old-access BODYTEXT")),
+             "URLError(TimeoutError)"),
         ],
     )
     def test_transient_exception_log_names_the_class_only(self, caplog, exc, name):
