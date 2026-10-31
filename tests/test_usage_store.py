@@ -291,7 +291,8 @@ class TestMarkAtLimit:
         }
 
         clock.advance(300.0)  # a poll taken while still walled...
-        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        polled = {**USAGE, "five_hour": {"pct": 25.0, "resets_at": iso}}
+        store.record({"1": FetchRecord(usage=polled)}, IDENT)
         assert store.entries(IDENT)["1"].decision_value() == {
             "five_hour": {"pct": 100.0, "resets_at": iso},
             "seven_day": {"pct": 10.0},
@@ -443,7 +444,7 @@ class TestWallMarkIdentity:
     # The shape of lmd42's slot 5 row on 2026-10-05: a good poll reading
     # every window under 100% and a mark that still has 70 min to run.
     UNDER = {
-        "five_hour": {"pct": 86.0},
+        "five_hour": {"pct": 86.0, "resets_at": "2099-01-01T00:00:00Z"},
         "seven_day": {"pct": 23.0},
         "scoped": [{"name": "Fable", "pct": 0.0}],
     }
@@ -505,10 +506,10 @@ class TestWallMarkIdentity:
 
     @pytest.mark.parametrize("usage,error", [
         # A window at the wall: the reading agrees with the mark.
-        ({"five_hour": {"pct": 100.0}, "seven_day": {"pct": 23.0}}, None),
-        ({"five_hour": {"pct": 20.0}, "seven_day": {"pct": 100.0}}, None),
+        ({"five_hour": {"pct": 100.0, "resets_at": "2099-01-01T00:00:00Z"}, "seven_day": {"pct": 23.0}}, None),
+        ({"five_hour": {"pct": 20.0, "resets_at": "2099-01-01T00:00:00Z"}, "seven_day": {"pct": 100.0}}, None),
         # A per-model window at the wall counts (the pin ranks on `all`).
-        ({"five_hour": {"pct": 20.0}, "seven_day": {"pct": 10.0},
+        ({"five_hour": {"pct": 20.0, "resets_at": "2099-01-01T00:00:00Z"}, "seven_day": {"pct": 10.0},
           "scoped": [{"name": "Fable", "pct": 100.0}]}, None),
         # The last poll FAILED: the stored reading is not a fresh measurement.
         (UNDER, "http-429"),

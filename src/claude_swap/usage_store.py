@@ -805,13 +805,14 @@ def _walled_decision_value(
     ``_seven_day_reset_unmeasured`` must see the real weekly reset, or a
     walled 5h-only slot reads as "weekly reset never reported" and becomes
     eligible as a last-chance probe target despite the wall. Forces ONE
-    window full: ``window``, the one ``mark_at_limit`` found binding, and
-    5h when none was recorded (a legacy mark, or no stored reading at the
-    time). A 5h window is forced only at the mark's own deadline
-    (``walled_until``, its ``resets_at``); a weekly one keeps its real reset.
-    ``seven_day`` is synthesized the same way when nothing stored carries it,
-    so every window carries the mark's deadline instead of one appearing
-    unmeasured. An account whose 5h is not live is never read "5h full".
+    window full: ``window``, the one ``mark_at_limit`` found binding. With
+    none recorded (a legacy mark, or no stored reading at the time) it is 5h.
+    Either way a reading with no live 5h marks 7d instead, so such an account
+    is never read "5h full". A 5h window is forced only at the mark's own
+    deadline (``walled_until``, its ``resets_at``); a weekly one keeps its real
+    reset. ``seven_day`` is synthesized the same way when nothing stored
+    carries it, so every window carries the mark's deadline instead of one
+    appearing unmeasured.
     """
     resets_at = _reset_ts_to_resets_at(walled_until) if walled_until is not None else None
     full: dict = {"pct": 100.0}
@@ -820,6 +821,8 @@ def _walled_decision_value(
     value: dict = {
         k: v for k, v in last_good.items() if k in ("seven_day", "scoped")
     } if isinstance(last_good, dict) else {}
+    if window in (None, oauth.FIVE_HOUR_LABEL) and last_good and not oauth.five_hour_live(last_good):
+        window = "7d"  # never "5h full" for an account with no live 5h
     if window in (None, oauth.FIVE_HOUR_LABEL):
         value["five_hour"] = dict(full)
     elif oauth.five_hour_live(last_good):
@@ -1698,13 +1701,15 @@ class UsageStore:
                 until = min(rolled) if rolled else ahead
             row["walledUntil"] = until if wall_until is None else min(until, wall_until)
             row["walledUuid"] = account_uuid
-            # The 429 does not name its window on this path: a live 5h is the
+            # The 429 does not name its window on this path: one already at
+            # 100 in the stored reading is the wall, else a live 5h is the
             # long-standing guess, else the highest weekly one. No reading, no
             # guess (None keeps the full 5h-and-7d synthesis).
+            top = max(readings, key=lambda w: w[1], default=("7d", 0.0))
             row["walledWindow"] = (
-                None if not isinstance(last_good, dict)
-                else oauth.FIVE_HOUR_LABEL if five_live
-                else max(readings, key=lambda w: w[1], default=("7d",))[0]
+                None if not last_good
+                else top[0] if top[1] >= 100.0 or not five_live
+                else oauth.FIVE_HOUR_LABEL
             )
 
         self._mutate(identities, [num], apply)

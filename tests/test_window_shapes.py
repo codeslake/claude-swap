@@ -201,6 +201,19 @@ def test_a_429_on_a_no_5h_account_marks_its_binding_window(store, shape):
     assert oauth.binding_window_label(value, ("all",)) == "7d"
 
 
+def test_a_legacy_mark_on_a_no_5h_account_does_not_read_5h_full(store):
+    usage = _usage("idle")
+    store.record({"1": FetchRecord(usage=usage)}, IDENT)
+    store.mark_at_limit("1", IDENT)
+    rows = json.loads(store.path.read_text(encoding="utf-8"))
+    del rows["accounts"]["1"]["walledWindow"]  # a mark written before the window was kept
+    store.path.write_text(json.dumps(rows), encoding="utf-8")
+
+    value = store.entries(IDENT)["1"].decision_value()
+    assert "five_hour" not in value
+    assert value["seven_day"]["pct"] == 100.0
+
+
 def test_a_429_marks_the_scoped_window_when_that_one_binds(store):
     usage = _usage("idle")
     usage["seven_day"]["pct"] = 40.0
@@ -223,6 +236,17 @@ def test_a_429_on_a_live_5h_account_still_reads_5h_full(store):
         "pct": 100.0, "resets_at": usage_store._reset_ts_to_resets_at(entry.walled_until),
     }
     assert value["seven_day"]["pct"] == 67.0
+
+
+def test_a_429_marks_the_window_already_at_100_even_beside_a_live_5h(store):
+    usage = _usage("live")
+    usage["seven_day"]["pct"] = 100.0
+    store.record({"1": FetchRecord(usage=usage)}, IDENT)
+    store.mark_at_limit("1", IDENT)
+
+    value = store.entries(IDENT)["1"].decision_value()
+    assert (value["five_hour"]["pct"], value["seven_day"]["pct"]) == (40.0, 100.0)
+    assert oauth.binding_window_label(value, ("all",)) == "7d"
 
 
 def test_a_rolling_phantom_reset_does_not_set_the_wall_span(store):
