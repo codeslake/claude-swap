@@ -18803,6 +18803,34 @@ class TestTheDynamicArmsHonourTheOverloadAndRefusalBar:
         assert (outcome, reasons) == ((TickOutcome.SWITCHED, []) if bar is None else held[bar])
         assert h.active_number() == (3 - active if bar is None else active)
 
+    @pytest.mark.parametrize("bar", [None, "backoff", "refused"], ids=["control", "backoff", "refused"])
+    def test_a_barred_partner_is_not_landed_on_under_the_percent_step(self, temp_home, bar):
+        h = EngineHarness(temp_home, strategy="dynamic")
+        step = h.settings.alternation_chunk_pct
+        assert step > 0   # the shipped default: the step arm, not the time-only dwell
+        _, usage, state, held = self.ARMS["alternation"]
+        anchor = usage["1"]["five_hour"]["pct"] - step - 1.0
+        for n in (1, 2):
+            h.seed(n, f"acct{n}@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+        h.set_active(1)
+        stay = {"account": "1", "since": state["lastActiveAt"]["1"], "anchor": anchor, "rise": 0.0,
+                "ran": True, "levels": {"5h": anchor}}
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps({"schemaVersion": 1, **state, "alternation": stay})
+        )
+        entries = {n: _entry_for(v, h.clock.now) for n, v in usage.items()}
+        if bar == "backoff":
+            h.engine._overload_backoff["2"] = h.clock.now + OVERLOAD_BACKOFF_S
+        elif bar == "refused":
+            store = h.switcher._usage_store
+            store.mark_refused("2", self.IDENT)
+            entries["2"] = replace(entries["2"], refused_until=store.entries(self.IDENT)["2"].refused_until)
+        outcome = h.tick_with_entries(entries)
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert (outcome, reasons) == ((TickOutcome.SWITCHED, []) if bar is None else held[bar])
+        assert h.active_number() == (2 if bar is None else 1)
+
 
 class TestARefusedAccountIsBarredFromTheEnginesPick:
     """The pin's refusal entry (`switch(current_refused=True)`) leaves the
