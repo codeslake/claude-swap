@@ -330,13 +330,13 @@ def _is_warm(number: str, last_active_at: dict, now: float, cache_ttl_seconds: f
     return ts is not None and (now - ts) < cache_ttl_seconds
 
 
-# The charge lands on `floor_headroom`, so a pinned model's scoped window can
-# bind it. Only the unit is chosen by windows, and by the 5h alone
-# (`_has_no_five_hour` reads no model window): 5h points where one exists, else
-# 7d points, this many times a 5h window's budget (the replay's median 7d units
-# per 1% over its 5h units per 1%: 9.06M / 2.08M, alternation-replay.md,
-# "Calibration"). A scoped window is charged at that 7d ratio until its own is
-# measured.
+# The charge lands on `floor_headroom`, which includes a pinned model's scoped
+# window. The 5h window's presence alone picks the unit (`_has_no_five_hour`
+# reads no model window): with a running 5h the full cost is charged in 5h
+# points; with none, cost / 4.4, a 7d window's budget over a 5h one's (the
+# replay's median 7d units per 1% over its 5h units per 1%: 9.06M / 2.08M,
+# alternation-replay.md, "Calibration"), a scoped window taking that 7d ratio
+# until its own is measured.
 WEEKLY_OVER_FIVE_HOUR = 4.4
 
 # `cold_switch_cost_pct` is the Ultra (Max 20x) figure; a Max 5x account has a

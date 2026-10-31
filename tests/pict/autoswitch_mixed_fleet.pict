@@ -9,7 +9,7 @@
 Plan: max5x, max20x
 PartnerPlan: max5x, max20x
 FiveHour: running, idle, removed
-SevenDay: low, mid, tight, near_cap, reset_from_full
+SevenDay: low, mid, tight, edge, near_cap, reset_from_full
 Partner: warm, cold
 Context: small, large
 Pinned: none, open, full
