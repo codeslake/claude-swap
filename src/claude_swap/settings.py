@@ -179,9 +179,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     for spec in (
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
-            help="Switch when the 5h window (or any window, if no weekly line) "
-            "reaches this pct (dynamic: fixed near 97% instead; still gates "
-            "blackout/cadence)",
+            help="Switch line for a running 5h window, and for every window while no weekly line is set "
+            "(dynamic: fixed near 97% instead; still gates blackout/cadence)",
         ),
         SettingSpec(
             "autoswitch", "weeklyThreshold", "weekly_threshold", "float", 50.0, 99.9,

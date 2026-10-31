@@ -1179,10 +1179,12 @@ def _window_pcts(
     Deliberately restricted to the windows the *decision* reads (same
     ``models`` filter): showing an unconfigured scoped window at 100% next
     to a switch onto that account would look like a bug, when the engine
-    correctly ignored it. Full per-model usage lives in ``cswap list``.
+    correctly ignored it. Full per-model usage lives in ``cswap list``. A 5h
+    window that is not running is left out, as on every other screen.
     """
     return {
-        name: pct for name, pct, _ in oauth.relevant_windows(usage, models)
+        name: pct
+        for name, pct, _ in oauth.relevant_windows(oauth.display_usage(usage), models)
     }
 
 

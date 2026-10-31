@@ -178,6 +178,7 @@ def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str,
     ``_usage_entry_lines`` (pads them together with the login-expiry row so
     both share one label column).
     """
+    usage = oauth.display_usage(usage)  # no 5h row without a running 5h window
     rows: list[tuple[str, str]] = []
     spend = usage.get("spend")
     if spend:
@@ -8893,9 +8894,15 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 time.sleep(idx * _FETCH_STAGGER_S)
             num = str(info[0])
             entry = entries.get(num) if entries else None
-            return num, self._fetch_account_usage(
+            record = self._fetch_account_usage(
                 info, entry.rejected_fingerprint if entry else None
             )
+            # The blob the fetch already holds names the plan: no extra read.
+            blob = oauth.extract_oauth_data(info[5]) or {}
+            plan = oauth.plan_label(
+                blob.get("subscriptionType"), blob.get("rateLimitTier")
+            )
+            return num, dataclasses.replace(record, plan=plan or None)
 
         with ThreadPoolExecutor() as executor:
             return dict(
@@ -10308,9 +10315,11 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
-            print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
+            entry = entries[str(num)]
+            plan = f" {muted(entry.plan)}" if entry.plan else ""
+            print(f"  {num}: {label} {muted(f'[{tag}]')}{plan}{markers}")
             login_expires_at = oauth.login_expires_at_epoch(creds)
-            for line in _usage_entry_lines(entries[str(num)], login_expires_at):
+            for line in _usage_entry_lines(entry, login_expires_at):
                 print(f"     {line}")
 
             if show_token_status:

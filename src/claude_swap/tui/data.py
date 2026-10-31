@@ -123,8 +123,11 @@ def sentinel_label(sentinel: str) -> str:
 
 
 def window_pct(last_good: dict | None, key: str) -> float | None:
-    """Utilization pct of one window ("five_hour"/"seven_day"), if known."""
-    if not isinstance(last_good, dict):
+    """Utilization pct of one window ("five_hour"/"seven_day"), if known.
+    A 5h window that is not running is not known: no chip is drawn for it."""
+    if not isinstance(last_good, dict) or (
+        key == "five_hour" and not oauth.five_hour_live(last_good)
+    ):
         return None
     window = last_good.get(key)
     if not isinstance(window, dict):

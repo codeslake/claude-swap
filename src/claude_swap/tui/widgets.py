@@ -148,6 +148,7 @@ def usage_rows(
     "refetching" (#325 follow-up) — the same object as ``fetched_at`` came
     from, passed alongside it rather than in place of it.
     """
+    last_good = oauth.display_usage(last_good)
     if not isinstance(last_good, dict):
         return []
     rows: list[tuple[str, float, str, str]] = []
@@ -287,6 +288,8 @@ def account_card_text(
         text.append(acc.email, style=palette.foreground)
     if show_tag:
         text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if acc.usage.plan:
+        text.append(f"  {acc.usage.plan}", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if cloud_pinned:
@@ -420,7 +423,10 @@ def _mini_name(acc: AccountSnapshot, palette: Palette) -> Text:
 def _mini_tag(acc: AccountSnapshot, palette: Palette) -> Text:
     tag = Text(acc.display_tag)
     tag.truncate(_MINI_TAG_CAP - 2, overflow="ellipsis")
-    return Text.assemble("[", tag, "]", style=palette.muted)
+    shown = Text.assemble("[", tag, "]", style=palette.muted)
+    if acc.usage.plan:
+        shown.append(f"  {acc.usage.plan}", style=palette.muted)
+    return shown
 
 
 def _mini_marks(
@@ -453,7 +459,7 @@ def _mini_body(
         return {}, Text(data.sentinel_label(sentinel), style=style), False
     if acc.usage.last_error == "oauth_not_allowed_for_organization":  # lapsed plan
         return {}, Text("no plan", style=palette.sev_warn), False
-    last_good = acc.usage.last_good
+    last_good = oauth.display_usage(acc.usage.last_good)
     if not isinstance(last_good, dict):
         last_good = {}
     fetched_at = acc.usage.fetched_at
