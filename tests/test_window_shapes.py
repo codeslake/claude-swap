@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from claude_swap import menubar, oauth, usage_store
+from claude_swap import menubar, oauth, poll_policy, usage_store
 from claude_swap.autoswitch import PollEvent, _window_pcts, consume_first_rank_key
 from claude_swap.lines import binding_window
 from claude_swap.models import AccountSnapshot
@@ -95,6 +95,14 @@ def _snapshot(usage: dict, plan: str | None = None) -> AccountSnapshot:
     )
 
 
+def _describe(value: dict) -> str:
+    event = PollEvent(
+        active=None, headroom={}, threshold=90.0,
+        windows={"1": _window_pcts(value, ("all",))},
+    )
+    return event._describe("1")
+
+
 @pytest.fixture
 def store(tmp_path):
     return UsageStore(tmp_path / "cache")
@@ -138,8 +146,11 @@ def test_plan_label(subscription, tier, label):
 @pytest.mark.parametrize("shape", NOT_LIVE)
 def test_non_live_shapes_rank_and_render_like_an_absent_window(shape):
     ref, got, now = _usage("absent"), _usage(shape), time.time()
+    # The two rank lines guard no-regression: they hold on the old code too.
     assert oauth.account_headroom(got) == oauth.account_headroom(ref)
     assert consume_first_rank_key(got, 90.0, now) == consume_first_rank_key(ref, 90.0, now)
+    assert _describe(got) == _describe(ref)  # the poll event's windows
+    assert menubar.format_usage_log("a@x.com", got) == menubar.format_usage_log("a@x.com", ref)
     assert _format_usage_lines(got) == _format_usage_lines(ref)
     assert widgets.usage_rows(got, now) == widgets.usage_rows(ref, now)
     assert menubar.usage_summary(got, now) == menubar.usage_summary(ref, now)
@@ -171,9 +182,7 @@ def test_a_running_window_still_renders(shape):
 def test_the_weekly_walled_capture_renders_no_5h_and_its_7d_at_100():
     got, now = _usage("idle"), time.time()
     assert oauth.five_hour_live(got) is False
-    assert [(label, pct) for label, pct, *_ in widgets.usage_rows(got, now)] == [
-        ("7d", 100.0), ("Fable", 0.0),
-    ]
+    assert [label for label, *_ in widgets.usage_rows(got, now)] == ["7d", "Fable"]
 
 
 def test_the_both_title_labels_its_numbers():
@@ -183,7 +192,8 @@ def test_the_both_title_labels_its_numbers():
 
 
 def test_a_missing_5h_line_is_not_a_preference():
-    # Same 7d: one account with a live low 5h, one without. Same rank key.
+    # Guards no-regression (holds on the old code too). Same 7d: one account
+    # with a live low 5h, one without. Same rank key.
     seven = {"pct": 67.0, "resets_at": _iso(5 * 86400)}
     live_low = {"five_hour": {"pct": 10.0, "resets_at": _iso(3600)}, "seven_day": seven}
     now = time.time()
@@ -194,6 +204,7 @@ def test_a_missing_5h_line_is_not_a_preference():
 
 @pytest.mark.parametrize("shape", NOT_LIVE)
 def test_a_threshold_with_no_weekly_line_still_leaves_a_no_5h_account_at_its_7d(shape):
+    # Guards no-regression: holds on the old code too.
     usage = _usage(shape)
     for pct, over in ((97.0, True), (96.0, False)):
         usage["seven_day"]["pct"] = pct
@@ -204,14 +215,6 @@ def test_a_threshold_with_no_weekly_line_still_leaves_a_no_5h_account_at_its_7d(
 # -- the 429 wall --------------------------------------------------------------
 
 
-def _describe(value: dict) -> str:
-    event = PollEvent(
-        active=None, headroom={}, threshold=90.0,
-        windows={"1": _window_pcts(value, ("all",))},
-    )
-    return event._describe("1")
-
-
 @pytest.mark.parametrize("shape", NOT_LIVE)
 def test_a_429_on_a_no_5h_account_marks_its_binding_window(store, shape):
     usage = _usage(shape)
@@ -219,10 +222,13 @@ def test_a_429_on_a_no_5h_account_marks_its_binding_window(store, shape):
     store.record({"1": FetchRecord(usage=usage)}, IDENT)
     store.mark_at_limit("1", IDENT)
 
-    value = store.entries(IDENT)["1"].decision_value()
+    entry = store.entries(IDENT)["1"]
+    value = entry.decision_value()
     assert "five_hour" not in value
     assert value["seven_day"]["pct"] == 100.0
-    assert value["seven_day"]["resets_at"] == usage["seven_day"]["resets_at"]
+    # A guess lifts with the mark, not at the real reset days away.
+    assert value["seven_day"]["resets_at"] == usage_store._reset_ts_to_resets_at(entry.walled_until)
+    assert poll_policy.limiting_reset_ts(value) == pytest.approx(entry.walled_until, abs=1)
     assert _describe(value) == "7d 100% · Fable 0%"
     assert oauth.binding_window_label(value, ("all",)) == "7d"
     # Nothing 5h-shaped sets the span, not even a phantom reset an hour out.
@@ -239,21 +245,30 @@ def test_a_legacy_mark_on_a_no_5h_account_does_not_read_5h_full(store):
     del rows["accounts"]["1"]["walledWindow"]  # a mark written before the window was kept
     store.path.write_text(json.dumps(rows), encoding="utf-8")
 
-    value = store.entries(IDENT)["1"].decision_value()
-    assert "five_hour" not in value
-    assert value["seven_day"]["pct"] == 100.0
+    assert "five_hour" not in store.entries(IDENT)["1"].decision_value()
 
 
-def test_a_429_marks_the_scoped_window_when_that_one_binds(store):
+@pytest.mark.parametrize("dropped", [False, True])
+def test_a_429_on_a_scoped_window_reads_7d_full_for_every_reader(store, dropped):
     usage = _usage("idle")
     usage["seven_day"]["pct"] = 40.0
     usage["scoped"] = [{"name": "Fable", "pct": 90.0, "resets_at": _iso(2 * 86400)}]
     store.record({"1": FetchRecord(usage=usage)}, IDENT)
     store.mark_at_limit("1", IDENT, ("all",))
+    for _ in range(2 if dropped else 0):  # a vanished window is held for one fetch
+        store.record({"1": FetchRecord(usage={**usage, "scoped": []})}, IDENT)
 
-    value = store.entries(IDENT)["1"].decision_value()
-    assert (value["seven_day"]["pct"], value["scoped"][0]["pct"]) == (40.0, 100.0)
-    assert oauth.binding_window_label(value, ("all",)) == "Fable"
+    entry = store.entries(IDENT)["1"]
+    value = entry.decision_value()
+    deadline = usage_store._reset_ts_to_resets_at(entry.walled_until)
+    assert value["seven_day"] == {**usage["seven_day"], "pct": 100.0, "resets_at": deadline}
+    assert [(w["pct"], w["resets_at"]) for w in value["scoped"]] == (
+        [] if dropped else [(100.0, deadline)]
+    )
+    # A reader whose models leave the name out still reads the slot full.
+    assert oauth.account_headroom(value, ()) == 0.0
+    assert oauth.account_headroom(value, ("all",)) == 0.0
+    assert poll_policy.limiting_reset_ts(value, ("all",)) == pytest.approx(entry.walled_until, abs=1)
 
 
 @pytest.mark.parametrize("shape,span", LIVE)
@@ -278,13 +293,14 @@ def test_a_429_marks_the_window_already_at_100_even_beside_a_live_5h(store):
 
     value = store.entries(IDENT)["1"].decision_value()
     assert (value["five_hour"]["pct"], value["seven_day"]["pct"]) == (10.0, 100.0)
+    assert value["seven_day"]["resets_at"] == usage["seven_day"]["resets_at"]  # a real 100 keeps its reset
     assert oauth.binding_window_label(value, ("all",)) == "7d"
 
 
 # -- header readings -------------------------------------------------------------
 
 
-def test_a_reply_without_a_5h_header_keeps_the_7d_reading(store):
+def test_a_reply_without_a_5h_header_carries_no_5h_window(store):
     scoped = [{"name": "Fable", "pct": 33.0}]
     store.record({"1": FetchRecord(usage={**_usage("live"), "scoped": scoped})}, IDENT)
 
@@ -293,7 +309,7 @@ def test_a_reply_without_a_5h_header_keeps_the_7d_reading(store):
     ) is True
     last_good = store.entries(IDENT)["1"].last_good
     assert last_good["seven_day"]["pct"] == pytest.approx(55.0)
-    assert last_good["five_hour"]["pct"] == 10.0  # left as polled until the next poll
+    assert "five_hour" not in last_good  # absent means absent: not the last poll's
     assert last_good["scoped"] == scoped
 
 

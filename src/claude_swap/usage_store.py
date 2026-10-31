@@ -808,11 +808,14 @@ def _walled_decision_value(
     window full: ``window``, the one ``mark_at_limit`` found binding. With
     none recorded (a legacy mark, or no stored reading at the time) it is 5h.
     Either way a reading with no running 5h window marks 7d instead, so such an
-    account is never read "5h full". A 5h window is forced only at the mark's
-    own deadline (``walled_until``, its ``resets_at``); a weekly one keeps its
-    real reset. ``seven_day`` is synthesized the same way when nothing stored
-    carries it, so every window carries the mark's deadline instead of one
-    appearing unmeasured.
+    account is never read "5h full". A window forced full carries the mark's
+    own deadline (``walled_until``, its ``resets_at``) unless the stored one
+    already reads 100%, which keeps its real reset: a guess lifts with the
+    mark, not days later. A named window other than 5h forces 7d too, the one
+    every reader includes: a reader's models may leave a scoped name out, and a
+    later poll may stop listing it. ``seven_day`` is synthesized the same way
+    when nothing stored carries it, so every window carries the mark's deadline
+    instead of one appearing unmeasured.
     """
     resets_at = _reset_ts_to_resets_at(walled_until) if walled_until is not None else None
     full: dict = {"pct": 100.0}
@@ -827,14 +830,20 @@ def _walled_decision_value(
         value["five_hour"] = dict(full)
     elif oauth.five_hour_live(last_good):
         value["five_hour"] = last_good["five_hour"]
-    seven = value.get("seven_day")
-    if seven is None or window == "7d":
-        value["seven_day"] = {**(seven or full), "pct": 100.0}
-    if window not in (None, oauth.FIVE_HOUR_LABEL, "7d"):
-        value["scoped"] = [
-            {**w, "pct": 100.0} if w.get("name") == window else w
-            for w in value.get("scoped") or []
-        ]
+
+    def forced(w: dict) -> dict:
+        pct = w.get("pct")
+        return w if isinstance(pct, (int, float)) and pct >= 100.0 else {**w, **full}
+
+    seven = value.get("seven_day") or dict(full)
+    if window not in (None, oauth.FIVE_HOUR_LABEL):
+        seven = forced(seven)
+        if window != "7d":
+            value["scoped"] = [
+                forced(w) if w.get("name") == window else w
+                for w in value.get("scoped") or []
+            ]
+    value["seven_day"] = seven
     return value
 
 
@@ -1780,8 +1789,8 @@ class UsageStore:
         Returns True when a reading was recorded (a 5h or 7d utilization
         header was present and the row was eligible); False, recording
         nothing, otherwise. A reply with no 5h header (an account with no
-        running 5h window) still records its 7d reading, and the stored 5h is
-        left as it was until the next poll.
+        running 5h window) still records its 7d reading and carries no 5h
+        window: the stored one is dropped, not trusted as fresh.
         """
         five_pct = _header_pct(headers, USAGE_HEADER_5H_PCT)
         seven_pct = _header_pct(headers, USAGE_HEADER_7D_PCT)
@@ -1806,6 +1815,8 @@ class UsageStore:
                 if five_reset is not None:
                     five_entry["resets_at"] = five_reset
                 last_good["five_hour"] = five_entry
+            else:
+                last_good.pop("five_hour", None)
             if seven_pct is not None:
                 seven_entry: dict = {"pct": seven_pct}
                 if seven_reset is not None:

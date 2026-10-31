@@ -362,6 +362,7 @@ def format_usage_log(email: str, usage: dict | str | None) -> str | None:
     window is available (sentinels, ``None``, or spend-only) so callers can skip
     logging nothing.
     """
+    usage = oauth.display_usage(usage)  # no 5h segment without a running 5h window
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         pct = _window_pct(usage, key)

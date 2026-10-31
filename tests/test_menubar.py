@@ -266,8 +266,8 @@ def test_format_usage_log_full():
 
 
 def test_format_usage_log_without_clock():
-    usage = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 12.0}}
-    assert menubar.format_usage_log("a@x.com", usage) == "usage a@x.com: 5h 0% · 7d 12%"
+    usage = {"five_hour": {"pct": 4.0}, "seven_day": {"pct": 12.0}}
+    assert menubar.format_usage_log("a@x.com", usage) == "usage a@x.com: 5h 4% · 7d 12%"
 
 
 def test_format_usage_log_partial_window():
