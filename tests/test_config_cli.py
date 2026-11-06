@@ -52,6 +52,8 @@ class TestConfigList:
             "ui.theme",
             "run.shareHistory",
             "updates.check",
+            "pin.desktopFollows",
+            "pin.connectorsFollowPin",
             "usage.headerProbe",
         ):
             assert key in out
@@ -100,6 +102,8 @@ class TestConfigList:
         assert by_key["autoswitch.weeklyThreshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
         assert by_key["updates.check"]["value"] is True
+        assert by_key["pin.desktopFollows"]["value"] is False
+        assert by_key["pin.connectorsFollowPin"]["value"] is False
 
 
 class TestConfigSetGet:
@@ -127,6 +131,21 @@ class TestConfigSetGet:
         assert "= false" in out
         raw = json.loads(_settings_file(capsys).read_text())
         assert raw["autoswitch"]["includeApiKeyAccounts"] is False
+
+    @pytest.mark.parametrize("key", ["desktopFollows", "connectorsFollowPin"])
+    def test_set_pin_switch_on_and_off(self, temp_home, capsys, key):
+        """`on`/`off` are accepted for bools: the pin's own switch speaks them."""
+        from claude_swap.settings import _read_raw
+
+        code, out, _ = _run(["set", f"pin.{key}", "on"], capsys)
+        assert code == 0
+        assert f"pin.{key} = true" in out
+        assert _read_raw(_settings_file(capsys))["pin"] == {key: True}
+        code, out, _ = _run(["set", f"pin.{key}", "off"], capsys)
+        assert code == 0
+        assert f"pin.{key} = false" in out
+        _, out, _ = _run(["get", f"pin.{key}"], capsys)
+        assert out.strip() == "false"
 
     def test_set_preserves_unknown_keys(self, temp_home, capsys):
         path = _settings_file(capsys)
