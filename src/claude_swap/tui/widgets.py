@@ -235,6 +235,20 @@ def pin_is_broken(acc: AccountSnapshot) -> bool:
     )
 
 
+_LOGIN_LABEL = "login"
+
+
+def _append_login_line(
+    text: Text, acc: AccountSnapshot, label_width: int, now: float, palette: Palette
+) -> None:
+    """One "login <countdown>" row, label-padded like the card's other rows."""
+    quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
+    value = oauth.format_login_expiry(acc.login_expires_at, quarantined, now)
+    text.append("\n    ")
+    text.append(f"{_LOGIN_LABEL:<{label_width}} ", style=palette.muted)
+    text.append(value, style=palette.muted)
+
+
 def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
     """``· Max 20x`` after the header — the same marker ``cswap list`` prints:
     a lapsed subscription is a highlighted ``Free`` rather than an appended
@@ -344,6 +358,7 @@ def account_card_text(
             if last_seen is not None:
                 text.append("\n    ")
                 text.append(f"└ {last_seen}", style=palette.muted)
+        _append_login_line(text, acc, len(_LOGIN_LABEL), now, palette)
         return text
 
     rows = usage_rows(acc.usage.last_good, now, acc.usage.fetched_at, entry=acc.usage)
@@ -356,10 +371,13 @@ def account_card_text(
             # identically.
             note = ERROR_NOTES.get(acc.usage.last_error, acc.usage.last_error)
             text.append(f" · {note}", style=palette.muted)
+        _append_login_line(text, acc, len(_LOGIN_LABEL), now, palette)
         return text
 
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
-    label_width = max(len(label) for label, _pct, _suffix, _full in rows)
+    label_width = max(
+        [len(label) for label, _pct, _suffix, _full in rows] + [len(_LOGIN_LABEL)]
+    )
     bar_width = max(12, min(30, width - 42 - label_width))
     for label, pct, suffix, suffix_full in rows:
         # everything on a row except the suffix: indent, label, bar, " NNN%"
@@ -386,6 +404,7 @@ def account_card_text(
                 palette=palette,
             )
         )
+    _append_login_line(text, acc, label_width, now, palette)
     return text
 
 
@@ -402,10 +421,18 @@ def spend_row(rows: list[tuple]) -> tuple | None:
     return next((r for r in rows if r[0] == SPEND_LABEL), None)
 
 
+def mini_row_display_name(acc: AccountSnapshot) -> str:
+    """The name shown in a mini row: ``alias (email)`` when aliased, else the
+    plain email — what ``email_width`` below must be measured over, so an
+    aliased slot's login column lines up with the rest."""
+    return f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+
+
 def mini_account_text(
     acc: AccountSnapshot,
     now: float,
     *,
+    email_width: int = 0,
     palette: Palette = Palette.DARK,
     cloud_pinned: bool = False,
 ) -> Text:
@@ -423,6 +450,10 @@ def mini_account_text(
         text.append(f" ({acc.email})", style=palette.foreground)
     else:
         text.append(acc.email, style=palette.foreground)
+    text.append(" " * max(0, email_width - len(mini_row_display_name(acc))))
+    quarantined = acc.usage.sentinel == USAGE_RELOGIN_REQUIRED
+    login_value = oauth.format_login_expiry(acc.login_expires_at, quarantined, now)
+    text.append(f"  {_LOGIN_LABEL} {login_value}", style=palette.muted)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if cloud_pinned:
         # Labelled, like the full card: a bare glyph sitting between the
@@ -569,6 +600,13 @@ class AccountsPanel(Static):
             )
         now = time.time()
         width = (self.size.width or 80) - 2
+        # Widest displayed name (alias included) among the mini rows, so
+        # their login columns start at the same offset regardless of which
+        # account's name is longest.
+        email_width = max(
+            (len(mini_row_display_name(acc)) for acc in snap.accounts if not acc.is_active),
+            default=0,
+        )
         blocks: list[Text] = []
         pinned_identity = self._pinned_identity
         by_number = {acc.number: acc for acc in snap.accounts}
@@ -589,7 +627,10 @@ class AccountsPanel(Static):
                 )
             elif self._show_minis:
                 blocks.append(
-                    mini_account_text(acc, now, palette=palette, cloud_pinned=pinned)
+                    mini_account_text(
+                        acc, now, email_width=email_width, palette=palette,
+                        cloud_pinned=pinned,
+                    )
                 )
         if not blocks:
             return Text("no active managed login", style=palette.muted)
