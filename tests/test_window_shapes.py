@@ -182,7 +182,7 @@ def test_a_running_window_still_renders(shape):
     assert [label for label, *_ in widgets.usage_rows(got, now)] == ["5h", "7d", "Fable"]
     assert _format_usage_lines(got)[0].startswith("5h:")
     assert menubar.usage_summary(got, now).startswith("5h 10%")
-    assert ":10%" in widgets.mini_account_text(_snapshot(got), now).plain
+    assert ": 10%" in widgets.mini_account_text(_snapshot(got), now).plain  # #425: the pct is right-aligned to width 3
     assert tui_data.window_pct(got, "five_hour") == 10.0
     assert "5h 10% · 7d 29%" in menubar.format_title(
         "a@x.com", got, menubar.MenuBarSettings(title_pct="both"), now
