@@ -2659,7 +2659,9 @@ class TestAutoScreen:
             assert len({ln.index("7d(") for ln in rows}) == 1, plain
             assert rows[0].endswith("threshold 97%"), plain
             assert rows[1].endswith("threshold 85%"), plain
-            assert "5h full" in rows[1] and "7d full" not in plain, plain
+            # #321 (owner, 2026-09-17): "full" is for a window at or over 100, so 5h 95% over its 85 line reads no label; the
+            # threshold it is judged against ends the row (#323), and 7d 93% under 97 is no block.
+            assert "95%" in rows[1] and "full" not in plain, plain
 
     async def test_candidates_ranking_honors_configured_model(
         self, tmp_path, fake_engine
@@ -2827,8 +2829,9 @@ class TestAutoScreen:
                 n: next(ln for ln in plain.splitlines() if f"user{n}@" in ln)
                 for n in (2, 3)
             }
-            assert re.search(r"Fable\S*:95% \(line 97%\)", rows[2]), rows[2]
-            assert re.search(r"Fable\S*:90% \(line 97%\)", rows[3]), rows[3]
+            assert re.search(r"Fable\S*:95%", rows[2]) and rows[2].endswith("threshold 97%"), rows[2]
+            assert rows[2].index("not a candidate") < rows[2].index("threshold"), rows[2]  # the note follows the row's own tag
+            assert re.search(r"Fable\S*:90%", rows[3]) and rows[3].endswith("threshold 97%"), rows[3]
 
     @pytest.mark.parametrize("strategy", ["consume-first", "weekly-first"])
     async def test_candidates_drain_soonest_seven_day_reset_first(
@@ -3513,7 +3516,8 @@ class TestUnswitchableRowsAreListed:
         import re
 
         def colon(window, line):
-            return re.search(re.escape(window) + r"(?:\(⟳\w+\))?:", line).end()
+            # `[^)]*`, not `\w+`: a window with no reset reads `7d(⟳?):`
+            return re.search(re.escape(window) + r"(?:\(⟳[^)]*\))?:", line).end()
 
         seven_d = [colon("7d", line) for line in lines]
         fable = [colon("Fable", line) for line in lines]
@@ -3561,7 +3565,8 @@ class TestUnswitchableRowsAreListed:
             hits = [
                 m
                 for line in rows.values()
-                if (m := re.search(r"(" + re.escape(window) + r"(?:\(⟳\w+\))?:)\s*\d+%", line))
+                # `[^)]*`, not `\w+`: a window with no reset reads `7d(⟳?):`
+                if (m := re.search(r"(" + re.escape(window) + r"(?:\(⟳[^)]*\))?:)\s*\d+%", line))
             ]
             colons = {m.end(1) for m in hits}
             ends = {m.end() for m in hits}
@@ -3608,7 +3613,7 @@ class TestUnswitchableRowsAreListed:
                 "seven_day": {"pct": 5.0}, "scoped": [{"name": "Fable", "pct": 95.0}],
             }),
             self._acct("3", "bbbb@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 5.0},
+                "five_hour": {"pct": 100.0}, "seven_day": {"pct": 5.0},  # 100: `full` is reserved for exhaustion
             }),
             self._acct("4", "cccc@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 1.0}, "seven_day": {"pct": 1.0},
@@ -3617,7 +3622,7 @@ class TestUnswitchableRowsAreListed:
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom
         assert len(rows) == 3, rows
         starts = {
-            e: m.start(1) if (m := re.search(r"\s{2}(\S+-only|\S+ full)$", line)) else None
+            e: m.start(1) if (m := re.search(r"\s{2}(\S+-walled|\S+ full)$", line)) else None  # `-walled`
             for e, line in rows.items()
         }
         assert starts["aaaa@x.com"] is not None, rows
