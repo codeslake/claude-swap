@@ -978,13 +978,12 @@ class TestUsageRows:
 
         now = time.time()
         last_good = {"five_hour": {"pct": 0.0}}  # no resets_at at all
-        row = usage_rows(last_good, now)[0]
-        assert row[2] == "resets 5h", row
-        assert row[3] == "resets 5h", row
+        # #199 (owner: a 5h window at 0% is not running, so it draws no row until its first use): nothing is drawn for a reset to be unknown about
+        assert usage_rows(last_good, now) == []
 
         entry = UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
-        assert "resets 5h" in card, card
+        assert "5h" not in card, card
         assert "reset unknown" not in card, card
 
     def test_active_cards_5h_row_reads_refetching_not_a_stale_100pct_reset(self):
@@ -3929,8 +3928,9 @@ class TestUnswitchableRowsAreListed:
         ), active="9", settings=settings)
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}  # by email: rows sort by headroom
         assert len(rows) == 3, rows
-        assert re.search(r"cccc@x\.com\s+7d:", rows["cccc@x.com"]), rows  # no leading dot
-        assert "7d(⟳" in rows["aaaa@x.com"] and "7d:" in rows["bbbb@x.com"], rows  # widths differ
+        # no leading dot; a window with no reset reads `7d(⟳?):`
+        assert re.search(r"cccc@x\.com\s+7d\(⟳\?\):", rows["cccc@x.com"]), rows
+        assert "7d(⟳" in rows["aaaa@x.com"] and "7d(⟳?):" in rows["bbbb@x.com"], rows  # widths differ (no reset: `⟳?`)
         for window in ("5h", "7d", "Fable"):
             hits = [
                 m
@@ -4263,11 +4263,11 @@ class TestUnswitchableRowsAreListed:
         assert "Fable(⟳?):91%" in out, out
 
     def test_an_unknown_reset_on_the_binding_window_keeps_its_line_note(self):
-        """The unknown-reset marker and the weekly line's `(line N%)` note
-        are independent facts about one chip: the binding window with no
-        reported reset must still name the line it is judged against, and
-        the note sits inside the chip's column so the chip after it (here
-        the 7d chip of the row above) starts at the same column in both rows."""
+        """The unknown-reset marker and the weekly line's `threshold N%` note
+        are independent facts about one row: the binding window with no
+        reported reset must still name the threshold it is judged against,
+        and the note ends the row, so the chip after it (here the 7d chip of
+        the row above) starts at the same column in both rows."""
         from claude_swap.settings import AutoSwitchSettings
 
         settings = AutoSwitchSettings(threshold=85.0, weekly_threshold=97.0)
@@ -4280,8 +4280,8 @@ class TestUnswitchableRowsAreListed:
                 "five_hour": {"pct": 90.0}, "seven_day": {"pct": 10.0},
             }),
         ), active="1", settings=settings)
-        assert "7d(⟳?):93% (line 97%)" in out, out
-        assert "5h(⟳?):90% (line 85%)" in out, out
+        assert "7d(⟳?):93%" in out and "5h(⟳?):90%" in out, out
+        assert [ln.rsplit("  ", 1)[-1] for ln in out.splitlines() if "@x.com" in ln] == ["threshold 97%", "threshold 85%"], out
         rows = [ln for ln in out.splitlines() if "@x.com" in ln]
         assert len(rows) == 2 and rows[0].index(" · 7d") == rows[1].index(" · 7d"), out
 
