@@ -46,8 +46,8 @@ from claude_swap.switcher import (
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
-    _usage_entry_lines,
     switch_off_at_limit_account,
+    _usage_entry_lines,
 )
 from claude_swap import macos_keychain as _kc
 from claude_swap.exceptions import ClaudeSwitchError
