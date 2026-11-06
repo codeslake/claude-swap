@@ -18340,6 +18340,97 @@ class TestT1313SettleWiring:
         assert delay > 0
 
 
+class TestTheDynamicArmsHonourTheOverloadAndRefusalBar:
+    """T1883: `overload_backoff` (an `overloaded` departure's in-memory bar,
+    merged with the usage store's `refused_until` mark) is read where
+    `_rank_candidates` ranks. `dynamic`'s `proactive` arm and its
+    `dynamic-healthy` alternation arm rank through `_rank_dynamic_candidates`
+    and never reach it, so each landed on an account the engine had left
+    for an overload or the API had refused."""
+
+    IDENT = {"1": ("acct1@example.invalid", ""), "2": ("acct2@example.invalid", "")}
+
+    WARM = {"lastActiveAt": {"1": FakeClock().now - 600.0, "2": FakeClock().now - 10.0}}
+    # arm: (active, usage, state, the tick the partner's bar ends in, by bar). The unbarred control (bar None) must
+    # SWITCH onto the partner, so a row cannot read green by holding for another reason (the dwell, the warmth TTL,
+    # the `lastActiveAt` key) or by ending in ERROR; each barred row names the outcome and reason the arm gives.
+    # `retry`: 2 left 1 for an `overloaded`, so `_left_account_recovered` reads True and 1 (headroom 5, under twice
+    # 2's 3) is still `no_return`: the barred ranking is empty and the no-return retry re-ranks the candidates by name.
+    ARMS = {
+        "proactive": (
+            1, {"1": _usage(97.0), "2": _usage(30.0)}, WARM,
+            {"backoff": (TickOutcome.BLOCKED, ["no-qualifying-candidate"]),
+             "refused": (TickOutcome.BLOCKED, ["account-refused"])},
+        ),
+        "alternation": (
+            1, {"1": _usage(50.0), "2": _usage(30.0)}, WARM,
+            dict.fromkeys(("backoff", "refused"), (TickOutcome.NO_ACTION, ["below-threshold"])),
+        ),
+        "retry": (
+            2, {"1": _usage(95.0), "2": _usage(97.0)},
+            {"lastSwitchFrom": 1, "lastSwitchTo": "2", "leftHeadroom": None,
+             "leftRecoveryAt": None, "leftTrigger": "overloaded"},
+            dict.fromkeys(("backoff", "refused"), (TickOutcome.BLOCKED, ["no-qualifying-candidate"])),
+        ),
+    }
+
+    @pytest.mark.parametrize("bar", [None, "backoff", "refused"], ids=["control", "backoff", "refused"])
+    @pytest.mark.parametrize("arm", ["proactive", "alternation", "retry"])
+    def test_a_barred_partner_is_not_landed_on(self, temp_home, arm, bar):
+        active, usage, state, held = self.ARMS[arm]
+        # T3167: the percent step (#321, default 20) is off here: the arms below pin the time-only dwell.
+        h = EngineHarness(temp_home, strategy="dynamic", alternation_chunk_pct=0.0)
+        for n in (1, 2):
+            h.seed(n, f"acct{n}@example.invalid")
+        h.make_live(f"acct{active}@example.invalid", active)
+        h.set_active(active)
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps({"schemaVersion": 1, **state})
+        )
+        partner = str(3 - active)
+        entries = {n: _entry_for(v, h.clock.now) for n, v in usage.items()}
+        if bar == "backoff":
+            h.engine._overload_backoff[partner] = h.clock.now + OVERLOAD_BACKOFF_S
+        elif bar == "refused":
+            store = h.switcher._usage_store
+            store.mark_refused(partner, self.IDENT)
+            entries[partner] = replace(
+                entries[partner], refused_until=store.entries(self.IDENT)[partner].refused_until
+            )
+        outcome = h.tick_with_entries(entries)
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert (outcome, reasons) == ((TickOutcome.SWITCHED, []) if bar is None else held[bar])
+        assert h.active_number() == (3 - active if bar is None else active)
+
+    @pytest.mark.parametrize("bar", [None, "backoff", "refused"], ids=["control", "backoff", "refused"])
+    def test_a_barred_partner_is_not_landed_on_under_the_percent_step(self, temp_home, bar):
+        h = EngineHarness(temp_home, strategy="dynamic")
+        step = h.settings.alternation_chunk_pct
+        assert step > 0   # the shipped default: the step arm, not the time-only dwell
+        _, usage, state, held = self.ARMS["alternation"]
+        anchor = usage["1"]["five_hour"]["pct"] - step - 1.0
+        for n in (1, 2):
+            h.seed(n, f"acct{n}@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+        h.set_active(1)
+        stay = {"account": "1", "since": state["lastActiveAt"]["1"], "anchor": anchor, "rise": 0.0,
+                "ran": True, "levels": {"5h": anchor}}
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps({"schemaVersion": 1, **state, "alternation": stay})
+        )
+        entries = {n: _entry_for(v, h.clock.now) for n, v in usage.items()}
+        if bar == "backoff":
+            h.engine._overload_backoff["2"] = h.clock.now + OVERLOAD_BACKOFF_S
+        elif bar == "refused":
+            store = h.switcher._usage_store
+            store.mark_refused("2", self.IDENT)
+            entries["2"] = replace(entries["2"], refused_until=store.entries(self.IDENT)["2"].refused_until)
+        outcome = h.tick_with_entries(entries)
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert (outcome, reasons) == ((TickOutcome.SWITCHED, []) if bar is None else held[bar])
+        assert h.active_number() == (2 if bar is None else 1)
+
+
 class TestARefusedAccountIsBarredFromTheEnginesPick:
     """The pin's refusal entry (`switch(current_refused=True)`) leaves the
     account the API refused and marks it for `REFUSAL_BAR_S`. The mark lives
@@ -20459,6 +20550,12 @@ def _xw_stamp(h, **ages: float) -> None:
     path.write_text(json.dumps(raw))
 
 
+def _xw_live_session(h, num: str):
+    """`num` has a live `cswap run` session. #199's `_freshen_target` reads the session directory itself (one scan carries the live pids and the unreadable count), so the scan is what is patched, not `live_session_pids_for`."""
+    session_dir = h.switcher._session_dir(num, f"acct{num}@example.invalid")
+    return patch("claude_swap.session.scan_live_sessions", side_effect=lambda d: ([4242], 0) if d == session_dir else ([], 0))
+
+
 def _xw_switch(h) -> SwitchEvent:
     return next(e for e in h.events if isinstance(e, SwitchEvent))
 
@@ -20586,10 +20683,7 @@ class TestAnExpiringWindowPullsTheSwitch:
 
     def test_a_first_target_that_cannot_be_landed_on_gives_way_to_the_next(self, temp_home):
         h = _xw_harness(temp_home)
-        with patch.object(
-            h.switcher, "live_session_pids_for",
-            side_effect=lambda num, email: [4242] if num == "3" else [],
-        ):
+        with _xw_live_session(h, "3"):  # 3 cannot be landed on, so the queue gives way to 2
             assert _xw_tick(h, self._two_expiring(h)) is TickOutcome.SWITCHED
         assert (h.active_number(), _xw_switch(h).trigger) == (2, "expiring-window")
 
@@ -20625,10 +20719,7 @@ class TestAnExpiringWindowPullsTheSwitch:
         is not due: the tick does not land on it under `expiring-window`."""
         h = _xw_harness(temp_home)
         usage = self._fleet(h, **{"3": _xw(h, 10.0, 40.0, 5 * _D)})
-        with patch.object(
-            h.switcher, "live_session_pids_for",
-            side_effect=lambda num, email: [4242] if num == "2" else [],
-        ):
+        with _xw_live_session(h, "2"):  # 2 is due and refused downstream; 3 is not due
             assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert _xw_hold(h).detail == (
@@ -20649,10 +20740,7 @@ class TestAnExpiringWindowPullsTheSwitch:
             "3": _xw(h, 10.0, 20.0, 4 * _D),
             "4": _xw(h, 10.0, 45.0, 5 * _D),
         }
-        with patch.object(
-            h.switcher, "live_session_pids_for",
-            side_effect=lambda num, email: [4242] if num == "2" else [],
-        ):
+        with _xw_live_session(h, "2"):  # the due account 2 is refused; warm 4 still comes first
             assert _xw_tick(h, usage) is TickOutcome.SWITCHED
         assert (h.active_number(), _xw_switch(h).trigger) == (4, "proactive")
 
