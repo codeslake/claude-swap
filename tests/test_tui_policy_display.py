@@ -53,9 +53,10 @@ from tests.test_tui import (
 # the card's login row come from the login-expiry column, which every account
 # view now carries.
 GOLDEN_CARD_HEADER = " 2  dev (user2@example.com)  [personal]   ● active"
-GOLDEN_MINI = " 2  dev (user2@example.com)  login ?       [personal]   5h:25% · 7d:10%"
+# The two mini goldens are the fixed-column compact row (PR #425), not the old one-line body.
+GOLDEN_MINI = " 2  dev (user2@example.com)  login ?       [personal]  5h: 25%  7d: 10%"
 GOLDEN_CARD_HEADER_DISABLED = " 3  user3@example.com  [personal]   (disabled)"
-GOLDEN_MINI_DISABLED = " 3  user3@example.com  login ?       [personal]  (disabled)   5h:25% · 7d:10%"
+GOLDEN_MINI_DISABLED = " 3  user3@example.com  login ?       [personal]  5h: 25%  7d: 10%  (disabled)"
 
 NOW = 1000.0
 
