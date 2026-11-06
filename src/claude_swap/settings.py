@@ -26,8 +26,11 @@ from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
+# "dynamic": a fixed ~97% switch bar, a 20-point rotation, and its own ranking
+# (leaving at its bar, a recently used account first; then a weekly reset
+# within a day, else the most headroom).
 AUTOSWITCH_STRATEGIES = (
-    "best", "weekly-first", "consume-first", "priority-consume-first",
+    "best", "weekly-first", "consume-first", "dynamic", "priority-consume-first",
 )
 
 _logger = logging.getLogger("claude-swap")
@@ -51,7 +54,9 @@ class AutoSwitchSettings:
     re-triggers next tick) and beat the active account by at least
     ``hysteresis_pct`` points of headroom measured against those lines, so two
     accounts hovering at the line never ping-pong while a strictly better
-    account is always taken.
+    account is always taken. This is ``best``'s rule; ``consume-first`` and
+    ``dynamic`` read the threshold differently (see
+    ``SETTING_SPECS["autoswitch.threshold"].help`` and the README).
     """
 
     threshold: float = 90.0
@@ -72,6 +77,26 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # `dynamic` only (#375): how long a departed account's cached org
+    # context stays "warm" — a candidate never touched inside this window
+    # is "cold" and pays the re-write cost on landing.
+    cache_ttl_seconds: float = 3600.0
+    # `dynamic` only: the least headroom a COLD candidate needs to be worth
+    # the re-write cost (measured: one cold landing cost ~19 5h-points on a
+    # 19-session fleet). The Ultra (Max 20x) figure; a Max 5x account pays 4x it.
+    cold_switch_cost_pct: float = 20.0
+    # `dynamic` only: how long a healthy active is held before rotating to a
+    # warm partner, so both accounts' caches stay inside `cache_ttl_seconds`.
+    # With `alternation_chunk_pct` > 0 it applies only when the percent step
+    # cannot be measured (traffic ran and the reading did not move).
+    alternation_chunk_seconds: float = 600.0
+    # `dynamic` only: the percent step. A healthy active is rotated to the best
+    # admissible account (warm or cold) once its binding window has risen this
+    # many points since the landing; `alternation_chunk_seconds` then applies
+    # only when that rise cannot be measured. 0 turns the step off (time-only
+    # alternation). 20 is the replay's winner (alternation-replay.md); the
+    # proposed 3 never passed its acceptance rule.
+    alternation_chunk_pct: float = 20.0
     # `dynamic` + pin only: the pin keeps warm sessions on their account and
     # keep-alives idle ones. Read by the pin (`autoswitch.cache_aware_active`),
     # never by the engine's switching.
@@ -177,7 +202,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     for spec in (
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
-            help="Switch line for a running 5h window, and for every window while no weekly line is set",
+            help="Switch line for a running 5h window, and for every window while no weekly line is set "
+            "(dynamic: fixed near 97% instead; still gates blackout/cadence)",
         ),
         SettingSpec(
             "autoswitch", "weeklyThreshold", "weekly_threshold", "float", 50.0, 99.9,
@@ -215,6 +241,23 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "cacheTtlSeconds", "cache_ttl_seconds", "float", 60.0, 86400.0,
+            help="dynamic: how long a departed account's cache stays warm",
+        ),
+        SettingSpec(
+            "autoswitch", "coldSwitchCostPct", "cold_switch_cost_pct", "float", 0.0, 100.0,
+            help="dynamic: headroom a cold candidate needs to be admitted (Ultra figure, x4 on Max 5x)",
+        ),
+        SettingSpec(
+            "autoswitch", "alternationChunkSeconds", "alternation_chunk_seconds",
+            "float", 60.0, 3600.0,
+            help="dynamic: how long to sit before rotating to a warm partner",
+        ),
+        SettingSpec(
+            "autoswitch", "alternationChunkPct", "alternation_chunk_pct", "float", 0.0, 100.0,
+            help="dynamic: points the active's binding window rises before rotating (0 = by time only)",
         ),
         SettingSpec(
             "autoswitch", "cacheAware", "cache_aware", "bool",
