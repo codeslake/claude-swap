@@ -195,7 +195,7 @@ def test_a_rejected_probe_with_an_unreadable_window_keeps_its_refusal(
     }.items():
         headers[key] = value
 
-    def urlopen(request, timeout):
+    def urlopen(request, timeout, **_kw):  # #210: the header probe passes context= too (the probe stub)
         assert request.full_url == oauth.USAGE_PROBE_URL
         raise urllib.error.HTTPError(
             oauth.USAGE_PROBE_URL, 429, "Too Many", hdrs=headers, fp=None,
