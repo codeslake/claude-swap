@@ -4444,8 +4444,8 @@ class TestAutoScreen:
                 n: next(ln for ln in plain.splitlines() if f"user{n}@" in ln)
                 for n in (2, 3)
             }
-            assert re.search(r"Fable\S*:95%", rows[2]) and rows[2].endswith("threshold 97%"), rows[2]
-            assert rows[2].index("not a candidate") < rows[2].index("threshold"), rows[2]  # the note follows the row's own tag
+            assert re.search(r"Fable\S*:95%", rows[2]) and "threshold 97%" in rows[2], rows[2]
+            assert rows[2].index("threshold") < rows[2].index("not a candidate"), rows[2]  # STATUS_ORDER: the note, then the row's own refusal
             assert re.search(r"Fable\S*:90%", rows[3]) and rows[3].endswith("threshold 97%"), rows[3]
 
     @pytest.mark.parametrize("strategy", ["consume-first", "weekly-first"])
@@ -5925,10 +5925,10 @@ class TestUnswitchableRowsAreListed:
     def test_an_unranked_no_plan_row_pads_its_email_like_the_others(self):
         """T1738, #323 + #392 + #371 merged: every row pads its email to the block's widest, so
         the next field starts in one column. The unranked no-plan row is #371's own, drawn
-        before the chip branch, and `no plan` starts where the other rows' first window (5h)
-        cell does: T1738 had it start at their `login` (the owner's report of 2026-10-04), and
-        the owner reversed that on 2026-10-05, so it carries a blank login cell. Its email is
-        the shortest, or the pad is a no-op."""
+        before the chip branch, and `no plan` is a status piece: it starts in the status slot,
+        after the chips' block (T1738 had it start at their `login`, the owner's report of
+        2026-10-04; from 2026-10-05 in their 5h column; the owner's rule of 2026-11-07 puts every
+        status marker in one column). Its email is the shortest, or the pad is a no-op."""
         from claude_swap.settings import AutoSwitchSettings
 
         no_plan = UsageEntry(
@@ -5948,16 +5948,17 @@ class TestUnswitchableRowsAreListed:
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}
         assert len(rows) == 2, rows
         assert "no plan (subscription inactive)" in rows["c@x.com"], rows  # premise: unranked
-        assert rows["c@x.com"].index("no plan") == rows["bbbbbbbb@x.com"].index("5h("), rows
+        assert rows["c@x.com"].index("no plan") == len(rows["bbbbbbbb@x.com"]) + 2, rows  # the status slot, after the chips
 
     def test_every_cell_of_a_next_best_row_starts_in_one_column(self):
         """T1795, the owner's report of 2026-10-05: `5h(⟳retry 3m):59%` started left of
         `5h(⟳5h00m):` (the chips were right-aligned), the spend row and its `auto-swap
         disabled` tag started elsewhere, and the pct beside a retry label read as live
         usage. One plain row, one retry-label row, a spend-only row and an unranked no-plan
-        row (the last two are notes): login, 5h, 7d and status cells each start in one
-        column, both notes start in the 5h column, and a pct that predates its window's reset
-        is dim while a live one is not."""
+        row (the spend row is a note): login, 5h, 7d and status cells each start in one
+        column, the spend note starts in the 5h column and every status piece (the no-plan
+        reason too) in the status column, and a pct that predates its window's reset is dim
+        while a live one is not."""
         import re
         from claude_swap.settings import AutoSwitchSettings
 
@@ -5997,12 +5998,12 @@ class TestUnswitchableRowsAreListed:
         five = column("5h(", "plain@x.com", "retry@x.com")
         column("login", "plain@x.com", "retry@x.com", "spend@x.com")
         column("7d(", "plain@x.com", "retry@x.com")
-        assert column("$$ ", "spend@x.com") == column("no plan", "noplan@x.com") == five, out.plain
+        assert column("$$ ", "spend@x.com") == five, out.plain
         statuses = {
-            e: re.search(r"Fable-walled|stale", rows[e].plain).start()
-            for e in ("plain@x.com", "retry@x.com")
+            e: re.search(r"Fable-walled|stale|no plan|auto-swap disabled", rows[e].plain).start()
+            for e in rows
         }
-        assert len(set(statuses.values())) == 1, (statuses, out.plain)
+        assert len(set(statuses.values())) == 1 and min(statuses.values()) > five, (statuses, out.plain)
 
         def dim(email, pct):
             row = rows[email]
@@ -6011,21 +6012,21 @@ class TestUnswitchableRowsAreListed:
         assert dim("retry@x.com", "59%") and not dim("retry@x.com", "9%"), out.plain
         assert not dim("plain@x.com", "5%"), out.plain
 
-        # the body is as wide as its widest note, not only the chips: a no-plan note wider than a lone 5h
-        # chip pushes the tag field past itself
+        # a no-plan note far wider than a lone 5h chip moves no column: both rows' status starts in the status slot
         narrow = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True),
             self._acct("2", "five@x.com", switchable=True, disabled=True, last_good={"five_hour": {"pct": 5.0}}),
             self._acct("5", "noplan@x.com", switchable=True, usage=no_plan),
         ), active="1", settings=AutoSwitchSettings(model="Fable", threshold=90.0))
         note, tag = (next(ln for ln in narrow.split("\n") if e in ln) for e in ("noplan@", "five@"))
-        assert tag.index("auto-swap disabled") == note.index("no plan") + len("no plan (subscription inactive)") + 2, narrow
+        assert tag.index("auto-swap disabled") == note.index("no plan"), narrow
 
     def test_the_status_cell_and_the_tag_cell_each_start_in_one_column(self, monkeypatch):
         """T2037, the owner's report of 2026-10-08: a row's status (`7d full`, `stale`) and its tags (`auto-swap
         disabled`, `not a candidate`, `○ cloud`) were one run of text, so a spend row, which has no status, drew
-        its `auto-swap disabled` where the other rows draw theirs. The status starts in one column across the
-        rows that have one, the tags in one column across every row, and the tags come after the status."""
+        its `auto-swap disabled` where the other rows draw theirs. The owner's rule of 2026-11-07: every status
+        piece (`7d full`, `stale`, `not a candidate`, `auto-swap disabled`) starts in one column across the rows
+        that have one, and `○ cloud` is the last column, clear of the widest status."""
         import re
         from claude_swap import pin
         from claude_swap.settings import AutoSwitchSettings
@@ -6060,10 +6061,11 @@ class TestUnswitchableRowsAreListed:
             assert len(set(cols.values())) == 1, (pattern, cols, out)
             return cols[emails[0]]
 
-        status = column(r"7d full|stale", "full@x.com", "retry@x.com", "off@x.com")
-        tag = column(r"auto-swap disabled|not a candidate|· ○ cloud", "close@x.com", "spend@x.com", "cloud@x.com", "off@x.com")
-        assert tag > status + len("7d full"), out
-        assert rows["open@x.com"] == rows["open@x.com"].rstrip(), out  # nothing after the chips, no trailing pad
+        status = column(r"7d full|stale|not a candidate|auto-swap disabled", "close@x.com", "full@x.com", "retry@x.com", "spend@x.com", "off@x.com")
+        assert "7d full \u00b7 auto-swap disabled" in rows["off@x.com"], out  # both pieces, in STATUS_ORDER, one cell
+        where = rows["cloud@x.com"].index("○ cloud")
+        assert where == max(len(r) for e, r in rows.items() if e != "cloud@x.com") + 2 and "\u00b7 ○ cloud" not in out, out
+        assert rows["open@x.com"] == rows["open@x.com"].rstrip(), out  # nothing after the chips: no trailing pad
 
     def test_a_weekly_cap_reads_in_the_status_cell_and_moves_no_column(self):
         """T3093, the owner's report of 2026-10-30: the cap's note (`capped 7d 93% >= 90%`) was appended to the capped row's BODY,
@@ -6111,7 +6113,56 @@ class TestUnswitchableRowsAreListed:
         # the Static wraps a row wider than the screen; no width branch in `_candidates_text`, so the same rows wrap the same
         wrapped, wrapped_base = narrow(out), narrow(base)
         assert {e: v for e, v in wrapped.items() if e != "cap@x.com"} == {e: v for e, v in wrapped_base.items() if e != "cap@x.com"}
-        assert "7d capped" in wrapped["cap@x.com"], wrapped["cap@x.com"]
+        assert "capped" in wrapped["cap@x.com"], wrapped["cap@x.com"]
+
+    def test_every_marker_of_a_next_best_row_has_one_place(self, monkeypatch):
+        """T3328, the owner's rule of 2026-11-07, on the MERGED tree (the PRs each pad their own marker; the integration build
+        stitched them with sweep entries and the markers floated): status markers share one column in STATUS_ORDER, joined by
+        ` · `; `○ cloud` is the last column, clear of the widest status, with no leading dot; the `threshold N%` note is a
+        status piece (it sat after whatever tags preceded it, 83 columns on one row and 103 on the next); a spend row's
+        `auto-swap disabled` and an unswitchable row's login sit in their slots too."""
+        import re
+        from rich.cells import cell_len
+        from claude_swap import pin
+        from claude_swap.models import AccountPolicy
+        from claude_swap.settings import AutoSwitchSettings
+
+        def windows(five, seven):
+            return {"five_hour": {"pct": five}, "seven_day": {"pct": seven}}
+
+        spend = {"used": 120.0, "limit": 466.0, "pct": 26.0, "currency": "USD"}
+        capped = self._acct("5", "capped@x.com", switchable=True, disabled=True, last_good=windows(10.0, 93.0))
+        capped.policy = AccountPolicy(threshold=70.0, weekly_cap=90.0)
+        noted = self._acct("4", "noted@x.com", switchable=True, last_good=windows(10.0, 5.0))
+        noted.policy = AccountPolicy(threshold=70.0)
+        cloud = self._acct("3", "cloud@x.com", switchable=True, last_good=windows(20.0, 10.0))
+        cloud.org_uuid = ""  # the badge compares (email, org) against the pin
+        monkeypatch.setattr(pin, "pinned_identity", lambda _sw: ("cloud@x.com", ""))
+        monkeypatch.setattr(pin, "pin_is_applying", lambda _sw: True)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good=windows(92.0, 5.0)),
+            self._acct("2", "plain@x.com", switchable=True, last_good=windows(20.0, 10.0)),
+            cloud, noted, capped,
+            self._acct("6", "spend@x.com", switchable=True, disabled=True, last_good={"spend": spend}),
+            self._acct("7", "empty@x.com", switchable=False),
+        ), active="1", settings=AutoSwitchSettings(threshold=90.0, strategy="best"))
+        rows = {ln.split()[1]: ln for ln in out.split("\n") if "@x.com" in ln}
+        assert len(rows) == 6, out  # premise: every row but the active one
+        widest = "7d capped \u00b7 threshold 70% \u00b7 auto-swap disabled"
+        assert widest in rows["capped@x.com"], out  # STATUS_ORDER, joined by " \u00b7 ": the note is not whatever tag came last
+        assert rows["noted@x.com"].endswith("threshold 70%"), out
+
+        def start(email, text):
+            return cell_len(rows[email][: rows[email].index(text)])
+
+        piece = re.compile(r"7d capped|threshold \d+%|auto-swap disabled")
+        statuses = {e: cell_len(l[: m.start()]) for e, l in rows.items() if (m := piece.search(l))}
+        assert set(statuses) == {"noted@x.com", "capped@x.com", "spend@x.com"}, out  # no other row carries one
+        assert len(set(statuses.values())) == 1, (statuses, out)
+        assert len({start(e, "login") for e in rows}) == 1, out  # the unswitchable row's login too
+        assert start("cloud@x.com", "○ cloud") == statuses["capped@x.com"] + cell_len(widest) + 2, out
+        assert rows["cloud@x.com"].endswith("○ cloud") and "\u00b7 ○ cloud" not in out, out
+        assert not piece.search(rows["plain@x.com"]) and not piece.search(rows["empty@x.com"]), out
 
     def test_the_cap_replaces_the_full_label_of_the_window_it_names(self):
         """T3093: a 7d window at 100% under a 90% cap would read `7d full  7d capped`; the cap is the stronger claim and
@@ -6197,7 +6248,7 @@ class TestUnswitchableRowsAreListed:
                 "five_hour": {"pct": 25.0}, "seven_day": {"pct": 65.0},
             }),
             self._acct("3", "much-longer@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 10.0},
+                "five_hour": {"pct": 100.0}, "seven_day": {"pct": 10.0},  # `full` is a window at 100 (#321)
             }),
         ), active="1", settings=AutoSwitchSettings(threshold=90.0, weekly_threshold=70.0))
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}
