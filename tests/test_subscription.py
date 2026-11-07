@@ -211,6 +211,26 @@ class TestPlanLabel:
         plan = {**ULTRA, "tier": tier, "planDisplayName": name}
         assert subscription.plan_label(plan) == label
 
+    def test_pro_organization_wins_over_the_default_tier(self):
+        # A paying Pro subscription reports the default rate-limit bucket
+        # (``default_claude_ai``), the same value a lapsed account falls back
+        # to; the tier alone would print "Free" for a subscriber who pays.
+        plan = {
+            "tier": "default_claude_ai",
+            "organizationType": "claude_pro",
+            "billingType": "apple_subscription",
+        }
+        assert subscription.plan_label(plan) == "Pro"
+
+    def test_pro_organization_does_not_mask_a_lapse(self):
+        # The label is cosmetic; expiry still comes from is_expired() alone.
+        plan = {
+            "tier": "default_claude_ai",
+            "organizationType": "claude_pro",
+            "subscriptionStatus": "canceled",
+        }
+        assert subscription.is_expired(plan)
+
     @pytest.mark.parametrize(
         "tier, label",
         [
