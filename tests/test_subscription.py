@@ -38,6 +38,12 @@ TEAM = {
     "billingType": "stripe_subscription",
     "subscriptionStatus": "active",
 }
+# Ultra shares the Max 20x tier string; only the server's plan name separates it.
+ULTRA = {
+    "tier": "default_claude_max_20x",
+    "organizationType": "claude_max",
+    "planDisplayName": "Ultra",
+}
 
 
 def _creds(token: str | None = "tok", expires_ms: int | None = None) -> str:
@@ -91,6 +97,17 @@ class TestFetchPlan:
             result = subscription.fetch_plan("tok")
         assert result.plan == TEAM
         assert (result.account_uuid, result.organization_uuid) == ("u", "o")
+
+    def test_keeps_the_plan_display_name(self):
+        payload = {
+            "organization": {
+                "rate_limit_tier": "default_claude_max_20x",
+                "organization_type": "claude_max",
+                "plan_display_name": "Ultra",
+            }
+        }
+        with patch("urllib.request.urlopen", return_value=_response(payload)):
+            assert subscription.fetch_plan("tok").plan == ULTRA
 
     def test_no_tier_is_no_answer(self):
         payload = {"organization": {"billing_type": "stripe_subscription"}}
@@ -154,6 +171,24 @@ class TestFetchPlan:
 class TestPlanLabel:
     def test_team_organization_wins_over_the_seat_tier(self):
         assert subscription.plan_label(TEAM) == "Team"
+        assert subscription.plan_label({**TEAM, "planDisplayName": "Ultra"}) == "Team"
+
+    @pytest.mark.parametrize(
+        "tier, name, label",
+        [
+            ("default_claude_max_20x", "Ultra", "Ultra"),
+            ("default_claude_max_20x", "", "Max 20x"),
+            ("default_claude_max_5x", "Max", "Max 5x"),
+            ("default_claude_max_5x", "", "Max 5x"),
+            ("default_claude_pro", "Pro", "Pro"),
+            (None, "Ultra", "Ultra"),
+        ],
+    )
+    def test_server_name_wins_unless_the_table_is_more_precise(
+        self, tier, name, label
+    ):
+        plan = {**ULTRA, "tier": tier, "planDisplayName": name}
+        assert subscription.plan_label(plan) == label
 
     @pytest.mark.parametrize(
         "tier, label",
@@ -731,6 +766,13 @@ class TestJson:
             "expired": True,
             "fetchedAt": "1970-01-01T00:00:00Z",
         }
+
+    def test_plan_display_name_is_emitted_when_kept(self):
+        row = self._row(subscription_plan={"plan": ULTRA, "fetchedAt": 0.0})
+        assert (row["plan"]["label"], row["plan"]["planDisplayName"]) == (
+            "Ultra",
+            "Ultra",
+        )
 
     def test_absent_source_fields_are_omitted_not_nulled(self):
         row = self._row(
