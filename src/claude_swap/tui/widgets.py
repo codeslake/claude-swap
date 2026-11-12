@@ -471,7 +471,7 @@ def _end_mini(text: Text, acc: AccountSnapshot, form: str | None, now: float, pa
 
 
 _MINI_TAG_CAP = 24  # widest "[tag]" a compact row shows, brackets included
-_MINI_NOTE_CAP = 30  # widest note that widens the body column; longer is ellipsized
+_MINI_NOTE_CAP = 30  # widest sentinel label that widens the body column; longer is ellipsized
 _MINI_GAP = "  "
 
 
@@ -481,8 +481,9 @@ class MiniWidths(NamedTuple):
     name: int
     tag: int
     cells: dict[str, int]  # window label -> cell width, in display order
-    note: int  # widest sentinel / "usage unknown" note shown, capped
-    marker: int  # widest "(ahead) (disabled)" marker field shown
+    note: int  # widest note shown: a spend note whole, a sentinel / "usage unknown" note capped
+    marker: int  # widest marker field shown, whichever kinds the rows carry
+    chip: dict[str, int]  # window label -> widest chip label, so its pct starts at one column
 
 
 def _fit(text: Text, width: int) -> Text:
@@ -506,10 +507,19 @@ def _mini_tag(acc: AccountSnapshot, palette: Palette) -> Text:
     return Text.assemble("[", tag, "]", style=palette.muted)
 
 
-def _mini_marks(acc: AccountSnapshot, ahead: bool, palette: Palette) -> Text:
-    """The row's one trailing marker field: ``(ahead)``, ``(disabled)``, the
-    account's policy badges, then its subscription plan."""
+def _mini_marks(
+    acc: AccountSnapshot, ahead: bool, cloud_pinned: bool, palette: Palette
+) -> Text:
+    """The row's one trailing marker field: ``(ahead)``, ``○ cloud``,
+    ``(not applying)``, ``(disabled)``, the account's policy badges, then its
+    subscription plan."""
     marks = [Text("(ahead)", style=palette.sev_warn)] if ahead else []
+    if cloud_pinned:
+        # Labelled, like the full card: a bare glyph sitting between the
+        # org tag and the usage figures read as decoration, not as a state.
+        marks.append(Text("○ cloud", style=f"bold {palette.sev_warn}"))
+        if pin_is_broken(acc):
+            marks.append(Text("(not applying)", style=f"bold {palette.sev_crit}"))
     if acc.disabled:
         marks.append(Text("(disabled)", style=palette.muted))
     marks.extend(Text(b, style=palette.muted) for b in _policy_badges(acc, ""))
@@ -532,9 +542,11 @@ def _mini_body(
         return {}, Text(data.sentinel_label(sentinel), style=style), False
     if acc.usage.last_error == "oauth_not_allowed_for_organization":  # lapsed plan
         return {}, Text("no plan", style=palette.sev_warn), False
-    last_good = acc.usage.last_good
+    last_good = oauth.display_usage(acc.usage.last_good)
     if not isinstance(last_good, dict):
         last_good = {}
+    fetched_at = acc.usage.fetched_at
+    entry = acc.usage
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
     cells: dict[str, Text] = {}
     ahead = False
@@ -550,48 +562,117 @@ def _mini_body(
             continue
         pct = float(window["pct"])
         color = palette.severity(pct)
-        cell = Text(f"{label} ", style=palette.muted)
+        # Same chip the auto view's Next-best rows draw, from the same
+        # helper — one account must not read two ways on two screens.
+        cell = Text(
+            data.chip_label(
+                label, data.reset_text(window, now, fetched_at, entry=entry),
+                pct,
+            ),
+            style=palette.muted,
+        )
         cell.append(f"{pct:3.0f}%", style=f"{color} dim" if stale else color)
-        # a window at/over 100% shows its reset; below it, 7d may be ahead of pace
-        if pct >= 100:
-            reset = data.reset_text(window, now)
-            if reset:
-                cell.append(f" ({reset})", style=palette.muted)
-        elif key == "seven_day":
-            result = pace.compute_pace(window, fetched_at=acc.usage.fetched_at)
+        if key == "seven_day":
+            result = pace.compute_pace(window, fetched_at=fetched_at)
             ahead = bool(result and result.ahead)
         cells[label] = cell
     for window in last_good.get("scoped") or []:
-        if float(window["pct"]) >= 100:
-            name = window["name"]
-            cells[name] = Text(f"{name} (!)", style=palette.sev_crit)
+        pct = float(window["pct"])
+        color = palette.severity(pct)
+        # Same chip helper the 5h/7d loop above uses — a scoped window reads
+        # the same way whether it is the account's only window or sits
+        # beside 5h/7d.
+        cell = Text(
+            data.chip_label(
+                window["name"], data.reset_text(window, now, fetched_at, entry=entry)
+            ),
+            style=palette.muted,
+        )
+        cell.append(f"{pct:3.0f}%", style=f"{color} dim" if stale else color)
+        if pct >= 100:
+            cell.append(" (!)", style=palette.sev_crit)
+        cells[window["name"]] = cell
     if isinstance(last_good.get("rejected"), dict):  # a refused setup-token probe
         cells["rejected"] = Text("rejected (!)", style=palette.sev_crit)
+    # Spend is a separate axis from a rate-limit window (never enters the
+    # ranking — see oauth.relevant_windows) so it must show whether or not a
+    # 5h/7d window already rendered above, not only as a last-resort fallback
+    # when nothing else was shown; a budget can be 95% spent behind a window
+    # that still reads perfectly healthy. From `usage_rows`, not a third
+    # spelling of the same amounts.
+    spend = spend_row(usage_rows(last_good, now, fetched_at, entry=entry))
+    if spend is not None:
+        _label, pct, suffix, _full = spend
+        color = palette.severity(pct)
+        cell = Text("$$ ", style=palette.muted)
+        cell.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        cell.append(f" · {suffix}", style=palette.muted)
+        cells[SPEND_LABEL] = cell
+        if len(cells) == 1:
+            # spend alone is the row's whole usage, like `no plan`: a note, so it starts at
+            # the 5h column and opens no `$$` column for the rows that carry windows
+            return {}, cell, ahead
+    # Nothing above rendered — every source `usage_rows` draws from
+    # (spend, 5h, 7d, scoped, rejected) uses the same truthiness test as
+    # the loops above, so `usage_rows` is provably empty here too.
     return cells, None if cells else Text("usage unknown", style=palette.muted), ahead
+
+
+def _chip_len(cell: Text) -> int:
+    """Where a window cell's pct starts: just past its chip's ``):`` (the end of
+    every ``data.chip_label``), or 0 for a cell with no chip, like the spend one."""
+    chip, sep, _pct = cell.plain.partition("):")
+    return len(chip) + 2 if sep else 0
+
+
+def _chip_pad(cell: Text, chip: int) -> Text:
+    """``cell`` with blanks after its chip, so its pct starts ``chip`` cells in."""
+    at = _chip_len(cell)
+    if not at or at >= chip:
+        return cell
+    head, tail = cell.divide([at])
+    return head.append(" " * (chip - at)).append(tail)
 
 
 def mini_widths(
     accs: Iterable[AccountSnapshot],
     now: float,
     show_tag: Callable[[AccountSnapshot], bool] = lambda _acc: True,
+    pinned_identity: tuple[str, str] | None = None,
 ) -> MiniWidths:
     """Column widths that fit every one of ``accs``, the compact rows shown.
     The tag column fits the tags ``show_tag`` keeps, and is absent (0) when
-    none is."""
+    none is.
+
+    A window's cell is its widest chip (``chip``) plus the widest of what
+    follows it, so every pct of that window starts at one column, a back-off
+    chip (``7d(⟳429 30m):``) included. ``pinned_identity``
+    (``pin.pinned_identity``) says which row carries the ``○ cloud`` marker,
+    which the marker field's width counts.
+    """
     palette = Palette.DARK  # widths do not depend on style
     name = tag = note = marker = 0
-    cells = {"5h": 0, "7d": 0}  # fixed order; scoped windows follow as seen
+    chip = {"5h": 0, "7d": 0}  # fixed order; scoped windows follow as seen
+    rest = dict(chip)
     for acc in accs:
         name = max(name, _mini_name(acc, palette).cell_len)
         if show_tag(acc):
             tag = max(tag, _mini_tag(acc, palette).cell_len)
         row_cells, row_note, ahead = _mini_body(acc, now, palette)
+        cloud = pin.account_is_pinned(pinned_identity, acc.email, acc.org_uuid)
+        marker = max(marker, _mini_marks(acc, ahead, cloud, palette).cell_len)
         for label, cell in row_cells.items():
-            cells[label] = max(cells.get(label, 0), cell.cell_len)
+            at = _chip_len(cell)
+            chip[label] = max(chip.get(label, 0), at)
+            rest[label] = max(rest.get(label, 0), cell.cell_len - at)
         if row_note:
-            note = max(note, min(row_note.cell_len, _MINI_NOTE_CAP))
-        marker = max(marker, _mini_marks(acc, ahead, palette).cell_len)
-    return MiniWidths(name, tag, {k: w for k, w in cells.items() if w}, note, marker)
+            # a spend note is the row's whole usage and stays whole, as the spend cell it replaced did
+            whole = row_note.plain.startswith(SPEND_LABEL)
+            note = max(note, row_note.cell_len if whole else min(row_note.cell_len, _MINI_NOTE_CAP))
+    # spend is its own cell after every window, wherever it was first seen
+    order = sorted(rest, key=lambda label: label == SPEND_LABEL)
+    cells = {label: chip[label] + rest[label] for label in order if rest[label]}
+    return MiniWidths(name, tag, cells, note, marker, chip)
 
 
 def mini_account_text(
@@ -607,14 +688,16 @@ def mini_account_text(
 ) -> Text:
     """One minimized line for an inactive account, in fixed columns.
 
-    ``2  work@acme.dev  [personal]  5h  92%  7d  63%  Fable (!)  (ahead) (disabled)``
+    ``2  work@acme.dev  [personal]  5h(⟳2h28m): 92%  7d(⟳3d04h): 63%  Fable(⟳?):100% (!)  (ahead) ○ cloud (disabled)``
     — slot, name, tag, one cell per window, then one marker field:
-    ``(ahead)`` (the weekly window is ahead of pace), ``(disabled)`` and
+    ``(ahead)`` (the weekly window is ahead of pace), ``○ cloud`` and
+    ``(not applying)`` (the pinned account, #210), ``(disabled)``,
     ``th 75%`` (a per-account threshold) and ``· Max 20x`` (the subscription
     plan), any of them together.
-    Pcts only, severity colored; a window at/over 100% brings its reset
-    countdown along, a maxed per-model window shows as ``Fable (!)`` and a
-    refused setup-token probe as ``rejected (!)``. A
+    Pcts only, severity colored; a window reads as the chip the auto view
+    draws, padded so every pct of a window starts at one column, a maxed
+    per-model window carries ``(!)``, the spend is a cell of its own after the
+    windows, and a refused setup-token probe reads ``rejected (!)``. A
     window the account lacks is a blank cell, and a sentinel state shows its
     label in place of the cells (ellipsized past ``_MINI_NOTE_CAP`` and the
     cells' width; the expanded card and the CLI carry the full text). Every
@@ -633,9 +716,10 @@ def mini_account_text(
     """
     widths = widths or mini_widths([acc], now, lambda _acc: show_tag)
     cells, note, ahead = _mini_body(acc, now, palette)
-    marks = _mini_marks(acc, ahead, palette)
+    marks = _mini_marks(acc, ahead, cloud_pinned, palette)
     grid = Text(_MINI_GAP).join(
-        _fit(cells.get(label) or Text(), width) for label, width in widths.cells.items()
+        _fit(_chip_pad(cells.get(label) or Text(), widths.chip[label]), width)
+        for label, width in widths.cells.items()
     )
     fields = [_fit(_mini_name(acc, palette), widths.name)]
     if widths.tag:  # a hidden tag is a blank cell, unless no row shows one
