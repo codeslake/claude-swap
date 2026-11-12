@@ -107,6 +107,7 @@ cswap auto --dry-run                 # log what it would do, never switch
 | `best` | when the active account reaches its threshold | the account with the most quota left |
 | `weekly-first` | same as `best` | the account whose weekly window resets soonest |
 | `consume-first` (default) | at the threshold, and earlier whenever an account that resets sooner has room | the account whose weekly window resets soonest |
+| `dynamic` | at a fixed ~97% used on the window in force, whatever `--threshold` says, and after 20 points of use on a healthy account | leaving at its bar, a recently used account first; then a weekly reset within a day, else the most quota left; never an account with no room on that window |
 | `priority-consume-first` | whenever a higher-tier account is usable | your highest tier (`cswap priority`), then the soonest weekly reset |
 
 The weekly ones exist because weekly quota left unused at its reset is lost.
@@ -114,15 +115,15 @@ The weekly ones exist because weekly quota left unused at its reset is lost.
 **Per-account controls**
 
 - `cswap disable <num|email>` holds an account out of rotation: auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies skip it until `cswap enable` puts it back. It keeps its login and is still a valid explicit `cswap switch <num|email>` target — with the caveat that a RUNNING auto-switch leaves a disabled account on its next tick, so an explicit switch onto one sticks only while auto is stopped.
-- `cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one.
+- `cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one. `--weekly-cap` sets a hard weekly ceiling instead (50–100).
 - `cswap priority <num|email> <tier>` ranks accounts for `priority-consume-first`: higher tiers (0–1000, default 0) are used first. The other strategies ignore tiers.
 
 **Good to know**
 
-- **Thresholds are switch-away lines, not hard caps.** With nothing under its line, or the active account at its limit, auto-switch still lands somewhere rather than stall. `priority-consume-first` is the exception: it never lands on an account at or over its line, so it holds and keeps polling.
+- **Thresholds are switch-away lines, not hard caps.** With nothing under its line, or the active account at its limit, auto-switch still lands somewhere rather than stall. `priority-consume-first` is the exception: it never lands on an account at or over its line, so it holds and keeps polling. `dynamic` holds too, unless the active account is at its limit, or within 3 points of it and a peer past its own per-account line still has room. The one hard stop is a per-account weekly cap: auto-switch never lands on an account at or past it, and moves off it when another account can take over.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping between accounts near the threshold.
 - An API outage (a burst of 529 overloaded responses on the active account's requests) moves it off immediately, ignoring the cooldown and margin, and holds the account it left out of rotation for 15 minutes. Needs the `cswap-pin` request trace armed (off by default); a silent no-op without it.
-- `--weekly-threshold 97` gives the 7-day and per-model windows their own line, so the weekly budget can run higher than the 5-hour window. `--threshold`, and any per-account threshold, then governs the 5-hour window only.
+- `--weekly-threshold 97` gives the 7-day and per-model windows their own line, so the weekly budget can run higher than the 5-hour window. `--threshold`, and any per-account threshold, then governs the 5-hour window only (`dynamic` keeps its own switch point and ignores the weekly line).
 - `--model Fable` folds that model's weekly limit into the decision, for when you hit a per-model limit before the account-wide ones. Names are the per-model rows in `cswap list` (e.g. `Fable: 100%`), matched case-insensitively.
 - Accounts with no 5-hour window (Ultra) are judged on their 7-day and `--model` windows alone.
 - If a usage check fails it keeps using the last-known numbers for a limited time while it retries, and an expired token on an idle machine makes it hold rather than fail over.
@@ -222,7 +223,9 @@ cswap disable 2                 # Hold an account out of auto-rotation (keeps it
 cswap enable 2                  # Return a disabled account to rotation
 cswap threshold 2 85            # Switch away from account 2 at 85%, not the global default
 cswap threshold 2 --unset       # Return account 2 to the global default
-cswap threshold                 # Show the global default and every per-account override
+cswap threshold                 # Show the global default and every per-account override and cap
+cswap threshold 2 90 --weekly-cap   # Never use account 2 past 90% on a weekly window
+cswap threshold 2 --weekly-cap --unset   # Remove account 2's weekly cap
 cswap priority 2 100            # Use account 2 before lower tiers (priority-consume-first strategy)
 cswap priority 2 --unset        # Return account 2 to tier 0
 cswap priority                  # Show every account's tier
