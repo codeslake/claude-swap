@@ -105,7 +105,7 @@ def _blind_quarantine(h, num, email, reason="identity-conflict"):
     store = h.switcher._store
     real = store._read_account_credentials
 
-    def unreadable(account_num, e, failed=None, cached=False):
+    def unreadable(account_num, e, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (0)
         if account_num == num:
             if failed is not None:
                 failed.append(True)
@@ -4446,7 +4446,7 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None, cached=False):
+        def unreadable(account_num, email, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (1)
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
@@ -4507,7 +4507,7 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None, cached=False):
+        def unreadable(account_num, email, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (2)
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
@@ -4570,7 +4570,7 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None, cached=False):
+        def unreadable(account_num, email, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (3)
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
@@ -4668,7 +4668,7 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None, cached=False):
+        def unreadable(account_num, email, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (4)
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
@@ -4848,7 +4848,7 @@ class TestQuarantineLifecycle:
         store = harness.switcher._store
         real_read = store._read_account_credentials
 
-        def unreadable(account_num, email, failed=None, cached=False):
+        def unreadable(account_num, email, failed=None, cached=False, **_kw):  # T2681: absorbs #286's probe_reassigned_slots (5)
             if account_num == "2":
                 if failed is not None:
                     failed.append(True)
@@ -21661,10 +21661,7 @@ class TestThePrimaryIsSpentToItsWall:
         h = _xw_harness(temp_home)
         _xw_stamp(h, **{"2": 3100.0})
         fleet = {"2": (19.0, 5.5 * _D), "3": (20.0, 5 * _D)}
-        with patch.object(
-            h.switcher, "live_session_pids_for",
-            side_effect=lambda num, email: [4242] if num == "2" else [],
-        ):
+        with _xw_live_session(h, "2"):  # 2, the pair, is always refused
             assert _xw_tick(h, self._primary_active(h, fleet)) is TickOutcome.SWITCHED
         assert (h.active_number(), _xw_switch(h).trigger) == (3, "alternation")
         h.clock.advance(700.0)  # the chunk is served: the primary takes it back
@@ -21684,17 +21681,14 @@ class TestThePrimaryIsSpentToItsWall:
         h = _xw_harness(temp_home)
         _xw_stamp(h, **stamps)
         usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (19.0, 5.5 * _D)})
-        with patch.object(
-            h.switcher, "live_session_pids_for",
-            side_effect=lambda num, email: [4242] if num == "3" else [],
-        ):
+        with _xw_live_session(h, "3"):  # 3, the pair, is held every tick
             assert _xw_tick(h, usage) is TickOutcome.SWITCHED
         assert (h.active_number(), _xw_switch(h).trigger) == (2, "alternation")
 
     def test_every_partner_failing_holds_with_the_count(self, temp_home):
         h = _xw_harness(temp_home)
         usage = self._primary_active(h, {"2": (20.0, 5 * _D), "3": (19.0, 5.5 * _D)})
-        with patch.object(h.switcher, "live_session_pids_for", return_value=[4242]):
+        with patch("claude_swap.session.scan_live_sessions", return_value=([4242], 0)):  # every partner is held
             assert _xw_tick(h, usage) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert "2 warming account(s) could not be landed on; #1: " in _xw_hold(h).detail

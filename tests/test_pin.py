@@ -2260,7 +2260,7 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         monkeypatch.setattr(
             autoview.AutoScreen,
             "query_one",
-            lambda self, *_a, **_k: types.SimpleNamespace(size=types.SimpleNamespace(width=80)),
+            lambda self, *_a, **_k: types.SimpleNamespace(size=types.SimpleNamespace(width=100)),  # the merged row is 92 wide with the badge whole (T3394)
         )
 
         monkeypatch.setattr(autoview.pin, "pinned_identity", lambda sw: (pinned, ""))

@@ -37,6 +37,8 @@ from claude_swap.autoswitch import (
     _seven_day_reset_ts,
     dynamic_candidate_order,
     dynamic_expiring_walk,
+    empty_pass_refusal,
+    no_peer_refusal,
     over_own_threshold,
     rank_candidates_pass,
     rank_priority_candidates,
@@ -384,12 +386,18 @@ def rank_switch_candidates(
     active_number: str | None,
     last_active_at: dict | None = None,
     reasons_out: dict | None = None,
+    probe_cooldown: dict[str, float] | None = None,
+    overloaded: bool = False,
+    hold_out: dict | None = None,
 ) -> tuple[list[str], str | None, str, bool]:
     """(ordered, rank_axis, trigger, unmodeled): mirrors the engine's own
     admission and order. THE shared computation -- ``ordered_accounts`` and
     the auto view's "Next best" panel both read off this, never a pass of
     their own. ``reasons_out``, when given, is filled with the engine's own
-    plain-words cause for each candidate the pass whose result is used dropped.
+    plain-words cause for each candidate the pass whose result is used dropped. ``overloaded`` is the engine's verdict that the active is on a 5xx
+    burst (`AutoSwitchEngine.overloaded_account`, a trace no snapshot carries): the trigger is the tick's `overloaded`. ``hold_out``, when given,
+    is filled with ``refusal``, the key of the refusal the tick emits when nobody is picked (``no_peer_refusal`` before the pass,
+    ``empty_pass_refusal`` after it), for the pass-ranked strategies; absent under `dynamic`'s and the priority strategy's own passes.
     """
     reasons = {} if reasons_out is None else reasons_out
     models = parse_model_names(settings.model)
@@ -433,6 +441,11 @@ def rank_switch_candidates(
     def _trigger_for(active_headroom: float | None, active_disabled: bool) -> str:
         if active_disabled:
             return "disabled-active"
+        if overloaded and active_headroom is not None:
+            # The tick reads the burst before its cap and headroom branches: the API itself is not honouring what it reports. An unreadable active
+            # stays `unreadable-active`: the burst outranks the headroom read only on the tick's own gates (an API-key active it may not leave, a
+            # hold on the active's last reading), which a snapshot cannot see.
+            return "overloaded"
         if _capped(active_number) is not None:
             return "weekly-capped"  # a cap is no line: it leaves now, below one too
         if active_headroom is None:
@@ -489,6 +502,8 @@ def rank_switch_candidates(
         )
         return ordered, (rank_axis if ordered else None)
 
+    last_pass: dict = {}   # the readings of the last pass-ranked call, which the hold's refusal is worded from
+
     def _rank_on(
         axis: tuple[str, ...], trigger: str, dropped: bool = False
     ) -> tuple[list[str], str | None]:
@@ -506,7 +521,7 @@ def rank_switch_candidates(
                 usage=usage,
                 headroom=headroom,
                 current=active_number,
-                active_enabled=any(
+                active_enabled=trigger != "overloaded" and any(
                     acc.number == active_number and acc.switchable and not acc.disabled
                     for acc in snap.accounts
                 ),
@@ -518,7 +533,7 @@ def rank_switch_candidates(
             )
             # The legend names `_rank_priority_candidates`'s own sort key.
             return ordered, ("highest tier, then soonest reset" if ordered else None)
-        ordered, _any_known, _reset_ts, _waiting, rank_axis = rank_candidates_pass(
+        ordered, any_known, reset_ts, waiting, rank_axis = rank_candidates_pass(
             models=axis,
             trigger=trigger,
             consume_first=consume_first,
@@ -533,7 +548,10 @@ def rank_switch_candidates(
             reasons=reasons,
             entries=entries,
             thresholds=bars,
+            probe_cooldown=probe_cooldown,
         )
+        if not dropped:   # the tick keeps the FIRST pass's readings when its 5h/7d retry empties too (`_rank_candidates`), so the retry's never replace them
+            last_pass.update(any_known=any_known, active_reset_ts=reset_ts, waiting_for_recovery=waiting)
         return ordered, rank_axis
 
     model_headroom = _headroom_by_account(usage, models)
@@ -578,6 +596,23 @@ def rank_switch_candidates(
         and trigger not in (*CONSUME_FIRST_STRATEGIES, "priority")
     ):
         ordered, rank_axis = api_key_candidates, None
+    if hold_out is not None and not ordered and not unmodeled:
+        # The refusal the tick emits when it picks nobody: before the pass when no OAuth peer exists (`no_peer_refusal`), else from the pass's own
+        # readings (`empty_pass_refusal`, the model-gated headroom of the OAuth peers). A healthy hold (already consuming soonest, reset unknown,
+        # below the line with no peer) is a hold, never a block. `dynamic`'s and the priority strategy's own passes carry no such reading.
+        refusal = no_peer_refusal(
+            trigger=trigger, active_headroom=active_headroom,
+            oauth_candidates=oauth_candidates, api_key_candidates=api_key_candidates,
+        )
+        if refusal is None and last_pass:
+            refusal = empty_pass_refusal(
+                trigger=trigger, candidate_headrooms=[model_headroom.get(n) for n in oauth_candidates], **last_pass,
+            )
+        if vetoed and refusal in ("no-candidates", "all-exhausted", "deliberate-wait"):
+            # The tick's `_hold_over_own`: a peer only barred by its own line is neither "no account" nor "all exhausted".
+            refusal = "no-qualifying-candidate"
+        if refusal is not None:
+            hold_out["refusal"] = refusal
     reasons.update(dict.fromkeys(vetoed, "at or over its own threshold"))
     return ordered, rank_axis, trigger, unmodeled
 

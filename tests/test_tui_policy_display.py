@@ -346,7 +346,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             )
             assert ordered == []
             plain = app.screen.query_one("#candidates", Static).render().plain
-            assert "no candidate qualifies" in plain and plain.count("Fable-walled") == 2, plain
+            assert "no candidate qualifies" in plain and plain.count("Fable limit reached") == 2, plain  # #323: the panel words a model block `<model> limit reached`, not `<model>-walled`
 
     async def test_the_threshold_note_ends_the_row_and_moves_no_column(self):
         """The per-account threshold is the row's LAST cell, so it never sits

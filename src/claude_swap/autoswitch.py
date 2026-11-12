@@ -1172,52 +1172,6 @@ def candidate_is_untrustworthy(entry: UsageEntry | None, now: float) -> bool:
     )
 
 
-def _binding_at(
-    value: dict | str | None,
-    settings: AutoSwitchSettings,
-    models: Sequence[str],
-    line: float,
-) -> BindingWindow | None:
-    """The window binding one account under ``settings``' lines on the window
-    set ``models`` (see ``lines.binding_window``), or None when it reports no
-    window. ``line`` is the account's effective threshold. A module function,
-    so the static ranking pass (and the "Next best" panel through it) needs no
-    engine instance."""
-    return binding_window(
-        oauth.relevant_windows(value if isinstance(value, dict) else None, models),
-        line,
-        settings.weekly_threshold,
-        scale=_ruler(settings),
-    )
-
-
-def _room_at(
-    value: dict | str | None,
-    settings: AutoSwitchSettings,
-    models: Sequence[str],
-    line: float,
-) -> float | None:
-    """Points left before one account's nearest line (see ``lines.line_room``),
-    or None when it reports no window. Same inputs as ``_binding_at``."""
-    return line_room(
-        oauth.relevant_windows(value if isinstance(value, dict) else None, models),
-        line,
-        settings.weekly_threshold,
-    )
-
-
-def _over_at(
-    value: dict | str | None,
-    settings: AutoSwitchSettings,
-    models: Sequence[str],
-    line: float,
-) -> bool | None:
-    """Whether any window is at or over its line (``_binding_at``'s verdict);
-    None when the account reports no window. A module function for the static pass."""
-    binding = _binding_at(value, settings, models, line)
-    return None if binding is None else binding.over
-
-
 MESSAGE_ERROR_SAMPLE = 5
 MESSAGE_ERROR_SHARE = 0.5
 # Per-tick cap on how many trace bytes `_message_error_burst` reads -- named

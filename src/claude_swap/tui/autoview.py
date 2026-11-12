@@ -973,14 +973,20 @@ class AutoScreen(Screen):
                     label_text = data.chip_label(label, reset, wpct)
                     pct_text = f"{wpct:.0f}%"
                     usage.append(sep, style=palette.muted)
-                    # Label right-aligned so the `:` shares a column (owner,
-                    # 2026-09-15); pct right-aligned so the `%` does.
+                    # Chip left-aligned so it starts in one column (owner, 2026-10-05); pct
+                    # right-aligned so the `%` ends in one. A pct that predates its window's
+                    # reset (`retry 3m`, `refetching`: the filter below) reads dim, not live.
                     usage.append(
-                        " " * (label_w - cell_len(label_text)) + label_text
+                        label_text + " " * (label_w - cell_len(label_text))
                         + " " * (pct_w - cell_len(pct_text)),
                         style=palette.muted,
                     )
-                    usage.append(pct_text, style=palette.severity(wpct))
+                    reset = data.reset_text({"resets_at": resets_at}, now)
+                    live = reset is None or reset.startswith("resets ")
+                    usage.append(
+                        pct_text,
+                        style=palette.severity(wpct) if live else f"{palette.severity(wpct)} dim",
+                    )
                     shown = True
                 # A candidate whose LAST poll failed (an active backoff, a
                 # run of failures; a success clears both) must not present
