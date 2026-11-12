@@ -924,7 +924,12 @@ class AutoScreen(Screen):
                 label_w, pct_w = chip_width.get(label, (0, 0))
                 chip_width[label] = (
                     max(label_w, cell_len(data.chip_label(
-                        label, data.reset_text({"resets_at": resets_at}, now)
+                        label,
+                        data.reset_text(
+                            {"resets_at": resets_at}, now, acc.usage.fetched_at,
+                            entry=acc.usage,
+                        ),
+                        wpct,
                     ))),
                     max(pct_w, cell_len(f"{wpct:.0f}%")),
                 )
@@ -988,7 +993,10 @@ class AutoScreen(Screen):
                 # axis from a rate-limit window), so this row was the only
                 # place the same account read two different ways.
                 spend = spend_row(
-                    usage_rows(acc.usage.last_good, time.time())
+                    usage_rows(
+                        acc.usage.last_good, now, acc.usage.fetched_at,
+                        entry=acc.usage,
+                    )
                 )
                 if spend is not None:
                     _label, spend_pct, spend_suffix, _full = spend
@@ -1016,7 +1024,21 @@ class AutoScreen(Screen):
                 # chips and the label can never disagree on which windows
                 # exist for this account.
                 windows = row_windows[acc.number]
-                have = {label: (wpct, resets_at) for label, wpct, resets_at in windows}
+                fetched_at = acc.usage.fetched_at
+                # Computed once per window so the chip and the block label
+                # below read the exact same reset, never two separate calls
+                # that could drift.
+                chips = [
+                    (
+                        label, wpct,
+                        data.reset_text(
+                            {"resets_at": resets_at}, now, fetched_at,
+                            entry=acc.usage,
+                        ),
+                    )
+                    for label, wpct, resets_at in windows
+                ]
+                have = {label: (wpct, reset) for label, wpct, reset in chips}
                 shown = False
                 for i, (label, (label_w, pct_w)) in enumerate(
                     chip_width.items() if windows else ()
@@ -1025,10 +1047,8 @@ class AutoScreen(Screen):
                     if label not in have:
                         usage.append(" " * (len(sep) + label_w + pct_w))
                         continue
-                    wpct, resets_at = have[label]
-                    label_text = data.chip_label(
-                        label, data.reset_text({"resets_at": resets_at}, now)
-                    )
+                    wpct, reset = have[label]
+                    label_text = data.chip_label(label, reset, wpct)
                     pct_text = f"{wpct:.0f}%"
                     usage.append(sep, style=palette.muted)
                     # Label right-aligned so the `:` shares a column (owner,
@@ -1063,8 +1083,24 @@ class AutoScreen(Screen):
                 # for ORDERING purposes.
                 kind, blocked_model = "open", None
                 if self._settings:
+                    # A window whose chip reads data.REFETCHING, or one of
+                    # the retry/backoff markers reset_text names for the
+                    # same provably-stale case (#325 follow-up — the chip
+                    # no longer says REFETCHING forever, but the pct beside
+                    # it is exactly as stale either way), has no opinion to
+                    # contribute -- so it is dropped rather than zeroed: a
+                    # zeroed pct would still be a fabricated measurement,
+                    # never one the window actually reported (#325). Every
+                    # OTHER reading `reset_text` returns is prefixed
+                    # "resets " (a duration, "now") or is None (unknown) --
+                    # the stale-placeholder family is the one shape that is
+                    # neither, so that is what is excluded here rather than
+                    # naming each marker.
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows),
+                        (
+                            (label, p) for label, p, reset in chips
+                            if reset is None or reset.startswith("resets ")
+                        ),
                         line,
                         weekly,
                     )

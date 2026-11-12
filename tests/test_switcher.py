@@ -14417,10 +14417,17 @@ class TestLockstepUsageDetection:
     def test_identical_usage_and_resets_flagged(
         self, temp_home, sample_sequence_data,
     ):
+        # Reset instants must stay FUTURE — #325 nulls a reading whose own
+        # reset has already elapsed, and a hardcoded calendar date only
+        # stays future until the wall clock catches up to it.
+        from datetime import datetime, timedelta, timezone
+
+        h5_reset = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        d7_reset = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
         switcher = self._switcher(temp_home, sample_sequence_data)
         entries = {
-            "1": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
-            "2": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
+            "1": self._entry(25.0, h5_reset, 60.0, d7_reset),
+            "2": self._entry(25.0, h5_reset, 60.0, d7_reset),
         }
         warnings = switcher._lockstep_usage_warnings(self._info(), entries)
         assert len(warnings) == 1
@@ -14433,16 +14440,21 @@ class TestLockstepUsageDetection:
         """Issue #161: the two slots are fetched a fraction of a second
         apart, so the API hands back the same window boundary with a
         different sub-second component. The timestamps below are the pair
-        the reporter observed."""
+        the reporter observed, moved to a future boundary (#325 nulls a
+        reading whose own reset has elapsed)."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        h5, d7 = now + timedelta(days=2), now + timedelta(days=6)
         switcher = self._switcher(temp_home, sample_sequence_data)
         entries = {
             "1": self._entry(
-                25.0, "2026-07-25T09:00:00.129393+00:00",
-                60.0, "2026-07-28T00:00:00.101000+00:00",
+                25.0, h5.replace(microsecond=129393).isoformat(),
+                60.0, d7.replace(microsecond=101000).isoformat(),
             ),
             "2": self._entry(
-                25.0, "2026-07-25T09:00:00.340384+00:00",
-                60.0, "2026-07-28T00:00:00.902000+00:00",
+                25.0, h5.replace(microsecond=340384).isoformat(),
+                60.0, d7.replace(microsecond=902000).isoformat(),
             ),
         }
         warnings = switcher._lockstep_usage_warnings(self._info(), entries)
@@ -14461,11 +14473,16 @@ class TestLockstepUsageDetection:
         self, temp_home, sample_sequence_data,
     ):
         """The tolerance absorbs fetch skew, nothing more: two accounts whose
-        5h windows opened a minute apart are still two accounts."""
+        5h windows opened a minute apart are still two accounts. Future
+        boundaries, or #325 nulls both readings and the test proves nothing."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        h5, d7 = now + timedelta(days=2), (now + timedelta(days=6)).isoformat()
         switcher = self._switcher(temp_home, sample_sequence_data)
         entries = {
-            "1": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
-            "2": self._entry(25.0, "2026-07-10T12:01:00Z", 60.0, "2026-07-14T00:00:00Z"),
+            "1": self._entry(25.0, h5.isoformat(), 60.0, d7),
+            "2": self._entry(25.0, (h5 + timedelta(minutes=1)).isoformat(), 60.0, d7),
         }
         assert switcher._lockstep_usage_warnings(self._info(), entries) == []
 
@@ -14494,16 +14511,25 @@ class TestLockstepUsageDetection:
     def test_payload_carries_lockstep_warnings_additively(
         self, temp_home, sample_sequence_data,
     ):
+        # Reset instants must stay FUTURE — #325 nulls a reading whose own
+        # reset has already elapsed, and a hardcoded calendar date only
+        # stays future until the wall clock catches up to it.
+        from datetime import datetime, timedelta, timezone
+
+        h5_reset = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        h5_reset_later = (datetime.now(timezone.utc) + timedelta(days=2, hours=1)).isoformat()
+        d7_reset = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+        d7_reset_later = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
         switcher = self._switcher(temp_home, sample_sequence_data)
         lockstep = {
-            "1": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
-            "2": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
+            "1": self._entry(25.0, h5_reset, 60.0, d7_reset),
+            "2": self._entry(25.0, h5_reset, 60.0, d7_reset),
         }
         payload = switcher._build_list_payload(self._info(), lockstep)
         assert len(payload["lockstepUsageWarnings"]) == 1
         clean = {
-            "1": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
-            "2": self._entry(30.0, "2026-07-10T13:00:00Z", 10.0, "2026-07-15T00:00:00Z"),
+            "1": self._entry(25.0, h5_reset, 60.0, d7_reset),
+            "2": self._entry(30.0, h5_reset_later, 10.0, d7_reset_later),
         }
         payload = switcher._build_list_payload(self._info(), clean)
         assert "lockstepUsageWarnings" not in payload
