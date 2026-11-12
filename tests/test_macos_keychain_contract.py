@@ -1480,3 +1480,4 @@ class TestPinnedFileModeEndsWhenTheFileIsGone:
 
         store._read_active_credentials()
         assert store._use_keychain() is False
+
