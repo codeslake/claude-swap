@@ -673,6 +673,7 @@ class TestBootstrap:
             ACCOUNT_NUM, ACCOUNT_EMAIL,
             json.dumps({"claudeAiOauth": {"accessToken": "sk-new",
                                           "refreshToken": "rt-new"}}),
+            attributed=True,  # T2681: the test seeds this slot itself; #210 refuses an unattested new lineage
         )
 
         assert (session_dir / ".credentials.json").exists(), (

@@ -268,6 +268,30 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "identity-unreadable": (
+        "the session's identity file could not be read — the slot is not "
+        "refreshed until it is readable"
+    ),
+    "lineage-condemned": (
+        "the slot's stored lineage was condemned as another account's — "
+        "`cswap add` re-adopts the live login"
+    ),
+    "live-store-unreadable": (
+        "the live credential store could not be read — unlock the keychain "
+        "or fix the file, then retry"
+    ),
+    "live-store-current": (
+        "the live credential store already holds this slot's lineage — "
+        "refreshes once another account is switched to"
+    ),
+    "foreign-lineage": (
+        "this slot's stored grant is confirmed another account's — a switch "
+        "restores the slot's own backup"
+    ),
+    "stash-write-failed": (
+        "this slot's in-memory successor could not be written back — fix "
+        "the storage failure, then retry"
+    ),
     "oauth_not_allowed_for_organization": (
         "this account's organization does not allow OAuth sign-in (a lapsed "
         "plan or an org policy), so its usage cannot be read — renewing the "
