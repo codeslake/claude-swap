@@ -20,18 +20,22 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from claude_swap.models import AccountPolicy, AccountsSnapshot, UsageEntry
 from claude_swap.settings import AutoSwitchSettings, load_settings
+from claude_swap.tui import data as tui_data
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.theme import CSWAP_DARK
 from claude_swap.tui.widgets import account_card_text, mini_account_text
+from claude_swap.usage_store import UsageEntry
 
 from tests.test_tui import (
     FakeSwitcher,
+    _autoview_order,
     _iso_in,
     _next_best_order,
     _next_best_text,
@@ -70,13 +74,9 @@ NO_RESET = UsageEntry(
 )
 
 def with_policy(acc, **kwargs):
-    """Attach an ``AccountPolicy`` to a snapshot from ``tests.test_tui``.
-
-    ``make_account`` predates the policy field and takes no ``policy=``
-    argument; ``test_tui.py`` is upstream's and takes only the one change a
-    merge forced (the ``_acct`` fixture's real policy), so the snapshot is
-    rebuilt here instead of the helper being widened.
-    """
+    """Attach an ``AccountPolicy(**kwargs)`` to a snapshot from
+    ``tests.test_tui``: ``make_account(policy=...)`` for an account already
+    built."""
     return dataclasses.replace(acc, policy=AccountPolicy(**kwargs))
 
 
@@ -233,7 +233,7 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
         }))
         return FakeSwitcher(
             [
-                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(1, active=True, entry=make_entry(95.0, 20.0)),
                 with_policy(
                     make_account(2, entry=make_entry(50.0, 10.0)), threshold=60.0
                 ),
@@ -305,15 +305,13 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             assert "5h:50%" in row2 and row2.endswith("limit 60%"), row2
 
     @pytest.mark.usefixtures("quick_pilot")
-    async def test_a_candidate_blocked_on_its_own_line_counts_in_the_model_wall_check(
+    async def test_a_candidate_over_its_own_line_on_a_model_window_is_not_listed(
         self, tmp_path, fake_engine
     ):
-        """Under dynamic the panel ranks on 5h/7d alone once no candidate is
-        open on the model axis, as the engine's retry does. Candidates 2 and 3
-        sit under the dynamic bar (97) but over their own 80 line on Fable, so
-        neither is open and the ranking drops the model: 2's real 5h (20%)
-        beats 3's (60%). Judged on the bar, both read open, the model gate
-        stays, and 3 (Fable 84) ranks first."""
+        """Candidates 2 and 3 sit under the dynamic bar (97) but over their own
+        80 line on Fable. An own line is a landing veto on the model-gated
+        reading too, a fleet-wide model blackout no exception: the panel lists
+        neither (the 5h/7d room they hold is not a landing)."""
         (tmp_path / "settings.json").write_text(json.dumps({
             "schemaVersion": 1,
             "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
@@ -343,10 +341,12 @@ class TestNextBestRanksEachAccountOnItsOwnLine:
             await settle(pilot)
             from textual.widgets import Static
 
-            plain = app.screen.query_one("#candidates", Static).render().plain
-            assert plain.index("user2@example.com") < plain.index(
-                "user3@example.com"
+            ordered, *_ = tui_data.rank_switch_candidates(
+                fake.accounts_snapshot(), app.screen._settings, time.time(), "1"
             )
+            assert ordered == []
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "no candidate qualifies" in plain and plain.count("Fable-walled") == 2, plain
 
     async def test_the_threshold_note_ends_the_row_and_moves_no_column(self):
         """The per-account threshold is the row's LAST cell, so it never sits
@@ -461,3 +461,41 @@ class TestNextBestConsumeFirstKeyUsesTheAccountsOwnLine:
             threshold=90, strategy="consume-first", hysteresis_pct=2.0
         )
         assert _next_best_order(snap, "1", settings) == ["2", "3"]
+
+class TestAFleetOverItsLinesNeverListsAPeerOverItsOwnLineOnEitherScreen:
+    """Every account is over its line: "3" over its own 60% five-hour line, "2"
+    over the weekly 97, the active over 90. The own line is a landing veto, so
+    "3" is never ranked, however spent the rest is, and both screens agree on
+    the order of the others."""
+
+    @staticmethod
+    def _entry(five_hour, five_hour_resets, seven_day, seven_day_resets):
+        return UsageEntry(
+            last_good={
+                "five_hour": {"pct": five_hour, "resets_at": _iso_in(five_hour_resets)},
+                "seven_day": {"pct": seven_day, "resets_at": _iso_in(seven_day_resets)},
+            },
+            fetched_at=time.time(),
+            age_s=0.0,
+        )
+
+    def test_both_screens_drop_the_peer_over_its_own_line(self):
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=self._entry(95.0, 600, 20.0, 86400)),
+                make_account(2, entry=self._entry(10.0, 7200, 98.0, 86400)),
+                with_policy(
+                    make_account(3, entry=self._entry(70.0, 7200, 90.0, 86400 * 3)),
+                    threshold=60.0,
+                ),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(
+            strategy="best", threshold=90.0, weekly_threshold=97.0
+        )
+        ordered, *_ = tui_data.rank_switch_candidates(snap, settings, time.time(), "1")
+        assert "3" not in ordered
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order[1:] == _autoview_order(snap, "1", settings)

@@ -10355,7 +10355,8 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
           its limit (switching would not help) → stay
         - ``(None, "none")`` — no other switchable account exists
         - ``(None, "capped")``: every other switchable account is at its
-          weekly cap, so stay
+          weekly cap or at or over its own threshold (a vetoed peer counts
+          with the capped ones), so stay
 
         Ties (including current-vs-other) resolve in favour of staying put.
         Never raises on network failure.
@@ -10383,9 +10384,25 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 self._policy_from_data(data, n).weekly_cap, usage.get(n)
             )
         ]
-        if not uncapped:
+        # Nor is a peer at or over its OWN threshold (the engine's veto), by the
+        # engine's settings and the caller's model set (the pin's seam passes
+        # `models=("all",)`, every per-model window; else `autoswitch.model`); an
+        # account without one reads as before.
+        from claude_swap.autoswitch import over_own_threshold
+
+        settings = load_settings(self.backup_dir)
+        own = {
+            n: t for n in uncapped
+            if (t := self._policy_from_data(data, n).threshold) is not None
+        }
+        others = [
+            n for n in uncapped
+            if not over_own_threshold(
+                n, usage, settings, models or parse_model_names(settings.model), own
+            )
+        ]
+        if not others:
             return None, "capped"
-        others = uncapped
         current_headroom = oauth.account_headroom(usage.get(str(current_num)), models)
         if current_at_limit:
             # The caller measured the limit somewhere the poll cannot see (the
@@ -11449,8 +11466,8 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 return None
             if note == "capped":
                 msg = (
-                    f"Every other account is at its weekly cap; staying on "
-                    f"Account-{current_num}."
+                    f"Every other account is at its weekly cap or its own "
+                    f"threshold; staying on Account-{current_num}."
                 )
                 if json_output:
                     return self._switch_noop(
