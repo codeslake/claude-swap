@@ -402,128 +402,6 @@ def render_candidate_rows(
     return out
 
 
-# Triggers whose pass the panel never runs, each with WHY: a state the tick
-# acts on out of sight of a snapshot (an unreadable active counts ticks toward
-# failover) or ranks through a pass of its own. Never "no candidate qualifies",
-# the claim only a real, empty pass earns.
-_UNMODELED_TEXT = {
-    "below-threshold": "not previewed (active below threshold)",
-    "unreadable-active": "not previewed (active status unknown)",
-    "priority": "not previewed (priority strategy)",
-}
-
-
-# The panel's words for each refusal the tick reaches around its pass, one
-# key per literal `no_peer_refusal` and `empty_pass_refusal` return (the
-# engine's own reading of the state, shared with the tick). A hold the engine
-# calls healthy (NO_ACTION) is worded as a hold, never as a block. The
-# "below-threshold" here is the consume-first hold with no OAuth peer, not
-# `best` below its line (`_UNMODELED_TEXT`).
-_REFUSAL_TEXT = {
-    "below-threshold": "holding (below its line, no other OAuth account to compare)",
-    "no-candidates": "no account to switch to",
-    "no-comparison": "no candidate has readable usage",
-    "reset-unknown": "holding (the active account's weekly reset is unknown)",
-    "already-consuming-soonest":
-        "holding (no sooner-resetting account with room to spare)",
-    "no-qualifying-candidate": "no candidate qualifies",
-    "deliberate-wait": "holding for a nearer reset than any peer offers",
-    "all-exhausted": "all accounts exhausted",
-}
-
-
-def _engine_order(
-    snap: AccountsSnapshot,
-    settings,
-    active_number: str | None,
-    now: float,
-    *,
-    overloaded: bool,
-) -> tuple[list[str], str, set[str]]:
-    """(ordered, note, short): the order the engine's own pass
-    (`rank_candidates_pass`) gives this snapshot, never a key of the panel's
-    own. The trigger comes from the active's reading as `_tick_inner`
-    classifies it (`overloaded` is the engine's own verdict, a trace the
-    snapshot lacks), and a trigger in `_UNMODELED_TEXT` runs no pass. The
-    note is the panel's words for why nobody is previewed, empty when somebody
-    is. `short` is the peers the landing-room bar alone refuses: admitted by
-    the same pass with the margin at 0, the setting that removes the bar, and
-    not at the configured one. State a snapshot lacks (cooldown, the no-return
-    and refusal bars, quarantine, the failover count) is not modeled."""
-    models = parse_model_names(settings.model)
-    usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
-    bars = ThresholdMap(
-        {a.number: a.policy.threshold for a in snap.accounts if a.policy.threshold is not None},
-        settings.threshold,
-    )
-    headroom = _headroom_by_account(usage, models)
-    active_h = headroom.get(active_number)
-    if settings.strategy == "priority-consume-first":
-        trigger = "priority"
-    elif any(a.number == active_number and a.disabled for a in snap.accounts):
-        trigger = "disabled-active"
-    elif active_h is None:
-        # Before `overloaded`: the burst outranks the headroom read only on
-        # the tick's own gates (an API-key active it may not leave, a hold on
-        # the active's last reading), which a snapshot cannot see.
-        trigger = "unreadable-active"
-    elif overloaded:
-        trigger = "overloaded"
-    else:
-        # Each window against its own line, as the tick reads it.
-        binding = _binding_at(usage.get(active_number), settings, models, bars[active_number])
-        below = (
-            not binding.over
-            if binding is not None
-            else (100.0 - active_h) < bars[active_number]
-        )
-        if below:
-            trigger = "consume-first" if settings.strategy == "consume-first" else "below-threshold"
-        else:
-            trigger = "at-limit" if active_h <= 0 else "proactive"
-    if trigger in _UNMODELED_TEXT:
-        return [], _UNMODELED_TEXT[trigger], set()
-
-    peers = [
-        a for a in snap.accounts
-        if a.number != active_number and a.switchable and not a.disabled
-    ]
-    oauth_peers = [a.number for a in peers if a.kind != "api_key"]
-    key_peers = [
-        a.number for a in peers
-        if a.kind == "api_key" and settings.include_api_key_accounts
-    ]
-    if refusal := no_peer_refusal(
-        trigger=trigger, active_headroom=active_h,
-        oauth_candidates=oauth_peers, api_key_candidates=key_peers,
-    ):
-        return [], _REFUSAL_TEXT[refusal], set()
-
-    def rank(cfg):
-        return rank_candidates_pass(
-            models=models, trigger=trigger, consume_first=cfg.strategy == "consume-first",
-            oauth_candidates=oauth_peers, no_return=None, usage=usage, headroom=headroom,
-            current=active_number, active_headroom=active_h, settings=cfg, now=now,
-            thresholds=bars,
-        )
-
-    ordered, any_known, active_reset_ts, waiting = rank(settings)
-    short = (
-        set(rank(replace(settings, hysteresis_pct=0.0))[0]) - set(ordered)
-        if trigger == "consume-first" else set()
-    )
-    if not ordered and key_peers and trigger != "consume-first":
-        # The tick's last resort when it must move: a metered API-key slot.
-        return key_peers, "", short
-    if ordered:
-        return ordered, "", short
-    return [], _REFUSAL_TEXT[empty_pass_refusal(
-        trigger=trigger, any_known=any_known, active_reset_ts=active_reset_ts,
-        waiting_for_recovery=waiting,
-        candidate_headrooms=[headroom.get(n) for n in oauth_peers],
-    )], short
-
-
 class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
@@ -1032,7 +910,7 @@ class AutoScreen(Screen):
                 or binding_pct(acc.usage.last_good, models) is None
             ):
                 continue
-            row_windows[acc.number] = oauth.relevant_windows(acc.usage.last_good, models)
+            row_windows[acc.number] = oauth.relevant_windows(oauth.display_usage(acc.usage.last_good), models)  # #199: no chip for a 5h window that is not running
         # The column set is the union of window names over every chip row, in
         # first-seen order; a row without a window gets a blank cell, so no
         # later column moves. (label text, pct text) widths per column; the

@@ -2826,7 +2826,8 @@ class TestAutoScreen:
                 make_account(1, active=True, entry=make_entry(91.0, 20.0)),
                 make_account(2, entry=make_entry(5.0, 93.0),
                              email="a.very.long.address.indeed@example-company.com"),
-                make_account(3, entry=make_entry(95.0, 47.0)),
+                # 5h at 100: a window reads `5h limit reached` only at or over 100 (#321), so the note stays long enough to need the fit.
+                make_account(3, entry=make_entry(100.0, 47.0)),
                 # Its sentinel row is wider than the panel and sizes nothing.
                 make_account(4, switchable=False),
             ),
@@ -3015,8 +3016,8 @@ class TestAutoScreen:
                 n: next(ln for ln in plain.splitlines() if f"user{n}@" in ln)
                 for n in (2, 3)
             }
-            assert re.search(r"Fable\S*:95% \(line 97%\)", rows[2]), rows[2]
-            assert re.search(r"Fable\S*:90% \(line 97%\)", rows[3]), rows[3]
+            assert re.search(r"Fable\S*:95%\s+limit 97%", rows[2]), rows[2]
+            assert re.search(r"Fable\S*:90%\s+limit 97%", rows[3]), rows[3]
 
     @pytest.mark.parametrize("strategy", ["consume-first", "weekly-first"])
     async def test_candidates_drain_soonest_seven_day_reset_first(
@@ -4178,7 +4179,8 @@ class TestNextBestFollowsTheTick:
         import re
 
         def colon(window, line):
-            return re.search(re.escape(window) + r"(?:\(⟳\w+\))?:", line).end()
+            # `[^)]*`, not `\w+`: a window with no reset reads `7d(⟳?):`
+            return re.search(re.escape(window) + r"(?:\(⟳[^)]*\))?:", line).end()
 
         seven_d = [colon("7d", line) for line in lines]
         fable = [colon("Fable", line) for line in lines]
@@ -4226,7 +4228,8 @@ class TestNextBestFollowsTheTick:
             hits = [
                 m
                 for line in rows.values()
-                if (m := re.search(r"(" + re.escape(window) + r"(?:\(⟳\w+\))?:)\s*\d+%", line))
+                # `[^)]*`, not `\w+`: a window with no reset reads `7d(⟳?):`
+                if (m := re.search(r"(" + re.escape(window) + r"(?:\(⟳[^)]*\))?:)\s*\d+%", line))
             ]
             colons = {m.end(1) for m in hits}
             ends = {m.end() for m in hits}
@@ -4273,7 +4276,7 @@ class TestNextBestFollowsTheTick:
                 "seven_day": {"pct": 5.0}, "scoped": [{"name": "Fable", "pct": 95.0}],
             }),
             self._acct("3", "bbbb@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 5.0},
+                "five_hour": {"pct": 100.0}, "seven_day": {"pct": 5.0},  # 100: `full` is reserved for exhaustion
             }),
             self._acct("4", "cccc@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 1.0}, "seven_day": {"pct": 1.0},
@@ -4303,7 +4306,7 @@ class TestNextBestFollowsTheTick:
                 "five_hour": {"pct": 25.0}, "seven_day": {"pct": 65.0},
             }),
             self._acct("3", "much-longer@x.com", switchable=True, last_good={
-                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 10.0},
+                "five_hour": {"pct": 100.0}, "seven_day": {"pct": 10.0},  # `full` is a window at 100 (#321)
             }),
         ), active="1", settings=AutoSwitchSettings(threshold=90.0, weekly_threshold=70.0))
         rows = {l.split()[1]: l for l in out.split("\n") if "@x.com" in l}
