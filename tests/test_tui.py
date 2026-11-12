@@ -3341,6 +3341,7 @@ class TestUnswitchableRowsAreListed:
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.usage = UsageEntry(last_good=last_good, sentinel=sentinel, age_s=5.0)
         a.disabled = disabled
+        a.login_expires_at = None
         a.policy = AccountPolicy()
         a.login_expires_at = login_expires_at
         return a
