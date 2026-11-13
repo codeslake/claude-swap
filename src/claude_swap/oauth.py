@@ -9,6 +9,7 @@ import math
 import os
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -395,6 +396,7 @@ def try_refresh_oauth_credentials(
     if condemned is not None and condemned(credential_fingerprint(credentials)):
         return RefreshOutcome(None, "foreign-lineage")
 
+    started = time.monotonic()
     try:
         body = json.dumps({
             "grant_type": "refresh_token",
@@ -457,7 +459,10 @@ def try_refresh_oauth_credentials(
 
         # Keep the tier: CC refills it only in its own refresh, which this one pre-empts.
         data["claudeAiOauth"] = oauth
-        _logger.info("Refresh POST for account %s: ok", slot)
+        _logger.info(
+            "Refresh POST for account %s: ok in %.1f s",
+            slot, time.monotonic() - started,
+        )
         return RefreshOutcome(
             json.dumps(data), None, _parse_token_account(resp_data)
         )
@@ -485,16 +490,21 @@ def try_refresh_oauth_credentials(
             # (client_id rotated/blocked), no evidence about any slot, so it
             # keeps its own kind and lands no strike.
             if err in ("invalid_grant", "invalid_client"):
-                _logger.info("Refresh POST for account %s: failed (%s)", slot, err)
+                _logger.info(
+                    "Refresh POST for account %s: failed (%s) in %.1f s",
+                    slot, err, time.monotonic() - started,
+                )
                 return RefreshOutcome(None, err)
         _logger.info(
-            "Refresh POST for account %s: failed (transient): %s", slot, _transient_cause(e)
+            "Refresh POST for account %s: failed (transient): %s in %.1f s",
+            slot, _transient_cause(e), time.monotonic() - started,
         )
         return RefreshOutcome(None, "transient")
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
         _logger.info(
-            "Refresh POST for account %s: failed (transient): %s", slot, _transient_cause(e)
+            "Refresh POST for account %s: failed (transient): %s in %.1f s",
+            slot, _transient_cause(e), time.monotonic() - started,
         )
         return RefreshOutcome(None, "transient")
 

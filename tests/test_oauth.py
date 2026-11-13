@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import ssl
 import urllib.error
 import weakref
@@ -524,7 +525,10 @@ class TestRefreshOAuthCredentials:
             oauth.refresh_oauth_credentials(self._make_credentials(), slot="7")
 
         messages = [r.getMessage() for r in caplog.records]
-        assert "Refresh POST for account 7: ok" in messages, messages
+        assert any(
+            re.fullmatch(r"Refresh POST for account 7: ok in \d+\.\d s", m)
+            for m in messages
+        ), messages
 
 
 class TestTryRefreshOAuthCredentials:
@@ -697,12 +701,22 @@ class TestTryRefreshOAuthCredentials:
             blob = json.loads(result)["claudeAiOauth"]
             assert {k: blob[k] for k in keys if k in blob} == carried
 
-    def test_invalid_grant_body_on_400_is_permanent(self):
+    def test_invalid_grant_body_on_400_is_permanent(self, caplog):
         err = self._http_error(400, b'{"error": "invalid_grant"}')
-        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
-            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            outcome = oauth.try_refresh_oauth_credentials(
+                self._make_credentials(), slot="3"
+            )
         assert outcome.credentials is None
         assert outcome.error == "invalid_grant"
+        assert any(
+            re.fullmatch(
+                r"Refresh POST for account 3: failed \(invalid_grant\) in \d+\.\d s",
+                r.getMessage(),
+            )
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
 
     def test_400_without_marker_is_transient(self):
         err = self._http_error(400, b'{"error": "temporarily_unavailable"}')
@@ -758,9 +772,11 @@ class TestTryRefreshOAuthCredentials:
         body = b'{"detail": "BODYTEXT old-access old-refresh"}'
         err = self._http_error(code, body, headers=headers)
         messages = self._transient_info(caplog, err)
-        assert messages == [
-            f"Refresh POST for account 3: failed (transient): {cause}"
-        ]
+        assert len(messages) == 1
+        assert re.fullmatch(
+            rf"Refresh POST for account 3: failed \(transient\): {re.escape(cause)} in \d+\.\d s",
+            messages[0],
+        ), messages
 
     @pytest.mark.parametrize(
         "exc,name",
@@ -776,9 +792,11 @@ class TestTryRefreshOAuthCredentials:
     )
     def test_transient_exception_log_names_the_class_only(self, caplog, exc, name):
         messages = self._transient_info(caplog, exc)
-        assert messages == [
-            f"Refresh POST for account 3: failed (transient): {name}"
-        ]
+        assert len(messages) == 1
+        assert re.fullmatch(
+            rf"Refresh POST for account 3: failed \(transient\): {re.escape(name)} in \d+\.\d s",
+            messages[0],
+        ), messages
 
     def test_missing_refresh_token_is_permanent(self):
         creds = json.dumps({"claudeAiOauth": {"accessToken": "a", "expiresAt": 0}})
