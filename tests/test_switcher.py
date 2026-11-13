@@ -18897,7 +18897,10 @@ class TestConsumeGate:
                    return_value=oauth.RefreshOutcome(self._NEW, None)) as refresh:
             s.consume_backup_grant("1", "test@example.com", self._OLD, **extra)
 
-        assert refresh.call_args.kwargs == expected
+        # #210 hands its R1 gate (`condemned`) on the same call; the claim here is the bound, so the rest is what is compared
+        assert {
+            k: v for k, v in refresh.call_args.kwargs.items() if k != "condemned"
+        } == expected
 
     def test_gate_cas_persist_detects_racing_writer(
         self, temp_home: Path, sample_sequence_data: dict
@@ -19968,8 +19971,10 @@ class TestInactiveRefreshRoutesThroughGate:
         s._write_account_credentials("2", "b@example.com", expired)
         real_refresh = oauth.try_refresh_oauth_credentials
 
-        def refresh_with_short_default(credentials, timeout_s=0.2, slot=None):
-            return real_refresh(credentials, timeout_s=timeout_s, slot=slot)
+        def refresh_with_short_default(credentials, timeout_s=0.2, slot=None, condemned=None):
+            return real_refresh(
+                credentials, timeout_s=timeout_s, slot=slot, condemned=condemned
+            )
 
         monkeypatch.setattr(
             oauth, "try_refresh_oauth_credentials", refresh_with_short_default
