@@ -240,7 +240,7 @@ def test_a_429_on_a_no_5h_account_marks_its_binding_window(store, shape):
     # A guess lifts with the mark, not at the real reset days away.
     assert value["seven_day"]["resets_at"] == usage_store._reset_ts_to_resets_at(entry.walled_until)
     assert poll_policy.limiting_reset_ts(value) == pytest.approx(entry.walled_until, abs=1)
-    assert _describe(value) == "7d 100% · Fable 0%"
+    assert _describe(value) == "7d 100% · Fable 0% (7d full)"  # #323: a block label names its window
     assert oauth.binding_window_label(value, ("all",)) == "7d"
     # Nothing 5h-shaped sets the span, not even a phantom reset an hour out.
     assert store.entries(IDENT)["1"].walled_until == pytest.approx(
