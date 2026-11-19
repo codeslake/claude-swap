@@ -3269,6 +3269,8 @@ class TestEveryPinRoutedCallCarriesThePinAwareContext:
         seen = []
 
         class _Resp:
+            headers = {}  # #573: request_usage_data logs resp.headers, `.get` on it (the fake has none)
+
             def __enter__(self_inner):
                 return self_inner
 
