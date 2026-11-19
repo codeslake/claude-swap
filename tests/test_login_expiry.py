@@ -365,12 +365,17 @@ class TestDashboardFit:
 
     @pytest.mark.asyncio
     async def test_due_note_goes_before_usage_does(self, tmp_path):
-        # 88 columns: the rows fit without a note (79 wide) but not even the
-        # short one, so they read as before and keep their usage figures and
-        # the menu its rows.
+        # 88 columns: the rows fit without a note (79 wide) but not with even the short one, so the name column
+        # gives up columns first (cut with `…`, one width for every row, T3362) and the usage figures stay
+        # exactly as the bare rows draw them, with the menu its rows.
         lines, size, shown = await _dashboard(tmp_path, _seven(time.time() + DUE), (88, 24))
         bare, bare_size, bare_shown = await _dashboard(tmp_path, _seven(None), (88, 24))
-        assert lines == bare
+        row = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
+        bare_row = [line for line in bare if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
+        assert len(row) == len(bare_row) == 6 and all(cell_len(line) <= size.width for line in lines)
+        assert all(line.endswith(" · re-login in 5d") for line in row) and any("…" in line for line in row)
+        for with_note, without in zip(row, bare_row):
+            assert with_note.partition("5h(")[2].removesuffix(" · re-login in 5d") == without.partition("5h(")[2]
         assert size.height == bare_size.height
         assert shown == bare_shown > 0
 
