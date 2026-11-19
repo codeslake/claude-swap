@@ -2734,9 +2734,9 @@ class TestRankSwitchOwnBars:
         rows = _autoview_text(snap, "1", settings).split("\n")
         row2 = next(r for r in rows if "user2@example.com" in r)
         row3 = next(r for r in rows if "user3@example.com" in r)
-        assert re.search(r"5h\S*:70% \(line 60%\)", row2), row2
+        assert re.search(r"5h\S*:70%", row2) and row2.endswith("limit 60% reached"), row2  # over its own bar of 60
         assert "not picked" not in row2, row2
-        assert re.search(r"5h\S*:75% \(line 90%\)", row3), row3
+        assert re.search(r"5h\S*:75%", row3) and row3.endswith("limit 90%"), row3  # under the bar: the note names the line it is judged against
 
     def test_dynamic_walls_the_active_at_its_own_bar_and_refuses_peers_past_theirs(
         self,
@@ -3012,8 +3012,8 @@ class TestPanelOrderIsTheEnginesOrder:
         assert ordered == ["2"], ordered
 
     def test_a_fleet_of_capped_peers_reads_no_candidate_qualifies(self):
-        """Only #2 is ranked and it is capped: the engine finds no candidate,
-        so the panel says so rather than offering a top row."""
+        """Only #2 is ranked and it is capped: the engine finds no candidate
+        (`no-candidates`), so the panel says so rather than offering a top row."""
         settings = AutoSwitchSettings(strategy="best", threshold=90.0)
         snap = AccountsSnapshot(
             accounts=[
@@ -3027,9 +3027,9 @@ class TestPanelOrderIsTheEnginesOrder:
         ordered, *_ = tui_data.rank_switch_candidates(snap, settings, time.time(), "1")
         assert ordered == [], ordered
         text = _autoview_text(snap, "1", settings)
-        assert "no candidate qualifies" in text and "Next best (" not in text, text
+        assert "no account to switch to" in text and "Next best (" not in text, text
         row = next(ln for ln in text.splitlines() if "user2@example.com" in ln)
-        assert "capped" in row and "not a candidate" not in row, row
+        assert "limit 50% reached" in row and "not a candidate" not in row, row  # the cap, in the owner's words
 
     def test_a_capped_peer_takes_the_same_place_on_both_screens(self):
         """#2 is capped and its 7d window resets in 1h; #3 is refused (95%
@@ -4314,7 +4314,7 @@ class TestAutoScreen:
                 for n in (2, 3)
             )
             assert re.search(r"7d\S*:\s*93%", row2) and row2.endswith("limit 97%"), plain
-            assert re.search(r"5h\S*:\s*95%", row3) and row3.endswith("limit 85%"), plain
+            assert re.search(r"5h\S*:\s*95%", row3) and row3.endswith("limit 85% reached"), plain  # user3 is over its line of 85: one reason, the line
             # The note is the row's last cell, outside every chip column, and
             # a block label is for a window at or over 100 (the owner, 2026-09-17), so
             # neither row has one: 7d 93% is under its 97 line, 5h 95% is over its 85 line and the note says so.
@@ -4427,6 +4427,129 @@ class TestAutoScreen:
         # The long address is cut at both widths; the short one only at the narrow.
         assert "user3@example.com" in seen[96][1], seen[96]
         assert "user3@example.com" not in seen[71][1], seen[71]
+
+    def _read_notes(self, monkeypatch, accounts, forms, *, pcts, applying=True, strategy="best", model=None):
+        """T3362: the Next best rows of `accounts` at each of `forms`, (width, email_cut, notes), read off the panel at
+        the box of a `width` column screen (its less 4), with no app and no pilot (T3370: a pilot render costs about 0.4 s,
+        this about 2 ms). Every row ends in its note (the owner's words), every note starts in ONE column, no row is wider than
+        its box, a row keeps every pct of its chips whole (`pcts`, default 25 and 10), and the email is cut or kept as the
+        form says (a cut email ends in `…`; nothing else on these rows does); no login note is drawn (no stored login here is due)."""
+        from rich.cells import cell_len
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "pinned_identity", lambda _sw: ("cloud@example.com", ""))
+        monkeypatch.setattr(pin, "pin_is_applying", lambda _sw: applying)
+        active = next(a.number for a in accounts if a.is_active)
+        snap = AccountsSnapshot(active_number=active, accounts=tuple(accounts), taken_at=0.0)
+        settings = AutoSwitchSettings(threshold=90, strategy=strategy, model=model)
+        for width, email_cut, notes in forms:
+            plain = _next_best_text(snap, active, settings, width=width - 4)
+            rows = {ln.split()[0]: ln for ln in plain.splitlines() if re.match(r"\s+\d+  ", ln)}
+            assert set(rows) == set(notes), (width, plain)
+            for number, note in notes.items():
+                assert rows[number].endswith(note), (width, number, rows[number])
+            assert len({cell_len(ln) - cell_len(notes[number]) for number, ln in rows.items()}) == 1, (width, plain)  # one note column, whatever a row's note says
+            for number, ln in rows.items():
+                assert cell_len(ln) <= width - 4, (width, plain)
+                assert [int(p) for p in re.findall(r"\):\s*(\d+)%", ln)] == pcts.get(number, [25, 10]), (width, ln)
+                assert "re-login" not in ln and ("…" in ln) is email_cut, (width, ln)
+
+    async def test_every_kind_of_note_on_a_next_best_row_starts_in_one_column_in_the_owners_words(self, monkeypatch):
+        """T3362, the owner's rule of 2026-11-07, on the MERGED tree: a Next best row ends in ONE note cell (the status pieces,
+        then `○ cloud`), and every note starts in one column. One row of each kind the panel words here: `○ cloud` alone, the
+        account's own line alone, the line with auto-swap off, auto-swap off alone, the line with `○ cloud`, a row AT its line
+        (5h 95% over a line of 70: `limit 70% reached` once, never with the threshold note, the same number, beside it), a weekly
+        cap (alone, and with auto-swap off), a 5h window at 100, a failed poll (`stale`) and a lapsed plan. The words are the
+        owner's: long at 200 columns; at 93 every email is cut and every word is still long; at 85 and at 77 every email is still cut and every
+        word is short (the short forms are exact, `5h full` and `90% reached` included)."""
+        line, cap = AccountPolicy(threshold=70.0), AccountPolicy(weekly_cap=90.0)
+        failing = dataclasses.replace(make_entry(25.0, 10.0), consecutive_failures=2, last_error="http-500")
+        lapsed = UsageEntry(
+            last_good={"five_hour": {"pct": 100.0}, "seven_day": {"pct": 5.0}}, fetched_at=time.time() - STALE_OK_S - 600,
+            age_s=STALE_OK_S + 600, consecutive_failures=3, last_error="oauth_not_allowed_for_organization",
+        )
+        accounts = [
+            make_account(1, active=True, entry=make_entry(92.0, 20.0)),
+            make_account(2, entry=make_entry(25.0, 10.0), email="cloud@example.com"),
+            make_account(3, entry=make_entry(25.0, 10.0), policy=line),
+            make_account(4, entry=make_entry(25.0, 10.0), policy=line, disabled=True),
+            make_account(5, entry=make_entry(25.0, 10.0), disabled=True),
+            make_account(6, entry=make_entry(25.0, 10.0), email="cloud@example.com", policy=line),
+            make_account(7, entry=make_entry(95.0, 10.0), policy=line),
+            make_account(8, entry=make_entry(25.0, 93.0), policy=cap),
+            make_account(9, entry=make_entry(25.0, 93.0), policy=cap, disabled=True),
+            make_account(10, entry=make_entry(100.0, 10.0)),
+            make_account(11, entry=failing),
+            make_account(12, entry=lapsed),
+        ]
+        long = {
+            "2": "○ cloud", "3": "limit 70%", "4": "limit 70% · auto-swap off", "5": "auto-swap off", "6": "limit 70% · ○ cloud",
+            "7": "limit 70% reached", "8": "limit 90% reached", "9": "limit 90% reached · auto-swap off", "10": "5h limit reached",
+            "11": "usage out of date", "12": "no active plan",
+        }
+        short = {
+            "2": "○", "3": "lim 70%", "4": "lim 70% · off", "5": "off", "6": "lim 70% · ○", "7": "70% reached",
+            "8": "90% reached", "9": "90% reached · off", "10": "5h full", "11": "stale", "12": "no plan",
+        }
+        self._read_notes(
+            monkeypatch, accounts, [(200, False, long), (93, True, long), (85, True, short), (77, True, short)],
+            pcts={"7": [95, 10], "8": [25, 93], "9": [25, 93], "10": [100, 10], "12": []},
+        )
+
+    async def test_an_unpinned_cloud_row_and_a_refusal_reason_read_in_the_owners_words(self, monkeypatch):
+        """T3362, the merged tree: `⚠ cloud UNPINNED` (the pin set but not applying; short `⚠`) and the engine's refusal reason
+        under consume-first (a weekly reset later than the active's: `weekly reset comes later`, short `later reset`) each end a
+        row in one note column, in the owner's words, long at 200 columns and short at 80 (the email cut first and cut still)."""
+
+        def read(pct5, pct7, reset7_s):
+            return UsageEntry(
+                last_good={"five_hour": {"pct": pct5, "resets_at": _iso_in(7200)}, "seven_day": {"pct": pct7, "resets_at": _iso_in(reset7_s)}},
+                fetched_at=time.time() - 5.0, age_s=5.0,
+            )
+
+        accounts = [
+            make_account(4, active=True, entry=read(38.0, 53.0, 151200)),
+            make_account(2, entry=read(32.0, 42.0, 108000), email="cloud@example.com"),  # a sooner weekly reset: the engine admits it
+            make_account(3, entry=read(32.0, 62.0, 309600)),  # a later one: refused
+        ]
+        long, short = {"2": "⚠ cloud UNPINNED", "3": "weekly reset comes later"}, {"2": "⚠", "3": "later reset"}
+        self._read_notes(
+            monkeypatch, accounts, [(200, False, long), (83, True, long), (80, True, short)],
+            pcts={"2": [32, 42], "3": [32, 62]}, applying=False, strategy="consume-first",
+        )
+
+    async def test_a_model_wall_and_a_cap_on_a_model_window_read_one_reason_each(self, monkeypatch):
+        """T3362, the merged tree: a model window at its line reads `Fable limit reached` (short `Fable full`), and a weekly cap
+        on that same window reads `limit 90% reached` (short `90% reached`) ALONE: the wall is the same cause and its piece
+        goes with the threshold's, never `limit 90% reached · Fable limit reached`. Long at 200 columns; at 81 the email is cut; at 76 the words are short and the email is still cut."""
+        wall = make_entry(25.0, None, scoped=[("Fable", 95.0)])
+        accounts = [
+            make_account(1, active=True, entry=make_entry(92.0, 20.0)),
+            make_account(2, entry=wall),
+            make_account(3, entry=wall, policy=AccountPolicy(weekly_cap=90.0)),
+        ]
+        long, short = {"2": "Fable limit reached", "3": "limit 90% reached"}, {"2": "Fable full", "3": "90% reached"}
+        self._read_notes(
+            monkeypatch, accounts, [(200, False, long), (81, True, long), (76, True, short)],
+            pcts={"2": [25, 95], "3": [25, 95]}, model="Fable",
+        )
+
+    async def test_a_refusal_reason_reads_in_the_owners_words_or_keeps_its_own_text(self):
+        """T3362, the merged tree: the engine's reasons come in the owner's words (`no headroom left` is the dynamic ranker's own);
+        what a poll that failed says (`_unreadable_reason`'s texts) is short `unreadable`; any other text keeps itself, long and
+        short, and is never called unreadable; no reason is `not picked` / `skipped`."""
+        from claude_swap.tui.autoview import _refusal_words
+
+        assert _refusal_words("no headroom left") == ("no headroom left", "no headroom")
+        assert _refusal_words("weekly reset not sooner") == ("weekly reset comes later", "later reset")
+        assert _refusal_words(None) == ("not picked", "skipped")
+        for text in (
+            "usage unreadable", "usage overdue for refresh", "last read 1h 5m ago, rate-limited until 20:00", "last fetch failed",
+            "rate-limited until 20:00", "http-500, retry at 20:00", "no poll before 20:00",
+        ):
+            assert _refusal_words(text) == (text, "unreadable"), text
+        assert _refusal_words("a reason the engine words later") == ("a reason the engine words later",) * 2
 
     async def test_candidates_ranking_honors_configured_model(
         self, tmp_path, fake_engine
@@ -4556,7 +4679,7 @@ class TestAutoScreen:
 
             plain = app.screen.query_one("#candidates", Static).render().plain
             assert "no candidate qualifies" in plain, plain
-            assert plain.count("Fable-walled") == 2, (
+            assert plain.count("Fable limit reached") == 2, (  # a model wall, the owner's words
                 f"both rows must stay model-gated, never re-ranked on the "
                 f"5h axis `best` never uses: {plain!r}"
             )
@@ -4670,7 +4793,8 @@ class TestAutoScreen:
             tmp_path,
         )
         app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
+        # reads the merged row whole (108 wide, the line note and the refusal in full): 115 columns; a 100-column screen shows the short forms and cuts the email (T3394, T3362 round 3)
+        async with app.run_test(size=(115, 40)) as pilot:
             await self._open(pilot)
             from textual.widgets import Static
 
@@ -5416,7 +5540,7 @@ class TestUnswitchableRowsAreListed:
             f"the 7d-exhausted account outranked the 5h-exhausted one the "
             f"engine could still reach: {out!r}"
         )
-        assert "7d full" in out, (
+        assert "7d limit reached" in out, (  # at 100, the owner's words
             f"the excluded 7d-exhausted row gave no reason: {out!r}"
         )
 
@@ -5441,10 +5565,10 @@ class TestUnswitchableRowsAreListed:
             self._acct("2", "sevenday@x.com", switchable=True,
                        last_good=seven_day_full),
         ), active="1", settings=settings)
-        assert "no candidate qualifies" in out, (
+        assert "all accounts exhausted" in out, (
             f"an unusable account was ranked as next best instead: {out!r}"
         )
-        assert "7d full" in out, (
+        assert "7d limit reached" in out, (  # at 100, excluded, the owner's words
             f"the excluded 7d-exhausted row gave no reason: {out!r}"
         )
 
@@ -5742,7 +5866,7 @@ class TestUnswitchableRowsAreListed:
     def test_CONTROL_the_api_key_last_resort_needs_the_flag(self):
         """CONTROL for the row above: same fleet, `include_api_key_accounts`
         off -- the engine never falls back to the API-key slot either, so
-        "no candidate qualifies" is the honest claim here."""
+        "no account to switch to" (the tick's `no-candidates`) is the honest claim here."""
         from claude_swap.settings import AutoSwitchSettings
 
         settings = AutoSwitchSettings(include_api_key_accounts=False)
@@ -5752,7 +5876,7 @@ class TestUnswitchableRowsAreListed:
             self._acct("2", "apikey@x.com", switchable=True, kind="api_key",
                        last_good={}),
         ), active="1", settings=settings)
-        assert "no candidate qualifies" in out, out
+        assert "no account to switch to" in out, out  # the tick's `no-candidates`
 
     def test_CONTROL_the_api_key_last_resort_is_withheld_when_unmodeled(self):
         """CONTROL: a real below-threshold tick returns NO_ACTION at
@@ -5794,7 +5918,7 @@ class TestUnswitchableRowsAreListed:
                            last_good={}),
             ), active="1", settings=settings)
 
-        assert "no candidate qualifies" in render(20.0)
+        assert "holding (below its line, no other OAuth account to compare)" in render(20.0)
         assert "no candidate qualifies" not in render(95.0)
 
     def test_the_api_key_last_resort_sorts_above_a_refused_oauth_row(self):
@@ -6075,8 +6199,8 @@ class TestUnswitchableRowsAreListed:
         import re
 
         def colon(window, line):
-            # `[^)]*`, not `\w+`: a window with no reset reads `7d(⟳?):`
-            return re.search(re.escape(window) + r"(?:\(⟳[^)]*\))?:", line).end()
+            # The chip STARTS in one column (owner, 2026-10-05); `[^)]*`, not `\w+`: a window with no reset reads `7d(⟳?):`
+            return re.search(re.escape(window) + r"(?:\(⟳[^)]*\))?:", line).start()
 
         seven_d = [colon("7d", line) for line in lines]
         fable = [colon("Fable", line) for line in lines]
@@ -6128,9 +6252,9 @@ class TestUnswitchableRowsAreListed:
                 # `[^)]*`, not `\w+`: a window with no reset reads `7d(⟳?):`
                 if (m := re.search(r"(" + re.escape(window) + r"(?:\(⟳[^)]*\))?:)\s*\d+%", line))
             ]
-            colons = {m.end(1) for m in hits}
+            colons = {m.start(1) for m in hits}   # the chip's start, not its colon
             ends = {m.end() for m in hits}
-            assert len(colons) == 1, f"{window} colon not in one column: {colons} in {rows!r}"
+            assert len(colons) == 1, f"{window} chip not starting in one column: {colons} in {rows!r}"
             assert len(ends) == 1, f"{window} percent not in one column: {ends} in {rows!r}"
 
     def test_5h_and_7d_columns_come_first_then_the_rest_in_first_seen_order(self):
@@ -6358,7 +6482,7 @@ class TestUnswitchableRowsAreListed:
         row3 = out[out.index("between@x.com"):out.index("full@x.com")]
         assert ">=" not in row3 and "limit reached" not in row3, out
         row4 = out[out.index("full@x.com"):]
-        assert "7d full" in row4, out
+        assert "7d limit reached" in row4, out  # at 100
         assert ">=" not in row4, out
 
     def test_a_refused_row_names_the_reason_the_pass_dropped_it(self):
@@ -6402,7 +6526,7 @@ class TestUnswitchableRowsAreListed:
             threshold=90.0, hysteresis_pct=10.0, strategy="consume-first",
         ))
         assert "not a candidate" not in out[:out.index("tight@x.com")], out
-        assert "not a candidate (too little room under its line)" in out, out
+        assert "tight@x.com" in out and "too little room under its line" in out, out
 
     def test_a_no_plan_row_names_why_and_sorts_after_every_other_row(self):
         """A slot whose usage poll answered `oauth_not_allowed_for_
@@ -7432,8 +7556,6 @@ class TestNextBestFollowsTheTick:
             # Healthy holds: the engine reports NO_ACTION, never a block.
             ("consume-first", {"1": (40, 10), "2": (10, 50), "3": (10, 60)},
              {}, (), "already-consuming-soonest"),
-            ("dynamic", {"1": (40, 10), "2": (10, 50), "3": (10, 60)},
-             {}, (), "already-consuming-soonest"),
             ("consume-first",
              {"1": _window7(40, 0), "2": (85, 10), "3": (10, 50)},
              {}, (), "reset-unknown"),
@@ -7453,7 +7575,7 @@ class TestNextBestFollowsTheTick:
              {}, (), "deliberate-wait"),
         ],
         ids=[
-            "consume-first-already-soonest", "dynamic-already-soonest",
+            "consume-first-already-soonest",
             "consume-first-reset-unknown", "consume-first-no-oauth-peer",
             "best-no-qualifying-candidate", "best-no-comparison",
             "best-no-candidates", "best-all-exhausted", "best-deliberate-wait",
@@ -7502,6 +7624,8 @@ class TestNextBestFollowsTheTick:
             "unmanaged-active-account", "no-active-account", "active-api-key",
             "active-idle", "active-usage-unknown", "cooldown",
             "already-consuming-priority", "stale-usage", "no-viable-target",
+            "account-refused", "invalid_grant", "target-credential-unconfirmed",
+            "below-floor", "stale-candidate-skipped",
         }
         tree = ast.parse(textwrap.dedent(inspect.getsource(AutoSwitchEngine._tick_inner)))
         emitted = {
@@ -7834,6 +7958,8 @@ class TestNextBestFollowsTheTick:
             "active-idle", "active-usage-unknown", "cooldown", "account-refused",
             "already-consuming-priority", "stale-usage", "no-viable-target",
             "invalid_grant", "target-credential-unconfirmed",
+            "below-floor",
+            "stale-candidate-skipped",
         }
         tree = ast.parse(textwrap.dedent(inspect.getsource(AutoSwitchEngine._tick_inner)))
         emitted = {
@@ -7885,6 +8011,75 @@ class TestNextBestFollowsTheTick:
         h, snap, entries = _engine_and_snapshot(temp_home, {"strategy": "best"}, fleet)
         assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
         assert "u2@x.invalid" in _next_best_text(snap, "1", h.settings).splitlines()[1]
+
+    def test_an_overloaded_priority_active_is_ranked_as_the_tick_ranks_it(
+        self, temp_home, tmp_path, monkeypatch
+    ):
+        """A 5xx burst on the active is the tick's `overloaded` trigger, under
+        which the active is no rank to defend (the engine passes
+        `active_in_rotation` false): the tier-0 peers are legal picks even
+        against a tier-100 active, where the panel that read the active as
+        enabled would list nobody."""
+        from claude_swap import autoswitch
+        from claude_swap.autoswitch import TickOutcome
+        from tests.test_autoswitch import _trace_line
+
+        fleet = {"1": (40, 100), "2": (30, 10), "3": (20, 50)}
+        settings = {
+            "strategy": "priority-consume-first", "threshold": 90.0, "cooldown_seconds": 0.0,
+        }
+        h, snap, entries = _engine_and_snapshot(temp_home, settings, fleet)
+        h.switcher.set_account_priority("1", 100)
+        snap = dataclasses.replace(snap, accounts=tuple(
+            dataclasses.replace(a, policy=AccountPolicy(priority=100 if a.number == "1" else 0))
+            for a in snap.accounts
+        ))
+        trace = tmp_path / "trace.log"
+        trace.write_bytes(b"")
+        monkeypatch.setattr(autoswitch, "_trace_path", lambda switcher: trace)
+        # The baseline: a healthy tier-100 active under its line stays put.
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert "no candidate qualifies" in _next_best_text(snap, "1", h.settings), "premise: no peer outranks the active"
+        trace.write_bytes(b"".join(_trace_line(529) for _ in range(5)))
+        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
+        assert h.state()["leftTrigger"] == "overloaded"
+        picked = str(h.active_number())
+        assert picked == "2", "the case no longer builds the pick it is named for"
+        row = _next_best_text(snap, "1", h.settings, engine=h.engine).splitlines()[1]   # the first row, not the "no candidate qualifies" line
+        assert "u2@x.invalid" in row and "not picked" not in row, row
+
+    @pytest.mark.parametrize(
+        "peer, designed",
+        [
+            # A header-probe reading carries no Fable window: unreadable on the model axis, spent on 5h/7d.
+            ({"source": "headers", "five_hour": {"pct": 100.0}, "seven_day": {"pct": 100.0}}, "no-comparison"),
+            # A reading of the model window alone: spent on the model axis, no 5h/7d window to read at all.
+            ({"scoped": [{"name": "Fable", "pct": 100.0}]}, "all-exhausted"),
+        ],
+        ids=["peers-unreadable-on-the-model-axis", "peers-readable-on-the-model-axis-only"],
+    )
+    def test_a_dynamic_pass_that_empties_twice_says_what_the_tick_refused_with(
+        self, temp_home, peer, designed
+    ):
+        """`dynamic` with a model set re-ranks on 5h/7d alone when the model-gated
+        pass empties, and when that retry empties too the tick keeps the FIRST
+        pass's readings and the model-gated headroom. The panel words the same
+        refusal, not the one the retry alone would give (`all-exhausted` for the
+        first fleet, `no-qualifying-candidate` for the second)."""
+        from claude_swap.autoswitch import AllExhaustedEvent, TickOutcome
+        from claude_swap.tui.autoview import _REFUSAL_TEXT
+
+        active = {**_window7(20, 20, 100), "scoped": [{"name": "Fable", "pct": 100.0}]}
+        h, snap, entries = _engine_and_snapshot(
+            temp_home, {"strategy": "dynamic", "model": "Fable", "threshold": 90.0},
+            {"1": active, "2": peer, "3": peer}, disabled=("1",),
+        )
+        assert h.tick_with_entries(entries) is TickOutcome.BLOCKED
+        event = [e for e in h.events if isinstance(e, (NoSwitchEvent, AllExhaustedEvent))][-1]
+        reason = event.reason if isinstance(event, NoSwitchEvent) else "all-exhausted"
+        assert reason == designed, "the case no longer builds the refusal it is named for"
+        text = _next_best_text(snap, "1", h.settings, engine=h.engine)
+        assert [t for t in _REFUSAL_TEXT.values() if t in text] == [_REFUSAL_TEXT[reason]], text
 
 
 
