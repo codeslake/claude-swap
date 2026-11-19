@@ -28,28 +28,22 @@ from textual.widgets import Footer, RichLog, Static
 
 from claude_swap import oauth
 from claude_swap.autoswitch import (
-    CONSUME_FIRST_STRATEGIES,
     AutoSwitchEngine,
     AutoSwitchEvent,
-    _dynamic_active_headroom,
+    PollEvent,
+    _binding_at,
     binding_pct,
     classify_candidate_block,
-    ThresholdMap,
-    _binding_at,
-    _headroom_by_account,
-    consume_first_rank_key,
-    empty_pass_refusal,
-    no_peer_refusal,
     pct_label,
     proactive_switch_bar_pct,
-    rank_candidates_pass,
 )
 from claude_swap import pin
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
-from claude_swap.lines import BindingWindow, binding_window, weekly_capped
+from claude_swap.lines import BindingWindow, weekly_capped, window_line
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import (
     SETTING_SPECS,
+    AutoSwitchSettings,
     load_settings,
     parse_model_names,
     set_setting,
@@ -91,15 +85,37 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
-# Triggers whose pass the panel never runs, each with WHY: a state the tick
-# acts on out of sight of a snapshot (an unreadable active counts ticks toward
-# failover) or ranks through a pass of its own. Never "no candidate qualifies",
-# the claim only a real, empty pass earns.
+# Trigger names keyed to WHY the ranking pass never ran -- never "no
+# candidate qualifies", the claim only a real, empty pass earns.
 _UNMODELED_TEXT = {
     "below-threshold": "not previewed (active below threshold)",
     "unreadable-active": "not previewed (active status unknown)",
-    "priority": "not previewed (priority strategy)",
 }
+
+_NO_PLAN_TEXT = "no active plan"
+
+# The engine's refusal reasons (`reasons` of `rank_switch_candidates`) in the panel's plain words: (long, short), one entry for every literal the engine gives
+# but `over the switch threshold`, which is the at-line piece. `_unreadable_reason`'s texts (a poll that failed, a reading overdue) are told by how it opens them: short `unreadable`.
+# Any other text keeps itself, long and short, so a reason the engine words later is never called unreadable.
+_REFUSAL_WORDS = {
+    "weekly reset not sooner": ("weekly reset comes later", "later reset"),
+    "weekly reset unknown": ("weekly reset unknown", "reset unknown"),
+    "recovers no sooner": ("recovers no sooner", "no sooner"),
+    "headroom margin too small": ("too little headroom", "low headroom"),
+    "at its limit": ("at its limit", "at limit"),
+    "just left": ("just switched away", "just left"),
+    "no headroom left": ("no headroom left", "no headroom"),
+}
+_UNREADABLE_OPENINGS = ("usage unreadable", "usage overdue", "last read ", "last fetch failed", "rate-limited until", "no poll before")
+
+
+def _refusal_words(why: str | None) -> tuple[str, str]:
+    """The long and the short words of the engine's reason for refusing a row."""
+    if why is None:
+        return "not picked", "skipped"
+    if why in _REFUSAL_WORDS:
+        return _REFUSAL_WORDS[why]
+    return why, "unreadable" if why.startswith(_UNREADABLE_OPENINGS) or ", retry at " in why else why
 
 
 # The panel's words for each refusal the tick reaches around its pass, one
@@ -119,98 +135,6 @@ _REFUSAL_TEXT = {
     "deliberate-wait": "holding for a nearer reset than any peer offers",
     "all-exhausted": "all accounts exhausted",
 }
-
-
-def _engine_order(
-    snap: AccountsSnapshot, settings, active_number: str | None, now: float
-) -> tuple[list[str], tuple[str, ...], str]:
-    """(ordered, the window set it ranked on, note): the order the engine's
-    own pass (`rank_candidates_pass`) gives this snapshot, never a key of the
-    panel's own. The trigger comes from the active's reading as `_tick_inner`
-    classifies it, and a trigger in `_UNMODELED_TEXT` runs no pass. Under
-    `dynamic`, an empty model-gated pass is retried on 5h/7d alone, as
-    `_rank_candidates` does. The note is the panel's words for why nobody is
-    previewed, empty when somebody is. State a snapshot lacks (cooldown, the
-    no-return bar, quarantine, the failover count) is not modeled."""
-    models = parse_model_names(settings.model)
-    usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
-    bars = ThresholdMap(
-        {a.number: a.policy.threshold for a in snap.accounts if a.policy.threshold is not None},
-        settings.threshold,
-    )
-    headroom = _headroom_by_account(usage, models)
-    active_h = _dynamic_active_headroom(
-        settings, models, usage, active_number, headroom.get(active_number)
-    )
-    if settings.strategy == "priority-consume-first":
-        trigger = "priority"
-    elif any(a.number == active_number and a.disabled for a in snap.accounts):
-        trigger = "disabled-active"
-    elif active_h is None:
-        trigger = "unreadable-active"
-    else:
-        # Each window against its own line, on the set `active_h` was read on.
-        binding = _binding_at(
-            usage.get(active_number), settings,
-            () if settings.strategy == "dynamic" and models else models,
-            bars[active_number],
-        )
-        below = (
-            not binding.over
-            if binding is not None
-            else (100.0 - active_h) < bars[active_number]
-        )
-        if below:
-            trigger = (
-                settings.strategy
-                if settings.strategy in CONSUME_FIRST_STRATEGIES
-                else "below-threshold"
-            )
-        else:
-            trigger = "at-limit" if active_h <= 0 else "proactive"
-    if trigger in _UNMODELED_TEXT:
-        return [], models, _UNMODELED_TEXT[trigger]
-
-    peers = [
-        a for a in snap.accounts
-        if a.number != active_number and a.switchable and not a.disabled
-    ]
-    oauth_peers = [a.number for a in peers if a.kind != "api_key"]
-    key_peers = [
-        a.number for a in peers
-        if a.kind == "api_key" and settings.include_api_key_accounts
-    ]
-    if refusal := no_peer_refusal(
-        trigger=trigger, active_headroom=active_h,
-        oauth_candidates=oauth_peers, api_key_candidates=key_peers,
-    ):
-        return [], models, _REFUSAL_TEXT[refusal]
-
-    def rank(axis: tuple[str, ...]):
-        h = _headroom_by_account(usage, axis)
-        return rank_candidates_pass(
-            models=axis, trigger=trigger,
-            consume_first=settings.strategy in CONSUME_FIRST_STRATEGIES,
-            oauth_candidates=oauth_peers,
-            no_return=None, usage=usage, headroom=h, current=active_number,
-            active_headroom=h.get(active_number), settings=settings, now=now,
-            thresholds=bars,
-        )
-
-    ordered, any_known, active_reset_ts, waiting = rank(models)
-    if not ordered and models and settings.strategy == "dynamic":
-        if retry := rank(())[0]:
-            return retry, (), ""
-    if not ordered and key_peers and trigger not in CONSUME_FIRST_STRATEGIES:
-        # The tick's last resort when it must move: a metered API-key slot.
-        return key_peers, models, ""
-    if ordered:
-        return ordered, models, ""
-    return [], models, _REFUSAL_TEXT[empty_pass_refusal(
-        trigger=trigger, any_known=any_known, active_reset_ts=active_reset_ts,
-        waiting_for_recovery=waiting,
-        candidate_headrooms=[headroom.get(n) for n in oauth_peers],
-    )]
 
 
 def _line_note(binding: BindingWindow | None, label: str, noted: bool) -> str:
@@ -440,6 +364,9 @@ class AutoScreen(Screen):
         # cache-aware on: `c` and the summary's cache-aware segment follow
         # it, not the session copy.
         self._configured_strategy: str | None = None
+        # The bar the engine's last poll leaves the ACTIVE at (the primary's 99
+        # under `dynamic`, not 97); dropped on a session setting change.
+        self._switch_bar: float | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -456,14 +383,14 @@ class AutoScreen(Screen):
     def on_mount(self) -> None:
         self.app.set_store_only(True)
         self._settings = load_settings(self.app.switcher.backup_dir)
-        # The bar tick everywhere reads app.threshold_pct, loaded once at app
-        # startup — sync it to the fresh file value so bars and engine agree,
-        # and remember that value: unmount restores it (only the session
-        # adjustment reverts, not this correction).
+        # threshold_pct AND auto_settings are loaded once at app startup;
+        # sync both to the fresh file value (unmount reverts only the
+        # session threshold adjustment, never this correction).
         self._configured_threshold = self._settings.threshold
         self.app.threshold_pct = proactive_switch_bar_pct(
             self._settings.strategy, self._settings.threshold
         )
+        self.app.auto_settings = self._settings
         self._configured_strategy = self._settings.strategy
         # The weekly line is not session-adjustable, so this is only the same
         # sync-to-the-file correction; nothing to restore on unmount.
@@ -581,6 +508,8 @@ class AutoScreen(Screen):
     def _set_threshold(self, value: float) -> None:
         if value == self._settings.threshold:
             return
+        if self._switch_bar == self._settings.threshold:
+            self._switch_bar = None  # it was tracking the threshold; next poll resets
         self._settings = replace(self._settings, threshold=value)
         if self._engine is not None:
             self._engine.apply_threshold(value)
@@ -603,6 +532,7 @@ class AutoScreen(Screen):
         current = _STRATEGY_CYCLE.index(strategy) if strategy in _STRATEGY_CYCLE else -1
         value = _STRATEGY_CYCLE[(current + 1) % len(_STRATEGY_CYCLE)]
         self._settings = replace(self._settings, strategy=value)
+        self._switch_bar = None
         # A binding may be gated on strategy; the footer reads check_action
         # only on refresh.
         self.refresh_bindings()
@@ -652,10 +582,12 @@ class AutoScreen(Screen):
         bar = proactive_switch_bar_pct(
             self._settings.strategy, self._settings.threshold
         )
+        # The bar shown is the engine's (`_switch_bar`) once a poll has set it.
+        shown = bar if self._switch_bar is None else self._switch_bar
         # The field is the bar in force: it prints only when the threshold
-        # IS the bar (`bar == threshold`), plus while it is being adjusted
+        # IS the bar (`shown == threshold`), plus while it is being adjusted
         # (`t` + arrows) -- that is the number being changed.
-        show_threshold = self._adjusting or bar == self._settings.threshold
+        show_threshold = self._adjusting or shown == self._settings.threshold
         if show_threshold:
             text.append(
                 f"threshold {pct_label(self._settings.threshold)}%",
@@ -663,8 +595,8 @@ class AutoScreen(Screen):
             )
             if self._settings.threshold != self._configured_threshold:
                 text.append(" (session)", style=palette.muted)
-        if bar != self._settings.threshold:
-            text.append(f"{' · ' if show_threshold else ''}switch at {pct_label(bar)}%")
+        if shown != self._settings.threshold:
+            text.append(f"{' · ' if show_threshold else ''}switch at {pct_label(shown)}%")
         text.append(f" · {self._settings.strategy}")
         if self._settings.strategy != self._configured_strategy:
             text.append(" (session)", style=palette.muted)
@@ -734,7 +666,12 @@ class AutoScreen(Screen):
         # live engine — worse than the stuck-dry-run it fixes, because now the
         # display disagrees with what is actually switching accounts.
         self._update_badge()
+        if isinstance(event, PollEvent) and event.strategy == self._settings.strategy:
+            self._switch_bar = event.switch_bar
+            self._update_summary()
         if event.kind == "switch":
+            self._switch_bar = None  # the old active's bar; the next poll sets it
+            self._update_summary()
             self.app.request_refresh()
 
     def action_toggle_live(self) -> None:
@@ -780,6 +717,7 @@ class AutoScreen(Screen):
     def _on_snapshot(self, snap: AccountsSnapshot | None) -> None:
         if snap is None:
             return
+        self._last_active_at = data.read_last_active_at(self.app.switcher.backup_dir)
         self.query_one("#candidates", Static).update(
             self._candidates_text(snap, active_number=snap.active_number)
         )
@@ -796,94 +734,23 @@ class AutoScreen(Screen):
         # Not a guarantee the order agrees end to end: see below, the
         # engine's own tick can rank on a different axis.
         palette = Palette.from_theme(self.app.current_theme)
-        settings = self._settings
-        models = parse_model_names(settings.model) if settings else ()
-        weekly = settings.weekly_threshold if settings else None
-
-        # `bar` is bound further down, before the first call.
-        def line_of(acc) -> float:
-            return acc.policy.threshold if acc.policy.threshold is not None else bar
+        models = parse_model_names(self._settings.model) if self._settings else ()
+        settings = self._settings or AutoSwitchSettings()
+        weekly = settings.weekly_threshold
 
         def noted(acc) -> bool:
             return weekly is not None or acc.policy.threshold is not None
 
-        # `dynamic` ranks on `consume_first_rank_key` below, same as
-        # `consume-first` (CONSUME_FIRST_STRATEGIES) -- but that is not
-        # always the engine's OWN axis for a `dynamic` tick: depending on
-        # what triggered it, the engine can instead rank through
-        # `_rank_dynamic_candidates`, keyed on `lastActiveAt` state this
-        # panel does not have, or an at-limit escape key (autoswitch.py).
-        # So this label's order under `dynamic` is not a promise of what
-        # the next tick actually picks.
-        # The strategy's bare key, for the rows the engine's pass refuses.
-        consume_first = bool(
-            self._settings
-            and self._settings.strategy in (*CONSUME_FIRST_STRATEGIES, "weekly-first")
-        )
-        now = time.time()
-        # THE ENGINE'S OWN ADMISSION AND ORDER decide the rows it admits; a
-        # refused row keeps the strategy's bare key below, behind every
-        # admitted one.
-        engine = self._engine
-        ordered, note, short = (
-            _engine_order(
-                snap, settings, active_number, now,
-                overloaded=engine is not None
-                and active_number is not None
-                and engine.overloaded_account == active_number,
-            )
-            if settings else ([], "", set())
-        )
-        # THE BAR EVERY ADMISSION/LABEL DECISION BELOW READS (#321): under
+        # THE STRATEGY'S BAR, EVERY ROW'S FALLBACK (#321; see `row_bar`): under
         # `dynamic` this is `proactive_switch_bar_pct`'s 97, not the raw
         # `settings.threshold` — a candidate with hours left on its reset
         # is headroom `dynamic` exists to spend, not a blocked one. Every
         # other strategy gets `settings.threshold` back unchanged, so this
-        # is a no-op for them.
-        bar = (
-            proactive_switch_bar_pct(self._settings.strategy, self._settings.threshold)
-            if self._settings else 0.0
-        )
-        # THE AXIS THE ENGINE WILL ACTUALLY RANK ON THIS TICK, not always
-        # `models`: `_rank_candidates` (autoswitch.py) drops the model set
-        # and retries on 5h/7d alone when the model-gated pass finds no
-        # healthy candidate — so a panel that always ranks on `models` can
-        # name a top row the engine would never pick (still model-gated
-        # ranking a fleet the engine has already dropped it for). But the
-        # engine only runs that retry under `strategy == "dynamic"`
-        # (autoswitch.py's `_rank_candidates`) — gated the same way here, or
-        # `best`/`consume-first` rank on an axis the engine is forbidden to
-        # use. Same predicate as the model-gated pass's own health filter
-        # (`classify_candidate_block` — "open" is exactly what that filter
-        # lets through): any candidate reading "open" means the model-gated
-        # pass has something to work with, so keep `models`; none reading
-        # "open" means it would come back empty, so rank on the retry's
-        # axis instead — a "model"-only block clears once `models` drops,
-        # and a "full" block stays blocked either way.
-        rank_models = models
-        if models and self._settings and self._settings.strategy == "dynamic":
-            for acc in snap.accounts:
-                if (
-                    acc.number == active_number
-                    or not acc.switchable
-                    or acc.usage.sentinel is not None
-                    or binding_pct(acc.usage.last_good, models) is None
-                ):
-                    continue
-                windows = (
-                    (label, p)
-                    for label, p, _ in oauth.relevant_windows(
-                        acc.usage.last_good, models
-                    )
-                )
-                own = acc.policy.threshold
-                kind, _ = classify_candidate_block(
-                    windows, bar if own is None else own, weekly
-                )
-                if kind == "open":
-                    break
-            else:
-                rank_models = ()
+        # is a no-op for them. Off `settings` (never `self._settings`
+        # directly, which can be `None` before `on_mount` loads it) so the
+        # bar can never read a DIFFERENT strategy than the ranking below.
+        bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
+        bars = data.switch_bars(snap)
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         rows: dict[str, CandidateRow] = {}
         # The badge rides on that account's own row rather than the summary
@@ -895,6 +762,30 @@ class AutoScreen(Screen):
         # mistake was fixed for the pin lookup itself — see the test that pins
         # its call count.
         pin_applying = pin.pin_is_applying(self.app.switcher) if pinned_identity else None
+        now = time.time()
+        # THE engine's own admission and order -- `ordered_accounts` (data.py)
+        # reads off this exact same call for every other listing screen.
+        # `getattr` (never plain `self._last_active_at`): a test instance
+        # built via `AutoScreen.__new__` skips `__init__`/`_on_snapshot`.
+        last_active_at = getattr(self, "_last_active_at", None) or {}
+        reasons: dict[str, str] = {}   # the engine's own cause per refused row
+        engine = getattr(self, "_engine", None)
+        hold: dict[str, str] = {}   # the engine's own refusal when it picks nobody (`hold_out`)
+        ordered, rank_axis, trigger, unmodeled = data.rank_switch_candidates(
+            snap, settings, now, active_number,
+            probe_cooldown=engine._last_probe_cooldown if engine is not None else None,
+            last_active_at=last_active_at,
+            reasons_out=reasons,
+            # The engine's own verdict, a 5xx burst read off the pin's trace that no snapshot carries (T3433)
+            overloaded=engine is not None and active_number is not None
+            and getattr(engine, "overloaded_account", None) == active_number,
+            hold_out=hold,
+        )
+        ordered_rank = {num: i for i, num in enumerate(ordered)}
+        # Captured before the loop rebinds `now` below (per-row, for the
+        # window chips) -- the fallback key must agree with the SAME `now`
+        # the admission pass above just ran on, not a fresh read.
+        admission_now = now
         # Chip columns are keyed by WINDOW NAME, never by position: two rows
         # can have different-length window lists built from that account's
         # own payload (`relevant_windows`), so "chip 1" is not the same
@@ -908,6 +799,8 @@ class AutoScreen(Screen):
                 or not acc.switchable
                 or acc.usage.sentinel is not None
                 or binding_pct(acc.usage.last_good, models) is None
+                # an unranked no-plan row draws no chips (below), so it sizes no column
+                or (data.is_no_plan(acc) and acc.number not in ordered_rank)
             ):
                 continue
             row_windows[acc.number] = oauth.relevant_windows(oauth.display_usage(acc.usage.last_good), models)  # #199: no chip for a 5h window that is not running
@@ -938,6 +831,14 @@ class AutoScreen(Screen):
         chip_width = dict(sorted(
             chip_width.items(), key=lambda kv: {"5h": 0, "7d": 1}.get(kv[0], 2)
         ))
+
+        def key_of(acc) -> tuple:
+            """The engine's own rank when it picked the row, else the tier every
+            other switchable row sorts in (`ordered_accounts` reads the same key)."""
+            if acc.number in ordered_rank:
+                return (0, ordered_rank[acc.number])
+            return data.non_candidate_key(acc, admission_now)
+
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -968,13 +869,27 @@ class AutoScreen(Screen):
                 )
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
-            line = line_of(acc)
-            binding = binding_window(
-                oauth.relevant_windows(acc.usage.last_good, models),
-                line,
-                weekly,
-                scale=bar,
-            )
+            no_plan = data.is_no_plan(acc)
+            if no_plan and acc.number not in ordered_rank:
+                # No subscription behind this login and the pass did not rank
+                # it: chips would read as a candidate, so the reason replaces
+                # them and the row goes behind even the unswitchable ones. A
+                # RANKED one (`decision_value()` serves `last_good` for a
+                # while after polls fail) is the engine's pick and keeps its
+                # place below, the reason a marker after the chips.
+                rows[acc.number] = CandidateRow(
+                    Text(acc.number, style=palette.muted),
+                    Text(acc.email, style=palette.muted),
+                    Text(),
+                    status={"no-plan": Text(_NO_PLAN_TEXT, style=palette.sev_warn)},
+                    short={"no-plan": Text("no plan", style=palette.sev_warn)},
+                )
+                ranked.append(((1001.0,), acc.number))
+                continue
+            # THIS row's bar: its own threshold when it has one, as the engine
+            # lands on it (`_rank_candidates_pass`), else the strategy's.
+            row_bar = bars.get(acc.number, bar)
+            binding = _binding_at(acc.usage.last_good, settings, models, row_bar)
             usage = Text()
             status: dict[str, Text] = {}
             short: dict[str, Text] = {}
@@ -984,7 +899,10 @@ class AutoScreen(Screen):
                 usage.append(
                     data.sentinel_label(acc.usage.sentinel), style=palette.muted
                 )
-                ranked.append(((998.0,), acc.number))
+                # `ordered_rank` first: the API-key last resort (data.rank_
+                # switch_candidates) can name THIS row as the engine's actual
+                # next pick, and it must not sort behind every refused row.
+                ranked.append((key_of(acc), acc.number))
             elif binding is None:
                 # An extra-usage (pay-as-you-go) account has no 5h/7d window,
                 # so binding_window answers None — but it is not unknown, it has
@@ -1012,11 +930,15 @@ class AutoScreen(Screen):
                 # `_rank` can't see it) -- but every OTHER row here says why
                 # it is never chosen, and this was the one silent exception.
                 if acc.disabled:
-                    status["disabled"] = Text("auto-swap disabled", style=palette.muted)
-                # RANKED LAST EITHER WAY. Spend is not headroom: folding it
-                # into the sort key would change which account the engine
-                # picks, and the ranking axis is not this row's to move.
-                ranked.append(((999.0,), acc.number))
+                    status["disabled"] = Text("auto-swap off", style=palette.muted)
+                    short["disabled"] = Text("off", style=palette.muted)
+                # RANKED LAST, UNLESS THE API-KEY LAST RESORT NAMED IT:
+                # spend is not headroom, so folding it into the sort key
+                # would change which account the engine picks -- but when
+                # `ordered_rank` already names this row (never derived here),
+                # it IS the engine's pick and must not sort behind a row the
+                # engine refused.
+                ranked.append((key_of(acc), acc.number))
             else:
                 # Per-window chips, from the same helper the dashboard uses
                 # (data.chip_label) so one account cannot read two ways. The
@@ -1066,20 +988,31 @@ class AutoScreen(Screen):
                 # healthy row's `fetched_at` is older than that for most of
                 # every poll cycle, and the engine lands on it happily.
                 if acc.usage.in_backoff(now) or acc.usage.consecutive_failures:
-                    # A lapsed plan is a permanent 403, not a poll gap.
-                    lapsed = acc.usage.last_error == "oauth_not_allowed_for_organization"
-                    status["no-plan" if lapsed else "stale"] = Text(
-                        "no plan" if lapsed else "stale", style=palette.sev_warn
-                    )
+                    # A lapsed plan is a permanent 403, not a poll gap: the
+                    # no-plan marker below speaks for it, never "stale".
+                    if not no_plan:
+                        status["stale"] = Text("usage out of date", style=palette.sev_warn)
+                        short["stale"] = Text("stale", style=palette.sev_warn)
+                if no_plan:
+                    status["no-plan"] = Text(_NO_PLAN_TEXT, style=palette.sev_warn)
+                    short["no-plan"] = Text("no plan", style=palette.sev_warn)
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
                 # a model-only block (the engine's fallback ranks around it).
-                # The decision log classifies with the same helper,
-                # `classify_candidate_block`, but words it its own way; the
-                # panel words it plainly. Always on `models`, the full pinned
-                # set: this label explains why the row is not simply "open" on
-                # the criteria the user actually configured, independent of
-                # whether `rank_models` below has dropped to the retry's axis
+                # The CLASSIFICATION (open/model/full) reads the same way
+                # here as in the decision log — same helper,
+                # `classify_candidate_block`, the same row bar the engine's
+                # own landing gate reads (#321). It still does
+                # not fold in the engine's other, separate, stricter landing
+                # floor -- `cold_switch_cost_pct` in autoswitch.py -- a
+                # candidate clearing this label can still fail that one. The
+                # two print `kind == "full"` in different words on purpose
+                # (the elif below): the log always says "full", this panel
+                # reserves "full" for a window actually at or over 100 and
+                # says nothing otherwise. Always on `models`, the full pinned
+                # set: this label explains why the row is not simply "open"
+                # on the criteria the user actually configured, independent
+                # of whether the pass above retried on the 5h/7d-only axis
                 # for ORDERING purposes.
                 kind, blocked_model = "open", None
                 if self._settings:
@@ -1101,55 +1034,80 @@ class AutoScreen(Screen):
                             (label, p) for label, p, reset in chips
                             if reset is None or reset.startswith("resets ")
                         ),
-                        line,
+                        row_bar,
                         weekly,
                     )
                     if kind == "model":
                         status["walled"] = Text(f"{blocked_model} limit reached", style=palette.muted)
                         short["walled"] = Text(f"{blocked_model} full", style=palette.muted)
                     elif kind == "full":
-                        # A window at or over 100 is `<w> limit reached` (short `<w> full`): the label is reserved for
-                        # actual exhaustion (the owner's report, 92% read "full" against a threshold of 90), so a window
-                        # merely over its line reads no label here; its chip and the `limit <line>` note below show it.
+                        # A window at or over 100 is `<w> limit reached` (short `<w> full`); a window at or over its switch line but under
+                        # 100 reads `limit <line>% reached` (short `<line>% reached`) when the pass above left the row out, the line the
+                        # window is judged against (the strategy's bar, or the weekly line). The line alone refuses on the proactive path:
+                        # at-limit, failover and a capped active skip the landing gate, and a fleet with every account over its line admits
+                        # them, so a picked row reads nothing. Never on an unmodeled pass, which ranked nobody (T3328).
                         window_pct = next(
                             p for label, p, _ in windows if label == blocked_model
                         )
                         if window_pct >= 100.0:
                             status["block"] = Text(f"{blocked_model} limit reached", style=palette.muted)
                             short["block"] = Text(f"{blocked_model} full", style=palette.muted)
+                        elif acc.number not in ordered_rank and not unmodeled:
+                            line_pct = pct_label(window_line(blocked_model, row_bar, weekly))
+                            status["at-line"] = Text(f"limit {line_pct}% reached", style=palette.muted)
+                            short["at-line"] = Text(f"{line_pct}% reached", style=palette.muted)
                 # Only when the binding window's chip was drawn above.
                 if binding.label in have:
                     pct = _line_note(binding, binding.label, noted(acc))
                     if pct:
                         status["threshold"] = Text(f"limit {pct}", style=palette.muted)
                         short["threshold"] = Text(f"lim {pct}", style=palette.muted)
-                rank_binding = binding_window(
-                    oauth.relevant_windows(acc.usage.last_good, rank_models),
-                    line,
-                    weekly,
-                    scale=bar,
-                ) or binding
-                key = (
-                    consume_first_rank_key(
-                        acc.usage.last_good, line, now, rank_models,
-                        weekly_threshold=weekly, scale=bar,
-                    )
-                    if consume_first
-                    else (-rank_binding.line_headroom,)
-                )
                 capped = weekly_capped(acc.policy.weekly_cap, acc.usage.last_good)
+                if acc.disabled:
+                    status["disabled"] = Text("auto-swap off", style=palette.muted)
+                    short["disabled"] = Text("off", style=palette.muted)
+                elif (
+                    acc.number not in ordered_rank
+                    and kind == "open"
+                    and not unmodeled
+                    and not capped
+                ):
+                    # "open": nothing per-window blocks it, yet the engine's
+                    # own pass still refused it -- a weekly reset later than
+                    # the active's own, losing the hysteresis margin to a
+                    # healthier peer, or ranking behind a sooner recovery.
+                    # Every other excluded row already has a reason above,
+                    # a capped one its "capped" label below.
+                    # Never when `unmodeled`: this pass never ran, so
+                    # "refused" is not a claim this row can support.
+                    why = reasons.get(acc.number)
+                    if why == "over the switch threshold":
+                        # The engine's own words for a row over its line: the same piece, in the same words, as a window at its line above.
+                        line_pct = pct_label(binding.line)
+                        status["at-line"] = Text(f"limit {line_pct}% reached", style=palette.muted)
+                        short["at-line"] = Text(f"{line_pct}% reached", style=palette.muted)
+                    else:
+                        words, short_words = _refusal_words(why)
+                        status["not-candidate"] = Text(words, style=palette.muted)
+                        short["not-candidate"] = Text(short_words, style=palette.muted)
+                # Position from `ordered_rank` (the engine's own pass, called once
+                # above), never a locally re-derived key; a row the pass never
+                # ranked sorts by `key_of`'s tier.
                 if capped:
                     # A veto, not a rank: the engine never lands here. A weekly cap vetoes the row, so it reads in the status as `limit <cap>% reached`
                     # (short `<cap>% reached`, the cap being the account's own `weekly_cap`), ONE reason: it takes the place of the threshold note and of
-                    # the label that names the same window (a window block or a model wall: the stronger claim, not a second one beside it).
-                    for name in ("threshold", *(("block", "walled") if blocked_model == capped[0] else ())):
+                    # the label that names the same window (a window block, the line, or a model wall: the stronger claim, not a second one beside it).
+                    for name in ("threshold", *(("block", "at-line", "walled") if blocked_model == capped[0] else ())):
                         status.pop(name, None)
                         short.pop(name, None)
                     cap_pct = pct_label(acc.policy.weekly_cap)
                     status["capped"] = Text(f"limit {cap_pct}% reached", style=palette.sev_warn)
                     short["capped"] = Text(f"{cap_pct}% reached", style=palette.sev_warn)
-                    key = (997.0,)
-                ranked.append((key, acc.number))
+                # ONE reason: a row at its switch line reads `limit <line>% reached` (either producer above), so the threshold note, the same number, goes.
+                if "at-line" in status:
+                    status.pop("threshold", None)
+                    short.pop("threshold", None)
+                ranked.append((key_of(acc), acc.number))
             # Outside the usage branches on purpose: an account whose usage is
             # unknown still owns the claude.ai side, so the badge must not hang
             # off whichever branch happened to run.
@@ -1180,16 +1138,31 @@ class AutoScreen(Screen):
             )
 
         text = Text()
-        text.append("Next best", style=palette.muted)
+        # `rank_axis`: the engine's own report, never re-derived here.
+        if rank_axis is not None:
+            text.append(f"Next best ({rank_axis})", style=palette.muted)
+        else:
+            text.append("Next best", style=palette.muted)
         if not ranked:
             # Reached only when this is the sole account. Slots that cannot be
             # switched to are listed above with the reason, so "no other
             # accounts" is now literal rather than a filter's side effect.
             text.append("\n  no other accounts", style=palette.muted)
             return text
-        if note:
-            # Rows are still listed, but none is something a tick would switch to.
-            text.append(f"\n  {note}", style=palette.muted)
+        if not ordered:
+            reason = _UNMODELED_TEXT.get(trigger)
+            if reason is not None:
+                # The honest claim for WHY the pass never ran -- never
+                # "no candidate qualifies", which claims one did.
+                text.append(f"\n  {reason}", style=palette.muted)
+            else:
+                # DIFFERENT from "no other accounts": rows are still listed
+                # below, each naming why -- but none is something a tick would
+                # switch to, and ranking one anyway would name a top row the
+                # engine could never pick.
+                text.append(
+                    f"\n  {_REFUSAL_TEXT.get(hold.get('refusal'), 'no candidate qualifies')}", style=palette.muted
+                )
         # The box has no width before its first layout (the app's less its
         # padding), and a screen built with `__new__` has no `_nodes` to query.
         try:
@@ -1198,13 +1171,7 @@ class AutoScreen(Screen):
             width = None
         else:
             width = box.size.width or self.app.size.width - 4
-        place = {number: i for i, number in enumerate(ordered)}
         text.append_text(render_candidate_rows(
-            [rows[number] for _key, number in sorted(
-                ranked,
-                key=lambda kn: (
-                    (0, place[kn[1]]) if kn[1] in place else (1, *kn[0]), kn[1]
-                ),
-            )], palette, width
+            [rows[number] for _key, number in sorted(ranked)], palette, width
         ))
         return text
