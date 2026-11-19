@@ -15,9 +15,10 @@ snapshot poller runs store-only: the engine is the only fetcher.
 from __future__ import annotations
 
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -30,13 +31,13 @@ from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     AutoSwitchEngine,
     AutoSwitchEvent,
+    _dynamic_active_headroom,
     binding_pct,
     classify_candidate_block,
     ThresholdMap,
     _binding_at,
     _headroom_by_account,
     consume_first_rank_key,
-    model_block_label,
     empty_pass_refusal,
     no_peer_refusal,
     pct_label,
@@ -45,8 +46,8 @@ from claude_swap.autoswitch import (
 )
 from claude_swap import pin
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
-from claude_swap.lines import binding_window, weekly_capped
-from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.lines import BindingWindow, binding_window, weekly_capped
+from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import (
     SETTING_SPECS,
     load_settings,
@@ -56,13 +57,7 @@ from claude_swap.settings import (
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import (
-    AccountsPanel,
-    fit_login,
-    login_segment,
-    spend_row,
-    usage_rows,
-)
+from claude_swap.tui.widgets import AccountsPanel, login_segment, spend_row, usage_rows
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -95,6 +90,316 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 
 
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
+
+# Triggers whose pass the panel never runs, each with WHY: a state the tick
+# acts on out of sight of a snapshot (an unreadable active counts ticks toward
+# failover) or ranks through a pass of its own. Never "no candidate qualifies",
+# the claim only a real, empty pass earns.
+_UNMODELED_TEXT = {
+    "below-threshold": "not previewed (active below threshold)",
+    "unreadable-active": "not previewed (active status unknown)",
+    "priority": "not previewed (priority strategy)",
+}
+
+
+# The panel's words for each refusal the tick reaches around its pass, one
+# key per literal `no_peer_refusal` and `empty_pass_refusal` return (the
+# engine's own reading of the state, shared with the tick). A hold the engine
+# calls healthy (NO_ACTION) is worded as a hold, never as a block. The
+# "below-threshold" here is the consume-first hold with no OAuth peer, not
+# `best` below its line (`_UNMODELED_TEXT`).
+_REFUSAL_TEXT = {
+    "below-threshold": "holding (below its line, no other OAuth account to compare)",
+    "no-candidates": "no account to switch to",
+    "no-comparison": "no candidate has readable usage",
+    "reset-unknown": "holding (the active account's weekly reset is unknown)",
+    "already-consuming-soonest":
+        "holding (no sooner-resetting account with room to spare)",
+    "no-qualifying-candidate": "no candidate qualifies",
+    "deliberate-wait": "holding for a nearer reset than any peer offers",
+    "all-exhausted": "all accounts exhausted",
+}
+
+
+def _engine_order(
+    snap: AccountsSnapshot, settings, active_number: str | None, now: float
+) -> tuple[list[str], tuple[str, ...], str]:
+    """(ordered, the window set it ranked on, note): the order the engine's
+    own pass (`rank_candidates_pass`) gives this snapshot, never a key of the
+    panel's own. The trigger comes from the active's reading as `_tick_inner`
+    classifies it, and a trigger in `_UNMODELED_TEXT` runs no pass. Under
+    `dynamic`, an empty model-gated pass is retried on 5h/7d alone, as
+    `_rank_candidates` does. The note is the panel's words for why nobody is
+    previewed, empty when somebody is. State a snapshot lacks (cooldown, the
+    no-return bar, quarantine, the failover count) is not modeled."""
+    models = parse_model_names(settings.model)
+    usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
+    bars = ThresholdMap(
+        {a.number: a.policy.threshold for a in snap.accounts if a.policy.threshold is not None},
+        settings.threshold,
+    )
+    headroom = _headroom_by_account(usage, models)
+    active_h = _dynamic_active_headroom(
+        settings, models, usage, active_number, headroom.get(active_number)
+    )
+    if settings.strategy == "priority-consume-first":
+        trigger = "priority"
+    elif any(a.number == active_number and a.disabled for a in snap.accounts):
+        trigger = "disabled-active"
+    elif active_h is None:
+        trigger = "unreadable-active"
+    else:
+        # Each window against its own line, on the set `active_h` was read on.
+        binding = _binding_at(
+            usage.get(active_number), settings,
+            () if settings.strategy == "dynamic" and models else models,
+            bars[active_number],
+        )
+        below = (
+            not binding.over
+            if binding is not None
+            else (100.0 - active_h) < bars[active_number]
+        )
+        if below:
+            trigger = (
+                settings.strategy
+                if settings.strategy in CONSUME_FIRST_STRATEGIES
+                else "below-threshold"
+            )
+        else:
+            trigger = "at-limit" if active_h <= 0 else "proactive"
+    if trigger in _UNMODELED_TEXT:
+        return [], models, _UNMODELED_TEXT[trigger]
+
+    peers = [
+        a for a in snap.accounts
+        if a.number != active_number and a.switchable and not a.disabled
+    ]
+    oauth_peers = [a.number for a in peers if a.kind != "api_key"]
+    key_peers = [
+        a.number for a in peers
+        if a.kind == "api_key" and settings.include_api_key_accounts
+    ]
+    if refusal := no_peer_refusal(
+        trigger=trigger, active_headroom=active_h,
+        oauth_candidates=oauth_peers, api_key_candidates=key_peers,
+    ):
+        return [], models, _REFUSAL_TEXT[refusal]
+
+    def rank(axis: tuple[str, ...]):
+        h = _headroom_by_account(usage, axis)
+        return rank_candidates_pass(
+            models=axis, trigger=trigger,
+            consume_first=settings.strategy in CONSUME_FIRST_STRATEGIES,
+            oauth_candidates=oauth_peers,
+            no_return=None, usage=usage, headroom=h, current=active_number,
+            active_headroom=h.get(active_number), settings=settings, now=now,
+            thresholds=bars,
+        )
+
+    ordered, any_known, active_reset_ts, waiting = rank(models)
+    if not ordered and models and settings.strategy == "dynamic":
+        if retry := rank(())[0]:
+            return retry, (), ""
+    if not ordered and key_peers and trigger not in CONSUME_FIRST_STRATEGIES:
+        # The tick's last resort when it must move: a metered API-key slot.
+        return key_peers, models, ""
+    if ordered:
+        return ordered, models, ""
+    return [], models, _REFUSAL_TEXT[empty_pass_refusal(
+        trigger=trigger, any_known=any_known, active_reset_ts=active_reset_ts,
+        waiting_for_recovery=waiting,
+        candidate_headrooms=[headroom.get(n) for n in oauth_peers],
+    )]
+
+
+def _line_note(binding: BindingWindow | None, label: str, noted: bool) -> str:
+    """The line's pct ("97%") for the "limit 97%" status piece, once a weekly
+    line or the account's own threshold makes the lines differ: the chip's raw
+    pct stays, and the line it is judged against is named only where it is not
+    the one number in the header. Empty unless `label` is the BINDING window's."""
+    if not noted or binding is None or label != binding.label:
+        return ""
+    return f"{pct_label(binding.line)}%"
+
+
+# Every per-account reason a Next best row is not a plain candidate, in the one
+# order they read: the limits reached, the other reasons, auto-swap off. A new
+# marker registers by adding its key here; only "block" and "threshold" have a
+# producer on this branch.
+STATUS_ORDER = (
+    "capped", "at-line", "block", "walled", "threshold", "stale", "no-plan",
+    "not-candidate", "disabled",
+)
+
+EMAIL_FLOOR = 12  # display columns the email slot is cut to, at the least
+
+
+@dataclass
+class CandidateRow:
+    """One Next best row as named slots. A producer fills a slot and never
+    pads it: `render_candidate_rows` owns every column. `status` and `where`
+    render as ONE trailing note, `where` last; the `login` note is the last slot."""
+
+    number: Text
+    email: Text
+    usage: Text  # the chip block, the spend text, or the sentinel note
+    status: dict[str, Text] = field(default_factory=dict)  # keys of STATUS_ORDER
+    # The short form of a status piece, for a narrow panel; a key without one
+    # keeps its long text.
+    short: dict[str, Text] = field(default_factory=dict)
+    where: Text = field(default_factory=Text)  # where-in-use markers, joined by " · "
+    # The `re-login in 5d 12h` note that ends the row, empty unless the login is
+    # due, and its short form for a narrow panel (a row without one keeps the long).
+    login: Text = field(default_factory=Text)
+    login_short: Text = field(default_factory=Text)
+    note: bool = False  # usage is free text (a sentinel note): it sizes no column
+
+    def __post_init__(self) -> None:
+        for pieces in (self.status, self.short):
+            if unknown := pieces.keys() - set(STATUS_ORDER):
+                raise ValueError(f"status key not in STATUS_ORDER: {sorted(unknown)}")
+        # A marker never pads itself; usage is exempt, its chip blanks pad on purpose.
+        for cell in (self.login, self.login_short, self.where, *self.status.values(), *self.short.values()):
+            if cell.plain != cell.plain.strip():
+                raise ValueError(
+                    f"marker has leading or trailing whitespace: {cell.plain!r}"
+                )
+        if orphan := self.short.keys() - self.status.keys():
+            raise ValueError(f"short form without a status entry: {sorted(orphan)}")
+
+
+def _cut(cell: Text, width: int) -> Text:
+    """`cell` in at most `width` display columns, ending in `…` where it is cut."""
+    cell = cell.copy()
+    cell.truncate(width, overflow="ellipsis")
+    return cell
+
+
+def render_candidate_rows(
+    rows: list[CandidateRow], palette: Palette, width: int | None = None
+) -> Text:
+    """The block's rows, each led by a newline, every slot starting in one
+    display column on all of them. A slot is as wide as its widest cell over
+    every row that fills it; a free-text usage note sizes nothing, and a slot
+    empty on every row takes no column at all. The status pieces and `where`
+    are one note cell, joined by a dot, `where` last; the login note ends the row.
+
+    Over `width`, the block takes ONE form so its columns stay aligned. In
+    this order it gives up: the login, to its short form; the email slot, cut
+    to a shared width no narrower than EMAIL_FLOOR; the long status texts for
+    their short ones; the login; last, the note itself, cut to the room left.
+    A form given up stays given up at every narrower width: the email slot
+    keeps the width its cut left it and takes back no room a later step frees.
+    The usage slot is never cut.
+    A free-text note row counts in the fit unless it overflows even with no
+    login and the email at its floor: that one never fits, so it is left out
+    and carries no login."""
+    sep = Text(" \u00b7 ", style=palette.muted)
+
+    def note(row: CandidateRow, short: bool) -> Text:
+        pieces = [
+            (row.short.get(key) if short else None) or row.status[key]
+            for key in STATUS_ORDER if key in row.status
+        ]
+        if row.where:
+            # Each marker's leading glyph (`○ cloud` -> `○`).
+            pieces.append(Text(" ").join(
+                marker[: len(marker.plain.partition(" ")[0])]
+                for marker in row.where.split(" \u00b7 ")
+            ) if short else row.where)
+        out = Text()
+        for piece in pieces:
+            if out:
+                out.append_text(sep)
+            out.append_text(piece)
+        return out
+
+    def login_in(row: CandidateRow, login: str | None) -> Text:
+        """The row's login in the `login` form: `"full"`, `"short"`, or none."""
+        if login == "full":
+            return row.login
+        return (row.login_short or row.login) if login else Text()
+
+    def lines(
+        email: int, short: bool, login: str | None = None, room: int | None = None
+    ) -> list[Text]:
+        """Every row at an email slot of at most `email` columns, its login in
+        the `login` form; with `room`, a note is cut to end by that column."""
+        grid = [
+            [row.number, _cut(row.email, email), row.usage, note(row, short),
+             login_in(row, login if ok else None)]
+            for row, ok in zip(rows, fits)
+        ]
+        usage, notes = 2, 3
+        widths = [2, 0, 0, 0, 0]  # the number is right-aligned, two wide at least
+        used = [False] * len(widths)
+        for row, cells in zip(rows, grid):
+            for i, cell in enumerate(cells):
+                used[i] |= bool(cell)
+                if not (i == usage and row.note):
+                    widths[i] = max(widths[i], cell.cell_len)
+        out = []
+        for cells in grid:
+            line = Text()
+            for i, cell in enumerate(cells):
+                if i and not used[i]:
+                    continue
+                if room is not None and i == notes:
+                    if (left := room - line.cell_len - 2) < 2:
+                        continue
+                    cell = _cut(cell, left)
+                else:
+                    cell = cell.copy()
+                # A note wider than usage overflows on its own row; the next slot follows it.
+                pad = max(0, widths[i] - cell.cell_len)
+                if i:
+                    cell.pad_right(pad)
+                else:
+                    cell.pad_left(pad)
+                line.append("  ")  # the row's indent, then the gutter between slots
+                line.append_text(cell)
+            line.rstrip()
+            out.append(line)
+        return out
+
+    limit = 10**9 if width is None else width
+
+    widest = max((row.email.cell_len for row in rows), default=0)
+    # A free-text note row that overflows without its login, even at the email
+    # floor, is left out of the fit: its text is never cut, and it gives up its login.
+    fits = [True] * len(rows)  # `lines` reads it; the probe below carries no login
+    fits[:] = [
+        not row.note or line.cell_len <= limit
+        for row, line in zip(rows, lines(EMAIL_FLOOR, True))
+    ]
+
+    def over(block: list[Text]) -> int:
+        return max((line.cell_len for ok, line in zip(fits, block) if ok), default=0) - limit
+
+    # (login form, short status texts, email cut): each step keeps what the one
+    # before gave up, the email slot at the width the last cut left it.
+    email = widest
+    for login, short, cut in (
+        ("full", False, False),
+        ("short", False, False),
+        ("short", False, True),
+        ("short", True, True),
+        (None, True, True),
+    ):
+        shown = lines(email, short, login)
+        if cut and over(shown) > 0:
+            email = max(EMAIL_FLOOR, email - over(shown))
+            shown = lines(email, short, login)
+        if over(shown) <= 0:
+            break
+    else:
+        shown = lines(EMAIL_FLOOR, True, room=limit)
+    out = Text()
+    for line in shown:
+        out.append("\n")
+        out.append_text(line)
+    return out
 
 
 # Triggers whose pass the panel never runs, each with WHY: a state the tick
@@ -408,7 +713,7 @@ class AutoScreen(Screen):
         self._update_summary()
         # The Next best list ranks by the lines in force, so it must follow
         # the session value now rather than at the next snapshot: under a
-        # weekly line the order and the 5h rows' "(line N%)" both move.
+        # weekly line the order and the 5h rows' "threshold N%" both move.
         self._on_snapshot(self.app.snapshot)
 
     def action_cycle_strategy(self) -> None:
@@ -615,8 +920,15 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         settings = self._settings
         models = parse_model_names(settings.model) if settings else ()
-        threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
+
+        # `bar` is bound further down, before the first call.
+        def line_of(acc) -> float:
+            return acc.policy.threshold if acc.policy.threshold is not None else bar
+
+        def noted(acc) -> bool:
+            return weekly is not None or acc.policy.threshold is not None
+
         # `dynamic` ranks on `consume_first_rank_key` below, same as
         # `consume-first` (CONSUME_FIRST_STRATEGIES) -- but that is not
         # always the engine's OWN axis for a `dynamic` tick: depending on
@@ -695,8 +1007,7 @@ class AutoScreen(Screen):
             else:
                 rank_models = ()
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
-        # (acc while the row can carry a re-login note, name, the rest)
-        lines: dict[str, tuple[AccountSnapshot | None, Text, Text]] = {}
+        rows: dict[str, CandidateRow] = {}
         # The badge rides on that account's own row rather than the summary
         # line: naming the pin separately makes you match an email against the
         # list directly below it instead of just reading the list.
@@ -706,6 +1017,44 @@ class AutoScreen(Screen):
         # mistake was fixed for the pin lookup itself — see the test that pins
         # its call count.
         pin_applying = pin.pin_is_applying(self.app.switcher) if pinned_identity else None
+        # Chip columns are keyed by WINDOW NAME, never by position: two rows
+        # can have different-length window lists built from that account's
+        # own payload (`relevant_windows`), so "chip 1" is not the same
+        # window across rows. Computed once, before any row is drawn, over
+        # exactly the accounts that will reach the chip branch below
+        # (switchable, no sentinel, a known binding pct).
+        row_windows: dict[str, list[tuple[str, float, str | None]]] = {}
+        for acc in snap.accounts:
+            if (
+                acc.number == active_number
+                or not acc.switchable
+                or acc.usage.sentinel is not None
+                or binding_pct(acc.usage.last_good, models) is None
+            ):
+                continue
+            row_windows[acc.number] = oauth.relevant_windows(acc.usage.last_good, models)
+        # The column set is the union of window names over every chip row, in
+        # first-seen order; a row without a window gets a blank cell, so no
+        # later column moves. (label text, pct text) widths per column; the
+        # threshold note is the row's last cell, so it takes no column.
+        chip_width: dict[str, tuple[int, int]] = {}
+        for acc in snap.accounts:
+            windows = row_windows.get(acc.number)
+            if windows is None:
+                continue
+            for label, wpct, resets_at in windows:
+                label_w, pct_w = chip_width.get(label, (0, 0))
+                chip_width[label] = (
+                    max(label_w, cell_len(data.chip_label(
+                        label, data.reset_text({"resets_at": resets_at}, now)
+                    ))),
+                    max(pct_w, cell_len(f"{wpct:.0f}%")),
+                )
+        # 5h and 7d lead whatever row came first (sorted is stable, so the
+        # rest keep first-seen order).
+        chip_width = dict(sorted(
+            chip_width.items(), key=lambda kv: {"5h": 0, "7d": 1}.get(kv[0], 2)
+        ))
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -715,9 +1064,6 @@ class AutoScreen(Screen):
             # showed two accounts here and five in the engine's own log. A row
             # that says why it cannot be picked beats a row that isn't there.
             if not acc.switchable:
-                head, entry = Text(), Text()
-                head.append(f"\n  {acc.number:>2}  ", style=palette.muted)
-                head.append(acc.email, style=palette.muted)
                 # From SENTINEL_NOTES, not written here: an API-key slot has no
                 # login to restore, and the switch screen reads the same table,
                 # so both surfaces must describe a slot identically.
@@ -731,23 +1077,29 @@ class AutoScreen(Screen):
                     USAGE_API_KEY if acc.kind == "api_key"
                     else acc.usage.sentinel or USAGE_NO_CREDENTIALS
                 )
-                entry.append(f"  {why}", style=palette.sev_warn)
-                lines[acc.number] = (None, head, entry)  # no stored login, no re-login note
+                rows[acc.number] = CandidateRow(
+                    Text(acc.number, style=palette.muted),
+                    Text(acc.email, style=palette.muted),
+                    Text(why, style=palette.sev_warn),
+                    note=True,
+                )
                 ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
-            line = acc.policy.threshold if acc.policy.threshold is not None else bar
+            line = line_of(acc)
             binding = binding_window(
                 oauth.relevant_windows(acc.usage.last_good, models),
                 line,
                 weekly,
                 scale=bar,
             )
-            head, entry = Text(), Text()
-            head.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            head.append(acc.email, style=palette.foreground)
+            usage = Text()
+            status: dict[str, Text] = {}
+            short: dict[str, Text] = {}
+            free_text = False
             if acc.usage.sentinel is not None:
-                entry.append(
-                    f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
+                free_text = True
+                usage.append(
+                    data.sentinel_label(acc.usage.sentinel), style=palette.muted
                 )
                 ranked.append(((998.0,), acc.number))
             elif binding is None:
@@ -762,18 +1114,19 @@ class AutoScreen(Screen):
                 )
                 if spend is not None:
                     _label, spend_pct, spend_suffix, _full = spend
-                    entry.append("  $$ ", style=palette.muted)
-                    entry.append(f"{spend_pct:.0f}%",
+                    usage.append("$$ ", style=palette.muted)
+                    usage.append(f"{spend_pct:.0f}%",
                                  style=palette.severity(spend_pct))
-                    entry.append(f" · {spend_suffix}", style=palette.muted)
+                    usage.append(f" · {spend_suffix}", style=palette.muted)
                 else:
-                    entry.append("  usage unknown", style=palette.muted)
+                    free_text = True
+                    usage.append("usage unknown", style=palette.muted)
                 # A spend-axis account is never a ranking target regardless
                 # of `acc.disabled` (`relevant_windows` excludes spend, so
                 # `_rank` can't see it) -- but every OTHER row here says why
                 # it is never chosen, and this was the one silent exception.
                 if acc.disabled:
-                    entry.append("  auto-swap disabled", style=palette.muted)
+                    status["disabled"] = Text("auto-swap disabled", style=palette.muted)
                 # RANKED LAST EITHER WAY. Spend is not headroom: folding it
                 # into the sort key would change which account the engine
                 # picks, and the ranking axis is not this row's to move.
@@ -784,23 +1137,31 @@ class AutoScreen(Screen):
                 # SAME relevant_windows call feeds the label below, so the
                 # chips and the label can never disagree on which windows
                 # exist for this account.
-                now = time.time()
-                windows = oauth.relevant_windows(acc.usage.last_good, models)
-                for i, (label, wpct, resets_at) in enumerate(windows):
-                    entry.append("  " if i == 0 else " · ", style=palette.muted)
-                    entry.append(
-                        data.chip_label(label, data.reset_text({"resets_at": resets_at}, now)),
+                windows = row_windows[acc.number]
+                have = {label: (wpct, resets_at) for label, wpct, resets_at in windows}
+                shown = False
+                for i, (label, (label_w, pct_w)) in enumerate(
+                    chip_width.items() if windows else ()
+                ):
+                    sep = "" if i == 0 else " · " if shown else "   "
+                    if label not in have:
+                        usage.append(" " * (len(sep) + label_w + pct_w))
+                        continue
+                    wpct, resets_at = have[label]
+                    label_text = data.chip_label(
+                        label, data.reset_text({"resets_at": resets_at}, now)
+                    )
+                    pct_text = f"{wpct:.0f}%"
+                    usage.append(sep, style=palette.muted)
+                    # Label right-aligned so the `:` shares a column (owner,
+                    # 2026-09-15); pct right-aligned so the `%` does.
+                    usage.append(
+                        " " * (label_w - cell_len(label_text)) + label_text
+                        + " " * (pct_w - cell_len(pct_text)),
                         style=palette.muted,
                     )
-                    entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
-                    # Once the lines differ, name the one the BINDING window is
-                    # judged against; the raw pct stays.
-                    if (
-                        weekly is not None or acc.policy.threshold is not None
-                    ) and label == binding.label:
-                        entry.append(
-                            f" (line {pct_label(binding.line)}%)", style=palette.muted
-                        )
+                    usage.append(pct_text, style=palette.severity(wpct))
+                    shown = True
                 # A candidate whose LAST poll failed (an active backoff, a
                 # run of failures; a success clears both) must not present
                 # its cached figures as live. Not `fresh()`'s 180 s TTL: a
@@ -809,22 +1170,20 @@ class AutoScreen(Screen):
                 if acc.usage.in_backoff(now) or acc.usage.consecutive_failures:
                     # A lapsed plan is a permanent 403, not a poll gap.
                     lapsed = acc.usage.last_error == "oauth_not_allowed_for_organization"
-                    entry.append("  no plan" if lapsed else "  stale", style=palette.sev_warn)
+                    status["no-plan" if lapsed else "stale"] = Text(
+                        "no plan" if lapsed else "stale", style=palette.sev_warn
+                    )
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
                 # a model-only block (the engine's fallback ranks around it).
-                # The CLASSIFICATION (open/model/full) reads the same way
-                # here as in the decision log — same helper,
-                # `classify_candidate_block`, the same strategy-aware `bar`
-                # the engine's own landing gate reads (#321). It still does
-                # not fold in the engine's other, separate, stricter landing
-                # floor -- `cold_switch_cost_pct` in autoswitch.py -- a
-                # candidate clearing this label can still fail that one.
-                # Always on `models`, the full pinned set: this label
-                # explains why the row is not simply "open"
-                # on the criteria the user actually configured, independent
-                # of whether `rank_models` below has dropped to the retry's
-                # axis for ORDERING purposes.
+                # The decision log classifies with the same helper,
+                # `classify_candidate_block`, but words it its own way; the
+                # panel words it plainly. Always on `models`, the full pinned
+                # set: this label explains why the row is not simply "open" on
+                # the criteria the user actually configured, independent of
+                # whether `rank_models` below has dropped to the retry's axis
+                # for ORDERING purposes.
+                kind, blocked_model = "open", None
                 if self._settings:
                     kind, blocked_model = classify_candidate_block(
                         ((label, p) for label, p, _ in windows),
@@ -832,25 +1191,24 @@ class AutoScreen(Screen):
                         weekly,
                     )
                     if kind == "model":
-                        entry.append(
-                            f"  {model_block_label(blocked_model)}",
-                            style=palette.muted,
-                        )
+                        status["walled"] = Text(f"{blocked_model} limit reached", style=palette.muted)
+                        short["walled"] = Text(f"{blocked_model} full", style=palette.muted)
                     elif kind == "full":
-                        # The WORDING, unlike the classification, does not
-                        # read the same here as in the decision log's own
-                        # "(<window> full)" (autoswitch.py `_describe`):
-                        # "full" is reserved here for actual exhaustion (the
-                        # window's own pct at or over 100); a window merely
-                        # blocked at the bar prints no marker (the owner's
-                        # report, 92% read "full" against a threshold of 90).
+                        # A window at or over 100 is `<w> limit reached` (short `<w> full`): the label is reserved for
+                        # actual exhaustion (the owner's report, 92% read "full" against a threshold of 90), so a window
+                        # merely over its line reads no label here; its chip and the `limit <line>` note below show it.
                         window_pct = next(
                             p for label, p, _ in windows if label == blocked_model
                         )
                         if window_pct >= 100.0:
-                            entry.append(
-                                f"  {blocked_model} full", style=palette.muted
-                            )
+                            status["block"] = Text(f"{blocked_model} limit reached", style=palette.muted)
+                            short["block"] = Text(f"{blocked_model} full", style=palette.muted)
+                # Only when the binding window's chip was drawn above.
+                if binding.label in have:
+                    pct = _line_note(binding, binding.label, noted(acc))
+                    if pct:
+                        status["threshold"] = Text(f"limit {pct}", style=palette.muted)
+                        short["threshold"] = Text(f"lim {pct}", style=palette.muted)
                 rank_binding = binding_window(
                     oauth.relevant_windows(acc.usage.last_good, rank_models),
                     line,
@@ -867,23 +1225,22 @@ class AutoScreen(Screen):
                 )
                 capped = weekly_capped(acc.policy.weekly_cap, acc.usage.last_good)
                 if capped:
-                    # A veto, not a rank: the engine never lands here.
-                    entry.append(
-                        f"  capped {capped[0]} {capped[1]:.0f}% >= "
-                        f"{acc.policy.weekly_cap:g}%",
-                        style=palette.sev_warn,
-                    )
+                    # A veto, not a rank: the engine never lands here. A weekly cap vetoes the row, so it reads in the status as `limit <cap>% reached`
+                    # (short `<cap>% reached`, the cap being the account's own `weekly_cap`), ONE reason: it takes the place of the threshold note and of
+                    # the label that names the same window (a window block or a model wall: the stronger claim, not a second one beside it).
+                    for name in ("threshold", *(("block", "walled") if blocked_model == capped[0] else ())):
+                        status.pop(name, None)
+                        short.pop(name, None)
+                    cap_pct = pct_label(acc.policy.weekly_cap)
+                    status["capped"] = Text(f"limit {cap_pct}% reached", style=palette.sev_warn)
+                    short["capped"] = Text(f"{cap_pct}% reached", style=palette.sev_warn)
                     key = (997.0,)
-                if acc.number in short:
-                    entry.append(
-                        "  too little room under its line", style=palette.sev_warn
-                    )
                 ranked.append((key, acc.number))
             # Outside the usage branches on purpose: an account whose usage is
             # unknown still owns the claude.ai side, so the badge must not hang
             # off whichever branch happened to run.
+            where = Text()
             if pin.account_is_pinned(pinned_identity, acc.email, acc.org_uuid):
-                entry.append("  · ", style=palette.muted)
                 # SET IS NOT APPLYING. This badge used to be lit by
                 # the pin's presence alone, so it stayed green while the daemon
                 # could not mint the pinned token and every request went out
@@ -893,10 +1250,20 @@ class AutoScreen(Screen):
                 # tell" and must read as healthy here, same rule as
                 # `pin_is_broken`.
                 if pin_applying is False:
-                    entry.append("⚠ cloud UNPINNED", style=f"bold {palette.sev_crit}")
+                    where.append("⚠ cloud UNPINNED", style=f"bold {palette.sev_crit}")
                 else:
-                    entry.append("○ cloud", style=f"bold {palette.sev_warn}")
-            lines[acc.number] = (acc, head, entry)
+                    where.append("○ cloud", style=f"bold {palette.sev_warn}")
+            rows[acc.number] = CandidateRow(
+                Text(acc.number, style=palette.foreground),
+                Text(acc.email, style=palette.foreground),
+                usage,
+                status=status,
+                short=short,
+                where=where,
+                login=Text(login_segment(acc, "full", gap=""), style=palette.muted),
+                login_short=Text(login_segment(acc, "short", gap=""), style=palette.muted),
+                note=free_text,
+            )
 
         text = Text()
         text.append("Next best", style=palette.muted)
@@ -909,28 +1276,21 @@ class AutoScreen(Screen):
         if note:
             # Rows are still listed, but none is something a tick would switch to.
             text.append(f"\n  {note}", style=palette.muted)
+        # The box has no width before its first layout (the app's less its
+        # padding), and a screen built with `__new__` has no `_nodes` to query.
+        try:
+            box = self.query_one("#candidates", Static)
+        except AttributeError:
+            width = None
+        else:
+            width = box.size.width or self.app.size.width - 4
         place = {number: i for i, number in enumerate(ordered)}
-        order = [lines[number] for _key, number in sorted(
-            ranked,
-            key=lambda kn: ((0, place[kn[1]]) if kn[1] in place else (1, *kn[0]), kn[1]),
-        )]
-        # The box has no width before its first layout; its CSS padding is 2 a side.
-        budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
-        # Only the rows that can carry a re-login note are fitted: an
-        # unswitchable row's long note would otherwise fail every form and
-        # drop the note from the rows that have one.
-        fitted = iter(
-            fit_login(
-                lambda login: [
-                    Text.assemble(
-                        head, tail, Text(login_segment(acc, login), style=palette.muted)
-                    )
-                    for acc, head, tail in order
-                    if acc
-                ],
-                budget,
-            )
-        )
-        for acc, head, tail in order:
-            text.append(next(fitted) if acc else Text.assemble(head, tail))
+        text.append_text(render_candidate_rows(
+            [rows[number] for _key, number in sorted(
+                ranked,
+                key=lambda kn: (
+                    (0, place[kn[1]]) if kn[1] in place else (1, *kn[0]), kn[1]
+                ),
+            )], palette, width
+        ))
         return text
