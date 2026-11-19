@@ -336,9 +336,9 @@ class TestDashboardFit:
 
     @pytest.mark.asyncio
     async def test_due_note_steps_down_to_fit_the_row(self, tmp_path):
-        # 104 columns (the minis' chips carry their reset countdown): the full
+        # 96 columns (the minis' chips have no reset time here and read `(⟳?)`, narrower than a countdown): the full
         # note overflows the minis, the short one fits.
-        lines, size, _shown = await _dashboard(tmp_path, _seven(time.time() + DUE), (104, 24))
+        lines, size, _shown = await _dashboard(tmp_path, _seven(time.time() + DUE), (96, 24))
         assert all(cell_len(line) <= size.width for line in lines)
         assert size.height == len(lines)
         minis = [line for line in lines if line.split()[:1] in [[str(n)] for n in range(2, 8)]]
