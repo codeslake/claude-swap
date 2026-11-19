@@ -472,3 +472,17 @@ def test_a_disabled_active_holds_no_rank_to_defend(temp_home):
     h.switcher.set_account_disabled("1", True)
     assert h.tick_with_usage(usage(h)) is TickOutcome.SWITCHED
     assert h.active_number() == 2
+
+
+def test_a_stale_probe_pick_does_not_rename_a_priority_switch(temp_home):
+    """`_last_probe_num` is the side channel of the last consume-first rank. A
+    priority rank never rewrites it, so a pick left from an earlier tick under
+    another strategy must not name this switch a probe (and arm a probe
+    cooldown on the account)."""
+    h = fleet(temp_home)
+    h.engine._last_probe_num = "2"
+    assert h.tick_with_usage(usage(h, pcts=(90, 10, 10, 10))) is TickOutcome.SWITCHED
+    assert h.active_number() == 2
+    sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+    assert sw.trigger == "proactive"  # the active is over its line; never "probe"
+    assert not h.engine._read_state()["probeCooldown"]
