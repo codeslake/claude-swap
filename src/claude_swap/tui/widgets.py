@@ -183,6 +183,8 @@ def usage_rows(
 # nothing. A row carries one only while its login is due
 # (``oauth.login_time_left``), so most rows read as if there were no note.
 LOGIN_FORMS = ("full", "short", None)
+# The narrowest a name or email column is cut to, in display columns, when a row is over its panel.
+NAME_FLOOR = 12
 
 
 def login_segment(
@@ -199,13 +201,24 @@ def login_segment(
     return f"{gap}{note}" if note else ""
 
 
-def fit_login(build: Callable[[str | None], list[Text]], budget: int) -> list[Text]:
+def fit_login(
+    build: Callable[..., list[Text]], budget: int, squeeze: bool = False
+) -> list[Text]:
     """``build(form)`` for the fullest login form in which every row's first
     line fits ``budget`` columns; usage figures are never cut, so with no
-    fitting form the login goes."""
+    fitting form the login goes. With ``squeeze``, ``build(form, cut)`` also
+    cuts ``cut`` columns off the fields it can shorten: a form that does not
+    fit is built again with the columns it is over by, before the next form
+    (the login itself goes last) is tried."""
+
+    def over(rows: list[Text]) -> int:
+        return max((cell_len(row.plain.strip("\n").partition("\n")[0]) for row in rows), default=0) - budget
+
     for form in LOGIN_FORMS:
-        rows = build(form)
-        if all(cell_len(row.plain.strip("\n").partition("\n")[0]) <= budget for row in rows):
+        rows = build(form, 0) if squeeze else build(form)
+        if squeeze and form != "full" and over(rows) > 0:
+            rows = build(form, over(rows))
+        if over(rows) <= 0:
             break
     return rows
 
