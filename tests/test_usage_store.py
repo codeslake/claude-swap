@@ -3023,3 +3023,92 @@ class TestSuspectDrop:
         store.record({"1": FetchRecord(usage=new)}, IDENT)
         assert store.entries(IDENT)["1"].decision_value() == new
         assert not self._stamp(store)
+
+    @pytest.mark.parametrize(
+        "prior_seven, header_7d, seven, omit, held",
+        [
+            (100.0, "0.04", 4.0, False, False),
+            (30.0, None, 10.0, False, False),
+            (29.0, "0.29", 29.0, False, True),
+            (30.0, "0.295", 29.5, False, True),
+            (30.0, None, 29.5, False, True),
+            (100.0, "0.04", 4.0, True, True),
+            (30.0, None, 10.0, True, True),
+        ],
+        ids=[
+            "a header reading lowered 7d first",
+            "7d falls in the same reading",
+            "header float noise below the stored 7d",
+            "header sub-point jitter",
+            "7d sub-point fall in the same reading",
+            "scoped omitted after a header drop",
+            "scoped omitted beside a 7d that fell",
+        ],
+    )
+    def test_a_scoped_drop_is_taken_only_beside_a_corroborating_7d(
+        self, store, clock, prior_seven, header_7d, seven, omit, held
+    ):
+        # A real early reset drops 7d (past the floor) and the scoped window
+        # together; the header path (no scoped window) may already have lowered
+        # the 7d baseline. A scoped window the reading omits is never a reset.
+        prior = self._reading(clock, 0.0, prior_seven, 99.0)
+        store.record({"1": FetchRecord(usage=prior)}, IDENT)
+        if header_7d:
+            store.record_header_reading("1", IDENT, {usage_store.USAGE_HEADER_7D_PCT: header_7d})
+        clock.advance(80.0)
+        new = self._reading(clock, 3.0, seven, 4.0)
+        if omit:
+            del new["scoped"]
+        store.record({"1": FetchRecord(usage=new)}, IDENT)
+        expected = {**new, "scoped": prior["scoped"]} if held else new
+        assert store.entries(IDENT)["1"].decision_value() == expected
+        assert bool(self._stamp(store)) is held
+
+    @pytest.mark.parametrize("header_first", [False, True], ids=["plain", "after a header drop"])
+    def test_a_lone_scoped_drop_is_held_once(self, store, clock, header_first):
+        store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, 10.0, 99.0))}, IDENT)
+        if header_first:  # the next success clears the header-drop flag
+            store.record_header_reading("1", IDENT, {usage_store.USAGE_HEADER_7D_PCT: "0.04"})
+            clock.advance(80.0)
+            store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, 4.0, 99.0))}, IDENT)
+        seven = 4.0 if header_first else 10.0
+        clock.advance(80.0)
+        glitch = self._reading(clock, 0.0, seven, 4.0)
+        store.record({"1": FetchRecord(usage=glitch)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value()["scoped"][0]["pct"] == 99.0
+        assert self._stamp(store) is True
+        clock.advance(80.0)
+        store.record({"1": FetchRecord(usage=glitch)}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() == glitch
+        assert not self._stamp(store)
+
+    def test_a_held_seven_day_keeps_the_scoped_drop_held_after_a_header_drop(
+        self, store, clock
+    ):
+        prior = self._reading(clock, 0.0, 100.0, 99.0)
+        store.record({"1": FetchRecord(usage=prior)}, IDENT)
+        store.record_header_reading(
+            "1",
+            IDENT,
+            {
+                usage_store.USAGE_HEADER_7D_PCT: "0.4",
+                usage_store.USAGE_HEADER_7D_RESET: str(clock.now + 86_400.0),
+            },
+        )
+        clock.advance(80.0)
+        store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, 0.0, 0.0))}, IDENT)
+        held = store.entries(IDENT)["1"].decision_value()
+        assert held["seven_day"]["pct"] == pytest.approx(40.0)
+        assert held["scoped"] == prior["scoped"]
+        assert self._stamp(store) is True
+
+    def test_an_adopted_reading_clears_the_header_drop_flag(self, store, clock):
+        store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, 100.0, 99.0))}, IDENT)
+        store.record_header_reading("1", IDENT, {usage_store.USAGE_HEADER_7D_PCT: "0.04"})
+        clock.advance(10.0)
+        adopted = self._reading(clock, 0.0, 4.0, 99.0)
+        assert store.adopt({"1": (adopted, 0.0)}, IDENT) == {"1"}
+        clock.advance(80.0)
+        store.record({"1": FetchRecord(usage=self._reading(clock, 0.0, 4.0, 4.0))}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value()["scoped"] == adopted["scoped"]
+        assert self._stamp(store) is True
