@@ -479,6 +479,8 @@ CROSS_PR_WRITE_SITES: dict[tuple[str, str], int] = {
     ("switcher.py", "_adopt_login_into_slot"): 1,
     ("switcher.py", "_adopt_stashed_login_for_slot"): 1,
     ("switcher.py", "_adopt_into_dead_slot"): 1,
+    # T2116: #199's tier fill, a same-lineage CAS write, unattributed.
+    ("switcher.py", "_fill_slot_tier"): 1,
 }
 
 # A SECOND call PR 199 added inside a function this round DID review
@@ -489,6 +491,11 @@ CROSS_PR_WRITE_SITES: dict[tuple[str, str], int] = {
 # an override could silently absorb an unreviewed second write; addition cannot.
 CROSS_PR_WRITE_SITE_DELTAS: dict[tuple[str, str], int] = {
     ("switcher.py", "_fetch_active_usage"): 1,
+    # T1125: the in-memory `_unpersisted` fast path, a second write
+    # inside the same function EXPECTED_WRITE_SITE_ROSTER already
+    # reviews once (the on-disk stash scan) -- keyed here, not
+    # there, so the count above stays #210's own branch exactly.
+    ("switcher.py", "_adopt_stashed_successor"): 1,
 }
 
 # The union below (`{**EXPECTED_WRITE_SITE_ROSTER, **CROSS_PR_WRITE_SITES}`) lets a
