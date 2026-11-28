@@ -984,17 +984,23 @@ class AutoScreen(Screen):
                         continue
                     wpct, label_text, pct_text, was_passed = have[label]
                     usage.append(sep, style=palette.muted)
-                    # Label right-aligned so the `:` shares a column (owner,
-                    # 2026-09-15); pct right-aligned so the `%` does.
-                    usage.append(
-                        " " * (label_w - cell_len(label_text)) + label_text
-                        + " " * (pct_w - cell_len(pct_text)),
-                        style=palette.muted,
-                    )
-                    usage.append(
-                        pct_text,
-                        style=palette.muted if was_passed else palette.severity(wpct),
-                    )
+                    # Chip left-aligned so it starts in one column (owner, 2026-10-05); pct
+                    # right-aligned so the `%` ends in one. A passed window reads `5h ?` (upstream
+                    # #625): the chip and its `?` stay together and the padding follows, so the column
+                    # after it starts where it does on every row.
+                    if was_passed:
+                        usage.append(
+                            label_text + pct_text
+                            + " " * (label_w + pct_w - cell_len(label_text) - cell_len(pct_text)),
+                            style=palette.muted,
+                        )
+                    else:
+                        usage.append(
+                            label_text + " " * (label_w - cell_len(label_text))
+                            + " " * (pct_w - cell_len(pct_text)),
+                            style=palette.muted,
+                        )
+                        usage.append(pct_text, style=palette.severity(wpct))
                     shown = True
                 # A candidate whose LAST poll failed (an active backoff, a
                 # run of failures; a success clears both) must not present
