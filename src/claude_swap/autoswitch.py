@@ -969,6 +969,50 @@ def empty_pass_refusal(
     return "deliberate-wait" if waiting_for_recovery else "no-qualifying-candidate"
 
 
+def no_peer_refusal(
+    *,
+    trigger: str,
+    active_headroom: float | None,
+    oauth_candidates: Sequence[str],
+    api_key_candidates: Sequence[str],
+) -> str | None:
+    """The refusal before any pass runs, when no OAuth peer exists: a healthy
+    below-line hold for the consume-first family (API-key candidates do not
+    change it, they have no weekly window to consume), else the lack of any
+    candidate. None when a pass has someone to rank. The tick and the "Next
+    best" panel share this one reading."""
+    if (
+        trigger in (*CONSUME_FIRST_STRATEGIES, "priority")
+        and not oauth_candidates
+        and active_headroom is not None
+    ):
+        return "below-threshold"
+    if not oauth_candidates and not api_key_candidates:
+        return "no-candidates"
+    return None
+
+
+def empty_pass_refusal(
+    *,
+    trigger: str,
+    any_known: bool,
+    active_reset_ts: float | None,
+    waiting_for_recovery: bool,
+    candidate_headrooms: Sequence[float | None],
+) -> str:
+    """Why a pass that admitted nobody holds, from what the pass returned (see
+    ``_rank_candidates_pass``) and the model-gated headroom of the OAuth
+    candidates. Not the priority strategy's, which has its own pass. The tick
+    and the "Next best" panel share this one reading."""
+    if not any_known:
+        return "no-comparison"
+    if trigger in CONSUME_FIRST_STRATEGIES:
+        return "reset-unknown" if active_reset_ts is None else "already-consuming-soonest"
+    if all(h is not None and h <= 0 for h in candidate_headrooms):
+        return "all-exhausted"
+    return "deliberate-wait" if waiting_for_recovery else "no-qualifying-candidate"
+
+
 def _all_above_margin_met(candidate_headroom: float, active_headroom: float) -> bool:
     """Does a candidate beat the active by enough to move, every account over
     its own switch lines?
@@ -4231,18 +4275,23 @@ class AutoSwitchEngine:
                 # Its own landing rule, and no no-return bar: the account
                 # this engine left qualifies again only once it has been
                 # read anew, which is what the bar would otherwise ask.
-                return (
-                    self._rank_verified_landings(
-                        oauth_candidates=kw["oauth_candidates"],
-                        entries=entries, usage=kw["usage"],
-                        headroom=kw["headroom"], settings=settings,
-                        now=kw["now"], thresholds=thresholds, policies=policies,
-                        overload_backoff=overload_backoff,
-                    ),
-                    True,
-                    None,
-                    False,
+                landing = dict(
+                    oauth_candidates=kw["oauth_candidates"], entries=entries,
+                    usage=kw["usage"], settings=settings, now=kw["now"],
+                    thresholds=thresholds, policies=policies,
+                    overload_backoff=overload_backoff,
                 )
+                landings = self._rank_verified_landings(
+                    headroom=kw["headroom"], **landing
+                )
+                # `dynamic` only, as in `_rank_candidates`: the blind active
+                # is judged on 5h/7d, so a model window is no blackout here.
+                if not landings and self._models and settings.strategy == "dynamic":
+                    landings = self._rank_verified_landings(
+                        headroom=_headroom_by_account(kw["usage"], ()),
+                        models=(), **landing,
+                    )
+                return landings, True, None, False
             if priority_mode:
                 # Strict landing and a stable priority/reset ordering make the
                 # legacy escape/no-return heuristics unnecessary. A recovered
@@ -5473,6 +5522,7 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings, now: float,
         thresholds: Mapping[str, float], policies: Mapping[str, AccountPolicy],
         overload_backoff: Mapping[str, float] | None = None,
+        models: Sequence[str] | None = None,
     ) -> list[str]:
         """Where an ``active-stale`` move may land, best first.
 
@@ -5491,6 +5541,9 @@ class AutoSwitchEngine:
         weekly reset under ``priority-consume-first``, soonest weekly reset
         under ``consume-first``, ``dynamic`` and ``weekly-first``, else most
         headroom against the account's own lines.
+
+        ``models`` is the window set ``headroom`` was read on (default the
+        pinned model set), so room and binding read the same one.
         """
         dynamic = settings.strategy == "dynamic"
         by_reset = settings.strategy in (*CONSUME_FIRST_STRATEGIES, "weekly-first")
@@ -5506,12 +5559,12 @@ class AutoSwitchEngine:
                 if h <= _wall_headroom(thresholds.get(num)):
                     continue
             else:
-                room = self._room(usage.get(num), settings, thresholds[num])
+                room = self._room(usage.get(num), settings, thresholds[num], models=models)
                 if room is None:
                     room = thresholds[num] - (100.0 - h)
                 if room <= 0 or room < settings.hysteresis_pct:
                     continue
-            binding = self._binding(usage.get(num), settings, thresholds[num])
+            binding = self._binding(usage.get(num), settings, thresholds[num], models=models)
             lh = binding.line_headroom if binding is not None else h
             reset = _seven_day_reset_ts(usage.get(num), now)
             soonest = reset if reset is not None else float("inf")
@@ -5568,6 +5621,8 @@ class AutoSwitchEngine:
         comes back empty and the caller's existing blackout path is
         untouched.
         """
+        if thresholds is None:
+            thresholds = ThresholdMap({}, settings.threshold)
         kw = dict(
             trigger=trigger,
             consume_first=consume_first,
@@ -5644,8 +5699,6 @@ class AutoSwitchEngine:
         "Next best" panel reaches it through the module-level ``rank_candidates_pass`` with no
         engine instance.
         """
-        if thresholds is None:
-            thresholds = ThresholdMap({}, settings.threshold)
         # weekly-first is `best` with consume-first's ranking: the same
         # departure line, landing gates, hysteresis and escapes as `best`, but
         # a proactive move picks the eligible account whose weekly window
@@ -6092,7 +6145,10 @@ class AutoSwitchEngine:
                     # `active_headroom` is the axis THIS pass ranks by — the
                     # model-gated one on the primary call, `fallback_headroom
                     # [current]` on the 5h/7d retry — so a landing is always
-                    # an improvement on the axis that admitted it.
+                    # an improvement on the axis that admitted it. Measured in
+                    # policy headroom, so a 7d 93% candidate under a 97 line
+                    # beats a 5h 95% active under 85 — raw headroom (7 vs 5)
+                    # would park on the account about to hit its limit.
                     if lh - active_lh < settings.hysteresis_pct:
                         continue
             if all_above:

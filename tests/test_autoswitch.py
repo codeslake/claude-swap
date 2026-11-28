@@ -2025,12 +2025,75 @@ class TestAdaptiveScheduler:
         assert [(a, t) for a, _, t in self._switches(h)] == [(1, "weekly-capped")]
         assert set(counts) == {"2", "3"}  # 1 is in backoff; both peers read
 
+    def test_a_blind_dynamic_active_on_a_model_wall_leaves_its_peers_on_their_plan(
+        self, temp_home, monkeypatch
+    ):
+        # `dynamic` judges the active on 5h/7d with the pinned model's window
+        # dropped, so a frozen reading whose ONLY over-line window is the model
+        # wall is still below its line: the tick counts it, and the count must
+        # not refetch every peer on each waiting tick.
+        h = self._harness(temp_home, monkeypatch, strategy="dynamic", model="Fable")
+        frozen = {
+            "five_hour": {"pct": 40.0}, "seven_day": {"pct": 40.0},
+            "scoped": [{"name": "Fable", "pct": 98.0,
+                        "resets_at": _iso_at(h.clock.now + 3 * 86400)}],
+        }
+        usage = {"1": frozen, "2": _usage(10), "3": _usage(20)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        self._refuse(h, "1", 600.0)
+        h.clock.advance(400)
+        counts.clear()
+        h.events.clear()
+        assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["active-usage-stale"]
+        assert sum(counts.values()) <= 1  # the baseline slot only, no escalate-all
+
+    @pytest.mark.parametrize(
+        "strategy, active_fable, lands",
+        [("dynamic", 98.0, True), ("best", 50.0, False)],
+    )
+    def test_a_blind_active_lands_on_peers_over_only_their_model_line_under_dynamic(
+        self, temp_home, monkeypatch, strategy, active_fable, lands
+    ):
+        # Every peer is measured and has 5h/7d room, over only the pinned
+        # model's line. A model window is not a blackout under `dynamic`
+        # (`_rank_candidates` retries on 5h/7d), and the blind active is
+        # judged on 5h/7d too, so the landing reads that basis as well.
+        h = self._harness(temp_home, monkeypatch, strategy=strategy, model="Fable")
+
+        def fable(pct, fable_pct):
+            return {
+                "five_hour": {"pct": pct}, "seven_day": {"pct": pct},
+                "scoped": [{"name": "Fable", "pct": fable_pct,
+                            "resets_at": _iso_at(h.clock.now + 3 * 86400)}],
+            }
+
+        usage = {"1": fable(40, active_fable), "2": fable(10, 100), "3": fable(20, 100)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        h.clock.advance(60)
+        self._tick(h, counts, usage)
+        self._refuse(h, "1", 600.0)
+        h.clock.advance(400)
+        for _ in range(3):
+            self._tick(h, counts, usage)
+            h.clock.advance(60)
+        if lands:
+            assert self._switches(h) == [(1, 2, "active-stale")]
+        else:
+            assert self._switches(h) == []
+            assert self._reasons(h)[-1] == "no-verified-target"
+
     def test_a_429_frozen_active_reading_moves_to_a_measured_account(
         self, temp_home, monkeypatch
     ):
         # #208 as reported: line 85, the active account's last reading 58%,
         # then every refresh 429s while the account keeps being used. The
         # frozen 58% must not keep answering "below the line".
+        # Pinned: "below-threshold" is not emitted under the consume-first default.
         h = self._harness(temp_home, monkeypatch, threshold=85.0, strategy="best")
         usage = {"1": _usage(58), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
@@ -2307,6 +2370,7 @@ class TestAdaptiveScheduler:
     def test_a_refresh_that_gets_through_clears_the_count(
         self, temp_home, monkeypatch
     ):
+        # Pinned: "below-threshold" is not emitted under the consume-first default.
         h = self._harness(temp_home, monkeypatch, strategy="best")
         usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
@@ -2380,6 +2444,7 @@ class TestAdaptiveScheduler:
     ):
         # A single 429 on a reading younger than STALE_OK_S changes nothing:
         # the reading is as recent as any trusted one.
+        # Pinned: "below-threshold" is not emitted under the consume-first default.
         h = self._harness(temp_home, monkeypatch, strategy="best")
         usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
@@ -3189,6 +3254,7 @@ class TestAdaptiveScheduler:
         outcome = self._tick(h, counts, view_b)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+        assert counts["2"] == 1  # the hold kept phase 2 from refetching #2
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert "stale-usage" not in reasons
 
@@ -7599,6 +7665,39 @@ class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
             "only on the axis that blocked the active) must beat #2 "
             "(headroom 1, genuinely near-dead)"
         )
+
+    def test_classify_reads_each_window_against_its_own_line(self):
+        """Under a weekly line the block label and the engine's `over` verdict
+        read ONE set of lines: 7d 93 under a 97 line is open (the engine would
+        land there), 5h 90 over an 85 line still blocks, and a scoped window
+        takes the weekly line."""
+        windows = [("5h", 5.0), ("7d", 93.0)]
+        assert classify_candidate_block(windows, 85.0) == ("full", "7d")
+        assert classify_candidate_block(windows, 85.0, 97.0) == ("open", None)
+        assert classify_candidate_block(
+            [("5h", 90.0), ("7d", 50.0)], 85.0, 97.0
+        ) == ("full", "5h")
+        assert classify_candidate_block(
+            [("5h", 5.0), ("7d", 5.0), ("Fable", 96.0)], 85.0, 97.0
+        ) == ("open", None)
+        assert classify_candidate_block(
+            [("5h", 5.0), ("7d", 5.0), ("Fable", 96.0)], 85.0, 95.0
+        ) == ("model", "Fable")
+
+    def test_the_decision_log_does_not_call_a_window_under_its_line_full(self):
+        def line(weekly):
+            return PollEvent(
+                active={"number": 1, "email": "a@example.com"},
+                headroom={"1": 5.0, "2": 7.0},
+                threshold=85.0,
+                windows={"1": {"5h": 95.0, "7d": 1.0}, "2": {"5h": 5.0, "7d": 93.0}},
+                weekly_threshold=weekly,
+            ).human()
+
+        assert "#2: 5h 5% · 7d 93% (7d full)" in line(None)
+        under_line = line(97.0)
+        assert "#2: 5h 5% · 7d 93%" in under_line
+        assert "(7d full)" not in under_line, under_line
 
 
 class TestTheRetryAdmitsOnlyAnImprovement:
@@ -15180,9 +15279,9 @@ class TestLiveLock:
             reasons=['PollEvent', 'stale-usage']
 
         against `['PollEvent', 'engine-stopped']` unmutated. "usage could not
-        be refreshed this tick (backoff or a concurrent poller); retrying"
-        sends an operator after a fetch problem that does not exist, for an
-        engine that simply stopped.
+        be refreshed this tick (backoff, a hold, or a concurrent poller);
+        retrying" sends an operator after a fetch problem that does not
+        exist, for an engine that simply stopped.
 
         Asserts the REASON, which is what the gate decides now, rather than
         the freshen count, which something else already bounds.
@@ -21225,6 +21324,29 @@ class TestWeeklyThreshold:
         assert h.tick_with_usage({"1": active, "2": _usage7(5, 5)}) is expected
         if detail is not None:
             assert self._details(h) == [detail]
+
+    @pytest.mark.parametrize(
+        "strategy,fable,stays_on",
+        [
+            # Headroom is 15 on the model-gated and the 5h/7d bases alike, so
+            # dynamic's widening does not fire at 82 (it does at 86, where
+            # the model window is read as no wall); the trigger must read the
+            # same 5h/7d windows at both. `best` keeps the model wall.
+            ("dynamic", 82.0, 1),
+            ("dynamic", 86.0, 1),
+            ("best", 82.0, 2),
+        ],
+    )
+    def test_dynamic_does_not_depart_for_a_model_window_over_its_weekly_line(
+        self, temp_home, strategy, fable, stays_on
+    ):
+        h = self._harness(
+            temp_home, threshold=90.0, weekly_threshold=80.0,
+            model="Fable", strategy=strategy,
+        )
+        active = {**_usage7(85, 10), "scoped": [{"name": "Fable", "pct": fable}]}
+        h.tick_with_usage({"1": active, "2": _usage7(5, 5)})
+        assert h.active_number() == stays_on
 
     @pytest.mark.parametrize(
         "fable,weekly,expected,detail",
