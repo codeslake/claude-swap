@@ -2035,7 +2035,7 @@ class TestAdaptiveScheduler:
         h = self._harness(temp_home, monkeypatch, strategy="dynamic", model="Fable")
         frozen = {
             "five_hour": {"pct": 40.0}, "seven_day": {"pct": 40.0},
-            "scoped": [{"name": "Fable", "pct": 98.0,
+            "scoped": [{"name": "Fable", "pct": 92.0,   # T3586: over the 90 line, short of the wall
                         "resets_at": _iso_at(h.clock.now + 3 * 86400)}],
         }
         usage = {"1": frozen, "2": _usage(10), "3": _usage(20)}
@@ -2043,8 +2043,10 @@ class TestAdaptiveScheduler:
         self._tick(h, counts, usage)
         h.clock.advance(60)
         self._tick(h, counts, usage)
+        h.clock.advance(240)   # T3586 (model-wall case): the peers come due at 300 s and are read there (#199 reads every due peer), so they sit on a plan again when the count is taken
+        self._tick(h, counts, usage)
         self._refuse(h, "1", 600.0)
-        h.clock.advance(400)
+        h.clock.advance(340)   # inside the 360 s #199 trusts a failed row
         counts.clear()
         h.events.clear()
         assert self._tick(h, counts, usage) is TickOutcome.NO_ACTION
@@ -2053,7 +2055,7 @@ class TestAdaptiveScheduler:
 
     @pytest.mark.parametrize(
         "strategy, active_fable, lands",
-        [("dynamic", 98.0, True), ("best", 50.0, False)],
+        [("dynamic", 92.0, True), ("best", 50.0, False)],   # T3586: 98.0 is inside the wall #321 leaves a blind dynamic active at (see the model-wall case above)
     )
     def test_a_blind_active_lands_on_peers_over_only_their_model_line_under_dynamic(
         self, temp_home, monkeypatch, strategy, active_fable, lands
@@ -2077,7 +2079,7 @@ class TestAdaptiveScheduler:
         h.clock.advance(60)
         self._tick(h, counts, usage)
         self._refuse(h, "1", 600.0)
-        h.clock.advance(400)
+        h.clock.advance(340)   # T3586 (landing case): inside the 360 s #199 trusts a failed row
         for _ in range(3):
             self._tick(h, counts, usage)
             h.clock.advance(60)
