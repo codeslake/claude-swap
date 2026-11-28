@@ -62,6 +62,7 @@ from claude_swap.tui.widgets import AccountsPanel, login_segment, spend_row, usa
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
+    from claude_swap.usage_store import UsageEntry
 
 _EVENT_ROLES = {
     "switch": "accent",
@@ -408,6 +409,22 @@ def render_candidate_rows(
         out.append("\n")
         out.append_text(line)
     return out
+
+
+def _chip_parts(
+    label: str, wpct: float, resets_at: str | None, now: float,
+    entry: UsageEntry,
+) -> tuple[str, str, bool]:
+    """One window's chip as ``(reading, figure, passed)``, read as the
+    dashboard reads it: ``5h ?`` once the reset has passed
+    (``oauth.window_reset_passed``, the stored pct describes a window that
+    ended), else ``5h(⟳2h04m):`` and the pct. A refused probe (``rejected``)
+    is a limit, not a window that ended."""
+    window = {"resets_at": resets_at}
+    if label != oauth.REJECTED_LABEL and oauth.window_reset_passed(window, now):
+        return f"{label} ", "?", True
+    reset = data.reset_text(window, now, entry.fetched_at, entry=entry)
+    return data.chip_label(label, reset, wpct), f"{wpct:.0f}%", False
 
 
 class AutoScreen(Screen):
@@ -929,12 +946,14 @@ class AutoScreen(Screen):
             if windows is None:
                 continue
             for label, wpct, resets_at in windows:
+                # The chip as the row draws it: `5h ?` once the window's reset has passed.
+                reading, figure, _passed = _chip_parts(
+                    label, wpct, resets_at, now, acc.usage
+                )
                 label_w, pct_w = chip_width.get(label, (0, 0))
                 chip_width[label] = (
-                    max(label_w, cell_len(data.chip_label(
-                        label, data.reset_text({"resets_at": resets_at}, now)
-                    ))),
-                    max(pct_w, cell_len(f"{wpct:.0f}%")),
+                    max(label_w, cell_len(reading)),
+                    max(pct_w, cell_len(figure)),
                 )
         # 5h and 7d lead whatever row came first (sorted is stable, so the
         # rest keep first-seen order).
@@ -996,7 +1015,10 @@ class AutoScreen(Screen):
                 # axis from a rate-limit window), so this row was the only
                 # place the same account read two different ways.
                 spend = spend_row(
-                    usage_rows(acc.usage.last_good, time.time())
+                    usage_rows(
+                        acc.usage.last_good, now, acc.usage.fetched_at,
+                        entry=acc.usage,
+                    )
                 )
                 if spend is not None:
                     _label, spend_pct, spend_suffix, _full = spend
@@ -1024,7 +1046,16 @@ class AutoScreen(Screen):
                 # chips and the label can never disagree on which windows
                 # exist for this account.
                 windows = row_windows[acc.number]
-                have = {label: (wpct, resets_at) for label, wpct, resets_at in windows}
+                # Each window's chip is read once (`_chip_parts`), so the widths above and the draw
+                # below agree on it.
+                chips = [
+                    (label, wpct, *_chip_parts(label, wpct, resets_at, now, acc.usage))
+                    for label, wpct, resets_at in windows
+                ]
+                have = {
+                    label: (wpct, label_text, pct_text, was_passed)
+                    for label, wpct, label_text, pct_text, was_passed in chips
+                }
                 shown = False
                 for i, (label, (label_w, pct_w)) in enumerate(
                     chip_width.items() if windows else ()
@@ -1033,11 +1064,7 @@ class AutoScreen(Screen):
                     if label not in have:
                         usage.append(" " * (len(sep) + label_w + pct_w))
                         continue
-                    wpct, resets_at = have[label]
-                    label_text = data.chip_label(
-                        label, data.reset_text({"resets_at": resets_at}, now)
-                    )
-                    pct_text = f"{wpct:.0f}%"
+                    wpct, label_text, pct_text, was_passed = have[label]
                     usage.append(sep, style=palette.muted)
                     # Label right-aligned so the `:` shares a column (owner,
                     # 2026-09-15); pct right-aligned so the `%` does.
@@ -1046,7 +1073,10 @@ class AutoScreen(Screen):
                         + " " * (pct_w - cell_len(pct_text)),
                         style=palette.muted,
                     )
-                    usage.append(pct_text, style=palette.severity(wpct))
+                    usage.append(
+                        pct_text,
+                        style=palette.muted if was_passed else palette.severity(wpct),
+                    )
                     shown = True
                 # A candidate whose LAST poll failed (an active backoff, a
                 # run of failures; a success clears both) must not present
@@ -1071,6 +1101,9 @@ class AutoScreen(Screen):
                 # for ORDERING purposes.
                 kind, blocked_model = "open", None
                 if self._settings:
+                    # Over EVERY window, a passed one included: the engine and
+                    # the decision log read its stored pct, so only its chip
+                    # reads `5h ?`, never the label (#325).
                     kind, blocked_model = classify_candidate_block(
                         ((label, p) for label, p, _ in windows),
                         line,
