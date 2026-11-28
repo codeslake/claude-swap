@@ -1460,6 +1460,7 @@ class TestRunCommand:
         # An unmapped directory launches the default login, which reads no
         # credential on the way, so the stub needs nothing account-shaped.
         script = textwrap.dedent("""\
+            import logging
             import sys
             from pathlib import Path
             from types import SimpleNamespace
@@ -1469,7 +1470,7 @@ class TestRunCommand:
 
             switcher = SimpleNamespace(
                 backup_dir=Path.cwd(),
-                _logger=None,
+                _logger=logging.getLogger("claude-swap"),
                 slot_for_directory=lambda cwd: (None, None),
                 _is_running_in_container=lambda: True,
             )
@@ -2528,6 +2529,14 @@ class TestRunAutoResolve:
 
             def exec_default(self, claude_args):
                 calls.append(("exec_default", claude_args))
+
+            # The launch notices go through these so they outlive the exec's
+            # screen blank; the fake prints them the way the real ones do.
+            def _warn(self, msg):
+                print(msg)
+
+            def _note(self, msg, *, dim=True):
+                print(msg)
 
         return FakeSessionManager
 
