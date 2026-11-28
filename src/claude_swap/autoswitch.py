@@ -3598,6 +3598,9 @@ class AutoSwitchEngine:
                     )
                 return warm, cold
 
+            # T1883 sweep: drop an account whose overload/refusal bar is live BEFORE either ranking below.
+            # The no-return retry re-ranks `cands` by name, so it releases `no_return` only, never this bar.
+            cands = [n for n in cands if at_now >= (overload_backoff.get(n) or 0)]
             warm, cold = rank([n for n in cands if n != no_return])
             bar_active = no_return is not None
             if no_return is not None and not warm and not cold and recovered:
@@ -3760,6 +3763,15 @@ class AutoSwitchEngine:
             dynamic_ordered = ahead
         elif settings.strategy == "dynamic" and trigger == "dynamic-healthy":
             now = self.clock()
+            # T1883 sweep: the same bar on the alternation arm, which ranks `oauth_candidates` itself and never
+            # reaches `_dynamic_rank`. Rebound only in this arm: it returns, or falls through with
+            # `dynamic_ordered` drawn from this list, so the shared `no-candidates` check never reads it empty.
+            oauth_candidates = [
+                n for n in oauth_candidates if now >= (overload_backoff.get(n) or 0)
+            ]
+            healthy_peers = [
+                n for n in healthy_peers if now >= (overload_backoff.get(n) or 0)
+            ]
             # NOT `_dynamic_rank`: the no-return bar would permanently
             # block F3's deliberate, healthy alternation between two
             # unchanged accounts (never "recovered").
@@ -4359,7 +4371,7 @@ class AutoSwitchEngine:
         if trigger == "active-stale" and not ordered:
             # Every peer spent: wait for the earliest reset as an exhausted
             # fleet does, not at the ordinary cadence.
-            spent = empty_pass_refusal(
+            spent = bool(oauth_candidates) and empty_pass_refusal(
                 trigger=trigger, any_known=any_known,
                 active_reset_ts=active_reset_ts,
                 waiting_for_recovery=waiting_for_recovery,

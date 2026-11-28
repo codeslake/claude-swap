@@ -103,7 +103,7 @@ def _refresh_lines(caplog):
         # The retry lands the successor in the slot while the live write
         # failed: the only place the order of the retry and the log line shows.
         (1, True),
-        # Neither store took it: nothing was saved, so no line claims it.
+        # Neither store took it: nothing was saved, but the stash took it and its own line closes the start line (T3539 sweep).
         (2, False),
     ],
 )
@@ -120,7 +120,7 @@ def test_a_retry_that_saves_the_successor_closes_the_start_line(
         calls.append(creds)
         if len(calls) <= backup_fails:
             raise OSError("transient")
-        return real(num, email, creds)
+        return real(num, email, creds, **_kw)  # T3539 sweep
 
     def live_refused(_creds):
         raise OSError("live store refused")
@@ -133,6 +133,7 @@ def test_a_retry_that_saves_the_successor_closes_the_start_line(
     old = oauth.credential_fingerprint(SPENT)[:19]
     new = oauth.credential_fingerprint(ROTATED)[:19]
     expected = [f"Refresh starting for account 1 ({old})."]
-    if saved:
-        expected.append(f"Refresh for account 1 saved its successor ({new}).")
+    expected.append(  # T3539 sweep
+        f"Refresh for account 1 {'saved' if saved else 'stashed'} its successor ({new})."
+    )
     assert _refresh_lines(caplog) == expected
