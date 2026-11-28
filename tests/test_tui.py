@@ -674,7 +674,7 @@ class TestFormatting:
         assert seven[:2] == ("7d", 22.0) and seven[2].startswith("resets ")
         assert fable[:3] == ("Fable", None, "reset 3h 5m ago")
         mini = mini_account_text(make_account(2, entry=entry), now).plain
-        assert "5h    ?  7d  22%" in mini and "Fable" not in mini  # fixed columns
+        assert re.search(r"5h\s+\?\s+7d\(⟳\S*\):\s*22%\s+Fable\s+\?", mini)  # T3602: fixed columns, the chip the fork draws, and a passed Fable as `?` (the panel's reading)
 
 
 def _bump(path: Path) -> None:
@@ -1238,7 +1238,7 @@ class TestMiniAccountText:
             last_good={"five_hour": {"pct": 42.0}}, fetched_at=now, age_s=0.0,
         )
         acc = make_account(1, entry=entry)
-        assert "5h(⟳?):42%" in mini_account_text(acc, now).plain
+        assert "5h(⟳?): 42%" in mini_account_text(acc, now).plain  # no reset: right-aligned, width 3
 
     def test_dashboard_chip_draws_a_passed_reset_as_unknown_whatever_the_fetch_state(
         self,
@@ -1264,7 +1264,7 @@ class TestMiniAccountText:
         waiting = dataclasses.replace(claimed, claim_until=None, next_poll_at=now + 300)
         for entry in (claimed, waiting):
             out = mini_account_text(make_account(1, entry=entry), now).plain
-            assert "5h ?" in out, out
+            assert re.search(r"5h\s+\?", out), out  # T3602: the compact row sets the chip in its column
             assert "100%" not in out and "⟳" not in out, out
 
     @pytest.mark.parametrize(
@@ -1356,7 +1356,7 @@ class TestMiniAccountText:
             f"a scoped-only account below its cap still reads as unknown: {out!r}"
         )
         assert "Fable" in out and "99%" in out, out
-        pct_span = next(s for s in text.spans if out[s.start : s.end] == "99%")
+        pct_span = next(s for s in text.spans if out[s.start : s.end] == " 99%")  # the span carries the pad (width 3)
         assert ("dim" in str(pct_span.style)) == expect_dim, (
             f"age_s={age_s}: expected dim={expect_dim}, style={pct_span.style!r}"
         )
@@ -1381,7 +1381,8 @@ class TestMiniAccountText:
         assert "95%" in out, (
             f"a 95%-spent budget vanished behind a healthy window: {out!r}"
         )
-        assert "10% \u00b7 $$" in out, (
+        # two cells of a fixed-column row (the gap is blank), never run together
+        assert "10%  $$ 95%" in out, (
             f"the window and the spend row ran together: {out!r}"
         )
 
@@ -1395,7 +1396,7 @@ class TestMiniAccountText:
         acc = make_account(
             1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         )
-        assert "5h(⟳1h00m):42%" in mini_account_text(acc, now).plain
+        assert "5h(⟳1h00m): 42%" in mini_account_text(acc, now).plain  # below 100: right-aligned, width 3
 
     def test_scoped_window_below_100_shows_its_pct_alongside_5h_7d(self):
         """PROBE: the scoped loop only fires at/over 100 (`maxed`), so once a
@@ -1488,11 +1489,11 @@ class TestMiniAccountText:
         widths, mixed = rows(lambda a: a.number != "3")
         assert widths.tag == len("[orgA]")  # the hidden long tag adds no width
         assert "[a-much" not in mixed[1]
-        assert len({r.index("5h ") for r in mixed}) == 1  # hidden row keeps the column
+        assert len({r.index("5h(") for r in mixed}) == 1  # hidden row keeps the column
         widths_none, bare = rows(lambda a: False)
         assert widths_none.tag == 0 and "[" not in "".join(bare)
         # every tag hidden leaves no blank column: the body starts a column earlier
-        assert mixed[0].index("5h ") - bare[0].index("5h ") == widths.tag + len("  ")
+        assert mixed[0].index("5h(") - bare[0].index("5h(") == widths.tag + len("  ")
 
 
 class TestOrgTagSetting:
@@ -1596,7 +1597,8 @@ class TestDashboard:
             tmp_path,
         )
         app = make_app(fake)
-        async with app.run_test(size=(100, 32)) as pilot:
+        # wide enough for the mini row with its right-aligned pct and `(disabled)`
+        async with app.run_test(size=(110, 32)) as pilot:
             await settle(pilot)
             from claude_swap.tui.widgets import AccountsPanel
 
@@ -1660,11 +1662,11 @@ class TestDashboard:
 
             panel = app.screen.query_one(AccountsPanel).render().plain
             mini_part = panel.split("user2@example.com", 1)[1]
-            # The window reads as one chip now — "5h(⟳1h59m):92%" — built by
+            # The window reads as one chip now — "5h(⟳1h59m): 92%" — built by
             # the same helper the auto view uses. Assert the parts that carry
             # the meaning (which window, what pct), not the spacing between
             # them, so the two surfaces can keep sharing one format.
-            assert "5h(" in mini_part and ":92%" in mini_part
+            assert "5h(" in mini_part and "92%" in mini_part
             assert "7d" not in mini_part
 
     async def test_compact_rows_share_fixed_columns(self, tmp_path, monkeypatch):
@@ -1765,24 +1767,28 @@ class TestDashboard:
         def starts(token, lines=rows):
             return {ln.index(token) for ln in lines if token in ln}
 
-        assert "(ahead)" in panel and "⟳429" in panel
-        for token in ("[", "5h(", "7d(", "Fable(", "$$ "):
+        assert "(ahead)" in panel  # T3602: a rolled window reads `?` (upstream #625), so no `⟳429` chip is drawn
+        for token in ("[", "5h(", "7d(", "Fable("):
             assert len(starts(token)) == 1, (token, rows)
             assert len(starts(token, cut)) <= 1, (token, cut)  # a cut row may lose it
+        # beside windows the spend cell is a column of its own; spend alone is a note, and
+        # starts in the 5h column instead (test_a_spend_only_row_starts_at_the_first_metric_column)
+        assert len(starts("$$ ", [ln for ln in rows if "Fable(" in ln])) == 1, rows
+        assert len(starts("$$ ", [ln for ln in cut if "Fable(" in ln])) <= 1, cut  # a cut row may lose it
         # every pct of one window starts at one column, a back-off chip included:
         # the chip is padded to the widest one shown, so `7d(⟳429 30m):100%` and
         # `7d(⟳0d20h):   20%` put the `%` in the same column
         for token in ("5h(", "7d(", "Fable("):
             pcts = {ln.index("%", ln.index(token)) for ln in rows if token in ln}
             assert len(pcts) == 1, (token, rows)
-        assert "5h(⟳429 30m):" in rows[1] and "7d(⟳429 30m):100%" in rows[1]
-        assert "7d(⟳0d20h):   20%" in rows[9]
+        assert re.search(r"5h\s+\?", rows[1]) and re.search(r"7d\s+\?", rows[1])  # T3602: both windows rolled
+        assert "7d(⟳0d20h): 20%" in rows[9]  # T3602: no back-off chip widens the column any more
         # a short chip is padded to the widest, then the pct is right-aligned in width 3
-        assert re.search(r"5h\(⟳\S+\):    8%", rows[9]) and re.search(r"5h\(⟳\S+\):    5%", rows[2])
+        assert re.search(r"5h\(⟳\S+\):\s+8%", rows[9]) and re.search(r"5h\(⟳\S+\):\s+5%", rows[2])  # T3602
         # the pace marker is no part of the 7d cell: ahead or not, only the pct
         assert "Fable(" in rows[0] and "Fable(" in rows[3]  # wide rows are whole
         s7, sf = starts("7d(").pop(), starts("Fable(").pop()
-        for n in (2, 3, 9, 11):
+        for n in (2, 9, 11):  # T3602: row 3 reads `?` in both its windows
             assert re.fullmatch(r"7d\([^)]*\):\s*\d+%\s*", rows[n - 2][s7:sf]), rows[n - 2]
         tags = [re.search(r"\[[^\]]*\]", ln).group() for ln in rows]
         assert [len(t) for t in tags[:2]] == [24, 24]  # capped, ellipsis inside
@@ -1854,6 +1860,34 @@ class TestDashboard:
         marked = {str(n): f for n, f in {**fields, 12: "(disabled)"}.items()}
         assert all(out[n].endswith(f) for n, f in marked.items())
         assert len({len(out[n]) - len(f) for n, f in marked.items()}) == 1
+
+    @pytest.mark.parametrize("pct7", [10.0, None], ids=["usage-widest", "spend-widest"])
+    async def test_a_spend_only_row_starts_at_the_first_metric_column(self, pct7):
+        # Spend with no window is the row's whole usage, like `no plan`: it starts
+        # where a usage row's 5h cell does (no `$$` column pushes it right), and the
+        # marker field follows the widest metric cell, one gap on.
+        from claude_swap.tui.widgets import mini_account_text, mini_widths
+
+        now = time.time()
+        # 31 cells, one past `_MINI_NOTE_CAP`: the cap is for sentinel labels, a spend note stays whole
+        spend = {"used": 1234.56, "limit": 2000.0, "pct": 100.0, "currency": "USD"}
+        no_plan = UsageEntry(
+            last_good={}, last_error="oauth_not_allowed_for_organization",
+            fetched_at=now - 5, age_s=5.0,
+        )
+        accs = [
+            make_account(2, entry=make_entry(40.0, pct7)),
+            make_account(3, entry=make_entry(None, None, spend=spend), disabled=True),
+            make_account(4, entry=no_plan, disabled=True),
+        ]
+        widths = mini_widths(accs, now)
+        usage, only, plan = (mini_account_text(a, now, widths=widths).plain for a in accs)
+        cell = "$$ 100% · $1,234.56 / $2,000.00"
+        assert cell in only, (usage, only, plan)
+        assert only.index(cell) == plan.index("no plan") == usage.index("5h("), (usage, only, plan)
+        # the usage row carries no marker, so it ends where its last cell does
+        end = max(len(usage), only.index(cell) + len(cell))
+        assert only.index("(disabled)") == plan.index("(disabled)") == end + 2, (usage, only, plan)
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path, monkeypatch):
         # SAY WHICH WORLD THIS IS, rather than inherit it. The list below used
@@ -6890,11 +6924,11 @@ class TestUnswitchableRowsAreListed:
         ), active="1", settings=AutoSwitchSettings(model="Fable"))
         mini = mini_account_text(make_account(2, entry=entry), now).plain
         for out in (panel, mini):
-            assert "5h ? · 7d(⟳" in out and "):5%" in out, out
+            assert re.search(r"5h\s+\?\s+(?:· )?7d\(⟳\S*\):\s*5%", out), out  # T3602: the panel strings its chips, the compact row sets them in columns
             assert "100%" not in out and "5h(⟳" not in out, out
         # The chips read `?`; the label is the engine's veto on the stored
         # figure, as in the decision log (5h before Fable).
-        assert "Fable ?" in panel and "  5h full" in panel, panel
+        assert "Fable ?" in panel and "5h limit reached" in panel, panel  # T3602: #323's words, a window at 100 reads `limit reached`
         assert "-walled" not in panel, panel
         # Every window past its reset: the chip reads `?`, the label still
         # names the stored figure's veto.
@@ -6906,7 +6940,7 @@ class TestUnswitchableRowsAreListed:
             self._acct("1", "a@x.com", switchable=True),
             self._acct("2", "b@x.com", switchable=True, usage=only),
         ), active="1", settings=AutoSwitchSettings())
-        assert "5h ?" in out and "100%" not in out and "  5h full" in out, out
+        assert "5h ?" in out and "100%" not in out and "5h limit reached" in out, out  # T3602: #323's words, a window at 100 reads `limit reached`
 
     @pytest.mark.parametrize(
         ("active_pct", "header"),
@@ -7275,11 +7309,13 @@ class TestUnswitchableRowsAreListed:
                 self._acct("2", "b@x.com", switchable=True, usage=entry),
             ), active="1", settings=AutoSwitchSettings(model="Fable"))
             mini = mini_account_text(make_account(2, entry=entry), now).plain
+            assert "5h ?" in panel and "Fable ?" in panel, panel
+            # the compact row (#425) sets each `?` in its column: `5h    ?`, `Fable    ?`
+            assert re.search(r"5h\s+\?", mini) and re.search(r"Fable\s+\?", mini), mini
             for out in (panel, mini):
-                assert "5h ?" in out and "Fable ?" in out, out
                 assert "100%" not in out and "⟳" not in out, out
-            assert "  5h full" in panel and "-only" not in panel, panel
-            assert "full" not in mini, mini
+            assert "5h limit reached" in panel and "-only" not in panel, panel  # T3602: #323's words, a window at 100 reads `limit reached`
+            assert "full" not in mini and "limit reached" not in mini, mini
 
     @pytest.mark.parametrize(
         ("active_pct", "header"),
